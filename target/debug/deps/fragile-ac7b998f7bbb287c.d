@@ -1,0 +1,11 @@
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\libfragile-ac7b998f7bbb287c.rmeta: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\errors.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\fragile.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\registry.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\semisticky.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\sticky.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\thread_id.rs
+
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\fragile-ac7b998f7bbb287c.d: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\errors.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\fragile.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\registry.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\semisticky.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\sticky.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\thread_id.rs
+
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src/lib.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\errors.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\fragile.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\registry.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\semisticky.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\sticky.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\fragile-2.0.1\src\thread_id.rs:
