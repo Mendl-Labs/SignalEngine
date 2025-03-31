@@ -1,0 +1,11 @@
+appName: data-engine
+database: timescale
+timescale:
+  port: 35220
+redis:
+  port: 19298
+cache: redis
+volumeName: config-volume
+image:
+  repository: prodtradingbotregistry.azurecr.io/data-engine
+  tag: default

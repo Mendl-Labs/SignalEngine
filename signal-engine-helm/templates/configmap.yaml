@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.appName }}-configmap
+data:
+  POSTGRES_DB: "tsdb_transaction"
+  POSTGRES_HOST: "ll8stnrnd9.yd4ed8gjcp.tsdb.cloud.timescale.com"
+  POSTGRES_PORT: "{{ .Values.timescale.port }}"
+  REDIS_DB: "cache-LW5CEFX0"
+  REDIS_HOST: "redis-{{ .Values.redis.port }}.c91.us-east-1-3.ec2.redns.redis-cloud.com"
+  REDIS_PORT: "{{ .Values.redis.port }}"
+  config.yaml: |
+    message_broker:
+      address: 'amqp://guest:guest@rabbitmq:5672/'
+      port: 3200
+      
+    topics:
+      - 'signal-data'

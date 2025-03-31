@@ -5,5 +5,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.97"
+async-trait = "0.1.88"
+config = { path = "../config" }
+dotenv = "0.15.0"
 mockall = "0.13.1"
+publisher = { path = "../../MessageBrokerEngine/publisher" }
+subscriber = { path = "../../MessageBrokerEngine/subscriber" }
 tokio = "1.44.1"
