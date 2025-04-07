@@ -5,5 +5,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.97"
+async-trait = "0.1.88"
+config = { path = "../config" }
+datahandler = { path = "../datahandler" }
+dotenv = "0.15.0"
 mockall = "0.13.1"
+portfoliohandler = { path = "../portfoliohandler" }
+signaldispatcher = { path = "../signaldispatcher" }
 tokio = "1.44.1"

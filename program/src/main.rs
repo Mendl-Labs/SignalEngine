@@ -1,3 +1,9 @@
-fn main() {
-    println!("Hello, world!");
+use hostbuilder::{
+    HostedObject,
+    HostedObjectTrait
+};
+use anyhow::Result;
+
+fn main() -> Result<()> {
+    Ok(())
 }

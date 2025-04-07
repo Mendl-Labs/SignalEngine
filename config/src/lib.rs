@@ -1,14 +1,30 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use serde::{Serialize, Deserialize};
+use serde_yaml;
+use std::fs;
+use anyhow::{
+    Context,
+    Result
+};
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Config {
+    pub message_broker: MessageBroker,
+    pub publish_topic: String,
+    pub subscribe_topics: Vec<String>
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct MessageBroker {
+    pub address: String,
+    pub port: u16,
+}
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+impl Config {
+    pub fn new(file_path: &str) -> Result<Self> {
+        let config_data = fs::read_to_string(file_path)
+            .with_context(|| format!("Unable to read file: {}", file_path))?;
+        let config: Config = serde_yaml::from_str(&config_data)
+            .context("YAML was not well-formatted")?;
+        Ok(config)
     }
 }
