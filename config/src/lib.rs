@@ -9,7 +9,8 @@ use anyhow::{
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Config {
     pub message_broker: MessageBroker,
-    pub topics: Vec<String>
+    pub publish_topic: String,
+    pub subscribe_topics: Vec<String>
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

@@ -4,8 +4,6 @@ use hostbuilder::{
 };
 use anyhow::Result;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let mut engine = HostedObject::build().await?;
+fn main() -> Result<()> {
     Ok(())
 }

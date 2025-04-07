@@ -14,5 +14,9 @@ data:
       address: 'amqp://guest:guest@rabbitmq:5672/'
       port: 3200
       
-    topics:
+    publish_topic:
       - 'signal-data'
+
+    subscribe_topics:
+      - 'event-data'
+      - 'portfolio-data'

@@ -1,14 +1,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.appName }}-service
+  name: {{ include "signal-engine-helm.fullname" . }}
   labels:
-    app: {{ .Values.appName }}
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
 spec:
-  type: ClusterIP
-  selector:
-    app: {{ .Values.appName }}
+  type: {{ .Values.service.type }}
   ports:
-    - protocol: TCP
-      port: 445
-      targetPort: 445
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "signal-engine-helm.selectorLabels" . | nindent 4 }}

@@ -1,108 +1,68 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Values.appName }}-deployment
+  name: {{ include "signal-engine-helm.fullname" . }}
   labels:
-    app: {{ .Values.appName }}
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
-      app: {{ .Values.appName }}
+      {{- include "signal-engine-helm.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
-        app: {{ .Values.appName }}
+        {{- include "signal-engine-helm.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        - name: acr-secret
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "signal-engine-helm.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-      - name: {{ .Values.appName }}
-        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
-        ports:
-        - containerPort: 443
-        env:
-        - name: CONFIG_PATH
-          value: "/etc/config/config.yaml"
-        - name: REDIS_USER
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.appName }}-secret
-              key: {{ .Values.cache }}-root-username
-        - name: REDIS_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.appName }}-secret
-              key: {{ .Values.cache }}-root-password
-        - name: REDIS_HOST
-          valueFrom:
-            configMapKeyRef:
-              name: {{ .Values.appName }}-configmap
-              key: REDIS_HOST
-        - name: REDIS_PORT
-          valueFrom:
-            configMapKeyRef:
-              name: {{ .Values.appName }}-configmap
-              key: REDIS_PORT
-        - name: REDIS_URL
-          value: "redis://$(REDIS_USER):$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)"
-        - name: POSTGRES_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.appName }}-secret
-              key: {{ .Values.database }}-root-username
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.appName }}-secret
-              key: {{ .Values.database }}-root-password
-        - name: POSTGRES_DB
-          valueFrom:
-            configMapKeyRef:
-              name: {{ .Values.appName }}-configmap
-              key: POSTGRES_DB
-        - name: POSTGRES_HOST
-          valueFrom:
-            configMapKeyRef:
-              name: {{ .Values.appName }}-configmap
-              key: POSTGRES_HOST
-        - name: POSTGRES_PORT
-          valueFrom:
-            configMapKeyRef:
-              name: {{ .Values.appName }}-configmap
-              key: POSTGRES_PORT
-        - name: DATABASE_URL
-          value: "postgres://$(POSTGRES_USERNAME):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/tsdb?sslmode=require"
-        volumeMounts:
-        - name: {{ .Values.volumeName }}
-          mountPath: /etc/config
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "200m"
-        livenessProbe:
-          exec:
-            command:
-              - "/usr/local/bin/liveness_check.sh"
-          initialDelaySeconds: 10
-          periodSeconds: 20
-          failureThreshold: 3
-        readinessProbe:
-          exec:
-            command:
-              - "/usr/local/bin/health_check.sh"
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          failureThreshold: 3
-        imagePullPolicy: IfNotPresent
-      terminationGracePeriodSeconds: 30
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.volumes }}
       volumes:
-      - name: {{ .Values.volumeName }}
-        configMap:
-          name: {{ .Values.appName }}-configmap
-          items:
-            - key: config.yaml
-              path: config.yaml
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
