@@ -46,8 +46,24 @@ pub struct Trades {
     pub trades: ::prost::alloc::vec::Vec<Trade>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Wallet {
+    #[prost(string, tag = "1")]
+    pub symbol: ::prost::alloc::string::String,
+    #[prost(float, tag = "2")]
+    pub balance: f32,
+    #[prost(uint64, tag = "3")]
+    pub sequence: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Wallets {
+    #[prost(string, tag = "1")]
+    pub exchange: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub wallets: ::prost::alloc::vec::Vec<Wallet>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MarketMessage {
-    #[prost(oneof = "market_message::Payload", tags = "1, 2")]
+    #[prost(oneof = "market_message::Payload", tags = "1, 2, 3")]
     pub payload: ::core::option::Option<market_message::Payload>,
 }
 /// Nested message and enum types in `MarketMessage`.
@@ -58,6 +74,8 @@ pub mod market_message {
         TradesPayload(super::Trades),
         #[prost(message, tag = "2")]
         OrdersPaylaod(super::Orders),
+        #[prost(message, tag = "3")]
+        WalletsPayload(super::Wallets),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
