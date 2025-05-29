@@ -4,4 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+config = { path = "../config" }
+dotenv = "0.15.0"
+lazy_static = "1.5.0"
+portfolio = { path = "../portfolio" }
+prost = "0.13.5"
+protocol = { path = "../../MessageBrokerEngine/protocol" }
+serde = "1.0.219"
+spin_sleep = "1.3.1"
 subscriber = { path = "../../MessageBrokerEngine/subscriber" }

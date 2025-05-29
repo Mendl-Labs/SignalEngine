@@ -15,8 +15,8 @@ data:
       port: 3200
       
     publish_topic:
-      - 'signal-data'
+      - 'signal.data'
 
     subscribe_topics:
-      - 'event-data'
-      - 'portfolio-data'
+      - 'event.data'
+      - 'portfolio.data'
