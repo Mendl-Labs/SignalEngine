@@ -2,7 +2,6 @@ use config::Config;
 use dotenv::dotenv;
 use lazy_static::lazy_static;
 use orderbook::Orderbook;
-use portfolio::CryptoWallet;
 use prost::Message;
 use protocol::broker::messages::{market_message, MarketMessage};
 use std::{collections::HashMap, env, error::Error, hash::{DefaultHasher, Hash, Hasher}, sync::{Arc, RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -12,7 +11,6 @@ use subscriber::{ConnectionConfig, Subscriber};
 lazy_static! {
     static ref ORDERBOOKS: RwLock<HashMap<(String, String), Arc<Orderbook>>> = RwLock::new(HashMap::new());
     static ref LAST_UPDATE: RwLock<HashMap<(String, String), Instant>> = RwLock::new(HashMap::new());
-    static ref PORTFOLIO: Arc<CryptoWallet> = Arc::new(CryptoWallet::new());
 }
 
 pub trait DataHandlerTrait {
@@ -427,42 +425,6 @@ impl DataHandler {
                             _ => {
                                 eprintln!("Unknown order event: {}", order.event);
                             }
-                        }
-                    }
-                },
-                Some(market_message::Payload::WalletsPayload(wallets)) => {
-                    // Process wallet balance updates using the new direct method
-                    match PORTFOLIO.process_wallets_message(
-                        &wallets.exchange,
-                        &wallets.wallets,
-                        current_timestamp / 1000000  // Convert nanos to millis
-                    ) {
-                        Ok(_) => {
-                            if cfg!(debug_assertions) {
-                                // Log some stats about the update
-                                let total_symbols = wallets.wallets.len();
-                                println!(
-                                    "Updated portfolio for {} with {} symbols",
-                                    wallets.exchange,
-                                    total_symbols
-                                );
-                                
-                                // Optionally log individual balances
-                                for wallet in &wallets.wallets {
-                                    println!(
-                                        "  {}: {:.8}",
-                                        wallet.symbol,
-                                        wallet.balance,
-                                    );
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to update portfolio for {}: {}",
-                                wallets.exchange,
-                                e
-                            );
                         }
                     }
                 },

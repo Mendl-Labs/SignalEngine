@@ -1,0 +1,11 @@
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\libtinyvec-3bb8a5c87f6cd7da.rmeta: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array\generated_impl.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec_drain.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\slicevec.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\tinyvec.rs
+
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\tinyvec-3bb8a5c87f6cd7da.d: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array\generated_impl.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec_drain.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\slicevec.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\tinyvec.rs
+
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src/lib.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\array\generated_impl.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\arrayvec_drain.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\slicevec.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tinyvec-1.9.0\src\tinyvec.rs:

@@ -1,0 +1,13 @@
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\libuuid-6e4f313db1083585.rmeta: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\builder.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\error.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\non_nil.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\parser.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\fmt.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\timestamp.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\external.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\macros.rs
+
+C:\Users\ikenn\TradingPlatform\SignalEngine\target\debug\deps\uuid-6e4f313db1083585.d: C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src/lib.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\builder.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\error.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\non_nil.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\parser.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\fmt.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\timestamp.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\external.rs C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\macros.rs
+
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src/lib.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\builder.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\error.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\non_nil.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\parser.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\fmt.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\timestamp.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\external.rs:
+C:\Users\ikenn\.cargo\registry\src\index.crates.io-6f17d22bba15001f\uuid-1.17.0\src\macros.rs:

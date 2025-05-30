@@ -1,14 +1,14 @@
 use config::Config;
 use dotenv::dotenv;
 use lazy_static::lazy_static;
-use portfolio::{CryptoWallet, Position};
+use portfolio::{CryptoWallet, Position, PortfolioMetrics};
 use prost::Message;
-use protocol::broker::messages::MarketMessage;
+use protocol::broker::messages::{portfolio_message, PortfolioMessage};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, error::Error, sync::{Arc, RwLock}, time::{Instant, SystemTime, UNIX_EPOCH}};
 use subscriber::{ConnectionConfig, Subscriber};
 
-// Global storage for portfolios
+// Global storage for portfolios - properly structured as a HashMap
 lazy_static! {
     static ref PORTFOLIOS: RwLock<HashMap<String, Arc<CryptoWallet>>> = RwLock::new(HashMap::new());
     static ref LAST_UPDATE: RwLock<HashMap<String, Instant>> = RwLock::new(HashMap::new());
@@ -58,12 +58,22 @@ impl PortfolioHandler {
         
         for (exchange, portfolio) in portfolios.iter() {
             if let Ok(metrics) = portfolio.get_metrics() {
-                println!("Exchange: {}, Portfolio Value: {}, PnL: {}, Positions: {}",
+                println!("Exchange: {}, Portfolio Value: {:.2}, Positions: {}",
                     exchange,
                     metrics.total_value,
-                    metrics.value_by_exchange.get(exchange).unwrap_or(&0.0),
                     metrics.positions.len()
                 );
+                
+                // Log top positions
+                for (i, position) in metrics.positions.iter().take(5).enumerate() {
+                    println!("  Top {}: {} - {:.8} @ ${:.2} = ${:.2}",
+                        i + 1,
+                        position.symbol,
+                        position.quantity,
+                        position.market_price,
+                        position.market_value
+                    );
+                }
             } else {
                 eprintln!("Failed to get metrics for portfolio on exchange {}", exchange);
             }
@@ -74,22 +84,31 @@ impl PortfolioHandler {
     
     // Get or create a portfolio for the given exchange
     fn get_or_create_portfolio(&self, exchange: &str) -> Arc<CryptoWallet> {
-        let mut portfolios = PORTFOLIOS.write().unwrap();
-        
-        // If the portfolio doesn't exist, create a new one
-        if !portfolios.contains_key(exchange) {
-            let portfolio = Arc::new(CryptoWallet::new());
-            portfolios.insert(exchange.to_string(), portfolio.clone());
-            
-            // Also initialize the last update timestamp
-            let mut last_update = LAST_UPDATE.write().unwrap();
-            last_update.insert(exchange.to_string(), Instant::now());
-            
-            return portfolio;
+        // Try to get with read lock first
+        {
+            let portfolios = PORTFOLIOS.read().unwrap();
+            if let Some(portfolio) = portfolios.get(exchange) {
+                return Arc::clone(portfolio);
+            }
         }
         
-        // Return the existing portfolio
-        portfolios.get(exchange).unwrap().clone()
+        // Need to create new portfolio
+        let mut portfolios = PORTFOLIOS.write().unwrap();
+        
+        // Check again in case another thread created it
+        if let Some(portfolio) = portfolios.get(exchange) {
+            return Arc::clone(portfolio);
+        }
+        
+        // Create new portfolio
+        let portfolio = Arc::new(CryptoWallet::new());
+        portfolios.insert(exchange.to_string(), Arc::clone(&portfolio));
+        
+        // Also initialize the last update timestamp
+        let mut last_update = LAST_UPDATE.write().unwrap();
+        last_update.insert(exchange.to_string(), Instant::now());
+        
+        portfolio
     }
     
     // Update the last update timestamp for an exchange
@@ -138,7 +157,7 @@ impl PortfolioHandlerTrait for PortfolioHandler {
                                   latency_ns / 1000, topic_idx);
                     }
                     
-                    // Process message data - replace with your actual processing logic
+                    // Process message data
                     self.process_message(topic_idx, message.get_data())
                         .unwrap_or_else(|e| eprintln!("Error processing message: {}", e));
                 }
@@ -180,8 +199,6 @@ impl PortfolioHandlerTrait for PortfolioHandler {
     }
 }
 
-// Add this implementation to your PortfolioHandler impl block
-
 impl PortfolioHandler {
     #[inline]
     fn process_message(&self, topic_idx: usize, data: &[u8]) -> Result<(), Box<dyn Error>> {
@@ -194,11 +211,11 @@ impl PortfolioHandler {
             .unwrap_or_default()
             .as_millis() as u64;
         
-        // Decode the MarketMessage
-        if let Ok(market_msg) = MarketMessage::decode(data) {            
-            // Now process based on whether it contains trades, orders, or wallets
-            match market_msg.payload {
-                Some(protocol::broker::messages::market_message::Payload::WalletsPayload(wallets)) => {
+        // Decode the PortfolioMessage
+        if let Ok(portfolio_msg) = PortfolioMessage::decode(data) {            
+            // Process based on payload type
+            match portfolio_msg.payload {
+                Some(portfolio_message::Payload::WalletsPayload(wallets)) => {
                     // Get or create portfolio for this exchange
                     let portfolio = self.get_or_create_portfolio(&wallets.exchange);
                     
@@ -242,58 +259,21 @@ impl PortfolioHandler {
                         }
                     }
                 },
-                Some(protocol::broker::messages::market_message::Payload::TradesPayload(trades)) => {
-                    // Optionally update market prices based on trades
-                    // This would help with portfolio valuation
-                    for trade in &trades.trades {
-                        // Find which portfolio this trade belongs to
-                        let portfolio = self.get_or_create_portfolio(&trade.exchange);
-                        
-                        // Update the market price for this symbol
-                        if let Err(e) = portfolio.set_market_price(&trade.symbol, trade.price as f64) {
-                            eprintln!(
-                                "Failed to update market price for {}: {}",
-                                trade.symbol,
-                                e
-                            );
-                        }
-                    }
-                    
-                    if cfg!(debug_assertions) {
-                        println!(
-                            "Processed {} trades from topic {}",
-                            trades.trades.len(),
-                            topic_name
-                        );
-                    }
-                },
-                Some(protocol::broker::messages::market_message::Payload::OrdersPaylaod(orders)) => {
-                    // Orders don't directly affect portfolio balances
-                    // but we can log them for monitoring
-                    if cfg!(debug_assertions) {
-                        println!(
-                            "Received {} order updates from topic {} (not affecting portfolio)",
-                            orders.orders.len(),
-                            topic_name
-                        );
-                    }
-                },
                 None => {
-                    eprintln!("Empty market message payload for topic {}", topic_name);
+                    eprintln!("Empty portfolio message payload for topic {}", topic_name);
                     return Err("Empty payload".into());
                 }
             }
         } else {
-            eprintln!("Failed to decode MarketMessage for topic {}", topic_name);
+            eprintln!("Failed to decode PortfolioMessage for topic {}", topic_name);
             return Err("Failed to decode message".into());
         }
         
         Ok(())
     }
     
-    // Additional helper method to update portfolio prices for valuation
-    #[inline]
-    fn update_portfolio_prices(&self, prices: HashMap<String, f64>) -> Result<(), Box<dyn Error>> {
+    // Update portfolio prices for valuation
+    pub fn update_portfolio_prices(&self, prices: HashMap<String, f64>) -> Result<(), Box<dyn Error>> {
         let portfolios = PORTFOLIOS.read().unwrap();
         
         for (exchange, portfolio) in portfolios.iter() {
@@ -303,6 +283,18 @@ impl PortfolioHandler {
         }
         
         Ok(())
+    }
+    
+    // Get portfolio for a specific exchange
+    pub fn get_portfolio(&self, exchange: &str) -> Option<Arc<CryptoWallet>> {
+        let portfolios = PORTFOLIOS.read().unwrap();
+        portfolios.get(exchange).map(Arc::clone)
+    }
+    
+    // Get all portfolios
+    pub fn get_all_portfolios(&self) -> HashMap<String, Arc<CryptoWallet>> {
+        let portfolios = PORTFOLIOS.read().unwrap();
+        portfolios.clone()
     }
     
     // Helper method to get aggregated portfolio metrics across all exchanges
@@ -332,6 +324,17 @@ impl PortfolioHandler {
                 .unwrap_or_default()
                 .as_millis() as u64,
         })
+    }
+    
+    // Check if we have recent updates from an exchange
+    pub fn is_exchange_stale(&self, exchange: &str, max_age_ms: u64) -> bool {
+        let last_update = LAST_UPDATE.read().unwrap();
+        
+        if let Some(last_time) = last_update.get(exchange) {
+            last_time.elapsed().as_millis() as u64 > max_age_ms
+        } else {
+            true // No update recorded, consider it stale
+        }
     }
 }
 
