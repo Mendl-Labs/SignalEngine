@@ -14,5 +14,6 @@ portfolio = { path = "../portfolio" }
 serde = "1.0.219"
 serde_json = "1.0.140"
 strategy = { path = "../../BacktestingEngine/strategy" }
+signalgenerator = { path = "../signalgenerator" }
 tokio = "1.45.1"
 uuid = "1.17.0"

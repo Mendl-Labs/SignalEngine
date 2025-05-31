@@ -1642,6 +1642,11 @@ version = "0.1.0"
 [[package]]
 name = "signalgenerator"
 version = "0.1.0"
+dependencies = [
+ "crossbeam",
+ "serde",
+ "uuid",
+]
 
 [[package]]
 name = "simba"
@@ -1733,6 +1738,7 @@ dependencies = [
  "portfolio",
  "serde",
  "serde_json",
+ "signalgenerator",
  "strategy",
  "tokio",
  "uuid",
