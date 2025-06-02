@@ -288,6 +288,7 @@ impl SignalAggregator {
 }
 
 /// Signal filter for filtering signals based on criteria
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalFilter {
     min_confidence: f64,
     allowed_actions: Vec<SignalAction>,

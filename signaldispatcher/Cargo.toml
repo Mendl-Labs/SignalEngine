@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = "0.1.88"
+crossbeam = "0.8.4"
+protocol = { path = "../../MessageBrokerEngine/protocol" }
+publisher = { path = "../../MessageBrokerEngine/publisher" }
+serde = "1.0.219"
+signalgenerator = { path = "../signalgenerator" }

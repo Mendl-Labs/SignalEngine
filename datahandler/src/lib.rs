@@ -7,15 +7,17 @@ use protocol::broker::messages::{market_message, MarketMessage};
 use std::{collections::HashMap, env, error::Error, hash::{DefaultHasher, Hash, Hasher}, sync::{Arc, RwLock}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use subscriber::{ConnectionConfig, Subscriber};
 
-// Global storage for orderbooks
+// Global storage for orderbooks - made public for use in hostbuilder
 lazy_static! {
-    static ref ORDERBOOKS: RwLock<HashMap<(String, String), Arc<Orderbook>>> = RwLock::new(HashMap::new());
+    pub static ref ORDERBOOKS: Arc<RwLock<HashMap<(String, String), Arc<Orderbook>>>> = Arc::new(RwLock::new(HashMap::new()));
     static ref LAST_UPDATE: RwLock<HashMap<(String, String), Instant>> = RwLock::new(HashMap::new());
 }
 
 pub trait DataHandlerTrait {
     fn listen(&mut self) -> Result<(), Box<dyn Error>>;
 }
+
+#[derive(Clone)]
 pub struct DataHandler {
     subscriber: Subscriber
 }

@@ -1,7 +1,7 @@
 use config::Config;
 use dotenv::dotenv;
 use lazy_static::lazy_static;
-use portfolio::{CryptoWallet, Position, PortfolioMetrics};
+use portfolio::{CryptoWallet, Position};
 use prost::Message;
 use protocol::broker::messages::{portfolio_message, PortfolioMessage};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use subscriber::{ConnectionConfig, Subscriber};
 
 // Global storage for portfolios - properly structured as a HashMap
 lazy_static! {
-    static ref PORTFOLIOS: RwLock<HashMap<String, Arc<CryptoWallet>>> = RwLock::new(HashMap::new());
+    pub static ref PORTFOLIOS: Arc<RwLock<HashMap<String, Arc<CryptoWallet>>>> = Arc::new(RwLock::new(HashMap::new()));
     static ref LAST_UPDATE: RwLock<HashMap<String, Instant>> = RwLock::new(HashMap::new());
 }
 
@@ -18,6 +18,7 @@ pub trait PortfolioHandlerTrait {
     fn listen(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
+#[derive(Clone)]
 pub struct PortfolioHandler {
     subscriber: Subscriber
 }
