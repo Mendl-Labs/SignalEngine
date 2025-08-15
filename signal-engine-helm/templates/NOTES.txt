@@ -1,0 +1,140 @@
+🚀 SignalEngine Ultra-Low Latency Trading Platform
+
+{{- if .Values.ingress.enabled }}
+📊 Your SignalEngine is accessible at:
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+📊 Get the application URL by running these commands:
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "signal-engine-helm.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+📊 NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+       You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "signal-engine-helm.fullname" . }}'
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "signal-engine-helm.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+{{- else if contains "ClusterIP" .Values.service.type }}
+📊 Get the application URL by running these commands:
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "signal-engine-helm.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  export CONTAINER_PORT=$(kubectl get pod --namespace {{ .Release.Namespace }} $POD_NAME -o jsonpath="{.spec.containers[0].ports[0].containerPort}")
+  echo "Visit http://127.0.0.1:8080 to use your application"
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:$CONTAINER_PORT
+{{- end }}
+
+📈 Environment: {{ .Values.global.environment | upper }}
+🔄 Replicas: {{ .Values.replicaCount }}
+{{- if .Values.autoscaling.enabled }}
+📊 Autoscaling: Enabled ({{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas)
+{{- end }}
+
+🔍 Monitoring & Observability:
+{{- if .Values.monitoring.prometheus.enabled }}
+✅ Prometheus metrics: http://{{ include "signal-engine-helm.fullname" . }}:8081/metrics
+{{- end }}
+{{- if .Values.monitoring.grafana.enabled }}
+✅ Grafana dashboards: Available
+{{- end }}
+{{- if .Values.monitoring.tracing.enabled }}
+✅ Distributed tracing: Enabled
+{{- end }}
+
+🔒 Security Features:
+{{- if .Values.networkPolicy.enabled }}
+✅ Network policies: Enabled
+{{- end }}
+{{- if .Values.podSecurityContext }}
+✅ Pod security context: Configured
+{{- end }}
+{{- if .Values.rbac.create }}
+✅ RBAC: Enabled
+{{- end }}
+
+💾 Storage:
+{{- if .Values.persistence.enabled }}
+✅ Persistent storage: {{ .Values.persistence.size }} ({{ .Values.persistence.storageClass }})
+{{- else }}
+⚠️  Persistent storage: Disabled
+{{- end }}
+
+🔧 Useful Commands:
+
+# Check deployment status
+kubectl get deployment {{ include "signal-engine-helm.fullname" . }} -n {{ .Release.Namespace }}
+
+# View pods
+kubectl get pods -l app.kubernetes.io/name={{ include "signal-engine-helm.name" . }} -n {{ .Release.Namespace }}
+
+# Check logs
+kubectl logs -l app.kubernetes.io/name={{ include "signal-engine-helm.name" . }} -n {{ .Release.Namespace }} -f
+
+# View configuration
+kubectl get configmap {{ include "signal-engine-helm.fullname" . }}-config -n {{ .Release.Namespace }} -o yaml
+
+{{- if .Values.monitoring.prometheus.enabled }}
+# Check metrics
+kubectl port-forward svc/{{ include "signal-engine-helm.fullname" . }} 8081:8081 -n {{ .Release.Namespace }}
+curl http://localhost:8081/metrics
+{{- end }}
+
+{{- if .Values.development.enabled }}
+🛠️  Development Mode:
+{{- if .Values.development.debug.enabled }}
+✅ Debug port: {{ .Values.development.debug.port }}
+{{- end }}
+{{- if .Values.development.profiling.enabled }}
+✅ Profiling port: {{ .Values.development.profiling.port }}
+{{- end }}
+
+# Connect to debug sidecar
+kubectl exec -it deployment/{{ include "signal-engine-helm.fullname" . }} -c debug-sidecar -n {{ .Release.Namespace }} -- /bin/sh
+{{- end }}
+
+{{- if eq .Values.global.environment "prod" }}
+🏭 Production Checklist:
+{{- if not .Values.resources.limits }}
+⚠️  Resource limits not set - consider setting CPU/Memory limits
+{{- end }}
+{{- if not .Values.autoscaling.enabled }}
+⚠️  Autoscaling disabled - enable for production workloads
+{{- end }}
+{{- if not .Values.monitoring.prometheus.enabled }}
+⚠️  Prometheus monitoring disabled - enable for production monitoring
+{{- end }}
+{{- if not .Values.backup.enabled }}
+⚠️  Backup disabled - enable for production data protection
+{{- end }}
+{{- end }}
+
+📚 Documentation:
+- Chart Repository: https://github.com/nwagbara-group/signal-engine-helm
+- Application Docs: https://docs.signal-engine.com
+- Support: engineering@nwagbara-group.com
+
+{{- if .Values.global.environment }}
+{{- if eq .Values.global.environment "dev" }}
+
+🚧 Development Environment Tips:
+- Use kubectl port-forward for local access
+- Enable debug mode for troubleshooting
+- Mock market data is enabled by default
+{{- else if eq .Values.global.environment "qa" }}
+
+🧪 QA Environment Notes:
+- Load testing is configured and enabled
+- Using sandbox/testnet exchanges
+- Monitoring is enabled for performance testing
+{{- else if eq .Values.global.environment "prod" }}
+
+🏭 Production Environment:
+- All production features are enabled
+- High availability configuration is active
+- Monitoring and alerting are configured
+- Regular backups are scheduled
+{{- end }}
+{{- end }}
+
+Happy Trading! 📈🚀

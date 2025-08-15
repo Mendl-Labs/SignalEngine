@@ -1,0 +1,112 @@
+# Default Signal Engine Configuration
+
+[message_broker]
+address = "127.0.0.1"
+port = 8080
+reconnect_interval_ms = 5000
+max_reconnect_attempts = 10
+connection_timeout_ms = 30000
+
+[database]
+host = "localhost"
+port = 5432
+database = "trading_db"
+username = "trading_user"
+# Note: Set DATABASE_PASSWORD environment variable for password
+
+# Topics for subscribing to market data and portfolio updates
+subscribe_topics = [
+    "market.binance.btcusd",
+    "market.binance.ethusd", 
+    "market.kraken.btcusd",
+    "market.kraken.ethusd",
+    "portfolio.binance",
+    "portfolio.kraken",
+    "portfolio.updates",
+    "wallet.balances"
+]
+
+# Topics for publishing trading signals and orders  
+publish_topics = [
+    "orders.btc",
+    "orders.eth",
+    "signals.market_making",
+    "signals.arbitrage"
+]
+
+[exchanges]
+
+[exchanges.kraken]
+enabled = true
+api_url = "https://api.kraken.com"
+websocket_url = "wss://ws.kraken.com"
+# Set KRAKEN_API_KEY and KRAKEN_SECRET_KEY environment variables
+rate_limit_requests_per_second = 10
+timeout_ms = 5000
+
+[exchanges.binance]
+enabled = false  # Disabled by default, requires API keys
+api_url = "https://api.binance.com"
+websocket_url = "wss://stream.binance.com:9443"
+# Set BINANCE_API_KEY and BINANCE_SECRET_KEY environment variables  
+rate_limit_requests_per_second = 20
+timeout_ms = 3000
+
+[exchanges.coinbase]
+enabled = false  # Disabled by default, requires API keys
+api_url = "https://api.exchange.coinbase.com"
+websocket_url = "wss://ws-feed.exchange.coinbase.com"
+# Set COINBASE_API_KEY, COINBASE_SECRET_KEY, COINBASE_PASSPHRASE environment variables
+rate_limit_requests_per_second = 10
+timeout_ms = 5000
+
+[strategies]
+
+[strategies.market_making]
+enabled = true
+symbols = ["BTC/USD", "ETH/USD"]
+exchanges = ["kraken"]
+# Risk management
+max_position_size = 10.0
+max_order_size = 1.0
+max_daily_loss = 1000.0
+max_open_orders = 20
+max_notional_exposure = 100000.0
+
+# Strategy parameters
+[strategies.market_making.parameters]
+gamma = 0.1
+k1 = 0.1
+k2 = 0.1
+k3 = 0.1
+k4 = 0.1
+k5 = 0.1
+k6 = 0.1
+w1 = 0.5
+w2 = 0.5
+w3 = 0.5
+w4 = 0.5
+w5 = 0.5
+w6 = 0.5
+w7 = 0.5
+w8 = 0.5
+w9 = 0.5
+w10 = 0.5
+w11 = 0.5
+
+[execution]
+# Ultra-low latency execution settings
+use_hardware_timestamps = true
+enable_simd_optimizations = true
+enable_memory_pools = true
+enable_cpu_affinity = true
+worker_threads = 4
+max_orders_per_second = 1000
+circuit_breaker_failure_threshold = 10
+circuit_breaker_recovery_timeout_ms = 30000
+
+[logging]
+level = "info"
+enable_performance_logging = true
+log_file = "signal_engine.log"
+max_log_size_mb = 100

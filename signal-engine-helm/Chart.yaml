@@ -1,0 +1,31 @@
+apiVersion: v2
+name: signal-engine-helm
+description: Ultra-Low Latency Trading Signal Engine Helm Chart for Kubernetes
+
+# This is a production-ready Helm chart for deploying the SignalEngine
+# trading platform with enterprise-grade features including:
+# - Multi-environment support (dev/qa/prod)
+# - Advanced autoscaling and resource management
+# - Security hardening and RBAC
+# - Comprehensive monitoring and alerting
+# - High availability and disaster recovery
+type: application
+
+# Chart version following semantic versioning
+version: 1.0.0
+
+# Application version - should match the SignalEngine release version
+appVersion: "1.0.0"
+
+# Maintainers information
+maintainers:
+  - name: SignalEngine Team
+    email: engineering@nwagbara-group.com
+
+# Keywords for chart discovery
+keywords:
+  - trading
+  - hft
+  - signal-engine
+  - ultra-low-latency
+  - fintech

@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "program", 
+    "hostbuilder", 
+    "datahandler", 
+    "portfoliohandler", 
+    "signalgenerator", 
+    "config", 
+    "orderbook", 
+    "portfolio", 
+    "executionhandler", 
+    "smartorderrouter", 
+    "exchangemetricaggregator",
+    "strategyhandler",
+    "signal",
+    "signaldispatcher",
+]
+resolver = "2"

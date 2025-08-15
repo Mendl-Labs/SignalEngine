@@ -1,0 +1,643 @@
+# ==============================================================================
+# SignalEngine - Ultra-Low Latency Trading Platform Helm Chart Configuration
+# ==============================================================================
+
+# Global configuration
+global:
+  # Environment: dev, qa, prod
+  environment: dev
+  
+  # Registry configuration
+  registry:
+    url: ""
+    secretName: ""
+  
+  # Time zone for all containers
+  timezone: "UTC"
+  
+  # Cluster domain
+  clusterDomain: cluster.local
+
+# ==============================================================================
+# Application Configuration
+# ==============================================================================
+
+# Replica count for the main signal engine
+replicaCount: 1
+
+# Container image configuration
+image:
+  repository: signal-engine
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# Image pull secrets for private registries
+imagePullSecrets: []
+  # - name: registry-secret
+
+# Override chart names
+nameOverride: ""
+fullnameOverride: ""
+
+# ==============================================================================
+# Service Account & RBAC
+# ==============================================================================
+
+serviceAccount:
+  # Create service account
+  create: true
+  # Auto-mount API credentials
+  automount: true
+  # Service account annotations
+  annotations: {}
+  # Service account name (generated if empty)
+  name: ""
+
+# RBAC configuration
+rbac:
+  create: true
+  rules:
+    # Add custom RBAC rules for trading operations
+    - apiGroups: [""]
+      resources: ["secrets", "configmaps"]
+      verbs: ["get", "list"]
+    - apiGroups: ["apps"]
+      resources: ["deployments", "replicasets"]
+      verbs: ["get", "list", "watch"]
+
+# ==============================================================================
+# Pod Configuration
+# ==============================================================================
+
+# Pod annotations (for monitoring, security, etc.)
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+# Pod labels
+podLabels:
+  app.kubernetes.io/component: signal-engine
+  tier: trading
+
+# Pod security context
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+
+# ==============================================================================
+# Service Configuration
+# ==============================================================================
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+  # Additional ports for different components
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+    - name: metrics
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+
+# ==============================================================================
+# Ingress Configuration
+# ==============================================================================
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Rate limiting for API endpoints
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+  hosts:
+    - host: signal-engine.local
+      paths:
+        - path: /
+          pathType: Prefix
+        - path: /api
+          pathType: Prefix
+        - path: /health
+          pathType: Prefix
+  tls:
+    - secretName: signal-engine-tls
+      hosts:
+        - signal-engine.local
+
+# ==============================================================================
+# Resource Management
+# ==============================================================================
+
+# Resource requests and limits (critical for trading systems)
+resources:
+  limits:
+    cpu: "4000m"      # 4 CPU cores for high throughput
+    memory: "8Gi"     # 8GB RAM for in-memory processing
+    ephemeral-storage: "10Gi"
+  requests:
+    cpu: "2000m"      # Guaranteed 2 CPU cores
+    memory: "4Gi"     # Guaranteed 4GB RAM
+    ephemeral-storage: "5Gi"
+
+# ==============================================================================
+# Health Checks & Probes
+# ==============================================================================
+
+# Startup probe (for slow-starting containers)
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 30
+  successThreshold: 1
+
+# Liveness probe
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+# Readiness probe
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# ==============================================================================
+# Autoscaling Configuration
+# ==============================================================================
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # Custom metrics for trading-specific scaling
+  customMetrics:
+    - type: Pods
+      pods:
+        metric:
+          name: signal_processing_rate
+        target:
+          type: AverageValue
+          averageValue: "1000"  # Signals per second
+
+# Vertical Pod Autoscaler
+vpa:
+  enabled: false
+  updateMode: "Auto"  # Auto, Initial, Off
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  # maxUnavailable: 25%
+
+# ==============================================================================
+# Storage Configuration
+# ==============================================================================
+
+# Persistent volumes
+persistence:
+  enabled: true
+  storageClass: "fast-ssd"  # Use fast storage for trading data
+  accessMode: ReadWriteOnce
+  size: 100Gi
+  annotations: {}
+
+# Volume mounts
+volumeMounts:
+  - name: config-volume
+    mountPath: /etc/signal-engine
+    readOnly: true
+  - name: data-volume
+    mountPath: /data
+  - name: logs-volume
+    mountPath: /var/log/signal-engine
+  - name: tmp-volume
+    mountPath: /tmp
+
+# Volumes
+volumes:
+  - name: config-volume
+    configMap:
+      name: signal-engine-config
+  - name: data-volume
+    persistentVolumeClaim:
+      claimName: signal-engine-data
+  - name: logs-volume
+    emptyDir: {}
+  - name: tmp-volume
+    emptyDir: {}
+
+# ==============================================================================
+# Environment Variables & Configuration
+# ==============================================================================
+
+# Environment variables
+env:
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: RUST_LOG
+    value: "signal_engine=debug,ultra_signal=debug"
+  - name: ENVIRONMENT
+    value: "{{ .Values.global.environment }}"
+  - name: TZ
+    value: "{{ .Values.global.timezone }}"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://jaeger-collector:14268"
+
+# ConfigMap data
+configMap:
+  enabled: true
+  data:
+    config.toml: |
+      # SignalEngine Configuration
+      [server]
+      host = "0.0.0.0"
+      port = 8080
+      
+      [logging]
+      level = "info"
+      format = "json"
+      
+      [trading]
+      max_orders_per_second = 10000
+      latency_threshold_us = 100
+      
+      [exchanges]
+      binance_enabled = true
+      coinbase_enabled = true
+      kraken_enabled = true
+
+# ==============================================================================
+# Application Configuration
+# ==============================================================================
+
+config:
+  # Environment
+  environment: "development"
+  log_level: "info"
+  
+  # Message broker configuration
+  message_broker:
+    address: "localhost"
+    port: 5672
+    max_connections: 10
+    buffer_size: 8192
+    compression_enabled: true
+    batch_size: 1000
+    flush_interval: "100ms"
+  
+  # Topic configuration
+  publish_topics:
+    - "orders.btc"
+    - "orders.eth"
+    - "signals.trading"
+  
+  subscribe_topics:
+    - "market_data.orderbook"
+    - "portfolio.balances"
+    - "executions.fills"
+  
+  # Topic routing
+  topic_routing:
+    signals: "signals.trading"
+    orders: "orders.execution"
+    fills: "executions.fills"
+    positions: "portfolio.positions"
+  
+  # Strategy configurations
+  strategies:
+    - id: "market_maker_btc"
+      name: "BTC Market Maker"
+      strategy_type: "MarketMaking"
+      enabled: true
+      symbols: ["BTC/USD"]
+      exchanges: ["kraken"]
+      parameters:
+        spread_target: 0.0005
+        inventory_limit: 10.0
+      risk_limits:
+        max_position_size: 10.0
+        max_order_size: 1.0
+        max_daily_loss: 1000.0
+        max_position_value: 50000.0
+  
+  # Exchange configurations
+  exchanges:
+    - name: "kraken"
+      enabled: true
+      sandbox: false
+      rate_limits:
+        orders_per_second: 10
+        requests_per_second: 50
+        window_size: "60s"
+      timeout: "30s"
+    - name: "binance"
+      enabled: true
+      sandbox: false
+      rate_limits:
+        orders_per_second: 20
+        requests_per_second: 100
+        window_size: "60s"
+      timeout: "30s"
+  
+  # Security configuration
+  security:
+    api_key_required: false
+    request_signing_required: false
+    rate_limiting_enabled: true
+    max_requests_per_minute: 1000
+    blocked_ips: []
+    allowed_ips: []
+    encryption_enabled: true
+
+# Performance configuration
+performance:
+  worker_threads: 4
+  cpu_affinity_enabled: false
+  cpu_cores: []
+  memory_limit_mb: 1024
+  latency_threshold_us: 100
+  metrics_enabled: true
+  metrics_interval: "60s"
+  simd_enabled: true
+
+# Trading configuration
+trading:
+  max_orders_per_second: 10000
+  latency_threshold_us: 100
+
+# Exchange-specific configuration
+exchanges:
+  kraken:
+    enabled: true
+    sandbox: false
+  binance:
+    enabled: true
+    sandbox: false
+  coinbase:
+    enabled: false
+    sandbox: true
+
+# Strategy configuration
+strategies:
+  market_maker:
+    enabled: true
+
+# Secrets (stored separately for security)
+secrets:
+  enabled: true
+  # API keys and sensitive configuration
+  data: {}
+    # exchange_api_key: ""
+    # exchange_secret_key: ""
+
+# ==============================================================================
+# Performance & Optimization
+# ==============================================================================
+
+# Node selection
+nodeSelector:
+  # Select high-performance nodes
+  node-type: "compute-optimized"
+  # Ensure nodes have fast networking
+  network-tier: "premium"
+
+# Pod tolerations
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "trading"
+    effect: "NoSchedule"
+
+# Pod affinity and anti-affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - signal-engine-helm
+          topologyKey: kubernetes.io/hostname
+
+# Priority class for critical trading workloads
+priorityClassName: "trading-critical"
+
+# Topology spread constraints
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: signal-engine-helm
+
+# ==============================================================================
+# Monitoring & Observability
+# ==============================================================================
+
+monitoring:
+  # Enable Prometheus monitoring
+  prometheus:
+    enabled: true
+    port: 9090
+    # Service monitor for Prometheus operator
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+      path: /metrics
+      labels:
+        app: signal-engine
+    # Prometheus rules
+    rules:
+      enabled: true
+    
+  # Health checks
+  health_check_enabled: true
+  health_check_interval: "30s"
+  metrics_retention_days: 7
+  alerting_enabled: false
+  
+  # Alert thresholds
+  alert_thresholds:
+    latency_us: 1000.0
+    error_rate_percent: 5.0
+    cpu_usage_percent: 80.0
+    memory_usage_percent: 85.0
+    connection_failures: 10
+    
+  # Enable Grafana dashboards
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+
+  # Distributed tracing
+  tracing:
+    enabled: true
+    jaeger:
+      endpoint: "http://jaeger-collector:14268/api/traces"
+
+# ==============================================================================
+# Logging Configuration
+# ==============================================================================
+
+logging:
+  enabled: true
+  level: "info"
+  format: "json"
+  outputs: ["stdout"]
+  structured_logging: true
+  max_file_size_mb: 100
+  max_files: 5
+  # Log aggregation
+  fluentd:
+    enabled: true
+  # Log shipping to external systems
+  elasticsearch:
+    enabled: false
+    endpoint: ""
+
+# ==============================================================================
+# Networking & Security
+# ==============================================================================
+
+# Network policies
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+  egress:
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443  # HTTPS
+        - protocol: TCP
+          port: 53   # DNS
+        - protocol: UDP
+          port: 53   # DNS
+
+# Pod Security Policy
+podSecurityPolicy:
+  enabled: true
+
+# ==============================================================================
+# External Dependencies
+# ==============================================================================
+
+# External services configuration
+externalServices:
+  # Message broker (Redis/RabbitMQ)
+  messageBroker:
+    enabled: true
+    type: redis
+    host: redis-service
+    port: 6379
+    database: 0
+    
+  # Database
+  database:
+    enabled: true
+    type: postgresql
+    host: postgres-service
+    port: 5432
+    database: signal_engine
+    
+  # Market data feeds
+  marketData:
+    enabled: true
+    providers:
+      - name: binance
+        endpoint: "wss://stream.binance.com:9443"
+      - name: coinbase
+        endpoint: "wss://ws-feed.pro.coinbase.com"
+
+# ==============================================================================
+# Backup & Disaster Recovery
+# ==============================================================================
+
+backup:
+  enabled: false
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  retention: "30d"
+  storage:
+    type: s3
+    bucket: "signal-engine-backups"
+    region: "us-east-1"
+
+# ==============================================================================
+# Development & Testing
+# ==============================================================================
+
+# Development tools
+development:
+  enabled: false
+  debug:
+    enabled: false
+    port: 40000
+  profiling:
+    enabled: false
+    port: 6060
+
+# Testing configuration
+testing:
+  enabled: false
+  load:
+    enabled: false
+    duration: "10m"
+    rate: "1000rps"

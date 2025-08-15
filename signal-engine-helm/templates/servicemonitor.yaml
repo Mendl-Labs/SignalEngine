@@ -1,0 +1,41 @@
+{{- if .Values.monitoring.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheus.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "signal-engine-helm.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: {{ .Values.monitoring.prometheus.serviceMonitor.path | default "/metrics" }}
+      interval: {{ .Values.monitoring.prometheus.serviceMonitor.interval | default "30s" }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.serviceMonitor.scrapeTimeout | default "10s" }}
+      {{- if .Values.monitoring.prometheus.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml .Values.monitoring.prometheus.serviceMonitor.relabelings | nindent 8 }}
+      {{- end }}
+      {{- if .Values.monitoring.prometheus.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml .Values.monitoring.prometheus.serviceMonitor.metricRelabelings | nindent 8 }}
+      {{- end }}
+  {{- if .Values.monitoring.prometheus.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- toYaml .Values.monitoring.prometheus.serviceMonitor.targetLabels | nindent 4 }}
+  {{- end }}
+  {{- if .Values.monitoring.prometheus.serviceMonitor.podTargetLabels }}
+  podTargetLabels:
+    {{- toYaml .Values.monitoring.prometheus.serviceMonitor.podTargetLabels | nindent 4 }}
+  {{- end }}
+  {{- if .Values.monitoring.prometheus.serviceMonitor.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml .Values.monitoring.prometheus.serviceMonitor.namespaceSelector | nindent 4 }}
+  {{- end }}
+{{- end }}

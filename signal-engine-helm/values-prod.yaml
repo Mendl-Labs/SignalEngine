@@ -1,0 +1,266 @@
+# ==============================================================================
+# Production Environment Configuration for SignalEngine
+# ==============================================================================
+
+global:
+  environment: prod
+  registry:
+    url: "production-registry.company.com"
+    secretName: "prod-registry-secret"
+
+# High availability setup for production
+replicaCount: 5
+
+# Production image configuration
+image:
+  repository: "production-registry.company.com/signal-engine"
+  tag: "v1.0.0"
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: prod-registry-secret
+
+# Production resource allocation
+resources:
+  limits:
+    cpu: "8000m"        # 8 CPU cores
+    memory: "16Gi"      # 16GB RAM
+    ephemeral-storage: "50Gi"
+  requests:
+    cpu: "4000m"        # Guaranteed 4 CPU cores
+    memory: "8Gi"       # Guaranteed 8GB RAM
+    ephemeral-storage: "25Gi"
+
+# Aggressive autoscaling for production load
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70
+  customMetrics:
+    - type: Pods
+      pods:
+        metric:
+          name: signal_processing_rate
+        target:
+          type: AverageValue
+          averageValue: "5000"  # 5000 signals per second per pod
+
+# Production persistence
+persistence:
+  enabled: true
+  storageClass: "premium-ssd"
+  size: 500Gi
+
+# Production ingress with SSL
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "10000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: signal-engine.company.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: signal-engine-prod-tls
+      hosts:
+        - signal-engine.company.com
+
+# Production monitoring
+monitoring:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 5s  # More frequent monitoring in prod
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  tracing:
+    enabled: true
+  logging:
+    enabled: true
+    fluentd:
+      enabled: true
+
+# Production security
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+
+# Network policies for production
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+    - from:
+        - podSelector:
+            matchLabels:
+              app: allowed-client
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: market-data
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+
+# Production node selection
+nodeSelector:
+  node-type: "compute-optimized"
+  network-tier: "premium"
+  zone: "us-east-1a"
+
+# Production tolerations
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "trading"
+    effect: "NoSchedule"
+  - key: "high-performance"
+    operator: "Equal"
+    value: "required"
+    effect: "NoSchedule"
+
+# Production affinity rules
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+                - signal-engine-helm
+        topologyKey: kubernetes.io/hostname
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.kubernetes.io/instance-type
+              operator: In
+              values:
+                - c5n.9xlarge
+                - c5n.18xlarge
+
+# Production priority
+priorityClassName: "trading-critical"
+
+# Production backup
+backup:
+  enabled: true
+  schedule: "0 1 * * *"  # Daily at 1 AM
+  retention: "90d"
+  storage:
+    type: s3
+    bucket: "signal-engine-prod-backups"
+    region: "us-east-1"
+
+# Production external services
+externalServices:
+  messageBroker:
+    enabled: true
+    type: redis
+    host: redis-cluster.prod.company.com
+    port: 6379
+    database: 0
+    tls: true
+    
+  database:
+    enabled: true
+    type: postgresql
+    host: postgres-cluster.prod.company.com
+    port: 5432
+    database: signal_engine_prod
+    ssl: true
+    
+  marketData:
+    enabled: true
+    providers:
+      - name: binance
+        endpoint: "wss://stream.binance.com:9443"
+        auth: true
+      - name: coinbase
+        endpoint: "wss://ws-feed.pro.coinbase.com"
+        auth: true
+      - name: kraken
+        endpoint: "wss://ws.kraken.com"
+        auth: true
+
+# Production environment variables
+env:
+  - name: LOG_LEVEL
+    value: "WARN"
+  - name: RUST_LOG
+    value: "signal_engine=info,ultra_signal=info"
+  - name: ENVIRONMENT
+    value: "production"
+  - name: PERFORMANCE_MODE
+    value: "ultra-low-latency"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "https://jaeger-collector.monitoring.svc.cluster.local:14268"
+
+# Production health check configuration
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 60
+  successThreshold: 1
+
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1

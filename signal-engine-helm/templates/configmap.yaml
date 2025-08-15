@@ -1,0 +1,128 @@
+{{- if .Values.configMap.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-config
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: configuration
+data:
+  {{- if .Values.configMap.data }}
+  {{- range $key, $value := .Values.configMap.data }}
+  {{ $key }}: |
+    {{ $value | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  
+  # Auto-generated configuration based on values
+  runtime-config.yaml: |
+    # SignalEngine Configuration
+    # Generated from Helm values - DO NOT EDIT MANUALLY
+    
+    environment: {{ .Values.global.environment | default "dev" }}
+    
+    # Message broker configuration
+    message_broker:
+      address: {{ .Values.config.message_broker.address | default "localhost" }}
+      port: {{ .Values.config.message_broker.port | default 5672 }}
+      max_connections: {{ .Values.config.message_broker.max_connections | default 10 }}
+      buffer_size: {{ .Values.config.message_broker.buffer_size | default 8192 }}
+      compression_enabled: {{ .Values.config.message_broker.compression_enabled | default true }}
+      batch_size: {{ .Values.config.message_broker.batch_size | default 1000 }}
+      flush_interval: {{ .Values.config.message_broker.flush_interval | default "100ms" }}
+    
+    # Topic configuration
+    publish_topics:
+      - "orders.btc"
+      - "orders.eth" 
+      - "signals.trading"
+    
+    subscribe_topics:
+      - "market_data.orderbook"
+      - "portfolio.balances"
+      - "executions.fills"
+    
+    # Topic routing configuration
+    topic_routing:
+      signals: "signals.trading"
+      orders: "orders.execution"
+      fills: "executions.fills"
+      positions: "portfolio.positions"
+    
+    # Performance configuration
+    performance:
+      worker_threads: {{ .Values.performance.worker_threads | default 4 }}
+      cpu_affinity_enabled: {{ .Values.performance.cpu_affinity_enabled | default false }}
+      memory_limit_mb: {{ .Values.performance.memory_limit_mb | default 1024 }}
+      latency_threshold_us: {{ .Values.performance.latency_threshold_us | default 100 }}
+      metrics_enabled: {{ .Values.performance.metrics_enabled | default true }}
+      simd_enabled: {{ .Values.performance.simd_enabled | default true }}
+    
+    # Security configuration  
+    security:
+      api_key_required: {{ .Values.security.api_key_required | default false }}
+      request_signing_required: {{ .Values.security.request_signing_required | default false }}
+      rate_limiting_enabled: {{ .Values.security.rate_limiting_enabled | default true }}
+      max_requests_per_minute: {{ .Values.security.max_requests_per_minute | default 1000 }}
+      encryption_enabled: {{ .Values.security.encryption_enabled | default true }}
+    
+    # Monitoring configuration
+    monitoring:
+      health_check_enabled: {{ .Values.monitoring.health_check_enabled | default true }}
+      health_check_interval: {{ .Values.monitoring.health_check_interval | default "30s" }}
+      metrics_retention_days: {{ .Values.monitoring.metrics_retention_days | default 7 }}
+      alerting_enabled: {{ .Values.monitoring.alerting_enabled | default false }}
+      prometheus_enabled: {{ .Values.monitoring.prometheus.enabled | default true }}
+      prometheus_port: {{ .Values.monitoring.prometheus.port | default 9090 }}
+    
+    # Logging configuration
+    logging:
+      level: {{ .Values.logging.level | default "info" | quote }}
+      format: {{ .Values.logging.format | default "json" | quote }}
+      output: ["stdout"]
+      structured_logging: {{ .Values.logging.structured_logging | default true }}
+    
+    # Trading configuration
+    trading:
+      max_orders_per_second: {{ .Values.trading.max_orders_per_second | default 10000 }}
+      latency_threshold_us: {{ .Values.trading.latency_threshold_us | default 100 }}
+    
+    # Exchange configuration
+    exchanges:
+      - name: "kraken"
+        enabled: {{ .Values.exchanges.kraken.enabled | default true }}
+        sandbox: {{ .Values.exchanges.kraken.sandbox | default false }}
+        rate_limits:
+          orders_per_second: 10
+          requests_per_second: 50
+          window_size: "60s"
+        timeout: "30s"
+      
+      - name: "binance"  
+        enabled: {{ .Values.exchanges.binance.enabled | default true }}
+        sandbox: {{ .Values.exchanges.binance.sandbox | default false }}
+        rate_limits:
+          orders_per_second: 20
+          requests_per_second: 100
+          window_size: "60s"
+        timeout: "30s"
+    
+    # Default strategy configuration
+    strategies:
+      - id: "market_maker_btc"
+        name: "BTC Market Maker"
+        strategy_type: "MarketMaking"
+        enabled: {{ .Values.strategies.market_maker.enabled | default true }}
+        symbols: ["BTC/USD"]
+        exchanges: ["kraken"]
+        parameters:
+          spread_target: 0.0005
+          inventory_limit: 10.0
+        risk_limits:
+          max_position_size: 10.0
+          max_order_size: 1.0
+          max_daily_loss: 1000.0
+          max_position_value: 50000.0
+
+{{- end }}

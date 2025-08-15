@@ -1,0 +1,97 @@
+{{- if .Values.monitoring.prometheus.rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: monitoring
+spec:
+  groups:
+    - name: signal-engine.rules
+      rules:
+        # High-level application metrics
+        - alert: SignalEngineDown
+          expr: up{job="{{ include "signal-engine-helm.fullname" . }}"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "SignalEngine instance is down"
+            description: "SignalEngine instance {{ "{{ $labels.instance }}" }} has been down for more than 1 minute."
+        
+        - alert: SignalEngineHighCPU
+          expr: rate(container_cpu_usage_seconds_total{pod=~"{{ include "signal-engine-helm.fullname" . }}-.*"}[5m]) > 0.8
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High CPU usage on SignalEngine"
+            description: "SignalEngine pod {{ "{{ $labels.pod }}" }} has high CPU usage: {{ "{{ $value | humanizePercentage }}" }}."
+        
+        - alert: SignalEngineHighMemory
+          expr: container_memory_usage_bytes{pod=~"{{ include "signal-engine-helm.fullname" . }}-.*"} / container_spec_memory_limit_bytes > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory usage on SignalEngine"
+            description: "SignalEngine pod {{ "{{ $labels.pod }}" }} has high memory usage: {{ "{{ $value | humanizePercentage }}" }}."
+        
+        # Trading-specific metrics
+        - alert: SignalProcessingLatencyHigh
+          expr: histogram_quantile(0.99, rate(signal_processing_duration_seconds_bucket[5m])) > 0.001
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High signal processing latency"
+            description: "99th percentile signal processing latency is {{ "{{ $value | humanizeDuration }}" }}, exceeding 1ms threshold."
+        
+        - alert: SignalThroughputLow
+          expr: rate(signals_processed_total[5m]) < 1000
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Low signal processing throughput"
+            description: "Signal processing rate is {{ "{{ $value }}" }} signals per second, below expected 1000 signals/sec."
+        
+        - alert: ExchangeConnectionDown
+          expr: exchange_connection_status == 0
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: "Exchange connection is down"
+            description: "Connection to exchange {{ "{{ $labels.exchange }}" }} is down."
+        
+        - alert: OrderExecutionErrors
+          expr: rate(order_execution_errors_total[5m]) > 10
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High order execution error rate"
+            description: "Order execution error rate is {{ "{{ $value }}" }} errors per second."
+        
+        # Infrastructure metrics
+        - alert: SignalEnginePodCrashLooping
+          expr: rate(kube_pod_container_status_restarts_total{pod=~"{{ include "signal-engine-helm.fullname" . }}-.*"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "SignalEngine pod is crash looping"
+            description: "SignalEngine pod {{ "{{ $labels.pod }}" }} has restarted {{ "{{ $value }}" }} times in the last 15 minutes."
+        
+        - alert: SignalEngineDeploymentReplicasMismatch
+          expr: kube_deployment_spec_replicas{deployment="{{ include "signal-engine-helm.fullname" . }}"} != kube_deployment_status_ready_replicas{deployment="{{ include "signal-engine-helm.fullname" . }}"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "SignalEngine deployment replicas mismatch"
+            description: "SignalEngine deployment has {{ "{{ $labels.spec_replicas }}" }} desired replicas but {{ "{{ $labels.ready_replicas }}" }} ready replicas."
+{{- end }}

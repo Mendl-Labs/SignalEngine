@@ -1,0 +1,234 @@
+# ==============================================================================
+# QA Environment Configuration for SignalEngine
+# ==============================================================================
+
+global:
+  environment: qa
+  registry:
+    url: "qa-registry.company.com"
+    secretName: "qa-registry-secret"
+
+# Multiple replicas for QA testing
+replicaCount: 2
+
+# QA image configuration
+image:
+  repository: "qa-registry.company.com/signal-engine"
+  tag: "qa-latest"
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: qa-registry-secret
+
+# Moderate resources for QA
+resources:
+  limits:
+    cpu: "4000m"        # 4 CPU cores
+    memory: "8Gi"       # 8GB RAM
+    ephemeral-storage: "20Gi"
+  requests:
+    cpu: "1000m"        # 1 CPU core
+    memory: "2Gi"       # 2GB RAM
+    ephemeral-storage: "5Gi"
+
+# Limited autoscaling for QA
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# QA persistence
+persistence:
+  enabled: true
+  storageClass: "ssd"
+  size: 50Gi
+
+# QA ingress with basic SSL
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+  hosts:
+    - host: signal-engine.qa.company.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: signal-engine-qa-tls
+      hosts:
+        - signal-engine.qa.company.com
+
+# QA monitoring
+monitoring:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  tracing:
+    enabled: true
+  logging:
+    enabled: true
+    fluentd:
+      enabled: true
+
+# QA security (similar to production)
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+
+# Basic network policies for QA
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+  egress:
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+
+# QA node selection
+nodeSelector:
+  node-type: "general-purpose"
+
+# QA tolerations
+tolerations:
+  - key: "qa-testing"
+    operator: "Equal"
+    value: "allowed"
+    effect: "NoSchedule"
+
+# QA affinity (prefer spreading)
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - signal-engine-helm
+          topologyKey: kubernetes.io/hostname
+
+# Standard priority for QA
+priorityClassName: "standard"
+
+# No backup in QA (uses shared test data)
+backup:
+  enabled: false
+
+# QA external services
+externalServices:
+  messageBroker:
+    enabled: true
+    type: redis
+    host: redis.qa.svc.cluster.local
+    port: 6379
+    database: 0
+    tls: false
+    
+  database:
+    enabled: true
+    type: postgresql
+    host: postgres.qa.svc.cluster.local
+    port: 5432
+    database: signal_engine_qa
+    ssl: false
+    
+  marketData:
+    enabled: true
+    providers:
+      - name: binance
+        endpoint: "wss://testnet.binance.vision"
+        auth: false
+      - name: coinbase
+        endpoint: "wss://ws-feed-public.sandbox.pro.coinbase.com"
+        auth: false
+
+# QA environment variables
+env:
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: RUST_LOG
+    value: "signal_engine=debug,ultra_signal=debug"
+  - name: ENVIRONMENT
+    value: "qa"
+  - name: TEST_MODE
+    value: "true"
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://jaeger-collector.monitoring.svc.cluster.local:14268"
+
+# QA testing features enabled
+testing:
+  enabled: true
+  load:
+    enabled: true
+    duration: "5m"
+    rate: "100rps"
+
+# QA health checks
+startupProbe:
+  httpGet:
+    path: /health/startup
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 20
+  successThreshold: 1
+
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
