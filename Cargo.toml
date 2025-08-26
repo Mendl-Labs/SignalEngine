@@ -16,3 +16,9 @@ members = [
     "signaldispatcher",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+# Ultra-low latency logging engine
+ultra-logger = { path = "../LoggingEngine/ultra-logger" }
+log-aggregator = { path = "../LoggingEngine/log-aggregator" }
+metrics-collector = { path = "../LoggingEngine/metrics-collector" }

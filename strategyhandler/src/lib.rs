@@ -16,6 +16,7 @@ use ultra_signal::{Signal, SignalAction, OrderSide, ExchangeId};
 use exchangemetricaggregator::ExchangeMetricsAggregator;
 use smartorderrouter::{SmartOrderRouter, ExecutionUrgency, RoutingAlgorithm};
 use tracing::{info, warn, error, debug};
+use ultra_logger::{UltraLogger, LogLevel};
 
 /// Strategy handler specific errors
 #[derive(Debug)]
@@ -249,7 +250,8 @@ impl Strategy for SimpleMarketMakingStrategy {
     }
     
     async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("Initializing simple market making strategy: {}", self.config.name);
+        let logger = UltraLogger::new("StrategyHandler".to_string());
+        logger.log(LogLevel::Info, format!("Initializing simple market making strategy: {}", self.config.name)).await.ok();
         Ok(())
     }
     
@@ -306,7 +308,8 @@ impl Strategy for SimpleMarketMakingStrategy {
     }
     
     async fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("Shutting down simple market making strategy: {}", self.config.name);
+        let logger = UltraLogger::new("StrategyHandler".to_string());
+        logger.log(LogLevel::Info, format!("Shutting down simple market making strategy: {}", self.config.name)).await.ok();
         Ok(())
     }
 }
@@ -424,7 +427,12 @@ impl StrategyManager {
     /// Report signal execution back to the store
     pub fn report_execution(&self, signal_id: &str, execution_price: f64, executed_qty: f64, fees: f64) {
         if let Err(e) = self.signal_store.record_execution(signal_id, execution_price, executed_qty, fees) {
-            eprintln!("Failed to record execution for signal {}: {}", signal_id, e);
+            let logger = UltraLogger::new("StrategyHandler".to_string());
+            let signal_id = signal_id.to_string();
+            let error_msg = e.to_string();
+            tokio::spawn(async move {
+                logger.log(LogLevel::Error, format!("Failed to record execution for signal {}: {}", signal_id, error_msg)).await.ok();
+            });
         }
     }
 }

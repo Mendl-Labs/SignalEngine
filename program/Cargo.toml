@@ -7,3 +7,7 @@ edition = "2021"
 anyhow = "1.0.97"
 hostbuilder = { path = "../hostbuilder" }
 tokio = "1.44.1"
+# Ultra-low latency logging
+ultra-logger = { workspace = true }
+log-aggregator = { workspace = true }
+metrics-collector = { workspace = true }
