@@ -34,6 +34,8 @@ pub struct HostedObject {
     // Signal routing
     signal_tx: Option<Sender<Signal>>,
     signal_rx: Option<Receiver<Signal>>,
+    // Strategy manager
+    strategy_manager: Option<StrategyManager>,
 }
 
 impl HostedObject {
@@ -46,6 +48,7 @@ impl HostedObject {
             shutdown_tx: None,
             signal_tx: Some(signal_tx),
             signal_rx: Some(signal_rx),
+            strategy_manager: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl HostedObject {
             shutdown_tx: None,
             signal_tx: Some(signal_tx),
             signal_rx: Some(signal_rx),
+            strategy_manager: None,
         }
     }
 
@@ -113,15 +117,21 @@ impl HostedObject {
             ORDERBOOKS.clone(), // This should work as it expects RwLock
         )?;
         
+        Ok(strategy_manager)
+    }
+    
+    /// Initialize default strategies (async method)
+    async fn initialize_default_strategies(&mut self) -> Result<(), Box<dyn Error>> {
         // Add default market making strategies if configured
         // In a real implementation, you'd load strategy configurations from the config file
-        Self::add_default_strategies(&strategy_manager)?;
-        
-        Ok(strategy_manager)
+        if let Some(ref strategy_manager) = self.strategy_manager {
+            Self::add_default_strategies(strategy_manager).await?;
+        }
+        Ok(())
     }
 
     /// Add default strategies to the manager
-    fn add_default_strategies(manager: &StrategyManager) -> Result<(), Box<dyn Error>> {
+    async fn add_default_strategies(manager: &StrategyManager) -> Result<(), Box<dyn Error>> {
         // Example: Create a default market making strategy
         // In production, this would be loaded from configuration
         
@@ -159,7 +169,7 @@ impl HostedObject {
         // Create a simple market making strategy directly
         use strategyhandler::SimpleMarketMakingStrategy;
         let strategy = Box::new(SimpleMarketMakingStrategy::new(strategy_config));
-        manager.add_strategy(strategy)?;
+        manager.add_strategy(strategy).await?;
         
         Ok(())
     }
@@ -174,6 +184,13 @@ impl HostedObject {
         
         // Create handlers
         let (datahandler, portfoliohandler, strategyhandler, execution_handler) = Self::create_handlers()?;
+        
+        // Initialize strategy manager
+        let config = Config::default();
+        self.strategy_manager = Some(Self::create_strategy_manager(&config)?);
+        
+        // Initialize default strategies
+        self.initialize_default_strategies().await?;
         
         // Create shutdown channels - using broadcast for multiple subscribers
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(100);

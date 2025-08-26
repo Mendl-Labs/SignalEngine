@@ -895,6 +895,12 @@ impl SmartOrderRouter {
         
         self.metrics_aggregator.record_routing_performance(performance)?;
         
+        // Remove from active routes
+        {
+            let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
+            active_routes.remove(route_id);
+        }
+        
         // Move to completed routes
         {
             let mut completed = self.completed_routes.write().map_err(|_| "Failed to acquire completed routes lock")?;

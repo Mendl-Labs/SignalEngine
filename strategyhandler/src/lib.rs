@@ -331,12 +331,11 @@ impl StrategyManager {
         })
     }
     
-    pub fn add_strategy(&self, mut strategy: Box<dyn Strategy>) -> Result<(), Box<dyn Error>> {
+    pub async fn add_strategy(&self, mut strategy: Box<dyn Strategy>) -> Result<(), Box<dyn Error>> {
         let config = strategy.config().clone();
         
-        // Initialize the strategy
-        let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(strategy.initialize())?;
+        // Initialize the strategy using the current runtime
+        strategy.initialize().await?;
         
         let mut strategies = self.strategies.write()
             .map_err(|e| format!("Failed to acquire strategies write lock: {}", e))?;
@@ -466,7 +465,7 @@ mod tests {
         
         let orderbooks = DashMap::new();
         let manager = StrategyManager::new(orderbooks).expect("Failed to create strategy manager");
-        let result = manager.add_strategy(strategy.expect("Strategy creation failed"));
+        let result = manager.add_strategy(strategy.expect("Strategy creation failed")).await;
         assert!(result.is_ok());
     }
 }

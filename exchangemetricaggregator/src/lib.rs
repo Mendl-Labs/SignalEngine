@@ -802,13 +802,10 @@ mod tests {
         
         aggregator.update_exchange_metrics("Binance", "BTC/USD", old_metrics).unwrap();
         
-        // Clean up data older than current time
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // Clean up data older than 5 seconds (5000ms)
+        let max_age_ms = 5000;
         
-        let removed_count = aggregator.cleanup_old_data(current_time);
+        let removed_count = aggregator.cleanup_old_data(max_age_ms);
         assert!(removed_count.is_ok());
         assert!(removed_count.unwrap() > 0);
     }

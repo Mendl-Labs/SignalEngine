@@ -190,7 +190,8 @@ impl DataHandler {
         {
             let mut ob = orderbook.write().map_err(|e| format!("RwLock write failed: {}", e))?;
             
-            for update in updates {
+            for (i, update) in updates.iter().enumerate() {
+                let order_id = (start_time + i as u64) as u64; // Unique order ID
                 match update.side.as_str() {
                     "bid" => {
                         if update.quantity == 0.0 {
@@ -198,7 +199,7 @@ impl DataHandler {
                             println!("Would remove bid at price {}", update.price);
                         } else {
                             // Add/update bid - simplified
-                            let _ = ob.add_limit_bid(update.price, 1, update.quantity, start_time);
+                            let _ = ob.add_limit_bid(update.price, order_id, update.quantity, start_time);
                         }
                     }
                     "ask" => {
@@ -207,12 +208,15 @@ impl DataHandler {
                             println!("Would remove ask at price {}", update.price);
                         } else {
                             // Add/update ask - simplified
-                            let _ = ob.add_limit_ask(update.price, 1, update.quantity, start_time);
+                            let _ = ob.add_limit_ask(update.price, order_id, update.quantity, start_time);
                         }
                     }
                     _ => {} // Invalid side, skip
                 }
             }
+            
+            // Update metrics after adding orders
+            ob.update().map_err(|e| format!("Orderbook update failed: {}", e))?;
         } // Write lock released here - critical for performance
         
         // Update last update time using lock-free DashMap
