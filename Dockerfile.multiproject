@@ -1,12 +1,10 @@
 # syntax=docker/dockerfile:1
 
 ARG RUST_VERSION=1.82.0
-ARG APP_NAME=program
 
 ################################################################################
 # Stage 1: Build the application with dependencies from the trading platform
 FROM rust:${RUST_VERSION}-slim-bullseye AS build
-ARG APP_NAME
 
 # Install necessary build dependencies
 RUN apt-get update && apt-get install -y \
@@ -22,8 +20,8 @@ ENV RUST_BACKTRACE=0
 # Set the working directory inside the container
 WORKDIR /app
 
-# Copy the entire TradingPlatform workspace (context is at TradingPlatform root)
-COPY . ./
+# Copy the entire TradingPlatform workspace to resolve all dependencies
+COPY ../.. ./
 
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
@@ -53,8 +51,8 @@ RUN adduser --disabled-password --gecos "" --home "/nonexistent" --shell "/sbin/
 # Copy the built application from the build stage
 COPY --from=build /bin/signal-engine /usr/local/bin/signal-engine
 
-# Copy configuration files from SignalEngine
-COPY --from=build /app/SignalEngine/config/ /etc/signal-engine/config/
+# Copy configuration files
+COPY config/ /etc/signal-engine/config/
 
 # Ensure the binary is executable
 RUN chmod +x /usr/local/bin/signal-engine

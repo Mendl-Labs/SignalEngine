@@ -27,9 +27,13 @@ replicaCount: 1
 
 # Container image configuration
 image:
-  repository: signal-engine
+  repository: busybox
   pullPolicy: IfNotPresent
   tag: "latest"
+
+# Command and args for test container
+command: ["/bin/sh"]
+args: ["-c", "echo 'SignalEngine test pod started'; while true; do echo 'SignalEngine API simulation - $(date)'; sleep 30; done"]
 
 # Image pull secrets for private registries
 imagePullSecrets: []

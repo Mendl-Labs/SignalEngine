@@ -61,11 +61,11 @@ data:
     
     # Security configuration  
     security:
-      api_key_required: {{ .Values.security.api_key_required | default false }}
-      request_signing_required: {{ .Values.security.request_signing_required | default false }}
-      rate_limiting_enabled: {{ .Values.security.rate_limiting_enabled | default true }}
-      max_requests_per_minute: {{ .Values.security.max_requests_per_minute | default 1000 }}
-      encryption_enabled: {{ .Values.security.encryption_enabled | default true }}
+      api_key_required: {{ .Values.config.security.api_key_required | default false }}
+      request_signing_required: {{ .Values.config.security.request_signing_required | default false }}
+      rate_limiting_enabled: {{ .Values.config.security.rate_limiting_enabled | default true }}
+      max_requests_per_minute: {{ .Values.config.security.max_requests_per_minute | default 1000 }}
+      encryption_enabled: {{ .Values.config.security.encryption_enabled | default true }}
     
     # Monitoring configuration
     monitoring:
