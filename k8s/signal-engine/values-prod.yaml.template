@@ -1,0 +1,102 @@
+# SignalEngine Production Configuration Template
+# This template shows production-grade external secret management
+
+# PRODUCTION DEPLOYMENT INSTRUCTIONS:
+# Method 1 - External Secrets (RECOMMENDED):
+#   Setup External Secrets Operator with Vault/AWS Secrets Manager
+#   helm install signal-engine-prod ./k8s/signal-engine/ -f values-prod.yaml.template
+#
+# Method 2 - Secure Injection:
+#   helm install signal-engine-prod ./k8s/signal-engine/ -f values-prod.yaml.template \
+#     --set-string secrets.kraken.apiKey="your-real-api-key" \
+#     --set-string secrets.kraken.secretKey="your-real-secret-key"
+
+global:
+  environment: prod
+  registry:
+    url: "your-prod-registry.azurecr.io"
+
+# Production scaling
+replicaCount: 3
+
+resources:
+  limits:
+    cpu: "4000m"
+    memory: "8Gi"
+  requests:
+    cpu: "2000m" 
+    memory: "4Gi"
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# External Secrets Configuration (RECOMMENDED for Production)
+externalSecrets:
+  enabled: true
+  secretStore:
+    name: "vault-secret-store"
+    kind: "SecretStore"
+  
+  # External secret references - CONFIGURE YOUR SECRET MANAGEMENT SYSTEM
+  kraken:
+    secretName: "signal-engine-prod-kraken"
+    remoteSecretName: "signalengine/prod/kraken-api"
+    
+  database:
+    secretName: "signal-engine-prod-db"
+    remoteSecretName: "signalengine/prod/database"
+    
+  redis:
+    secretName: "signal-engine-prod-redis"
+    remoteSecretName: "signalengine/prod/redis"
+
+# Fallback secrets (use ONLY if external secrets not available)
+# NEVER commit real values here - use helm --set-string instead
+secrets:
+  kraken:
+    apiKey: ""  # Set via --set-string or external secrets
+    secretKey: ""  # Set via --set-string or external secrets
+  database:
+    password: ""  # Set via --set-string or external secrets
+  redis:
+    password: ""  # Set via --set-string or external secrets
+  messageBroker:
+    password: ""  # Set via --set-string or external secrets
+
+# Production persistence
+persistence:
+  enabled: true
+  size: 100Gi
+  storageClass: "premium-ssd"
+
+# Production monitoring
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+  grafana:
+    enabled: true
+
+# Production networking
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+  tls:
+    enabled: true
+
+# Production Kraken configuration
+exchanges:
+  kraken:
+    endpoint: "https://api.kraken.com"
+    websocket: "wss://ws.kraken.com" 
+    testnet: false
+    rateLimit:
+      requestsPerSecond: 10
+      burstLimit: 20
+    timeout: 5000

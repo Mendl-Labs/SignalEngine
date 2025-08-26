@@ -7,6 +7,39 @@
 
 A **production-grade, ultra-low latency trading engine** built in Rust for high-frequency trading across cryptocurrency and traditional financial markets. The system delivers **sub-microsecond signal generation** with enterprise-grade reliability, multi-exchange execution, and sophisticated trading strategies.
 
+## 🚀 **Quick Start - Secure Deployment**
+
+### **Prerequisites**
+- Kubernetes cluster (1.19+) | Helm 3.x | kubectl configured | Kraken Pro API credentials
+
+### **🧪 Step 1: Test API Connection**
+```powershell
+# Test Kraken API connectivity
+.\test-api-connection.ps1 -TestPublicOnly    # Public APIs only
+.\test-api-connection.ps1                    # Interactive credential test
+```
+
+### **🚀 Step 2: Deploy SignalEngine** 
+```powershell  
+# Secure deployment (recommended)
+.\deploy-secure.ps1                          # Development with credential prompts
+.\deploy-secure.ps1 -Environment prod        # Production deployment
+.\deploy-secure.ps1 -UseExternalSecrets      # External secret management
+
+# Manual deployment
+helm install signal-engine-dev .\k8s\signal-engine\ \
+  --set-string secrets.kraken.apiKey="your-api-key" \
+  --set-string secrets.kraken.secretKey="your-secret-key"
+```
+
+### **📊 Step 3: Verify**
+```powershell
+helm status signal-engine-dev -n signal-engine
+kubectl logs -l app.kubernetes.io/name=signal-engine-helm -f
+```
+
+**🔐 SECURITY**: All credentials are template-based. Real API keys are NEVER committed to Git!
+
 ---
 
 ## 🏗️ System Architecture

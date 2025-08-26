@@ -1,0 +1,125 @@
+environment: Development
+
+message_broker:
+  address: "message-broker"
+  port: 6379
+  max_connections: 1000
+  buffer_size: 10240
+  compression_enabled: true
+  batch_size: 100
+  flush_interval:
+    secs: 0
+    nanos: 100000000
+
+publish_topics:
+  - "signals.buy"
+  - "signals.sell" 
+  - "signals.market_making"
+  - "signals.arbitrage"
+  - "orders.execution"
+
+subscribe_topics:
+  - "market.kraken.btcusd"
+  - "market.kraken.ethusd"
+  - "market.data.feed"
+  - "portfolio.updates"
+  - "wallet.balances"
+
+topic_routing:
+  signals: "signals.trading"
+  orders: "orders.execution"
+  fills: "executions.fills"
+  positions: "portfolio.positions"
+
+strategies:
+  - id: "momentum_strategy"
+    name: "Ultra Fast Momentum"
+    strategy_type: "momentum"
+    enabled: true
+    symbols: ["BTC/USD", "ETH/USD"]
+    exchanges: ["kraken"]
+    parameters:
+      lookback_period: 20
+      threshold: 0.02
+    risk_limits:
+      max_position_size: 10000.0
+      max_order_size: 5000.0
+      max_daily_loss: 1000.0
+      max_position_value: 50000.0
+
+  - id: "mean_reversion_strategy"
+    name: "Mean Reversion"
+    strategy_type: "mean_reversion"
+    enabled: true
+    symbols: ["BTC/USD", "ETH/USD"]
+    exchanges: ["kraken"]
+    parameters:
+      lookback_period: 50
+      z_score_threshold: 2.0
+    risk_limits:
+      max_position_size: 5000.0
+      max_order_size: 2500.0
+      max_daily_loss: 500.0
+      max_position_value: 25000.0
+
+exchanges:
+  - name: "kraken"
+    enabled: true
+    api_key: "YOUR_KRAKEN_API_KEY_HERE"
+    secret_key: "YOUR_KRAKEN_SECRET_KEY_HERE" 
+    sandbox: true
+    rate_limits:
+      orders_per_second: 10
+      requests_per_second: 60
+      window_size:
+        secs: 1
+        nanos: 0
+    timeout:
+      secs: 5
+      nanos: 0
+
+performance:
+  worker_threads: 4
+  cpu_affinity_enabled: false
+  cpu_cores: [0, 1, 2, 3]
+  memory_limit_mb: 512
+  latency_threshold_us: 1000
+  metrics_enabled: true
+  metrics_interval:
+    secs: 1
+    nanos: 0
+  simd_enabled: true
+
+security:
+  api_key_required: false
+  request_signing_required: false
+  rate_limiting_enabled: true
+  max_requests_per_minute: 1000
+  blocked_ips: []
+  allowed_ips: []
+  encryption_enabled: false
+
+monitoring:
+  health_check_enabled: true
+  health_check_interval:
+    secs: 30
+    nanos: 0
+  metrics_retention_days: 7
+  alerting_enabled: false
+  alert_thresholds:
+    latency_us: 5000.0
+    error_rate_percent: 5.0
+    cpu_usage_percent: 80.0
+    memory_usage_percent: 85.0
+    connection_failures: 10
+  prometheus_enabled: false
+  prometheus_port: 9090
+
+logging:
+  level: "info"
+  format: "json"
+  output: ["stdout"]
+  file_path: null
+  max_file_size_mb: 100
+  max_files: 5
+  structured_logging: true

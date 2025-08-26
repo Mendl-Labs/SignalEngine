@@ -429,12 +429,24 @@ strategies:
     enabled: true
 
 # Secrets (stored separately for security)
+# DO NOT PUT REAL CREDENTIALS IN THIS FILE - IT GOES TO GIT
 secrets:
-  enabled: true
-  # API keys and sensitive configuration
-  data: {}
-    # exchange_api_key: ""
-    # exchange_secret_key: ""
+  # Kraken API credentials (TEMPLATE - replace with real values)
+  kraken:
+    apiKey: "YOUR_KRAKEN_API_KEY_HERE"
+    secretKey: "YOUR_KRAKEN_SECRET_KEY_HERE"
+  
+  # Database credentials  
+  database:
+    password: "YOUR_DATABASE_PASSWORD_HERE"
+  
+  # Redis credentials
+  redis:
+    password: "YOUR_REDIS_PASSWORD_HERE"
+    
+  # Message broker credentials
+  messageBroker:
+    password: "YOUR_MESSAGE_BROKER_PASSWORD_HERE"
 
 # ==============================================================================
 # Performance & Optimization

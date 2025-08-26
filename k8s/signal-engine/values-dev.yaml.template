@@ -1,0 +1,62 @@
+# SignalEngine Development Configuration Template  
+# Copy this file to values-dev-local.yaml (ignored by Git) and add real credentials
+
+# INSTRUCTIONS:
+# 1. Copy: cp values-dev.yaml.template values-dev-local.yaml
+# 2. Edit values-dev-local.yaml with your real API credentials
+# 3. Deploy: helm install signal-engine-dev ./k8s/signal-engine/ -f ./k8s/signal-engine/values-dev-local.yaml
+
+global:
+  environment: dev
+
+# Development resources
+resources:
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+
+# REPLACE THESE WITH YOUR REAL CREDENTIALS
+secrets:
+  # Kraken API credentials - GET FROM KRAKEN PRO
+  kraken:
+    apiKey: "YOUR_REAL_KRAKEN_API_KEY_HERE"
+    secretKey: "YOUR_REAL_KRAKEN_SECRET_KEY_HERE"
+  
+  # Database credentials
+  database:
+    password: "your_secure_database_password"
+  
+  # Redis credentials
+  redis:
+    password: "your_secure_redis_password"
+    
+  # Message broker credentials
+  messageBroker:
+    password: "your_secure_message_broker_password"
+
+# Development-specific overrides
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+
+persistence:
+  enabled: true
+  size: 10Gi
+
+monitoring:
+  enabled: true
+  debug: true
+
+# Kraken configuration for development
+exchanges:
+  kraken:
+    endpoint: "https://api.kraken.com"
+    websocket: "wss://ws.kraken.com"
+    testnet: false  # Set to true for Kraken testnet
+    rateLimit:
+      requestsPerSecond: 1
+      burstLimit: 5

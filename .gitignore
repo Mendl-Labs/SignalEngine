@@ -48,6 +48,34 @@ logs/
 
 # Environment files
 .env
+.env.*
+
+# Helm values files with real credentials - NEVER COMMIT THESE!
+**/values-dev.yaml
+**/values-qa.yaml
+**/values-prod.yaml
+**/values-dev-local.yaml
+**/values-qa-local.yaml
+**/values-prod-local.yaml
+**/values-local.yaml
+**/values-secrets.yaml
+k8s/**/values-*-local.yaml
+k8s/**/values-secrets.yaml
+helm/**/values-*.yaml
+
+# API credentials and secrets - NEVER COMMIT THESE!
+**/secrets.yaml
+**/credentials.yaml
+**/api-keys.yaml
+**/*credentials*
+**/*secrets*
+**/*api-key*
+**/kraken-credentials.yaml
+
+# Trading platform specific
+config/production.yaml
+config/staging.yaml
+config/secrets.yaml
 .env.local
 .env.development.local
 .env.test.local
