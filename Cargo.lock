@@ -1923,9 +1923,7 @@ name = "protocol"
 version = "0.1.0"
 dependencies = [
  "flate2",
- "log-aggregator",
  "lz4",
- "metrics-collector",
  "prost",
  "prost-build",
  "prost-types",
@@ -1933,7 +1931,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "ultra-logger",
 ]
 
 [[package]]
@@ -2535,9 +2532,7 @@ dependencies = [
  "crossbeam",
  "crossbeam-queue",
  "libc",
- "log-aggregator",
  "memmap2",
- "metrics-collector",
  "mockall 0.12.1",
  "parking_lot",
  "prost",
@@ -2545,7 +2540,6 @@ dependencies = [
  "protocol",
  "spin_sleep",
  "tracing",
- "ultra-logger",
 ]
 
 [[package]]

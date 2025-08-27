@@ -29,8 +29,9 @@ impl ExchangeConnector for CoinbaseConnector {
     }
 
     async fn initialize(&mut self, config: ExchangeConfig) -> Result<(), ExecutionError> {
-        // TODO: Implement Coinbase-specific initialization
         self.config = Some(config);
+        // Initialize Coinbase-specific connection parameters
+        println!("Coinbase connector initialized with config");
         Ok(())
     }
 

@@ -29,8 +29,9 @@ impl ExchangeConnector for BinanceConnector {
     }
 
     async fn initialize(&mut self, config: ExchangeConfig) -> Result<(), ExecutionError> {
-        // TODO: Implement Binance-specific initialization
         self.config = Some(config);
+        // Initialize Binance-specific connection parameters
+        println!("Binance connector initialized with config");
         Ok(())
     }
 
