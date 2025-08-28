@@ -202,8 +202,8 @@ impl PortfolioHandler {
             .unwrap_or_default()
             .as_millis() as u64;
         
-        // Decode the PortfolioMessage
-        if let Ok(portfolio_msg) = PortfolioMessage::decode(data) {            
+        // Decode the PortfolioMessage using JSON
+        if let Ok(portfolio_msg) = serde_json::from_slice::<PortfolioMessage>(data) {            
             // Process based on payload type
             match portfolio_msg.payload {
                 Some(portfolio_message::Payload::WalletsPayload(wallets)) => {
@@ -249,6 +249,22 @@ impl PortfolioHandler {
                             );
                         }
                     }
+                },
+                Some(portfolio_message::Payload::Position(wallet)) => {
+                    // Handle single wallet position update
+                    println!("Received position update for wallet: {:?}", wallet);
+                },
+                Some(portfolio_message::Payload::Balance(wallet)) => {
+                    // Handle single wallet balance update
+                    println!("Received balance update for wallet: {:?}", wallet);
+                },
+                Some(portfolio_message::Payload::Update(execution_report)) => {
+                    // Handle execution report update
+                    println!("Received execution update: {:?}", execution_report);
+                },
+                Some(portfolio_message::Payload::Risk(risk_alert)) => {
+                    // Handle risk alert
+                    println!("Received risk alert: {:?}", risk_alert);
                 },
                 None => {
                     eprintln!("Empty portfolio message payload for topic {}", topic_name);

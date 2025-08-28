@@ -17,6 +17,98 @@ pub trait ExchangeConnector: Send + Sync {
     /// Execute multiple orders in parallel for maximum throughput
     async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError>;
 
+    /// Execute multiple orders sequentially (safe, reliable)
+    async fn execute_batch_orders_sequential(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        let mut results = Vec::with_capacity(signals.len());
+        
+        for signal in signals {
+            match self.execute_order(signal).await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Continue processing other orders even if one fails
+                    results.push(ExecutionResult {
+                        order_id: format!("failed_{}", signal.id),
+                        exchange_order_id: None,
+                        exchange: self.exchange_name().to_string(),
+                        status: ExecutionStatus::Rejected,
+                        filled_quantity: 0.0,
+                        remaining_quantity: signal.quantity,
+                        avg_fill_price: 0.0,
+                        total_fees: 0.0,
+                        fills: vec![],
+                        reject_reason: Some(format!("Order execution failed: {}", e)),
+                        submitted_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos(),
+                        updated_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos(),
+                        latency_ns: 0,
+                    });
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
+    /// Execute multiple orders in parallel (high performance)
+    async fn execute_batch_orders_parallel(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        // Create futures for all orders
+        let futures = signals.iter().map(|signal| {
+            async move {
+                match self.execute_order(signal).await {
+                    Ok(result) => result,
+                    Err(e) => ExecutionResult {
+                        order_id: format!("failed_{}", signal.id),
+                        exchange_order_id: None,
+                        exchange: self.exchange_name().to_string(),
+                        status: ExecutionStatus::Rejected,
+                        filled_quantity: 0.0,
+                        remaining_quantity: signal.quantity,
+                        avg_fill_price: 0.0,
+                        total_fees: 0.0,
+                        fills: vec![],
+                        reject_reason: Some(format!("Order execution failed: {}", e)),
+                        submitted_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos(),
+                        updated_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos(),
+                        latency_ns: 0,
+                    }
+                }
+            }
+        });
+
+        // Execute all orders concurrently
+        let results: Vec<ExecutionResult> = futures::future::join_all(futures).await;
+        Ok(results)
+    }
+
+    /// Execute multiple orders with optimized batching (hybrid approach)
+    async fn execute_batch_orders_optimized(&self, signals: &[Signal], batch_size: usize) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        let mut all_results = Vec::with_capacity(signals.len());
+        
+        // Process in batches to balance throughput and resource usage
+        for batch in signals.chunks(batch_size) {
+            let batch_results = self.execute_batch_orders_parallel(batch).await?;
+            all_results.extend(batch_results);
+            
+            // Optional: Add small delay between batches to prevent overwhelming the exchange
+            if batch.len() == batch_size && all_results.len() < signals.len() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        }
+        
+        Ok(all_results)
+    }
+
     /// Cancel a specific order by ID
     async fn cancel_order(&self, order_id: &str) -> Result<CancelResult, ExecutionError>;
 

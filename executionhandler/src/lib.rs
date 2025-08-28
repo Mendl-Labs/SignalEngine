@@ -220,8 +220,13 @@ impl UltraLowLatencyExecutionHandler {
         self.execute_order_on_exchange(signal, exchange_name).await
     }
 
-    /// Execute batch orders across multiple exchanges
+    /// Execute batch orders across multiple exchanges (sequential - safe)
     pub async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        self.execute_batch_orders_sequential(signals).await
+    }
+
+    /// Execute batch orders sequentially (conservative approach)
+    pub async fn execute_batch_orders_sequential(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
         // Group signals by exchange
         let mut exchange_groups: HashMap<String, Vec<&Signal>> = HashMap::new();
         
@@ -248,6 +253,116 @@ impl UltraLowLatencyExecutionHandler {
                 let mut batch_results = connector.execute_batch_orders(&signals_vec).await?;
                 all_results.append(&mut batch_results);
             }
+        }
+        
+        Ok(all_results)
+    }
+
+    /// Execute batch orders in parallel across exchanges (high-performance)
+    pub async fn execute_batch_orders_parallel(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        use futures::future::{join_all, try_join_all};
+        use std::sync::Arc;
+        
+        // Group signals by exchange
+        let mut exchange_groups: HashMap<String, Vec<Signal>> = HashMap::new();
+        
+        for signal in signals {
+            let exchange = if !signal.exchange.is_empty() {
+                signal.exchange.clone()
+            } else if let Some(ref default) = self.default_exchange {
+                default.clone()
+            } else {
+                return Err(ExecutionError::Unknown("No exchange specified and no default set".to_string()));
+            };
+            
+            exchange_groups.entry(exchange).or_default().push(signal.clone());
+        }
+        
+        // Create futures for parallel execution across exchanges
+        let connectors = Arc::new(self.connectors.read().await);
+        let mut exchange_futures = Vec::new();
+        
+        for (exchange_name, exchange_signals) in exchange_groups {
+            if let Some(_) = connectors.get(&exchange_name) {
+                let connectors_ref = Arc::clone(&connectors);
+                let exchange_name_owned = exchange_name.clone();
+                
+                let future = async move {
+                    if let Some(connector) = connectors_ref.get(&exchange_name_owned) {
+                        connector.execute_batch_orders_parallel(&exchange_signals).await
+                    } else {
+                        Err(ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name_owned)))
+                    }
+                };
+                
+                exchange_futures.push(future);
+            }
+        }
+        
+        // Execute all exchange batches in parallel
+        let batch_results: Result<Vec<Vec<ExecutionResult>>, ExecutionError> = try_join_all(exchange_futures).await;
+        
+        // Flatten results from all exchanges
+        let all_batches = batch_results?;
+        let mut all_results = Vec::new();
+        
+        for mut batch in all_batches {
+            all_results.append(&mut batch);
+        }
+        
+        Ok(all_results)
+    }
+
+    /// Execute batch orders with hybrid approach: parallel exchanges, configurable intra-exchange processing
+    pub async fn execute_batch_orders_optimized(&self, signals: &[Signal], max_parallel_per_exchange: usize) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        use futures::future::try_join_all;
+        use std::sync::Arc;
+        
+        // Group signals by exchange
+        let mut exchange_groups: HashMap<String, Vec<Signal>> = HashMap::new();
+        
+        for signal in signals {
+            let exchange = if !signal.exchange.is_empty() {
+                signal.exchange.clone()
+            } else if let Some(ref default) = self.default_exchange {
+                default.clone()
+            } else {
+                return Err(ExecutionError::Unknown("No exchange specified and no default set".to_string()));
+            };
+            
+            exchange_groups.entry(exchange).or_default().push(signal.clone());
+        }
+        
+        // Execute exchanges in parallel
+        let connectors = Arc::new(self.connectors.read().await);
+        let mut exchange_futures = Vec::new();
+        
+        for (exchange_name, exchange_signals) in exchange_groups {
+            if let Some(_) = connectors.get(&exchange_name) {
+                let connectors_ref = Arc::clone(&connectors);
+                let exchange_name_owned = exchange_name.clone();
+                
+                let future = async move {
+                    if let Some(connector) = connectors_ref.get(&exchange_name_owned) {
+                        connector.execute_batch_orders_optimized(&exchange_signals, max_parallel_per_exchange).await
+                    } else {
+                        Err(ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name_owned)))
+                    }
+                };
+                
+                exchange_futures.push(future);
+            }
+        }
+        
+        // Execute all exchange batches in parallel
+        let batch_results: Result<Vec<Vec<ExecutionResult>>, ExecutionError> = try_join_all(exchange_futures).await;
+        
+        // Flatten results from all exchanges
+        let all_batches = batch_results?;
+        let mut all_results = Vec::new();
+        
+        for mut batch in all_batches {
+            all_results.append(&mut batch);
         }
         
         Ok(all_results)

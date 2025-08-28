@@ -23,8 +23,17 @@ signalgenerator = { path = "../signalgenerator" }
 strategyhandler = { path = "../strategyhandler" }
 tokio = "1.44.1"
 ultra_signal = { path = "../signal" }
+
 # Ultra-low latency logging
 ultra-logger = { workspace = true }
 log-aggregator = { workspace = true }
 metrics-collector = { workspace = true }
 tracing = "0.1.40"
+
+# Phase 2: Ultra-Fast Order Management Dependencies
+bytes = { workspace = true }
+bincode = { workspace = true }
+futures = { workspace = true }
+atomic = { workspace = true }
+fastrand = { workspace = true }
+serde = { workspace = true }

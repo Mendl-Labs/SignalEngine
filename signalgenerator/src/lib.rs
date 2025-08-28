@@ -3,7 +3,6 @@ use ultra_signal::{Signal, SignalAction, OrderSide, ExchangeId, SYMBOLS, signal_
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Technical indicator for strategy calculations
 #[derive(Debug, Clone, Serialize, Deserialize)]
