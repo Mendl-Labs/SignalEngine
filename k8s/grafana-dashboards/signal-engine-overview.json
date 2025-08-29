@@ -1,0 +1,141 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "SignalEngine - Trading Performance Overview",
+    "tags": ["trading", "signal-engine", "performance"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Order Execution Latency",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, signal_engine_execution_latency_seconds)",
+            "legendFormat": "P99 Latency"
+          },
+          {
+            "expr": "histogram_quantile(0.95, signal_engine_execution_latency_seconds)",
+            "legendFormat": "P95 Latency"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 0.001},
+                {"color": "red", "value": 0.005}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Orders Per Second",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rate(signal_engine_orders_total[1m])",
+            "legendFormat": "Order Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 100},
+                {"color": "green", "value": 1000}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Smart Order Router Performance",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "signal_engine_smart_router_route_success_rate",
+            "legendFormat": "Route Success Rate"
+          },
+          {
+            "expr": "signal_engine_smart_router_active_routes",
+            "legendFormat": "Active Routes"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          }
+        },
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Exchange Metrics",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "signal_engine_exchange_latency_microseconds",
+            "legendFormat": "{{exchange}} Latency"
+          },
+          {
+            "expr": "signal_engine_exchange_fill_rate",
+            "legendFormat": "{{exchange}} Fill Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "µs"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+      },
+      {
+        "id": 5,
+        "title": "System Health",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "signal_engine_cpu_usage_percent",
+            "legendFormat": "CPU Usage"
+          },
+          {
+            "expr": "signal_engine_memory_usage_percent",
+            "legendFormat": "Memory Usage"
+          },
+          {
+            "expr": "signal_engine_error_rate",
+            "legendFormat": "Error Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 70},
+                {"color": "red", "value": 90}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "5s"
+  }
+}

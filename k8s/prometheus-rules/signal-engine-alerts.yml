@@ -1,0 +1,72 @@
+groups:
+  - name: signal-engine-alerts
+    rules:
+      - alert: HighExecutionLatency
+        expr: histogram_quantile(0.99, signal_engine_execution_latency_seconds) > 0.005
+        for: 30s
+        labels:
+          severity: critical
+          component: execution-handler
+        annotations:
+          summary: "Execution latency is critically high"
+          description: "P99 execution latency is {{ $value }}s, exceeding the 5ms threshold"
+
+      - alert: OrderExecutionFailureRate
+        expr: rate(signal_engine_execution_failures_total[5m]) / rate(signal_engine_orders_total[5m]) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+          component: execution-handler
+        annotations:
+          summary: "High order execution failure rate"
+          description: "Order execution failure rate is {{ $value | humanizePercentage }}"
+
+      - alert: CircuitBreakerOpen
+        expr: signal_engine_circuit_breaker_open == 1
+        for: 0s
+        labels:
+          severity: critical
+          component: execution-handler
+        annotations:
+          summary: "Circuit breaker is open for {{ $labels.exchange }}"
+          description: "Exchange {{ $labels.exchange }} circuit breaker has opened due to failures"
+
+      - alert: SmartRouterPerformanceDegraded
+        expr: signal_engine_smart_router_route_success_rate < 0.95
+        for: 2m
+        labels:
+          severity: warning
+          component: smart-order-router
+        annotations:
+          summary: "Smart router success rate is below threshold"
+          description: "Smart router success rate is {{ $value | humanizePercentage }}, below 95% threshold"
+
+      - alert: LowThroughput
+        expr: rate(signal_engine_orders_total[1m]) < 100
+        for: 5m
+        labels:
+          severity: warning
+          component: signal-engine
+        annotations:
+          summary: "Order throughput is critically low"
+          description: "Order rate is {{ $value }} orders/sec, below expected threshold of 100/sec"
+
+      - alert: HighMemoryUsage
+        expr: signal_engine_memory_usage_percent > 85
+        for: 3m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Memory usage is high"
+          description: "Memory usage is {{ $value }}%, exceeding 85% threshold"
+
+      - alert: DatabaseConnectionFailures
+        expr: rate(signal_engine_database_connection_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Database connection failures detected"
+          description: "Database connection failure rate: {{ $value }} failures/sec"

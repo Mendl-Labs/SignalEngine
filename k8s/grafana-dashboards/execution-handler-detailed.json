@@ -1,0 +1,100 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "SignalEngine - Execution Handler Deep Dive",
+    "tags": ["trading", "execution", "latency"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Execution Latency Distribution",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "increase(signal_engine_execution_latency_bucket[1m])",
+            "legendFormat": "{{le}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "µs"
+          }
+        },
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Order Execution Status",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "signal_engine_order_status_total",
+            "legendFormat": "{{status}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 3,
+        "title": "Exchange Performance Comparison",
+        "type": "bargauge",
+        "targets": [
+          {
+            "expr": "avg_over_time(signal_engine_exchange_execution_time[5m])",
+            "legendFormat": "{{exchange}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "µs",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 500},
+                {"color": "red", "value": 1000}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Circuit Breaker Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "signal_engine_circuit_breaker_open",
+            "legendFormat": "{{exchange}} Circuit Breaker"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"options": {"0": {"text": "CLOSED", "color": "green"}}, "type": "value"},
+              {"options": {"1": {"text": "OPEN", "color": "red"}}, "type": "value"}
+            ]
+          }
+        },
+        "gridPos": {"h": 4, "w": 24, "x": 0, "y": 16}
+      },
+      {
+        "id": 5,
+        "title": "Performance Alerts",
+        "type": "logs",
+        "targets": [
+          {
+            "expr": "{job=\"signal-engine\"} |= \"ALERT\" or |= \"ERROR\"",
+            "legendFormat": ""
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20}
+      }
+    ],
+    "time": {
+      "from": "now-30m",
+      "to": "now"
+    },
+    "refresh": "1s"
+  }
+}
