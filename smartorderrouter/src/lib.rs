@@ -5,6 +5,8 @@ use std::thread;
 use serde::{Serialize, Deserialize};
 use exchangemetricaggregator::{ExchangeMetricsAggregator, ExchangeMetrics, SmartRoutingMetrics, RoutingPerformance};
 
+pub mod database_integration_example;
+
 /// Order side enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
@@ -362,6 +364,9 @@ pub struct SmartOrderRouter {
     // Worker thread handles
     worker_handles: Mutex<Vec<thread::JoinHandle<()>>>,
     is_running: Arc<Mutex<bool>>,
+    
+    // Database interface for order persistence
+    database: Option<Arc<dyn DatabaseOrderPersistence>>,
 }
 
 /// Performance statistics
@@ -436,6 +441,7 @@ impl SmartOrderRouter {
         metrics_aggregator: Arc<ExchangeMetricsAggregator>,
         max_route_history: usize,
         monitoring_interval_ms: u64,
+        database: Option<Arc<dyn DatabaseOrderPersistence>>,
     ) -> Self {
         Self {
             metrics_aggregator,
@@ -448,6 +454,7 @@ impl SmartOrderRouter {
             monitoring_interval_ms,
             worker_handles: Mutex::new(Vec::new()),
             is_running: Arc::new(Mutex::new(false)),
+            database,
         }
     }
     
@@ -511,6 +518,9 @@ impl SmartOrderRouter {
         // Generate child orders based on algorithm
         self.generate_child_orders(&mut route, &routing_metrics, algorithm)?;
         
+        // Log order creation for database integration
+        self.log_orders_for_database(&route);
+        
         // Add to active routes
         {
             let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
@@ -526,6 +536,105 @@ impl SmartOrderRouter {
         println!("Created route {} for {} {} {} with {} child orders", route_id, quantity, side, symbol, routing_metrics.routing_recommendations.len());
         
         Ok(route_id)
+    }
+    
+    /// Log orders for database integration - shows what would be saved
+    fn log_orders_for_database(&self, route: &SmartOrderRoute) {
+        println!("=== Saving orders to database ===");
+        println!("Route: {}", route.id);
+        println!("Symbol: {}, Side: {:?}, Total Quantity: {}", route.symbol, route.side, route.total_quantity);
+        
+        // Save each child order to database if database interface is available
+        if let Some(ref database) = self.database {
+            for child_order in &route.child_orders {
+                let strategy_order = StrategyOrderData {
+                    trade_id: child_order.id.clone(),
+                    symbol: route.symbol.clone(),
+                    order_type: match child_order.order_type {
+                        OrderType::Market => "Market".to_string(),
+                        OrderType::Limit => "Limit".to_string(),
+                        OrderType::StopLimit => "StopLimit".to_string(),
+                        OrderType::Iceberg => "Iceberg".to_string(),
+                        OrderType::TWAP => "TWAP".to_string(),
+                        OrderType::VWAP => "VWAP".to_string(),
+                        OrderType::Implementation => "Implementation".to_string(),
+                    },
+                    side: match route.side {
+                        OrderSide::Buy => "Buy".to_string(),
+                        OrderSide::Sell => "Sell".to_string(),
+                    },
+                    quantity: child_order.quantity.to_string(),
+                    price: child_order.price.map(|p| p.to_string()),
+                    time_in_force: match child_order.time_in_force {
+                        TimeInForce::IOC => "IOC".to_string(),
+                        TimeInForce::GTC => "GTC".to_string(),
+                        TimeInForce::FOK => "FOK".to_string(),
+                        TimeInForce::DAY => "DAY".to_string(),
+                        TimeInForce::GTD => "GTD".to_string(),
+                    },
+                    execution_urgency: match route.urgency {
+                        ExecutionUrgency::Low => "Low".to_string(),
+                        ExecutionUrgency::Medium => "Medium".to_string(),
+                        ExecutionUrgency::High => "High".to_string(),
+                        ExecutionUrgency::Critical => "Critical".to_string(),
+                    },
+                    created_at: Utc::now(),
+                };
+                
+                match database.save_strategy_order(&strategy_order) {
+                    Ok(_) => println!("✓ Saved child order {} to database", child_order.id),
+                    Err(e) => println!("✗ Failed to save child order {}: {}", child_order.id, e),
+                }
+            }
+        } else {
+            println!("No database interface configured - orders logged only");
+            for (i, child_order) in route.child_orders.iter().enumerate() {
+                println!("Child Order {}: ID={}, Exchange={}, Type={:?}, Quantity={}, Status={:?}", 
+                    i + 1,
+                    child_order.id,
+                    child_order.exchange,
+                    child_order.order_type,
+                    child_order.quantity,
+                    child_order.status
+                );
+            }
+        }
+        println!("=== End of database integration ===\n");
+    }
+
+    /// Log order execution updates to database
+    fn log_execution_to_database(
+        &self,
+        child_order_id: &str,
+        filled_qty: f64,
+        fill_price: f64,
+        fees: f64,
+        status: RouteStatus,
+    ) {
+        if let Some(ref database) = self.database {
+            let execution_data = OrderExecutionData {
+                trade_id: child_order_id.to_string(),
+                filled_quantity: filled_qty,
+                fill_price,
+                fees_paid: fees,
+                status: match status {
+                    RouteStatus::Pending => "Pending".to_string(),
+                    RouteStatus::PartiallyFilled => "PartiallyFilled".to_string(),
+                    RouteStatus::Filled => "Filled".to_string(),
+                    RouteStatus::Cancelled => "Cancelled".to_string(),
+                    RouteStatus::Rejected => "Rejected".to_string(),
+                    RouteStatus::Expired => "Expired".to_string(),
+                    RouteStatus::Failed => "Failed".to_string(),
+                },
+                updated_at: Utc::now(),
+            };
+            
+            match database.update_order_execution(&execution_data) {
+                Ok(_) => println!("✓ Updated execution for order {} - Filled: {}, Price: {}, Status: {:?}", 
+                    child_order_id, filled_qty, fill_price, status),
+                Err(e) => println!("✗ Failed to update execution for order {}: {}", child_order_id, e),
+            }
+        }
     }
     
     /// Generate child orders based on routing strategy
@@ -850,6 +959,9 @@ impl SmartOrderRouter {
         fees: f64,
         status: RouteStatus,
     ) -> Result<(), String> {
+        // Log execution to database first
+        self.log_execution_to_database(child_order_id, filled_qty, fill_price, fees, status);
+        
         let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
         
         if let Some(route) = active_routes.get_mut(route_id) {
@@ -1136,7 +1248,7 @@ mod tests {
     #[test]
     fn test_router_creation() {
         let aggregator = create_test_metrics_aggregator();
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000);
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
         
         assert_eq!(router.max_route_history, 1000);
         assert_eq!(router.monitoring_interval_ms, 1000);
@@ -1185,7 +1297,7 @@ mod tests {
         let aggregator = create_test_metrics_aggregator();
         setup_test_metrics(&aggregator);
         
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000);
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
         
         let route_id = router.route_order(
             "BTC/USD",
@@ -1252,7 +1364,7 @@ mod tests {
     #[test]
     fn test_performance_stats_update() {
         let aggregator = create_test_metrics_aggregator();
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000);
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
         
         let stats = router.get_performance_stats();
         assert!(stats.is_ok());
@@ -1267,7 +1379,7 @@ mod tests {
         let aggregator = create_test_metrics_aggregator();
         setup_test_metrics(&aggregator);
         
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000);
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
         
         // Test TWAP algorithm
         let route_id = router.route_order(
@@ -1305,7 +1417,7 @@ mod tests {
         let aggregator = create_test_metrics_aggregator();
         setup_test_metrics(&aggregator);
         
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000);
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
         
         let route_id = router.route_order(
             "BTC/USD",
@@ -1322,5 +1434,162 @@ mod tests {
         // Route should no longer be active
         let route = router.get_active_route(&route_id);
         assert!(route.is_err());
+    }
+
+    #[test]
+    fn test_database_integration() {
+        let aggregator = create_test_metrics_aggregator();
+        setup_test_metrics(&aggregator);
+        
+        // Create in-memory database for testing
+        let database = Arc::new(InMemoryOrderDatabase::new());
+        
+        // Create router with database integration
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, Some(database.clone()));
+        
+        // Create an order which should save to database
+        let route_id = router.route_order(
+            "BTC/USD",
+            OrderSide::Buy,
+            10.0,
+            ExecutionUrgency::Medium,
+            RoutingAlgorithm::SmartRouting,
+        );
+        
+        assert!(route_id.is_ok());
+        
+        // Check that orders were saved to database
+        let saved_orders = database.get_all_orders();
+        assert!(!saved_orders.is_empty(), "Orders should have been saved to database");
+        
+        println!("Successfully saved {} orders to database", saved_orders.len());
+        for order in &saved_orders {
+            println!("Order: {} {} {} at {}", order.side, order.quantity, order.symbol, order.created_at);
+        }
+    }
+
+    #[test] 
+    fn test_execution_tracking() {
+        let aggregator = create_test_metrics_aggregator();
+        setup_test_metrics(&aggregator);
+        
+        // Create in-memory database for testing
+        let database = Arc::new(InMemoryOrderDatabase::new());
+        
+        // Create router with database integration
+        let router = SmartOrderRouter::new(aggregator, 1000, 1000, Some(database.clone()));
+        
+        // Create an order
+        let route_id = router.route_order(
+            "BTC/USD",
+            OrderSide::Buy,
+            10.0,
+            ExecutionUrgency::Medium,
+            RoutingAlgorithm::SmartRouting,
+        ).expect("Failed to create route");
+        
+        // Get the route to find child order IDs
+        let route = {
+            let active_routes = router.active_routes.read().unwrap();
+            active_routes.get(&route_id).cloned()
+        };
+        
+        assert!(route.is_some(), "Route should exist");
+        let route = route.unwrap();
+        assert!(!route.child_orders.is_empty(), "Should have child orders");
+        
+        // Simulate execution of first child order
+        let first_child_id = &route.child_orders[0].id;
+        println!("\n=== Simulating execution of child order {} ===", first_child_id);
+        
+        // Partial fill
+        let result = router.update_child_order_execution(
+            &route_id,
+            first_child_id,
+            2.5,  // filled_qty
+            50000.0,  // fill_price
+            5.0,  // fees
+            RouteStatus::PartiallyFilled,
+        );
+        assert!(result.is_ok(), "Partial fill update should succeed");
+        
+        // Complete fill
+        let result = router.update_child_order_execution(
+            &route_id,
+            first_child_id,
+            2.5,  // remaining quantity
+            50100.0,  // fill_price
+            5.0,  // fees
+            RouteStatus::Filled,
+        );
+        assert!(result.is_ok(), "Complete fill update should succeed");
+        
+        println!("✓ Successfully tracked order execution lifecycle");
+    }
+}
+
+// Database integration module - simplified implementation for order persistence
+use chrono::{DateTime, Utc};
+
+// Simplified database interface to avoid complex dependencies
+pub trait DatabaseOrderPersistence {
+    fn save_strategy_order(&self, order_data: &StrategyOrderData) -> Result<(), String>;
+    fn update_order_execution(&self, execution_data: &OrderExecutionData) -> Result<(), String>;
+}
+
+// Struct that matches the database schema
+#[derive(Debug, Clone)]
+pub struct StrategyOrderData {
+    pub trade_id: String,
+    pub symbol: String,
+    pub order_type: String,
+    pub side: String,
+    pub quantity: String,
+    pub price: Option<String>,
+    pub time_in_force: String,
+    pub execution_urgency: String,
+    pub created_at: DateTime<Utc>,
+}
+
+// Struct for order execution updates
+#[derive(Debug, Clone)]
+pub struct OrderExecutionData {
+    pub trade_id: String,
+    pub filled_quantity: f64,
+    pub fill_price: f64,
+    pub fees_paid: f64,
+    pub status: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+// Simple in-memory implementation for demonstration
+pub struct InMemoryOrderDatabase {
+    orders: std::sync::Mutex<Vec<StrategyOrderData>>,
+}
+
+impl InMemoryOrderDatabase {
+    pub fn new() -> Self {
+        Self {
+            orders: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    
+    pub fn get_all_orders(&self) -> Vec<StrategyOrderData> {
+        self.orders.lock().unwrap().clone()
+    }
+}
+
+impl DatabaseOrderPersistence for InMemoryOrderDatabase {
+    fn save_strategy_order(&self, order_data: &StrategyOrderData) -> Result<(), String> {
+        self.orders.lock().unwrap().push(order_data.clone());
+        println!("Saved order to database: {:?}", order_data);
+        Ok(())
+    }
+    
+    fn update_order_execution(&self, execution_data: &OrderExecutionData) -> Result<(), String> {
+        // In a real database, this would update the existing order record
+        // For the in-memory implementation, we'll just log the execution
+        println!("Updated order execution: {:?}", execution_data);
+        Ok(())
     }
 }

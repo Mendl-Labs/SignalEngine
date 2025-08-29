@@ -31,6 +31,65 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::monitoring::MonitoringThresholds;
+use chrono::{DateTime, Utc};
+
+// Database integration for execution tracking
+pub trait DatabaseExecutionPersistence: Send + Sync {
+    fn save_execution(&self, execution_data: &ExecutionData) -> Result<(), String>;
+    fn update_execution_status(&self, order_id: &str, status: &str) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionData {
+    pub order_id: String,
+    pub exchange: String,
+    pub symbol: String,
+    pub side: String,
+    pub quantity: f64,
+    pub filled_quantity: f64,
+    pub price: f64,
+    pub fee: f64,
+    pub status: String,
+    pub executed_at: DateTime<Utc>,
+    pub latency_ns: u64,
+}
+
+// Simple in-memory implementation for testing
+pub struct InMemoryExecutionDatabase {
+    executions: std::sync::Mutex<Vec<ExecutionData>>,
+}
+
+impl InMemoryExecutionDatabase {
+    pub fn new() -> Self {
+        Self {
+            executions: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    
+    pub fn get_all_executions(&self) -> Vec<ExecutionData> {
+        self.executions.lock().unwrap().clone()
+    }
+}
+
+impl DatabaseExecutionPersistence for InMemoryExecutionDatabase {
+    fn save_execution(&self, execution_data: &ExecutionData) -> Result<(), String> {
+        self.executions.lock().unwrap().push(execution_data.clone());
+        println!("💾 Saved execution to database: {} {} {} @ {} (Fee: {}, Latency: {}ns)", 
+            execution_data.side, 
+            execution_data.filled_quantity, 
+            execution_data.symbol, 
+            execution_data.price,
+            execution_data.fee,
+            execution_data.latency_ns
+        );
+        Ok(())
+    }
+    
+    fn update_execution_status(&self, order_id: &str, status: &str) -> Result<(), String> {
+        println!("📊 Updated execution status for {}: {}", order_id, status);
+        Ok(())
+    }
+}
 
 /// Ultra-low latency multi-exchange execution handler
 #[derive(Clone)]
@@ -42,6 +101,7 @@ pub struct UltraLowLatencyExecutionHandler {
     circuit_breakers: Arc<RwLock<ExchangeCircuitBreakerManager>>,
     position_tracker: Arc<PositionTracker>,
     performance_monitor: Arc<PerformanceMonitor>,
+    execution_database: Option<Arc<dyn DatabaseExecutionPersistence>>,
 }
 
 impl UltraLowLatencyExecutionHandler {
@@ -57,6 +117,67 @@ impl UltraLowLatencyExecutionHandler {
             circuit_breakers: Arc::new(RwLock::new(ExchangeCircuitBreakerManager::new())),
             position_tracker: Arc::new(PositionTracker::new()),
             performance_monitor: Arc::new(PerformanceMonitor::new(MonitoringThresholds::default())),
+            execution_database: None,
+        }
+    }
+
+    /// Create a new execution handler with database integration
+    pub fn new_with_database(database: Arc<dyn DatabaseExecutionPersistence>) -> Self {
+        let mut handler = Self::new();
+        handler.execution_database = Some(database);
+        handler
+    }
+
+    /// Save execution details to database
+    fn save_execution_to_database(&self, signal: &Signal, execution_result: &ExecutionResult, exchange_name: &str, latency_ns: u64) {
+        if let Some(ref database) = self.execution_database {
+            // Save each fill as a separate execution record
+            for fill in &execution_result.fills {
+                let execution_data = ExecutionData {
+                    order_id: execution_result.order_id.clone(),
+                    exchange: exchange_name.to_string(),
+                    symbol: signal.symbol.clone(),
+                    side: match signal.action {
+                        SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "Buy".to_string(),
+                        SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => "Sell".to_string(),
+                    },
+                    quantity: signal.quantity,
+                    filled_quantity: fill.quantity,
+                    price: fill.price,
+                    fee: fill.fee,
+                    status: format!("{:?}", execution_result.status),
+                    executed_at: Utc::now(),
+                    latency_ns,
+                };
+                
+                if let Err(e) = database.save_execution(&execution_data) {
+                    TradingLogger::log_error("database", "save_execution", &e, Some(&signal.symbol));
+                }
+            }
+            
+            // If no fills but execution happened (pending order), save the order placement
+            if execution_result.fills.is_empty() {
+                let execution_data = ExecutionData {
+                    order_id: execution_result.order_id.clone(),
+                    exchange: exchange_name.to_string(),
+                    symbol: signal.symbol.clone(),
+                    side: match signal.action {
+                        SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "Buy".to_string(),
+                        SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => "Sell".to_string(),
+                    },
+                    quantity: signal.quantity,
+                    filled_quantity: 0.0,
+                    price: signal.price.unwrap_or(0.0),
+                    fee: 0.0,
+                    status: format!("{:?}", execution_result.status),
+                    executed_at: Utc::now(),
+                    latency_ns,
+                };
+                
+                if let Err(e) = database.save_execution(&execution_data) {
+                    TradingLogger::log_error("database", "save_execution", &e, Some(&signal.symbol));
+                }
+            }
         }
     }
 
@@ -140,6 +261,9 @@ impl UltraLowLatencyExecutionHandler {
                     latency_ns,
                     &format!("{:?}", execution_result.status)
                 );
+                
+                // Save execution to database
+                self.save_execution_to_database(signal, execution_result, exchange_name, latency_ns);
                 
                 // Update position tracking with execution fills
                 if !execution_result.fills.is_empty() {
@@ -633,6 +757,68 @@ mod tests {
     async fn test_handler_creation() {
         let handler = UltraLowLatencyExecutionHandler::new();
         assert!(handler.list_exchanges().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execution_database_integration() {
+        // Create execution database
+        let execution_db = Arc::new(InMemoryExecutionDatabase::new());
+        
+        // Create handler with database integration
+        let handler = UltraLowLatencyExecutionHandler::new_with_database(execution_db.clone());
+        
+        // Verify database is integrated
+        assert!(handler.execution_database.is_some());
+        
+        // Check initial state
+        let executions = execution_db.get_all_executions();
+        assert!(executions.is_empty());
+        
+        println!("✅ ExecutionHandler created with database integration");
+        println!("📊 Initial executions in database: {}", executions.len());
+    }
+
+    #[test]
+    fn test_execution_database_save() {
+        let execution_db = InMemoryExecutionDatabase::new();
+        
+        let execution_data = ExecutionData {
+            order_id: "test_order_123".to_string(),
+            exchange: "Kraken".to_string(),
+            symbol: "BTC/USD".to_string(),
+            side: "Buy".to_string(),
+            quantity: 1.0,
+            filled_quantity: 1.0,
+            price: 50000.0,
+            fee: 25.0,
+            status: "Filled".to_string(),
+            executed_at: Utc::now(),
+            latency_ns: 1500000, // 1.5ms
+        };
+        
+        // Save execution
+        let result = execution_db.save_execution(&execution_data);
+        assert!(result.is_ok());
+        
+        // Verify saved
+        let executions = execution_db.get_all_executions();
+        assert_eq!(executions.len(), 1);
+        
+        let saved_execution = &executions[0];
+        assert_eq!(saved_execution.order_id, "test_order_123");
+        assert_eq!(saved_execution.exchange, "Kraken");
+        assert_eq!(saved_execution.symbol, "BTC/USD");
+        assert_eq!(saved_execution.side, "Buy");
+        assert_eq!(saved_execution.filled_quantity, 1.0);
+        assert_eq!(saved_execution.price, 50000.0);
+        
+        println!("✅ Execution successfully saved to database");
+        println!("💾 Order ID: {}, Filled: {} {} @ {}", 
+            saved_execution.order_id, 
+            saved_execution.filled_quantity, 
+            saved_execution.symbol, 
+            saved_execution.price
+        );
     }
 
     #[tokio::test]
