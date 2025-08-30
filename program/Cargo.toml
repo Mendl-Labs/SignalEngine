@@ -11,3 +11,6 @@ tokio = "1.44.1"
 ultra-logger = { workspace = true }
 log-aggregator = { workspace = true }
 metrics-collector = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

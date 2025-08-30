@@ -5,6 +5,9 @@ use anyhow::Result;
 use std::env;
 use ultra_logger::{UltraLogger, LogLevel};
 
+#[cfg(test)]
+mod performance_tests;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize ultra-low latency logging
