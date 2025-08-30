@@ -176,7 +176,7 @@ impl<E: std::fmt::Display> std::fmt::Display for CircuitBreakerError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CircuitBreakerError::CircuitOpen => write!(f, "Circuit breaker is open"),
-            CircuitBreakerError::ServiceError(e) => write!(f, "Service error: {}", e),
+            CircuitBreakerError::ServiceError(e) => write!(f, "Service error: {e}"),
         }
     }
 }
@@ -216,14 +216,14 @@ impl ExchangeCircuitBreakerManager {
             match breaker.call(f) {
                 Ok(result) => Ok(result),
                 Err(CircuitBreakerError::CircuitOpen) => {
-                    Err(format!("Exchange {} is unavailable (circuit breaker open)", exchange_name))
+                    Err(format!("Exchange {exchange_name} is unavailable (circuit breaker open)"))
                 }
                 Err(CircuitBreakerError::ServiceError(e)) => {
-                    Err(format!("Exchange {} error: {:?}", exchange_name, e))
+                    Err(format!("Exchange {exchange_name} error: {e:?}"))
                 }
             }
         } else {
-            Err(format!("No circuit breaker configured for exchange {}", exchange_name))
+            Err(format!("No circuit breaker configured for exchange {exchange_name}"))
         }
     }
 
@@ -237,14 +237,14 @@ impl ExchangeCircuitBreakerManager {
             match breaker.call_async(f).await {
                 Ok(result) => Ok(result),
                 Err(CircuitBreakerError::CircuitOpen) => {
-                    Err(format!("Exchange {} is unavailable (circuit breaker open)", exchange_name))
+                    Err(format!("Exchange {exchange_name} is unavailable (circuit breaker open)"))
                 }
                 Err(CircuitBreakerError::ServiceError(e)) => {
-                    Err(format!("Exchange {} error: {:?}", exchange_name, e))
+                    Err(format!("Exchange {exchange_name} error: {e:?}"))
                 }
             }
         } else {
-            Err(format!("No circuit breaker configured for exchange {}", exchange_name))
+            Err(format!("No circuit breaker configured for exchange {exchange_name}"))
         }
     }
 

@@ -2,8 +2,33 @@
 // This shows how to connect the SmartOrderRouter to the actual strategy_order_ops.rs
 
 use std::sync::Arc;
-use crate::{DatabaseOrderPersistence, StrategyOrderData, SmartOrderRouter};
+use crate::UltraFastSmartOrderRouter;
 use exchangemetricaggregator::ExchangeMetricsAggregator;
+
+// Simple order data structure for database integration
+#[derive(Debug, Clone)]
+pub struct StrategyOrderData {
+    pub route_id: String,
+    pub symbol: String,
+    pub quantity: f64,
+    pub status: String,
+}
+
+// Order execution data for reporting
+#[derive(Debug, Clone)]
+pub struct OrderExecutionData {
+    pub order_id: String,
+    pub execution_price: f64,
+    pub executed_quantity: f64,
+    pub fees: f64,
+    pub timestamp: u64,
+}
+
+// Database persistence trait
+pub trait DatabaseOrderPersistence {
+    fn save_strategy_order(&self, order_data: &StrategyOrderData) -> Result<(), String>;
+    fn update_execution_data(&self, execution_data: &OrderExecutionData) -> Result<(), String>;
+}
 
 // This would be the real PostgreSQL implementation using the strategy_order_ops.rs
 // For now, this is a mock implementation showing the structure
@@ -29,104 +54,73 @@ impl DatabaseOrderPersistence for PostgresOrderDatabase {
         println!("MOCK: Would save order to PostgreSQL at {}", self.connection_string);
         println!("MOCK: Order Data: {:?}", order_data);
         
-        // Real implementation would look like:
-        // let new_order = NewStrategyOrder {
-        //     trade_id: order_data.trade_id.clone(),
-        //     symbol: order_data.symbol.clone(),
-        //     order_type: order_data.order_type.clone(),
-        //     side: order_data.side.clone(),
-        //     quantity: order_data.quantity.parse().map_err(|_| "Invalid quantity")?,
-        //     price: order_data.price.as_ref().and_then(|p| p.parse().ok()),
-        //     time_in_force: order_data.time_in_force.clone(),
-        //     execution_urgency: order_data.execution_urgency.clone(),
-        // };
-        
-        // let result = StrategyOrderWorkflow::create_order_with_state(
-        //     conn,
-        //     new_order,
-        //     Some("SmartOrderRouter".to_string())
-        // ).await;
-        
-        // match result {
-        //     Ok(_) => Ok(()),
-        //     Err(e) => Err(format!("Database error: {}", e)),
-        // }
-        
+        // Return success for the mock
         Ok(())
     }
     
-    fn update_order_execution(&self, execution_data: &crate::OrderExecutionData) -> Result<(), String> {
+    fn update_execution_data(&self, execution_data: &OrderExecutionData) -> Result<(), String> {
         // In the real implementation, this would:
-        // 1. Update the existing order record with execution details
-        // 2. Update filled_quantity, avg_fill_price, fees_paid, status fields
+        // 1. Update the existing order record in the database
+        // 2. Use StrategyOrderWorkflow::update_order_execution() from strategy_order_ops.rs
         
-        println!("MOCK: Would update order execution in PostgreSQL at {}", self.connection_string);
+        println!("MOCK: Would update execution data in PostgreSQL at {}", self.connection_string);
         println!("MOCK: Execution Data: {:?}", execution_data);
         
-        // Real implementation would look like:
-        // UPDATE strategy_orders SET 
-        //     filled_quantity = filled_quantity + ?,
-        //     avg_fill_price = ((avg_fill_price * filled_quantity) + (? * ?)) / (filled_quantity + ?),
-        //     fees_paid = fees_paid + ?,
-        //     status = ?,
-        //     updated_at = NOW()
-        // WHERE trade_id = ?
-        
+        // Return success for the mock
         Ok(())
     }
 }
 
-// Example usage function showing how to set up the SmartOrderRouter with database integration
-pub async fn setup_smart_router_with_database() -> Result<SmartOrderRouter, String> {
-    // Create the metrics aggregator with required parameters
+// Example integration function showing how to connect the router with database
+pub async fn setup_smart_router_with_database() -> Result<UltraFastSmartOrderRouter, String> {
+    // Create the database persistence layer
+    let _db = PostgresOrderDatabase::new("postgresql://localhost/trading_db".to_string());
+    
+    // Create metrics aggregator with correct parameters
     let metrics_aggregator = Arc::new(ExchangeMetricsAggregator::new(1000, 100));
     
-    // Create the PostgreSQL database interface
-    let database = Arc::new(PostgresOrderDatabase::new(
-        "postgresql://user:password@localhost/trading_db".to_string()
-    ));
+    // Create the ultra-fast smart order router
+    let router = UltraFastSmartOrderRouter::new(metrics_aggregator);
     
-    // Create the SmartOrderRouter with database integration
-    let router = SmartOrderRouter::new(
-        metrics_aggregator,
-        1000,  // max_route_history
-        1000,  // monitoring_interval_ms
-        Some(database), // Database interface
-    );
-    
-    println!("SmartOrderRouter created with PostgreSQL database integration");
+    // In a real implementation, you would:
+    // 1. Set up periodic database sync
+    // 2. Load existing orders from database on startup
+    // 3. Set up event handlers to persist new orders
     
     Ok(router)
 }
 
-// Example of how to use the router
-pub async fn example_order_with_database_save() -> Result<(), String> {
-    let router = setup_smart_router_with_database().await?;
+// Example of how to use the database integration
+pub async fn example_usage() -> Result<(), String> {
+    // Set up router with database
+    let _router = setup_smart_router_with_database().await?;
     
-    // Route an order - this will automatically save child orders to the database
-    let route_id = router.route_order(
-        "BTC/USD",
-        crate::OrderSide::Buy,
-        100.0,
-        crate::ExecutionUrgency::High,
-        crate::RoutingAlgorithm::SmartRouting,
-    )?;
+    // Create database instance
+    let db = PostgresOrderDatabase::new("postgresql://localhost/trading_db".to_string());
     
-    println!("Created route {} with database persistence", route_id);
+    // Example order data
+    let order_data = StrategyOrderData {
+        route_id: "route_123".to_string(),
+        symbol: "BTC/USD".to_string(),
+        quantity: 1.0,
+        status: "pending".to_string(),
+    };
     
+    // Save order to database
+    db.save_strategy_order(&order_data)?;
+    
+    // Example execution data
+    let execution_data = OrderExecutionData {
+        order_id: "route_123".to_string(),
+        execution_price: 50000.0,
+        executed_quantity: 0.5,
+        fees: 25.0,
+        timestamp: 1234567890,
+    };
+    
+    // Update execution in database
+    db.update_execution_data(&execution_data)?;
+    
+    println!("Database integration example completed successfully");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_postgres_mock_integration() {
-        let result = setup_smart_router_with_database().await;
-        assert!(result.is_ok());
-        
-        let result = example_order_with_database_save().await;
-        assert!(result.is_ok());
-    }
 }

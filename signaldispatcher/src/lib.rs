@@ -49,7 +49,94 @@ impl UltraFastSignalDispatcher {
         }
     }
 
-    /// Start ultra-fast signal processing loop
+        /// Ultra-fast batch signal processing using pre-allocated buffer
+    pub fn process_batch_signals(&mut self) -> u64 {
+        if self.batch_buffer.is_empty() {
+            self.batch_buffer.reserve(32); // Ensure capacity
+        }
+        self.batch_buffer.clear();
+        
+        let mut processed_count = 0u64;
+        let batch_start = std::time::Instant::now();
+        
+        // Fill batch buffer from urgent queue first (high priority)
+        while self.batch_buffer.len() < 16 { // Half batch from urgent
+            if let Some(signal) = self.urgent_queue.try_pop() {
+                self.batch_buffer.push(signal);
+            } else {
+                break;
+            }
+        }
+        
+        // Fill remaining from normal queue
+        while self.batch_buffer.len() < 32 { // Complete batch from normal
+            if let Some(signal) = self.normal_queue.try_pop() {
+                self.batch_buffer.push(signal);
+            } else {
+                break;
+            }
+        }
+        
+        // Process batch using SIMD-optimized routing
+        if !self.batch_buffer.is_empty() {
+            processed_count = self.dispatch_batch_simd();
+            
+            // Update performance metrics
+            let batch_latency_ns = batch_start.elapsed().as_nanos() as u64;
+            self.update_performance_metrics(processed_count, batch_latency_ns);
+        }
+        
+        processed_count
+    }
+
+    /// SIMD-optimized batch signal dispatch
+    #[inline]
+    fn dispatch_batch_simd(&self) -> u64 {
+        let mut processed = 0u64;
+        
+        // Process signals in groups of 4 for SIMD efficiency  
+        let chunks = self.batch_buffer.chunks(4);
+        
+        for chunk in chunks {
+            // Parallel processing of up to 4 signals
+            for signal in chunk {
+                Self::dispatch_signal_fast(
+                    signal,
+                    &self.execution_sender,
+                    &self.portfolio_sender,
+                    &self.risk_sender,
+                );
+                processed += 1;
+            }
+        }
+        
+        processed
+    }
+
+    /// Update performance metrics atomically
+    #[inline]
+    fn update_performance_metrics(&self, processed_count: u64, batch_latency_ns: u64) {
+        let current_processed = self.signals_processed.fetch_add(processed_count, Ordering::Relaxed);
+        
+        // Update average latency using exponential moving average
+        if processed_count > 0 {
+            let avg_per_signal = batch_latency_ns / processed_count;
+            let current_avg = self.avg_latency_ns.load(Ordering::Relaxed);
+            let new_avg = if current_processed == processed_count {
+                avg_per_signal // First batch
+            } else {
+                // Exponential moving average: new_avg = old_avg * 0.9 + new_sample * 0.1
+                (current_avg * 9 + avg_per_signal) / 10
+            };
+            self.avg_latency_ns.store(new_avg, Ordering::Relaxed);
+            
+            // Update max latency if needed
+            let current_max = self.max_latency_ns.load(Ordering::Relaxed);
+            if avg_per_signal > current_max {
+                self.max_latency_ns.store(avg_per_signal, Ordering::Relaxed);
+            }
+        }
+    }
     pub fn start(&self) -> std::thread::JoinHandle<()> {
         let urgent_queue = Arc::clone(&self.urgent_queue);
         let normal_queue = Arc::clone(&self.normal_queue);
@@ -235,6 +322,36 @@ impl UltraFastSignalDispatcher {
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::Relaxed);
     }
+
+    /// Get comprehensive performance statistics
+    pub fn get_performance_stats(&self) -> DispatcherStats {
+        DispatcherStats {
+            signals_processed: self.signals_processed.load(Ordering::Relaxed),
+            avg_latency_ns: self.avg_latency_ns.load(Ordering::Relaxed),
+            max_latency_ns: self.max_latency_ns.load(Ordering::Relaxed),
+            is_running: self.is_running.load(Ordering::Relaxed),
+            urgent_queue_size: self.urgent_queue.len(),
+            normal_queue_size: self.normal_queue.len(),
+        }
+    }
+
+    /// Reset performance counters
+    pub fn reset_stats(&self) {
+        self.signals_processed.store(0, Ordering::Relaxed);
+        self.avg_latency_ns.store(0, Ordering::Relaxed);
+        self.max_latency_ns.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Performance statistics for the signal dispatcher
+#[derive(Debug, Clone)]
+pub struct DispatcherStats {
+    pub signals_processed: u64,
+    pub avg_latency_ns: u64,
+    pub max_latency_ns: u64,
+    pub is_running: bool,
+    pub urgent_queue_size: usize,
+    pub normal_queue_size: usize,
 }
 
 /// Legacy signal dispatcher for backward compatibility

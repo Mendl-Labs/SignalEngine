@@ -1,0 +1,48 @@
+# Avellaneda-Stoikov Market Making Strategy Configuration
+# Exported from BacktestingEngine
+
+[strategy]
+name = "Avellaneda-Stoikov Market Maker"
+type = "avellaneda-stoikov"
+version = "1.0.0"
+enabled = true
+description = "High-frequency market making strategy based on optimal bid-ask spread calculation"
+
+[parameters]
+risk_aversion = 0.1
+inventory_target = 0.0
+order_size = 100.0
+window_ms = 1000
+min_quote_lifetime_ms = 100
+fee_rate = 0.001
+latency_buffer = 0.5
+volatility_cap = 0.2
+
+[trading]
+symbol = "BTCUSD"
+exchange = "kraken"
+max_position_pct = 0.05  # 5% of portfolio
+stop_loss_pct = 0.02     # 2% stop loss
+daily_loss_limit = 1000.0
+cooldown_minutes = 30
+risk_scaling = 1.0
+
+[live_trading]
+paper_trading = true
+paper_trading_days = 7
+max_orders_per_second = 10
+min_spread_bps = 5       # Minimum 5 basis points spread
+
+[performance_thresholds]
+# These were the thresholds that this strategy passed during export
+min_sharpe_ratio = 1.5
+min_profit_factor = 1.3
+min_win_rate = 0.55
+max_drawdown = 0.15
+
+[metadata]
+exported_at = "2025-08-29T19:12:00Z"
+exported_by = "backtesting-engine"
+authorized_by = "system"
+approval_level = "development"
+backtest_period = "2024-01-01 to 2024-12-31"

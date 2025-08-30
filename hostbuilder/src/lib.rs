@@ -79,12 +79,11 @@ use dotenv::dotenv;
 use mockall::automock;
 use portfoliohandler::{PortfolioHandler, PortfolioHandlerTrait};
 use strategyhandler::{StrategyManager, StrategyConfig}; // Remove non-existent types
-use std::{env, error::Error, sync::{Arc, RwLock, Mutex}, collections::HashMap}; // Add Mutex back
+use std::{env, error::Error, sync::{Arc, RwLock}, collections::HashMap};
 use tokio::sync::broadcast;
 use orderbook::Orderbook;
 use portfolio::CryptoWallet;
-use serde_json;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn};
 
 // Re-export the global storage from datahandler and portfoliohandler
 pub use datahandler::ORDERBOOKS;
@@ -123,7 +122,15 @@ impl HostedObject {
             ultra_order_manager: None, // Will be initialized during run()
         }
     }
+}
 
+impl Default for HostedObject {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostedObject {
     /// Create a HostedObject with a specific config path
     pub fn with_config_path(config_path: String) -> Self {
         let (signal_tx, signal_rx) = bounded(1000);
@@ -185,10 +192,8 @@ impl HostedObject {
             _signal_topics
         };
         
-        // Create strategy manager with the global orderbooks only (simplified API)
-        let strategy_manager = StrategyManager::new(
-            ORDERBOOKS.clone(), // This should work as it expects RwLock
-        )?;
+        // Create strategy manager with new signature (no orderbooks parameter)
+        let strategy_manager = StrategyManager::new()?;
         
         Ok(strategy_manager)
     }
@@ -237,6 +242,8 @@ impl HostedObject {
             symbols: vec!["BTC/USD".to_string(), "ETH/USD".to_string()],
             exchanges: vec!["binance".to_string()],
             parameters: params,
+            max_position_size: 10000.0, // Default max position size
+            risk_limit: 0.02, // 2% risk limit
         };
         
         // Create a simple market making strategy directly
@@ -288,8 +295,8 @@ impl HostedObject {
             // Note: In a real implementation, the handler.listen() should be interruptible
             // For now, we just run it and report errors
             if let Err(e) = handler.listen() {
-                eprintln!("DataHandler error: {:?}", e);
-                let _ = data_health_tx_clone.blocking_send(Err(format!("DataHandler failed: {:?}", e)));
+                eprintln!("DataHandler error: {e:?}");
+                let _ = data_health_tx_clone.blocking_send(Err(format!("DataHandler failed: {e:?}")));
             }
         });
         
@@ -301,8 +308,8 @@ impl HostedObject {
             let mut handler = portfoliohandler;
             // Note: In a real implementation, the handler.listen() should be interruptible
             if let Err(e) = handler.listen() {
-                eprintln!("PortfolioHandler error: {:?}", e);
-                let _ = portfolio_health_tx_clone.blocking_send(Err(format!("PortfolioHandler failed: {:?}", e)));
+                eprintln!("PortfolioHandler error: {e:?}");
+                let _ = portfolio_health_tx_clone.blocking_send(Err(format!("PortfolioHandler failed: {e:?}")));
             }
         });
         
@@ -409,12 +416,12 @@ impl HostedObject {
             }
             health_result = data_health_rx.recv() => {
                 if let Some(Err(e)) = health_result {
-                    eprintln!("Data handler health check failed: {}", e);
+                    eprintln!("Data handler health check failed: {e}");
                 }
             }
             health_result = portfolio_health_rx.recv() => {
                 if let Some(Err(e)) = health_result {
-                    eprintln!("Portfolio handler health check failed: {}", e);
+                    eprintln!("Portfolio handler health check failed: {e}");
                 }
             }
         }

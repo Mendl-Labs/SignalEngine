@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 databaseschema = { path = "../../databaseschema" }
 deadpool = "0.10"
@@ -13,3 +14,5 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
+dashmap = "5.5"
+crossbeam = "0.8"

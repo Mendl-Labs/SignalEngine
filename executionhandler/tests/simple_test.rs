@@ -1,4 +1,4 @@
-use executionhandler::{UltraLowLatencyExecutionHandler, ExchangeFactory};
+use executionhandler::UltraLowLatencyExecutionHandler;
 
 #[tokio::test]
 async fn test_new_architecture_basic() {

@@ -2796,10 +2796,13 @@ dependencies = [
  "anyhow",
  "bigdecimal 0.4.8",
  "chrono",
+ "crossbeam",
+ "dashmap 5.5.3",
  "databaseschema",
  "deadpool 0.10.0",
  "exchangemetricaggregator",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

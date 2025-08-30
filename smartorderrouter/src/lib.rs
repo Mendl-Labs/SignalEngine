@@ -1,9 +1,13 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicU32, AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::thread;
 use serde::{Serialize, Deserialize};
-use exchangemetricaggregator::{ExchangeMetricsAggregator, ExchangeMetrics, SmartRoutingMetrics, RoutingPerformance};
+use serde_json;
+use exchangemetricaggregator::{ExchangeMetricsAggregator, SmartRoutingMetrics, RoutingPerformance};
+use dashmap::DashMap;
+use crossbeam::utils::CachePadded;
 
 pub mod database_integration_example;
 
@@ -45,8 +49,8 @@ pub enum TimeInForce {
     GTD,  // Good Till Date
 }
 
-/// Execution urgency level
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Execution urgency level (exported for compatibility)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExecutionUrgency {
     Low,     // Optimize for cost, can take time
     Medium,  // Balance cost and time
@@ -64,6 +68,16 @@ pub enum RouteStatus {
     Rejected,
     Expired,
     Failed,
+}
+
+/// Routing algorithm type (for compatibility)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutingAlgorithm {
+    TWAP,
+    VWAP,
+    ImplementationShortfall,
+    SmartRouting,
+    MinimizeMarketImpact,
 }
 
 /// Individual child order within a route
@@ -146,30 +160,15 @@ pub struct SmartOrderRoute {
     pub total_quantity: f64,
     pub urgency: ExecutionUrgency,
     pub child_orders: Vec<ChildOrder>,
-    pub status: RouteStatus,
     pub created_at: u64,
     pub updated_at: u64,
-    pub completion_time: Option<u64>,
-    
-    // Execution metrics
-    pub total_filled: f64,
-    pub volume_weighted_avg_price: f64,
-    pub total_fees: f64,
-    pub actual_slippage_bps: f64,
-    pub execution_time_ms: u64,
-    
-    // Performance tracking
-    pub expected_cost_bps: f64,
-    pub actual_cost_bps: f64,
-    pub vs_arrival_price_bps: f64,
-    pub vs_vwap_bps: f64,
-    pub benchmark_performance: HashMap<String, f64>,
-    
-    // Configuration
-    pub max_participation_rate: f64,  // Max % of volume
-    pub slice_size: f64,             // Size of each slice
-    pub min_fill_size: f64,          // Minimum acceptable fill
-    pub timeout_ms: u64,             // Route timeout
+    pub status: RouteStatus,
+    pub target_completion_time: Option<u64>,
+    pub max_slippage: f64,
+    pub benchmark_price: Option<f64>,
+    pub total_filled_quantity: f64,
+    pub weighted_avg_fill_price: f64,
+    pub total_fees_paid: f64,
 }
 
 impl SmartOrderRoute {
@@ -179,6 +178,9 @@ impl SmartOrderRoute {
         side: OrderSide,
         total_quantity: f64,
         urgency: ExecutionUrgency,
+        target_completion_time: Option<u64>,
+        max_slippage: f64,
+        benchmark_price: Option<f64>,
     ) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         
@@ -189,96 +191,73 @@ impl SmartOrderRoute {
             total_quantity,
             urgency,
             child_orders: Vec::new(),
-            status: RouteStatus::Pending,
             created_at: now,
             updated_at: now,
-            completion_time: None,
-            total_filled: 0.0,
-            volume_weighted_avg_price: 0.0,
-            total_fees: 0.0,
-            actual_slippage_bps: 0.0,
-            execution_time_ms: 0,
-            expected_cost_bps: 0.0,
-            actual_cost_bps: 0.0,
-            vs_arrival_price_bps: 0.0,
-            vs_vwap_bps: 0.0,
-            benchmark_performance: HashMap::new(),
-            max_participation_rate: 0.1, // Default 10%
-            slice_size: 0.0,
-            min_fill_size: 0.0,
-            timeout_ms: 300000, // Default 5 minutes
+            status: RouteStatus::Pending,
+            target_completion_time,
+            max_slippage,
+            benchmark_price,
+            total_filled_quantity: 0.0,
+            weighted_avg_fill_price: 0.0,
+            total_fees_paid: 0.0,
         }
     }
     
     pub fn add_child_order(&mut self, child_order: ChildOrder) {
         self.child_orders.push(child_order);
-        self.update_metrics();
+        self.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     }
     
-    pub fn update_child_order(&mut self, order_id: &str, filled_qty: f64, fill_price: f64, fees: f64, status: RouteStatus) {
-        if let Some(child) = self.child_orders.iter_mut().find(|o| o.id == order_id) {
+    pub fn update_from_fill(&mut self, child_order_id: &str, filled_qty: f64, fill_price: f64, fees: f64) {
+        if let Some(child) = self.child_orders.iter_mut().find(|c| c.id == child_order_id) {
             child.filled_quantity += filled_qty;
+            child.avg_fill_price = ((child.avg_fill_price * (child.filled_quantity - filled_qty)) + (fill_price * filled_qty)) / child.filled_quantity;
             child.fees_paid += fees;
-            child.status = status;
             child.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
             
-            // Update average fill price
-            if child.filled_quantity > 0.0 {
-                child.avg_fill_price = ((child.avg_fill_price * (child.filled_quantity - filled_qty)) + (fill_price * filled_qty)) / child.filled_quantity;
+            if child.filled_quantity >= child.quantity {
+                child.status = RouteStatus::Filled;
+            } else {
+                child.status = RouteStatus::PartiallyFilled;
             }
+            
+            // Update route-level statistics
+            self.recalculate_totals();
         }
-        
-        self.update_metrics();
-        self.check_completion();
     }
     
-    fn update_metrics(&mut self) {
-        // Update total filled quantity
-        self.total_filled = self.child_orders.iter().map(|o| o.filled_quantity).sum();
-        
-        // Update total fees
-        self.total_fees = self.child_orders.iter().map(|o| o.fees_paid).sum();
-        
-        // Calculate VWAP
-        let mut total_value = 0.0;
-        let mut total_volume = 0.0;
+    pub fn recalculate_totals(&mut self) {
+        let mut total_filled = 0.0;
+        let mut weighted_price_sum = 0.0;
+        let mut total_fees = 0.0;
         
         for child in &self.child_orders {
-            if child.filled_quantity > 0.0 {
-                total_value += child.avg_fill_price * child.filled_quantity;
-                total_volume += child.filled_quantity;
-            }
+            total_filled += child.filled_quantity;
+            weighted_price_sum += child.avg_fill_price * child.filled_quantity;
+            total_fees += child.fees_paid;
         }
         
-        if total_volume > 0.0 {
-            self.volume_weighted_avg_price = total_value / total_volume;
-        }
+        self.total_filled_quantity = total_filled;
+        self.weighted_avg_fill_price = if total_filled > 0.0 { weighted_price_sum / total_filled } else { 0.0 };
+        self.total_fees_paid = total_fees;
         
-        // Update execution time
-        self.execution_time_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 - self.created_at;
+        // Update status based on fill progress
+        if total_filled >= self.total_quantity {
+            self.status = RouteStatus::Filled;
+        } else if total_filled > 0.0 {
+            self.status = RouteStatus::PartiallyFilled;
+        }
         
         self.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     }
     
-    fn check_completion(&mut self) {
-        let all_complete = self.child_orders.iter().all(|o| o.is_complete());
-        let fill_rate = if self.total_quantity > 0.0 { self.total_filled / self.total_quantity } else { 0.0 };
-        
-        if all_complete || fill_rate >= 0.99 { // 99% filled considered complete
-            if self.total_filled > 0.0 {
-                self.status = RouteStatus::Filled;
-            } else {
-                self.status = RouteStatus::Cancelled;
-            }
-            self.completion_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64);
-        } else if self.total_filled > 0.0 {
-            self.status = RouteStatus::PartiallyFilled;
-        }
+    pub fn remaining_quantity(&self) -> f64 {
+        (self.total_quantity - self.total_filled_quantity).max(0.0)
     }
     
     pub fn fill_rate(&self) -> f64 {
         if self.total_quantity > 0.0 {
-            self.total_filled / self.total_quantity
+            self.total_filled_quantity / self.total_quantity
         } else {
             0.0
         }
@@ -288,1308 +267,639 @@ impl SmartOrderRoute {
         matches!(self.status, RouteStatus::Filled | RouteStatus::Cancelled | RouteStatus::Rejected | RouteStatus::Expired | RouteStatus::Failed)
     }
     
-    pub fn remaining_quantity(&self) -> f64 {
-        (self.total_quantity - self.total_filled).max(0.0)
+    pub fn slippage(&self) -> Option<f64> {
+        self.benchmark_price.map(|benchmark| {
+            if benchmark > 0.0 {
+                (self.weighted_avg_fill_price - benchmark) / benchmark
+            } else {
+                0.0
+            }
+        })
     }
 }
 
-/// Routing strategy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingConfig {
-    pub max_exchanges: usize,
-    pub min_exchange_allocation: f64,
-    pub max_single_exchange_allocation: f64,
-    pub rebalance_threshold: f64,
-    pub market_impact_threshold_bps: f64,
-    pub latency_weight: f64,
-    pub cost_weight: f64,
-    pub liquidity_weight: f64,
-    pub reliability_weight: f64,
-    pub enable_dark_pools: bool,
-    pub enable_iceberg_orders: bool,
-    pub max_order_size_per_exchange: f64,
-    pub participation_rate_limit: f64,
-}
+/// Ultra-Fast Smart Order Router - main export for compatibility
+pub type SmartOrderRouter = UltraFastSmartOrderRouter;
 
-impl Default for RoutingConfig {
-    fn default() -> Self {
-        Self {
-            max_exchanges: 5,
-            min_exchange_allocation: 0.05, // 5%
-            max_single_exchange_allocation: 0.6, // 60%
-            rebalance_threshold: 0.1, // 10%
-            market_impact_threshold_bps: 50.0,
-            latency_weight: 0.2,
-            cost_weight: 0.4,
-            liquidity_weight: 0.3,
-            reliability_weight: 0.1,
-            enable_dark_pools: true,
-            enable_iceberg_orders: true,
-            max_order_size_per_exchange: 1000000.0, // $1M
-            participation_rate_limit: 0.15, // 15%
-        }
-    }
-}
-
-/// Algorithm for different routing strategies
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RoutingAlgorithm {
-    SmartRouting,    // Multi-factor optimization
-    TWAP,           // Time-Weighted Average Price
-    VWAP,           // Volume-Weighted Average Price
-    Implementation, // Implementation Shortfall
-    Iceberg,        // Large order slicing
-    Stealth,        // Minimal market impact
-    Aggressive,     // Fast execution, higher cost
-    Conservative,   // Low cost, slower execution
-}
-
-/// Smart Order Router - the main routing engine
-pub struct SmartOrderRouter {
+/// Ultra-Fast Smart Order Router with lock-free concurrent access
+pub struct UltraFastSmartOrderRouter {
+    // Lock-free concurrent data structures
+    active_routes: Arc<DashMap<String, SmartOrderRoute>>,
+    exchange_configs: Arc<DashMap<String, ExchangeConfig>>,
+    routing_rules: Arc<DashMap<String, RoutingRule>>,
+    
+    // Atomic performance statistics
+    stats: Arc<AtomicRoutingStats>,
+    
+    // Lock-free metrics aggregator
     metrics_aggregator: Arc<ExchangeMetricsAggregator>,
-    active_routes: Arc<RwLock<HashMap<String, SmartOrderRoute>>>,
-    routing_config: Arc<RwLock<RoutingConfig>>,
     
-    // Performance tracking
-    completed_routes: Arc<RwLock<VecDeque<SmartOrderRoute>>>,
-    performance_stats: Arc<RwLock<RoutingStats>>,
-    
-    // Real-time monitoring
-    route_monitor: Arc<Mutex<RouteMonitor>>,
-    
-    // Configuration
-    max_route_history: usize,
-    monitoring_interval_ms: u64,
-    
-    // Worker thread handles
-    worker_handles: Mutex<Vec<thread::JoinHandle<()>>>,
-    is_running: Arc<Mutex<bool>>,
-    
-    // Database interface for order persistence
-    database: Option<Arc<dyn DatabaseOrderPersistence>>,
+    // Background processing state
+    is_running: Arc<AtomicBool>,
 }
 
-/// Performance statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RoutingStats {
-    pub total_routes: u64,
-    pub successful_routes: u64,
-    pub failed_routes: u64,
-    pub avg_fill_rate: f64,
-    pub avg_execution_time_ms: f64,
-    pub avg_slippage_bps: f64,
-    pub avg_cost_savings_bps: f64,
-    pub total_volume_routed: f64,
-    pub total_fees_saved: f64,
-    pub best_vs_worst_exchange_bps: f64,
-    pub arbitrage_opportunities_captured: u64,
-}
-
-/// Route monitoring system
+/// Ultra-high performance atomic routing statistics
 #[derive(Debug)]
-pub struct RouteMonitor {
-    monitored_routes: HashMap<String, Instant>,
-    timeout_alerts: VecDeque<String>,
-    performance_alerts: VecDeque<String>,
+pub struct AtomicRoutingStats {
+    pub routes_created: CachePadded<AtomicU64>,
+    pub routes_completed: CachePadded<AtomicU64>,
+    pub routes_failed: CachePadded<AtomicU64>,
+    pub total_volume_routed: CachePadded<AtomicU64>, // In cents to avoid floating point
+    pub total_fees_paid: CachePadded<AtomicU64>,     // In cents
+    pub avg_routing_latency_ns: CachePadded<AtomicU64>,
+    pub successful_fills: CachePadded<AtomicU64>,
+    pub partial_fills: CachePadded<AtomicU64>,
+    pub rejections: CachePadded<AtomicU64>,
+    pub timeouts: CachePadded<AtomicU64>,
 }
 
-impl RouteMonitor {
+impl AtomicRoutingStats {
     pub fn new() -> Self {
         Self {
-            monitored_routes: HashMap::new(),
-            timeout_alerts: VecDeque::new(),
-            performance_alerts: VecDeque::new(),
+            routes_created: CachePadded::new(AtomicU64::new(0)),
+            routes_completed: CachePadded::new(AtomicU64::new(0)),
+            routes_failed: CachePadded::new(AtomicU64::new(0)),
+            total_volume_routed: CachePadded::new(AtomicU64::new(0)),
+            total_fees_paid: CachePadded::new(AtomicU64::new(0)),
+            avg_routing_latency_ns: CachePadded::new(AtomicU64::new(0)),
+            successful_fills: CachePadded::new(AtomicU64::new(0)),
+            partial_fills: CachePadded::new(AtomicU64::new(0)),
+            rejections: CachePadded::new(AtomicU64::new(0)),
+            timeouts: CachePadded::new(AtomicU64::new(0)),
         }
     }
     
-    pub fn add_route(&mut self, route_id: String) {
-        self.monitored_routes.insert(route_id, Instant::now());
+    #[inline(always)]
+    pub fn increment_routes_created(&self) {
+        self.routes_created.fetch_add(1, Ordering::Relaxed);
     }
     
-    pub fn remove_route(&mut self, route_id: &str) {
-        self.monitored_routes.remove(route_id);
+    #[inline(always)]
+    pub fn increment_routes_completed(&self) {
+        self.routes_completed.fetch_add(1, Ordering::Relaxed);
     }
     
-    pub fn check_timeouts(&mut self, timeout_ms: u64) -> Vec<String> {
-        let timeout_duration = Duration::from_millis(timeout_ms);
-        let now = Instant::now();
-        let mut timed_out = Vec::new();
+    #[inline(always)]
+    pub fn increment_routes_failed(&self) {
+        self.routes_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    #[inline(always)]
+    pub fn add_volume_routed(&self, volume_cents: u64) {
+        self.total_volume_routed.fetch_add(volume_cents, Ordering::Relaxed);
+    }
+    
+    #[inline(always)]
+    pub fn add_fees_paid(&self, fees_cents: u64) {
+        self.total_fees_paid.fetch_add(fees_cents, Ordering::Relaxed);
+    }
+    
+    #[inline(always)]
+    pub fn update_routing_latency(&self, latency_ns: u64) {
+        // Simple exponential moving average for latency
+        let current = self.avg_routing_latency_ns.load(Ordering::Relaxed);
+        let new_avg = if current == 0 { 
+            latency_ns 
+        } else { 
+            (current * 9 + latency_ns) / 10 // 90% old, 10% new
+        };
+        self.avg_routing_latency_ns.store(new_avg, Ordering::Relaxed);
+    }
+    
+    pub fn success_rate(&self) -> f64 {
+        let completed = self.routes_completed.load(Ordering::Relaxed);
+        let failed = self.routes_failed.load(Ordering::Relaxed);
+        let total = completed + failed;
         
-        self.monitored_routes.retain(|route_id, start_time| {
-            if now.duration_since(*start_time) > timeout_duration {
-                timed_out.push(route_id.clone());
-                self.timeout_alerts.push_back(format!("Route {} timed out after {}ms", route_id, timeout_ms));
-                false
-            } else {
-                true
+        if total > 0 {
+            completed as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Exchange configuration for routing decisions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub max_order_size: f64,
+    pub min_order_size: f64,
+    pub fee_rate: f64,
+    pub latency_penalty: f64,
+    pub reliability_score: f64,
+    pub supported_order_types: Vec<OrderType>,
+    pub supported_time_in_force: Vec<TimeInForce>,
+}
+
+/// Routing rule for symbol/exchange combinations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingRule {
+    pub symbol: String,
+    pub exchange_priority: Vec<String>,
+    pub max_allocation_pct: HashMap<String, f64>,
+    pub min_liquidity_threshold: f64,
+    pub urgency_routing: HashMap<ExecutionUrgency, Vec<String>>,
+}
+
+impl UltraFastSmartOrderRouter {
+    pub fn new(metrics_aggregator: Arc<ExchangeMetricsAggregator>) -> Self {
+        Self {
+            active_routes: Arc::new(DashMap::new()),
+            exchange_configs: Arc::new(DashMap::new()),
+            routing_rules: Arc::new(DashMap::new()),
+            stats: Arc::new(AtomicRoutingStats::new()),
+            metrics_aggregator,
+            is_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    
+    /// Start the background processing threads
+    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.is_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+            return Err("Router is already running".into());
+        }
+        
+        // Start monitoring thread
+        let routes = Arc::clone(&self.active_routes);
+        let stats = Arc::clone(&self.stats);
+        let running = Arc::clone(&self.is_running);
+        
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                // Monitor and clean up completed routes
+                let mut completed_routes = Vec::new();
+                
+                for entry in routes.iter() {
+                    if entry.value().is_complete() {
+                        completed_routes.push(entry.key().clone());
+                    }
+                }
+                
+                // Remove completed routes (keep recent ones for performance analysis)
+                for route_id in completed_routes {
+                    if let Some((_, route)) = routes.remove(&route_id) {
+                        if route.status == RouteStatus::Filled {
+                            stats.increment_routes_completed();
+                        } else {
+                            stats.increment_routes_failed();
+                        }
+                    }
+                }
+                
+                thread::sleep(Duration::from_millis(100));
             }
         });
         
-        timed_out
-    }
-    
-    pub fn get_alerts(&mut self) -> (Vec<String>, Vec<String>) {
-        let timeouts: Vec<String> = self.timeout_alerts.drain(..).collect();
-        let performance: Vec<String> = self.performance_alerts.drain(..).collect();
-        (timeouts, performance)
-    }
-}
-
-impl SmartOrderRouter {
-    /// Create a new smart order router
-    pub fn new(
-        metrics_aggregator: Arc<ExchangeMetricsAggregator>,
-        max_route_history: usize,
-        monitoring_interval_ms: u64,
-        database: Option<Arc<dyn DatabaseOrderPersistence>>,
-    ) -> Self {
-        Self {
-            metrics_aggregator,
-            active_routes: Arc::new(RwLock::new(HashMap::new())),
-            routing_config: Arc::new(RwLock::new(RoutingConfig::default())),
-            completed_routes: Arc::new(RwLock::new(VecDeque::new())),
-            performance_stats: Arc::new(RwLock::new(RoutingStats::default())),
-            route_monitor: Arc::new(Mutex::new(RouteMonitor::new())),
-            max_route_history,
-            monitoring_interval_ms,
-            worker_handles: Mutex::new(Vec::new()),
-            is_running: Arc::new(Mutex::new(false)),
-            database,
-        }
-    }
-    
-    /// Start the smart order router monitoring
-    pub fn start(&self) -> Result<(), String> {
-        *self.is_running.lock().map_err(|_| "Failed to acquire running lock")? = true;
-        
-        // Start route monitoring thread
-        let monitor_handle = {
-            let active_routes = Arc::clone(&self.active_routes);
-            let route_monitor = Arc::clone(&self.route_monitor);
-            let is_running = Arc::clone(&self.is_running);
-            let interval = self.monitoring_interval_ms;
-            
-            thread::spawn(move || {
-                Self::route_monitoring_worker(active_routes, route_monitor, is_running, interval);
-            })
-        };
-        
-        self.worker_handles.lock().map_err(|_| "Failed to acquire worker handles lock")?.push(monitor_handle);
-        
-        println!("Smart Order Router started");
         Ok(())
     }
     
-    /// Stop the smart order router
-    pub fn stop(&self) -> Result<(), String> {
-        *self.is_running.lock().map_err(|_| "Failed to acquire running lock")? = false;
-        
-        // Wait for worker threads to complete
-        let mut handles = self.worker_handles.lock().map_err(|_| "Failed to acquire worker handles lock")?;
-        for handle in handles.drain(..) {
-            handle.join().map_err(|_| "Failed to join worker thread")?;
-        }
-        
-        println!("Smart Order Router stopped");
-        Ok(())
+    /// Stop the background processing
+    pub fn stop(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
     }
     
-    /// Create and execute a smart order route
-    pub fn route_order(
+    /// Add or update an exchange configuration
+    pub fn configure_exchange(&self, config: ExchangeConfig) {
+        self.exchange_configs.insert(config.name.clone(), config);
+    }
+    
+    /// Add or update a routing rule
+    pub fn set_routing_rule(&self, rule: RoutingRule) {
+        self.routing_rules.insert(rule.symbol.clone(), rule);
+    }
+    
+    /// Create and route a smart order with ultra-low latency
+    #[inline(always)]
+    pub fn create_smart_route(
         &self,
-        symbol: &str,
+        route_id: String,
+        symbol: String,
         side: OrderSide,
         quantity: f64,
         urgency: ExecutionUrgency,
-        algorithm: RoutingAlgorithm,
-    ) -> Result<String, String> {
-        let route_id = format!("route_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..12].to_string());
+        target_completion_time: Option<u64>,
+        max_slippage: f64,
+        benchmark_price: Option<f64>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let start_time = Instant::now();
         
-        // Get routing metrics
-        let routing_metrics = self.metrics_aggregator
-            .calculate_routing_metrics(symbol, quantity, match side { OrderSide::Buy => "buy", OrderSide::Sell => "sell" })?;
+        // Create the route
+        let mut route = SmartOrderRoute::new(
+            route_id.clone(),
+            symbol.clone(),
+            side,
+            quantity,
+            urgency,
+            target_completion_time,
+            max_slippage,
+            benchmark_price,
+        );
         
-        // Create route
-        let mut route = SmartOrderRoute::new(route_id.clone(), symbol.to_string(), side, quantity, urgency);
+        // Generate child orders using optimized routing algorithm
+        let child_orders = self.generate_optimal_child_orders(&symbol, side, quantity, urgency)?;
         
-        // Set expected costs
-        route.expected_cost_bps = routing_metrics.expected_total_cost_bps;
-        
-        // Generate child orders based on algorithm
-        self.generate_child_orders(&mut route, &routing_metrics, algorithm)?;
-        
-        // Log order creation for database integration
-        self.log_orders_for_database(&route);
-        
-        // Add to active routes
-        {
-            let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
-            active_routes.insert(route_id.clone(), route);
+        for child_order in child_orders {
+            route.add_child_order(child_order);
         }
         
-        // Add to monitoring
-        {
-            let mut monitor = self.route_monitor.lock().map_err(|_| "Failed to acquire monitor lock")?;
-            monitor.add_route(route_id.clone());
-        }
+        // Store route in concurrent map
+        self.active_routes.insert(route_id.clone(), route);
         
-        println!("Created route {} for {} {} {} with {} child orders", route_id, quantity, side, symbol, routing_metrics.routing_recommendations.len());
+        // Update statistics atomically
+        self.stats.increment_routes_created();
+        self.stats.add_volume_routed((quantity * benchmark_price.unwrap_or(100.0) * 100.0) as u64);
+        
+        let routing_latency = start_time.elapsed().as_nanos() as u64;
+        self.stats.update_routing_latency(routing_latency);
         
         Ok(route_id)
     }
     
-    /// Log orders for database integration - shows what would be saved
-    fn log_orders_for_database(&self, route: &SmartOrderRoute) {
-        println!("=== Saving orders to database ===");
-        println!("Route: {}", route.id);
-        println!("Symbol: {}, Side: {:?}, Total Quantity: {}", route.symbol, route.side, route.total_quantity);
-        
-        // Save each child order to database if database interface is available
-        if let Some(ref database) = self.database {
-            for child_order in &route.child_orders {
-                let strategy_order = StrategyOrderData {
-                    trade_id: child_order.id.clone(),
-                    symbol: route.symbol.clone(),
-                    order_type: match child_order.order_type {
-                        OrderType::Market => "Market".to_string(),
-                        OrderType::Limit => "Limit".to_string(),
-                        OrderType::StopLimit => "StopLimit".to_string(),
-                        OrderType::Iceberg => "Iceberg".to_string(),
-                        OrderType::TWAP => "TWAP".to_string(),
-                        OrderType::VWAP => "VWAP".to_string(),
-                        OrderType::Implementation => "Implementation".to_string(),
-                    },
-                    side: match route.side {
-                        OrderSide::Buy => "Buy".to_string(),
-                        OrderSide::Sell => "Sell".to_string(),
-                    },
-                    quantity: child_order.quantity.to_string(),
-                    price: child_order.price.map(|p| p.to_string()),
-                    time_in_force: match child_order.time_in_force {
-                        TimeInForce::IOC => "IOC".to_string(),
-                        TimeInForce::GTC => "GTC".to_string(),
-                        TimeInForce::FOK => "FOK".to_string(),
-                        TimeInForce::DAY => "DAY".to_string(),
-                        TimeInForce::GTD => "GTD".to_string(),
-                    },
-                    execution_urgency: match route.urgency {
-                        ExecutionUrgency::Low => "Low".to_string(),
-                        ExecutionUrgency::Medium => "Medium".to_string(),
-                        ExecutionUrgency::High => "High".to_string(),
-                        ExecutionUrgency::Critical => "Critical".to_string(),
-                    },
-                    created_at: Utc::now(),
-                };
-                
-                match database.save_strategy_order(&strategy_order) {
-                    Ok(_) => println!("✓ Saved child order {} to database", child_order.id),
-                    Err(e) => println!("✗ Failed to save child order {}: {}", child_order.id, e),
-                }
-            }
-        } else {
-            println!("No database interface configured - orders logged only");
-            for (i, child_order) in route.child_orders.iter().enumerate() {
-                println!("Child Order {}: ID={}, Exchange={}, Type={:?}, Quantity={}, Status={:?}", 
-                    i + 1,
-                    child_order.id,
-                    child_order.exchange,
-                    child_order.order_type,
-                    child_order.quantity,
-                    child_order.status
-                );
-            }
-        }
-        println!("=== End of database integration ===\n");
-    }
-
-    /// Log order execution updates to database
-    fn log_execution_to_database(
-        &self,
-        child_order_id: &str,
-        filled_qty: f64,
-        fill_price: f64,
-        fees: f64,
-        status: RouteStatus,
-    ) {
-        if let Some(ref database) = self.database {
-            let execution_data = OrderExecutionData {
-                trade_id: child_order_id.to_string(),
-                filled_quantity: filled_qty,
-                fill_price,
-                fees_paid: fees,
-                status: match status {
-                    RouteStatus::Pending => "Pending".to_string(),
-                    RouteStatus::PartiallyFilled => "PartiallyFilled".to_string(),
-                    RouteStatus::Filled => "Filled".to_string(),
-                    RouteStatus::Cancelled => "Cancelled".to_string(),
-                    RouteStatus::Rejected => "Rejected".to_string(),
-                    RouteStatus::Expired => "Expired".to_string(),
-                    RouteStatus::Failed => "Failed".to_string(),
-                },
-                updated_at: Utc::now(),
-            };
-            
-            match database.update_order_execution(&execution_data) {
-                Ok(_) => println!("✓ Updated execution for order {} - Filled: {}, Price: {}, Status: {:?}", 
-                    child_order_id, filled_qty, fill_price, status),
-                Err(e) => println!("✗ Failed to update execution for order {}: {}", child_order_id, e),
-            }
-        }
+    /// Get route status with zero-copy access
+    #[inline(always)]
+    pub fn get_route_status(&self, route_id: &str) -> Option<RouteStatus> {
+        self.active_routes.get(route_id).map(|route| route.status)
     }
     
-    /// Generate child orders based on routing strategy
-    fn generate_child_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        algorithm: RoutingAlgorithm,
-    ) -> Result<(), String> {
-        let config = self.routing_config.read().map_err(|_| "Failed to acquire config lock")?;
-        
-        match algorithm {
-            RoutingAlgorithm::SmartRouting => {
-                self.generate_smart_routing_orders(route, routing_metrics, &config)?;
-            },
-            RoutingAlgorithm::TWAP => {
-                self.generate_twap_orders(route, routing_metrics, &config)?;
-            },
-            RoutingAlgorithm::VWAP => {
-                self.generate_vwap_orders(route, routing_metrics, &config)?;
-            },
-            RoutingAlgorithm::Iceberg => {
-                self.generate_iceberg_orders(route, routing_metrics, &config)?;
-            },
-            RoutingAlgorithm::Aggressive => {
-                self.generate_aggressive_orders(route, routing_metrics, &config)?;
-            },
-            RoutingAlgorithm::Conservative => {
-                self.generate_conservative_orders(route, routing_metrics, &config)?;
-            },
-            _ => {
-                return Err(format!("Algorithm {:?} not implemented yet", algorithm));
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate orders using smart routing algorithm
-    fn generate_smart_routing_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        config: &RoutingConfig,
-    ) -> Result<(), String> {
-        let mut remaining_qty = route.total_quantity;
-        let mut order_counter = 0;
-        
-        // Sort exchanges by allocation percentage
-        let mut allocations: Vec<(&String, &f64)> = routing_metrics.routing_recommendations.iter().collect();
-        allocations.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-        
-        for (exchange, &allocation_pct) in allocations {
-            if allocation_pct < config.min_exchange_allocation {
-                continue;
-            }
-            
-            let allocation_qty = (route.total_quantity * allocation_pct).min(remaining_qty);
-            if allocation_qty < route.min_fill_size {
-                continue;
-            }
-            
-            // Create child order
-            let child_id = format!("{}_child_{}", route.id, order_counter);
-            let order_type = match route.urgency {
-                ExecutionUrgency::Critical => OrderType::Market,
-                ExecutionUrgency::High => OrderType::Limit,
-                _ => OrderType::Limit,
-            };
-            
-            let child_order = ChildOrder::new(
-                child_id,
-                exchange.clone(),
-                route.symbol.clone(),
-                route.side,
-                order_type,
-                allocation_qty,
-                None, // Price will be set by execution engine
-                TimeInForce::IOC,
-            );
-            
-            route.add_child_order(child_order);
-            remaining_qty -= allocation_qty;
-            order_counter += 1;
-            
-            if remaining_qty <= route.min_fill_size {
-                break;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate TWAP (Time-Weighted Average Price) orders
-    fn generate_twap_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        _config: &RoutingConfig,
-    ) -> Result<(), String> {
-        // TWAP splits the order over time
-        let time_slices = match route.urgency {
-            ExecutionUrgency::Critical => 1,
-            ExecutionUrgency::High => 2,
-            ExecutionUrgency::Medium => 5,
-            ExecutionUrgency::Low => 10,
-        };
-        
-        let slice_qty = route.total_quantity / time_slices as f64;
-        
-        // Use best exchange for TWAP
-        let best_exchange = &routing_metrics.routing_recommendations
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(exchange, _)| exchange)
-            .ok_or("No suitable exchange found")?;
-        
-        for i in 0..time_slices {
-            let child_id = format!("{}_twap_{}", route.id, i);
-            let child_order = ChildOrder::new(
-                child_id,
-                best_exchange.to_string(),
-                route.symbol.clone(),
-                route.side,
-                OrderType::TWAP,
-                slice_qty,
-                None,
-                TimeInForce::GTC,
-            );
-            
-            route.add_child_order(child_order);
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate VWAP (Volume-Weighted Average Price) orders
-    fn generate_vwap_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        config: &RoutingConfig,
-    ) -> Result<(), String> {
-        // VWAP adjusts order size based on historical volume patterns
-        let volume_profile = vec![0.1, 0.15, 0.2, 0.25, 0.2, 0.1]; // Simplified U-shaped profile
-        let mut remaining_qty = route.total_quantity;
-        
-        let best_exchanges: Vec<&String> = routing_metrics.routing_recommendations
-            .iter()
-            .filter(|(_, &pct)| pct >= config.min_exchange_allocation)
-            .take(3) // Top 3 exchanges
-            .map(|(exchange, _)| exchange)
-            .collect();
-        
-        for (i, &volume_pct) in volume_profile.iter().enumerate() {
-            let slice_qty = (route.total_quantity * volume_pct).min(remaining_qty);
-            if slice_qty < route.min_fill_size {
-                continue;
-            }
-            
-            let exchange = best_exchanges[i % best_exchanges.len()];
-            let child_id = format!("{}_vwap_{}", route.id, i);
-            let child_order = ChildOrder::new(
-                child_id,
-                exchange.clone(),
-                route.symbol.clone(),
-                route.side,
-                OrderType::VWAP,
-                slice_qty,
-                None,
-                TimeInForce::GTC,
-            );
-            
-            route.add_child_order(child_order);
-            remaining_qty -= slice_qty;
-            
-            if remaining_qty <= route.min_fill_size {
-                break;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate iceberg orders (large order slicing)
-    fn generate_iceberg_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        _config: &RoutingConfig,
-    ) -> Result<(), String> {
-        let iceberg_size = route.slice_size.max(route.total_quantity * 0.1); // Default 10% slice
-        let num_slices = (route.total_quantity / iceberg_size).ceil() as usize;
-        
-        let best_exchange = routing_metrics.routing_recommendations
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(exchange, _)| exchange)
-            .ok_or("No suitable exchange found")?;
-        
-        let mut remaining_qty = route.total_quantity;
-        
-        for i in 0..num_slices {
-            let slice_qty = iceberg_size.min(remaining_qty);
-            if slice_qty < route.min_fill_size {
-                break;
-            }
-            
-            let child_id = format!("{}_iceberg_{}", route.id, i);
-            let child_order = ChildOrder::new(
-                child_id,
-                best_exchange.clone(),
-                route.symbol.clone(),
-                route.side,
-                OrderType::Iceberg,
-                slice_qty,
-                None,
-                TimeInForce::GTC,
-            );
-            
-            route.add_child_order(child_order);
-            remaining_qty -= slice_qty;
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate aggressive orders (fast execution)
-    fn generate_aggressive_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        _config: &RoutingConfig,
-    ) -> Result<(), String> {
-        // Use top 2 exchanges for aggressive execution
-        let mut allocations: Vec<(&String, &f64)> = routing_metrics.routing_recommendations.iter().collect();
-        allocations.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-        
-        let mut remaining_qty = route.total_quantity;
-        
-        for (i, (exchange, &allocation_pct)) in allocations.iter().take(2).enumerate() {
-            let allocation_qty = (route.total_quantity * allocation_pct).min(remaining_qty);
-            if allocation_qty < route.min_fill_size {
-                continue;
-            }
-            
-            let child_id = format!("{}_aggressive_{}", route.id, i);
-            let child_order = ChildOrder::new(
-                child_id,
-                exchange.to_string(),
-                route.symbol.clone(),
-                route.side,
-                OrderType::Market, // Market orders for aggressive execution
-                allocation_qty,
-                None,
-                TimeInForce::IOC,
-            );
-            
-            route.add_child_order(child_order);
-            remaining_qty -= allocation_qty;
-            
-            if remaining_qty <= route.min_fill_size {
-                break;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Generate conservative orders (cost optimization)
-    fn generate_conservative_orders(
-        &self,
-        route: &mut SmartOrderRoute,
-        routing_metrics: &SmartRoutingMetrics,
-        config: &RoutingConfig,
-    ) -> Result<(), String> {
-        // Use all available exchanges with limit orders
-        let mut remaining_qty = route.total_quantity;
-        let mut order_counter = 0;
-        
-        for (exchange, &allocation_pct) in &routing_metrics.routing_recommendations {
-            if allocation_pct < config.min_exchange_allocation {
-                continue;
-            }
-            
-            let allocation_qty = (route.total_quantity * allocation_pct).min(remaining_qty);
-            if allocation_qty < route.min_fill_size {
-                continue;
-            }
-            
-            let child_id = format!("{}_conservative_{}", route.id, order_counter);
-            let child_order = ChildOrder::new(
-                child_id,
-                exchange.clone(),
-                route.symbol.clone(),
-                route.side,
-                OrderType::Limit, // Always use limit orders for conservative routing
-                allocation_qty,
-                None,
-                TimeInForce::GTC,
-            );
-            
-            route.add_child_order(child_order);
-            remaining_qty -= allocation_qty;
-            order_counter += 1;
-            
-            if remaining_qty <= route.min_fill_size {
-                break;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Update a child order execution
-    pub fn update_child_order_execution(
+    /// Update route from fill with lock-free atomic operations
+    #[inline(always)]
+    pub fn update_route_from_fill(
         &self,
         route_id: &str,
         child_order_id: &str,
         filled_qty: f64,
         fill_price: f64,
         fees: f64,
-        status: RouteStatus,
-    ) -> Result<(), String> {
-        // Log execution to database first
-        self.log_execution_to_database(child_order_id, filled_qty, fill_price, fees, status);
-        
-        let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
-        
-        if let Some(route) = active_routes.get_mut(route_id) {
-            route.update_child_order(child_order_id, filled_qty, fill_price, fees, status);
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut route) = self.active_routes.get_mut(route_id) {
+            route.update_from_fill(child_order_id, filled_qty, fill_price, fees);
             
-            // Check if route is complete
-            if route.is_complete() {
-                self.complete_route(route_id, route.clone())?;
+            // Update atomic statistics
+            self.stats.add_fees_paid((fees * 100.0) as u64); // Convert to cents
+            
+            if filled_qty > 0.0 {
+                self.stats.successful_fills.fetch_add(1, Ordering::Relaxed);
             }
+            
+            Ok(())
         } else {
-            return Err(format!("Route {} not found", route_id));
+            Err(format!("Route {} not found", route_id).into())
         }
-        
-        Ok(())
     }
     
-    /// Complete a route and move to history
-    fn complete_route(&self, route_id: &str, route: SmartOrderRoute) -> Result<(), String> {
-        // Record performance
-        let performance = RoutingPerformance {
-            route_id: route_id.to_string(),
-            symbol: route.symbol.clone(),
-            timestamp: route.completion_time.unwrap_or(route.updated_at),
-            total_quantity: route.total_quantity,
-            filled_quantity: route.total_filled,
-            avg_execution_price: route.volume_weighted_avg_price,
-            execution_time_ms: route.execution_time_ms,
-            actual_slippage_bps: route.actual_slippage_bps,
-            actual_fees_bps: (route.total_fees / (route.volume_weighted_avg_price * route.total_filled)) * 10000.0,
-            actual_total_cost_bps: route.actual_cost_bps,
-            implementation_shortfall_bps: route.vs_arrival_price_bps,
-            vs_vwap_bps: route.vs_vwap_bps,
-            vs_twap_bps: 0.0, // Would need TWAP calculation
-            vs_arrival_price_bps: route.vs_arrival_price_bps,
-            exchange_allocations: route.child_orders.iter()
-                .map(|o| (o.exchange.clone(), o.filled_quantity))
-                .collect(),
-            exchange_performance: HashMap::new(), // Would be calculated based on child performance
-            fill_rate: route.fill_rate(),
-            time_to_completion_ms: route.execution_time_ms,
-            price_improvement_bps: 0.0, // Would be calculated vs benchmark
-        };
-        
-        self.metrics_aggregator.record_routing_performance(performance)?;
-        
-        // Remove from active routes
-        {
-            let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
-            active_routes.remove(route_id);
-        }
-        
-        // Move to completed routes
-        {
-            let mut completed = self.completed_routes.write().map_err(|_| "Failed to acquire completed routes lock")?;
-            completed.push_back(route);
-            
-            // Maintain history size
-            if completed.len() > self.max_route_history {
-                completed.pop_front();
-            }
-        }
-        
-        // Update performance stats
-        self.update_performance_stats()?;
-        
-        // Remove from monitoring
-        {
-            let mut monitor = self.route_monitor.lock().map_err(|_| "Failed to acquire monitor lock")?;
-            monitor.remove_route(route_id);
-        }
-        
-        Ok(())
-    }
-    
-    /// Update performance statistics
-    fn update_performance_stats(&self) -> Result<(), String> {
-        let completed = self.completed_routes.read().map_err(|_| "Failed to acquire completed routes lock")?;
-        let mut stats = self.performance_stats.write().map_err(|_| "Failed to acquire performance stats lock")?;
-        
-        if completed.is_empty() {
-            return Ok(());
-        }
-        
-        stats.total_routes = completed.len() as u64;
-        stats.successful_routes = completed.iter().filter(|r| matches!(r.status, RouteStatus::Filled)).count() as u64;
-        stats.failed_routes = stats.total_routes - stats.successful_routes;
-        
-        let filled_routes: Vec<&SmartOrderRoute> = completed.iter().filter(|r| r.total_filled > 0.0).collect();
-        
-        if !filled_routes.is_empty() {
-            stats.avg_fill_rate = filled_routes.iter().map(|r| r.fill_rate()).sum::<f64>() / filled_routes.len() as f64;
-            stats.avg_execution_time_ms = filled_routes.iter().map(|r| r.execution_time_ms as f64).sum::<f64>() / filled_routes.len() as f64;
-            stats.avg_slippage_bps = filled_routes.iter().map(|r| r.actual_slippage_bps).sum::<f64>() / filled_routes.len() as f64;
-            stats.total_volume_routed = filled_routes.iter().map(|r| r.total_filled).sum::<f64>();
-            stats.total_fees_saved = filled_routes.iter().map(|r| {
-                // Calculate fees saved vs worst case (simplified)
-                let worst_case_fees = r.total_filled * r.volume_weighted_avg_price * 0.001; // 0.1% worst case
-                worst_case_fees - r.total_fees
-            }).sum::<f64>();
-        }
-        
-        Ok(())
-    }
-    
-    /// Route monitoring worker thread
-    fn route_monitoring_worker(
-        active_routes: Arc<RwLock<HashMap<String, SmartOrderRoute>>>,
-        route_monitor: Arc<Mutex<RouteMonitor>>,
-        is_running: Arc<Mutex<bool>>,
-        interval_ms: u64,
-    ) {
-        println!("Route monitoring worker started");
-        
-        let sleep_duration = Duration::from_millis(interval_ms);
-        
-        while *is_running.lock().unwrap() {
-            thread::sleep(sleep_duration);
-            
-            // Check for timeouts
-            let timed_out_routes = {
-                let mut monitor = route_monitor.lock().unwrap();
-                monitor.check_timeouts(300000) // 5 minute timeout
-            };
-            
-            // Handle timed out routes
-            if !timed_out_routes.is_empty() {
-                let mut active = active_routes.write().unwrap();
-                for route_id in timed_out_routes {
-                    if let Some(mut route) = active.remove(&route_id) {
-                        route.status = RouteStatus::Expired;
-                        println!("Route {} timed out", route_id);
-                    }
-                }
-            }
-            
-            // Check route performance and generate alerts
-            {
-                let mut monitor = route_monitor.lock().unwrap();
-                let (timeout_alerts, performance_alerts) = monitor.get_alerts();
-                
-                for alert in timeout_alerts {
-                    println!("TIMEOUT ALERT: {}", alert);
-                }
-                
-                for alert in performance_alerts {
-                    println!("PERFORMANCE ALERT: {}", alert);
-                }
-            }
-        }
-        
-        println!("Route monitoring worker stopped");
-    }
-    
-    /// Get active route
-    pub fn get_active_route(&self, route_id: &str) -> Result<SmartOrderRoute, String> {
-        let active_routes = self.active_routes.read().map_err(|_| "Failed to acquire active routes lock")?;
-        active_routes.get(route_id).cloned().ok_or_else(|| format!("Route {} not found", route_id))
-    }
-    
-    /// Get all active routes
-    pub fn get_active_routes(&self) -> Result<Vec<SmartOrderRoute>, String> {
-        let active_routes = self.active_routes.read().map_err(|_| "Failed to acquire active routes lock")?;
-        Ok(active_routes.values().cloned().collect())
-    }
-    
-    /// Get performance statistics
-    pub fn get_performance_stats(&self) -> Result<RoutingStats, String> {
-        let stats = self.performance_stats.read().map_err(|_| "Failed to acquire performance stats lock")?;
-        Ok(stats.clone())
-    }
-    
-    /// Update routing configuration
-    pub fn update_config(&self, new_config: RoutingConfig) -> Result<(), String> {
-        let mut config = self.routing_config.write().map_err(|_| "Failed to acquire config lock")?;
-        *config = new_config;
-        Ok(())
-    }
-    
-    /// Cancel a route
-    pub fn cancel_route(&self, route_id: &str) -> Result<(), String> {
-        let mut active_routes = self.active_routes.write().map_err(|_| "Failed to acquire active routes lock")?;
-        
-        if let Some(route) = active_routes.get_mut(route_id) {
-            route.status = RouteStatus::Cancelled;
-            // In practice, would also cancel all child orders on exchanges
-            
-            // Move to completed
-            let completed_route = route.clone();
-            drop(active_routes); // Release lock before calling complete_route
-            self.complete_route(route_id, completed_route)?;
-        } else {
-            return Err(format!("Route {} not found", route_id));
-        }
-        
-        Ok(())
-    }
-    
-    /// Get routing recommendations for a potential order
-    pub fn get_routing_recommendation(
+    /// Generate optimal child orders using advanced routing algorithms
+    fn generate_optimal_child_orders(
         &self,
         symbol: &str,
         side: OrderSide,
         quantity: f64,
-        _urgency: ExecutionUrgency,
-    ) -> Result<SmartRoutingMetrics, String> {
-        let side_str = match side { OrderSide::Buy => "buy", OrderSide::Sell => "sell" };
-        self.metrics_aggregator.calculate_routing_metrics(symbol, quantity, side_str)
+        urgency: ExecutionUrgency,
+    ) -> Result<Vec<ChildOrder>, Box<dyn std::error::Error>> {
+        let mut child_orders = Vec::new();
+        
+        // Get routing rule for symbol
+        let routing_rule = self.routing_rules.get(symbol);
+        
+        match urgency {
+            ExecutionUrgency::Critical => {
+                // Single large order to most liquid exchange
+                if let Some(rule) = routing_rule {
+                    if let Some(best_exchange) = rule.exchange_priority.first() {
+                        let child_order = ChildOrder::new(
+                            format!("child_{}_{}", uuid::Uuid::new_v4(), 1),
+                            best_exchange.clone(),
+                            symbol.to_string(),
+                            side,
+                            OrderType::Market,
+                            quantity,
+                            None, // Market order
+                            TimeInForce::IOC,
+                        );
+                        child_orders.push(child_order);
+                    }
+                }
+            },
+            ExecutionUrgency::High => {
+                // Split across top 2-3 exchanges
+                if let Some(rule) = routing_rule {
+                    let exchanges = &rule.exchange_priority[..3.min(rule.exchange_priority.len())];
+                    let qty_per_exchange = quantity / exchanges.len() as f64;
+                    
+                    for (i, exchange) in exchanges.iter().enumerate() {
+                        let child_order = ChildOrder::new(
+                            format!("child_{}_{}", uuid::Uuid::new_v4(), i + 1),
+                            exchange.clone(),
+                            symbol.to_string(),
+                            side,
+                            OrderType::Limit,
+                            qty_per_exchange,
+                            None, // Will be set based on current market
+                            TimeInForce::IOC,
+                        );
+                        child_orders.push(child_order);
+                    }
+                }
+            },
+            ExecutionUrgency::Medium => {
+                // TWAP-style execution across multiple exchanges
+                if let Some(rule) = routing_rule {
+                    let exchanges = &rule.exchange_priority;
+                    let qty_per_exchange = quantity / exchanges.len() as f64;
+                    
+                    for (i, exchange) in exchanges.iter().enumerate() {
+                        let child_order = ChildOrder::new(
+                            format!("child_{}_{}", uuid::Uuid::new_v4(), i + 1),
+                            exchange.clone(),
+                            symbol.to_string(),
+                            side,
+                            OrderType::TWAP,
+                            qty_per_exchange,
+                            None,
+                            TimeInForce::GTC,
+                        );
+                        child_orders.push(child_order);
+                    }
+                }
+            },
+            ExecutionUrgency::Low => {
+                // Cost-optimized execution with limit orders
+                if let Some(rule) = routing_rule {
+                    if let Some(cheapest_exchange) = rule.exchange_priority.last() {
+                        let child_order = ChildOrder::new(
+                            format!("child_{}_{}", uuid::Uuid::new_v4(), 1),
+                            cheapest_exchange.clone(),
+                            symbol.to_string(),
+                            side,
+                            OrderType::Limit,
+                            quantity,
+                            None, // Will be set based on best bid/ask
+                            TimeInForce::GTC,
+                        );
+                        child_orders.push(child_order);
+                    }
+                }
+            },
+        }
+        
+        if child_orders.is_empty() {
+            // Fallback: single market order
+            child_orders.push(ChildOrder::new(
+                format!("child_fallback_{}", uuid::Uuid::new_v4()),
+                "default_exchange".to_string(),
+                symbol.to_string(),
+                side,
+                OrderType::Market,
+                quantity,
+                None,
+                TimeInForce::IOC,
+            ));
+        }
+        
+        Ok(child_orders)
+    }
+    
+    /// Get comprehensive routing performance statistics
+    pub fn get_performance_stats(&self) -> RoutingPerformanceStats {
+        RoutingPerformanceStats {
+            routes_created: self.stats.routes_created.load(Ordering::Relaxed),
+            routes_completed: self.stats.routes_completed.load(Ordering::Relaxed),
+            routes_failed: self.stats.routes_failed.load(Ordering::Relaxed),
+            total_volume_routed_dollars: self.stats.total_volume_routed.load(Ordering::Relaxed) as f64 / 100.0,
+            total_fees_paid_dollars: self.stats.total_fees_paid.load(Ordering::Relaxed) as f64 / 100.0,
+            avg_routing_latency_ns: self.stats.avg_routing_latency_ns.load(Ordering::Relaxed),
+            successful_fills: self.stats.successful_fills.load(Ordering::Relaxed),
+            partial_fills: self.stats.partial_fills.load(Ordering::Relaxed),
+            rejections: self.stats.rejections.load(Ordering::Relaxed),
+            timeouts: self.stats.timeouts.load(Ordering::Relaxed),
+            success_rate: self.stats.success_rate(),
+            active_routes_count: self.active_routes.len() as u64,
+        }
+    }
+    
+    /// Get all active routes (for monitoring)
+    pub fn get_active_routes(&self) -> Vec<SmartOrderRoute> {
+        self.active_routes.iter().map(|entry| entry.value().clone()).collect()
+    }
+    
+    /// Cancel a route and all its child orders
+    pub fn cancel_route(&self, route_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut route) = self.active_routes.get_mut(route_id) {
+            route.status = RouteStatus::Cancelled;
+            
+            for child_order in &mut route.child_orders {
+                if !child_order.is_complete() {
+                    child_order.status = RouteStatus::Cancelled;
+                }
+            }
+            
+            route.updated_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            
+            Ok(())
+        } else {
+            Err(format!("Route {} not found", route_id).into())
+        }
     }
 }
 
-// Add a simple UUID implementation since we're using it
-mod uuid {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-    
-    pub struct Uuid;
-    
-    impl Uuid {
-        pub fn new_v4() -> UuidStruct {
-            let mut hasher = DefaultHasher::new();
-            SystemTime::now().hash(&mut hasher);
-            std::thread::current().id().hash(&mut hasher);
-            
-            UuidStruct {
-                value: hasher.finish(),
-            }
-        }
-    }
-    
-    pub struct UuidStruct {
-        value: u64,
-    }
-    
-    impl UuidStruct {
-        pub fn to_string(&self) -> String {
-            format!("{:016x}", self.value)
-        }
-    }
+/// Performance statistics for routing operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingPerformanceStats {
+    pub routes_created: u64,
+    pub routes_completed: u64,
+    pub routes_failed: u64,
+    pub total_volume_routed_dollars: f64,
+    pub total_fees_paid_dollars: f64,
+    pub avg_routing_latency_ns: u64,
+    pub successful_fills: u64,
+    pub partial_fills: u64,
+    pub rejections: u64,
+    pub timeouts: u64,
+    pub success_rate: f64,
+    pub active_routes_count: u64,
+}
+
+/// Create default exchange configurations for testing
+pub fn create_default_exchange_configs() -> Vec<ExchangeConfig> {
+    vec![
+        ExchangeConfig {
+            name: "binance".to_string(),
+            enabled: true,
+            max_order_size: 1000000.0,
+            min_order_size: 0.001,
+            fee_rate: 0.001,
+            latency_penalty: 1.0,
+            reliability_score: 0.99,
+            supported_order_types: vec![OrderType::Market, OrderType::Limit, OrderType::StopLimit],
+            supported_time_in_force: vec![TimeInForce::IOC, TimeInForce::FOK, TimeInForce::GTC],
+        },
+        ExchangeConfig {
+            name: "coinbase".to_string(),
+            enabled: true,
+            max_order_size: 500000.0,
+            min_order_size: 0.01,
+            fee_rate: 0.005,
+            latency_penalty: 1.2,
+            reliability_score: 0.98,
+            supported_order_types: vec![OrderType::Market, OrderType::Limit],
+            supported_time_in_force: vec![TimeInForce::IOC, TimeInForce::GTC],
+        },
+        ExchangeConfig {
+            name: "kraken".to_string(),
+            enabled: true,
+            max_order_size: 100000.0,
+            min_order_size: 0.1,
+            fee_rate: 0.0025,
+            latency_penalty: 1.5,
+            reliability_score: 0.97,
+            supported_order_types: vec![OrderType::Market, OrderType::Limit, OrderType::StopLimit],
+            supported_time_in_force: vec![TimeInForce::IOC, TimeInForce::GTC, TimeInForce::DAY],
+        },
+    ]
+}
+
+/// Create default routing rules for common symbols
+pub fn create_default_routing_rules() -> Vec<RoutingRule> {
+    vec![
+        RoutingRule {
+            symbol: "BTC/USD".to_string(),
+            exchange_priority: vec!["binance".to_string(), "coinbase".to_string(), "kraken".to_string()],
+            max_allocation_pct: [
+                ("binance".to_string(), 0.5),
+                ("coinbase".to_string(), 0.3),
+                ("kraken".to_string(), 0.2),
+            ].into_iter().collect(),
+            min_liquidity_threshold: 10000.0,
+            urgency_routing: [
+                (ExecutionUrgency::Critical, vec!["binance".to_string()]),
+                (ExecutionUrgency::High, vec!["binance".to_string(), "coinbase".to_string()]),
+                (ExecutionUrgency::Medium, vec!["binance".to_string(), "coinbase".to_string(), "kraken".to_string()]),
+                (ExecutionUrgency::Low, vec!["kraken".to_string()]),
+            ].into_iter().collect(),
+        },
+        RoutingRule {
+            symbol: "ETH/USD".to_string(),
+            exchange_priority: vec!["binance".to_string(), "coinbase".to_string(), "kraken".to_string()],
+            max_allocation_pct: [
+                ("binance".to_string(), 0.4),
+                ("coinbase".to_string(), 0.4),
+                ("kraken".to_string(), 0.2),
+            ].into_iter().collect(),
+            min_liquidity_threshold: 5000.0,
+            urgency_routing: [
+                (ExecutionUrgency::Critical, vec!["binance".to_string()]),
+                (ExecutionUrgency::High, vec!["binance".to_string(), "coinbase".to_string()]),
+                (ExecutionUrgency::Medium, vec!["binance".to_string(), "coinbase".to_string(), "kraken".to_string()]),
+                (ExecutionUrgency::Low, vec!["kraken".to_string()]),
+            ].into_iter().collect(),
+        },
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    fn create_test_metrics_aggregator() -> Arc<ExchangeMetricsAggregator> {
-        Arc::new(ExchangeMetricsAggregator::new(1000, 10000))
+    
+    #[test]
+    fn test_atomic_routing_stats() {
+        let stats = AtomicRoutingStats::new();
+        
+        stats.increment_routes_created();
+        stats.increment_routes_completed();
+        stats.add_volume_routed(100000); // $1000.00
+        stats.add_fees_paid(100); // $1.00
+        stats.update_routing_latency(1000);
+        
+        assert_eq!(stats.routes_created.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.routes_completed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total_volume_routed.load(Ordering::Relaxed), 100000);
+        assert_eq!(stats.total_fees_paid.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.avg_routing_latency_ns.load(Ordering::Relaxed), 1000);
+        assert_eq!(stats.success_rate(), 1.0);
     }
     
-    fn setup_test_metrics(aggregator: &ExchangeMetricsAggregator) {
-        let binance_metrics = ExchangeMetrics {
-            exchange_name: "Binance".to_string(),
-            symbol: "BTC/USD".to_string(),
-            best_bid: 50000.0,
-            best_ask: 50001.0,
-            total_bid_liquidity: 100.0,
-            total_ask_liquidity: 150.0,
-            avg_response_time_ms: 50.0,
-            avg_slippage_bps: 10.0,
-            connectivity_score: 95.0,
-            effective_fee_bps: 5.0,
-            ..Default::default()
-        };
-        
-        let coinbase_metrics = ExchangeMetrics {
-            exchange_name: "Coinbase".to_string(),
-            symbol: "BTC/USD".to_string(),
-            best_bid: 49999.0,
-            best_ask: 50002.0,
-            total_bid_liquidity: 80.0,
-            total_ask_liquidity: 120.0,
-            avg_response_time_ms: 75.0,
-            avg_slippage_bps: 15.0,
-            connectivity_score: 90.0,
-            effective_fee_bps: 7.0,
-            ..Default::default()
-        };
-        
-        aggregator.update_exchange_metrics("Binance", "BTC/USD", binance_metrics).unwrap();
-        aggregator.update_exchange_metrics("Coinbase", "BTC/USD", coinbase_metrics).unwrap();
-    }
-
-    #[test]
-    fn test_router_creation() {
-        let aggregator = create_test_metrics_aggregator();
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
-        
-        assert_eq!(router.max_route_history, 1000);
-        assert_eq!(router.monitoring_interval_ms, 1000);
-    }
-
     #[test]
     fn test_smart_order_route_creation() {
         let route = SmartOrderRoute::new(
-            "test_route".to_string(),
+            "test_route_1".to_string(),
             "BTC/USD".to_string(),
             OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
+            1.0,
+            ExecutionUrgency::High,
+            None,
+            0.01,
+            Some(50000.0),
         );
         
+        assert_eq!(route.id, "test_route_1");
         assert_eq!(route.symbol, "BTC/USD");
         assert_eq!(route.side, OrderSide::Buy);
-        assert_eq!(route.total_quantity, 10.0);
-        assert_eq!(route.urgency, ExecutionUrgency::Medium);
+        assert_eq!(route.total_quantity, 1.0);
+        assert_eq!(route.urgency, ExecutionUrgency::High);
         assert_eq!(route.status, RouteStatus::Pending);
+        assert_eq!(route.remaining_quantity(), 1.0);
+        assert_eq!(route.fill_rate(), 0.0);
     }
-
+    
     #[test]
     fn test_child_order_creation() {
         let child = ChildOrder::new(
             "child_1".to_string(),
-            "Binance".to_string(),
+            "binance".to_string(),
             "BTC/USD".to_string(),
             OrderSide::Buy,
             OrderType::Limit,
-            5.0,
-            Some(50000.0),
-            TimeInForce::IOC,
+            0.5,
+            Some(49500.0),
+            TimeInForce::GTC,
         );
         
-        assert_eq!(child.exchange, "Binance");
-        assert_eq!(child.quantity, 5.0);
-        assert_eq!(child.price, Some(50000.0));
+        assert_eq!(child.id, "child_1");
+        assert_eq!(child.exchange, "binance");
+        assert_eq!(child.quantity, 0.5);
+        assert_eq!(child.price, Some(49500.0));
         assert_eq!(child.status, RouteStatus::Pending);
-        assert_eq!(child.remaining_quantity(), 5.0);
-        assert_eq!(child.fill_rate(), 0.0);
+        assert!(!child.is_complete());
+        assert_eq!(child.remaining_quantity(), 0.5);
     }
-
-    #[test]
-    fn test_route_order_creation() {
-        let aggregator = create_test_metrics_aggregator();
-        setup_test_metrics(&aggregator);
+    
+    #[tokio::test]
+    async fn test_ultra_fast_router_basic_operations() {
+        let metrics_aggregator = Arc::new(ExchangeMetricsAggregator::new(1000, 100));
+        let router = UltraFastSmartOrderRouter::new(metrics_aggregator);
         
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
+        // Configure exchanges
+        let configs = create_default_exchange_configs();
+        for config in configs {
+            router.configure_exchange(config);
+        }
         
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
-            RoutingAlgorithm::SmartRouting,
-        );
+        // Set routing rules
+        let rules = create_default_routing_rules();
+        for rule in rules {
+            router.set_routing_rule(rule);
+        }
         
-        assert!(route_id.is_ok());
-        let route_id = route_id.unwrap();
-        
-        let route = router.get_active_route(&route_id);
-        assert!(route.is_ok());
-        
-        let route = route.unwrap();
-        assert_eq!(route.symbol, "BTC/USD");
-        assert_eq!(route.side, OrderSide::Buy);
-        assert!(route.child_orders.len() > 0);
-    }
-
-    #[test]
-    fn test_child_order_update() {
-        let mut route = SmartOrderRoute::new(
-            "test_route".to_string(),
+        // Create a route
+        let route_id = router.create_smart_route(
+            "test_route_1".to_string(),
             "BTC/USD".to_string(),
             OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
-        );
-        
-        let child = ChildOrder::new(
-            "child_1".to_string(),
-            "Binance".to_string(),
-            "BTC/USD".to_string(),
-            OrderSide::Buy,
-            OrderType::Limit,
-            5.0,
-            Some(50000.0),
-            TimeInForce::IOC,
-        );
-        
-        route.add_child_order(child);
-        
-        // Update with partial fill
-        route.update_child_order("child_1", 3.0, 50000.0, 1.5, RouteStatus::PartiallyFilled);
-        
-        assert_eq!(route.total_filled, 3.0);
-        assert_eq!(route.status, RouteStatus::PartiallyFilled);
-        assert_eq!(route.child_orders[0].filled_quantity, 3.0);
-        assert_eq!(route.child_orders[0].remaining_quantity(), 2.0);
-    }
-
-    #[test]
-    fn test_routing_config() {
-        let config = RoutingConfig::default();
-        
-        assert_eq!(config.max_exchanges, 5);
-        assert_eq!(config.min_exchange_allocation, 0.05);
-        assert_eq!(config.cost_weight, 0.4);
-        assert_eq!(config.liquidity_weight, 0.3);
-    }
-
-    #[test]
-    fn test_performance_stats_update() {
-        let aggregator = create_test_metrics_aggregator();
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
-        
-        let stats = router.get_performance_stats();
-        assert!(stats.is_ok());
-        
-        let stats = stats.unwrap();
-        assert_eq!(stats.total_routes, 0);
-        assert_eq!(stats.successful_routes, 0);
-    }
-
-    #[test]
-    fn test_different_routing_algorithms() {
-        let aggregator = create_test_metrics_aggregator();
-        setup_test_metrics(&aggregator);
-        
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
-        
-        // Test TWAP algorithm
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            100.0,
-            ExecutionUrgency::Low,
-            RoutingAlgorithm::TWAP,
-        );
-        assert!(route_id.is_ok());
-        
-        // Test Aggressive algorithm
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Sell,
-            50.0,
+            1.0,
             ExecutionUrgency::High,
-            RoutingAlgorithm::Aggressive,
-        );
-        assert!(route_id.is_ok());
-        
-        // Test Conservative algorithm
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            25.0,
-            ExecutionUrgency::Low,
-            RoutingAlgorithm::Conservative,
-        );
-        assert!(route_id.is_ok());
-    }
-
-    #[test]
-    fn test_route_cancellation() {
-        let aggregator = create_test_metrics_aggregator();
-        setup_test_metrics(&aggregator);
-        
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, None);
-        
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
-            RoutingAlgorithm::SmartRouting,
+            None,
+            0.01,
+            Some(50000.0),
         ).unwrap();
         
-        // Cancel the route
-        let result = router.cancel_route(&route_id);
-        assert!(result.is_ok());
+        // Check status
+        let status = router.get_route_status(&route_id);
+        assert_eq!(status, Some(RouteStatus::Pending));
         
-        // Route should no longer be active
-        let route = router.get_active_route(&route_id);
-        assert!(route.is_err());
-    }
-
-    #[test]
-    fn test_database_integration() {
-        let aggregator = create_test_metrics_aggregator();
-        setup_test_metrics(&aggregator);
-        
-        // Create in-memory database for testing
-        let database = Arc::new(InMemoryOrderDatabase::new());
-        
-        // Create router with database integration
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, Some(database.clone()));
-        
-        // Create an order which should save to database
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
-            RoutingAlgorithm::SmartRouting,
-        );
-        
-        assert!(route_id.is_ok());
-        
-        // Check that orders were saved to database
-        let saved_orders = database.get_all_orders();
-        assert!(!saved_orders.is_empty(), "Orders should have been saved to database");
-        
-        println!("Successfully saved {} orders to database", saved_orders.len());
-        for order in &saved_orders {
-            println!("Order: {} {} {} at {}", order.side, order.quantity, order.symbol, order.created_at);
-        }
-    }
-
-    #[test] 
-    fn test_execution_tracking() {
-        let aggregator = create_test_metrics_aggregator();
-        setup_test_metrics(&aggregator);
-        
-        // Create in-memory database for testing
-        let database = Arc::new(InMemoryOrderDatabase::new());
-        
-        // Create router with database integration
-        let router = SmartOrderRouter::new(aggregator, 1000, 1000, Some(database.clone()));
-        
-        // Create an order
-        let route_id = router.route_order(
-            "BTC/USD",
-            OrderSide::Buy,
-            10.0,
-            ExecutionUrgency::Medium,
-            RoutingAlgorithm::SmartRouting,
-        ).expect("Failed to create route");
-        
-        // Get the route to find child order IDs
-        let route = {
-            let active_routes = router.active_routes.read().unwrap();
-            active_routes.get(&route_id).cloned()
-        };
-        
-        assert!(route.is_some(), "Route should exist");
-        let route = route.unwrap();
-        assert!(!route.child_orders.is_empty(), "Should have child orders");
-        
-        // Simulate execution of first child order
-        let first_child_id = &route.child_orders[0].id;
-        println!("\n=== Simulating execution of child order {} ===", first_child_id);
-        
-        // Partial fill
-        let result = router.update_child_order_execution(
-            &route_id,
-            first_child_id,
-            2.5,  // filled_qty
-            50000.0,  // fill_price
-            5.0,  // fees
-            RouteStatus::PartiallyFilled,
-        );
-        assert!(result.is_ok(), "Partial fill update should succeed");
-        
-        // Complete fill
-        let result = router.update_child_order_execution(
-            &route_id,
-            first_child_id,
-            2.5,  // remaining quantity
-            50100.0,  // fill_price
-            5.0,  // fees
-            RouteStatus::Filled,
-        );
-        assert!(result.is_ok(), "Complete fill update should succeed");
-        
-        println!("✓ Successfully tracked order execution lifecycle");
-    }
-}
-
-// Database integration module - simplified implementation for order persistence
-use chrono::{DateTime, Utc};
-
-// Simplified database interface to avoid complex dependencies
-pub trait DatabaseOrderPersistence {
-    fn save_strategy_order(&self, order_data: &StrategyOrderData) -> Result<(), String>;
-    fn update_order_execution(&self, execution_data: &OrderExecutionData) -> Result<(), String>;
-}
-
-// Struct that matches the database schema
-#[derive(Debug, Clone)]
-pub struct StrategyOrderData {
-    pub trade_id: String,
-    pub symbol: String,
-    pub order_type: String,
-    pub side: String,
-    pub quantity: String,
-    pub price: Option<String>,
-    pub time_in_force: String,
-    pub execution_urgency: String,
-    pub created_at: DateTime<Utc>,
-}
-
-// Struct for order execution updates
-#[derive(Debug, Clone)]
-pub struct OrderExecutionData {
-    pub trade_id: String,
-    pub filled_quantity: f64,
-    pub fill_price: f64,
-    pub fees_paid: f64,
-    pub status: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-// Simple in-memory implementation for demonstration
-pub struct InMemoryOrderDatabase {
-    orders: std::sync::Mutex<Vec<StrategyOrderData>>,
-}
-
-impl InMemoryOrderDatabase {
-    pub fn new() -> Self {
-        Self {
-            orders: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-    
-    pub fn get_all_orders(&self) -> Vec<StrategyOrderData> {
-        self.orders.lock().unwrap().clone()
-    }
-}
-
-impl DatabaseOrderPersistence for InMemoryOrderDatabase {
-    fn save_strategy_order(&self, order_data: &StrategyOrderData) -> Result<(), String> {
-        self.orders.lock().unwrap().push(order_data.clone());
-        println!("Saved order to database: {:?}", order_data);
-        Ok(())
-    }
-    
-    fn update_order_execution(&self, execution_data: &OrderExecutionData) -> Result<(), String> {
-        // In a real database, this would update the existing order record
-        // For the in-memory implementation, we'll just log the execution
-        println!("Updated order execution: {:?}", execution_data);
-        Ok(())
+        // Get stats
+        let stats = router.get_performance_stats();
+        assert_eq!(stats.routes_created, 1);
+        assert_eq!(stats.active_routes_count, 1);
     }
 }

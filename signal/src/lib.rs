@@ -70,6 +70,24 @@ pub mod signal_flags {
     pub const BYPASS_RISK_CHECKS: u32 = 1 << 5;
 }
 
+impl Default for Signal {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            strategy_id: 0,
+            timestamp_ns: 0,
+            symbol_hash: 0,
+            exchange_id: 0,
+            action: SignalAction::Hold,
+            side: OrderSide::Buy,
+            quantity: 0.0,
+            price: 0.0,
+            confidence: 0.0,
+            flags: 0,
+        }
+    }
+}
+
 impl Signal {
     /// Create new signal with atomic ID generation (zero allocation)
     #[inline]
@@ -87,6 +105,38 @@ impl Signal {
             id: SIGNAL_COUNTER.fetch_add(1, Ordering::Relaxed),
             strategy_id,
             timestamp_ns: high_precision_timestamp_ns(),
+            symbol_hash,
+            exchange_id: exchange_id as u8,
+            action,
+            side: if matches!(action, SignalAction::Buy | SignalAction::BuyLimit) {
+                OrderSide::Buy 
+            } else { 
+                OrderSide::Sell 
+            },
+            quantity,
+            price,
+            confidence: 1.0,
+            flags: 0,
+        }
+    }
+
+    /// Create new signal with custom timestamp (zero allocation)
+    #[inline]
+    pub fn new_with_timestamp(
+        strategy_id: u16,
+        symbol_hash: u64,
+        exchange_id: ExchangeId,
+        action: SignalAction,
+        quantity: f64,
+        price: f64,
+        timestamp_ns: u64,
+    ) -> Self {
+        static SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
+        
+        Self {
+            id: SIGNAL_COUNTER.fetch_add(1, Ordering::Relaxed),
+            strategy_id,
+            timestamp_ns,
             symbol_hash,
             exchange_id: exchange_id as u8,
             action,

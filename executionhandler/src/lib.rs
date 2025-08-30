@@ -59,6 +59,12 @@ pub struct InMemoryExecutionDatabase {
     executions: std::sync::Mutex<Vec<ExecutionData>>,
 }
 
+impl Default for InMemoryExecutionDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryExecutionDatabase {
     pub fn new() -> Self {
         Self {
@@ -86,7 +92,7 @@ impl DatabaseExecutionPersistence for InMemoryExecutionDatabase {
     }
     
     fn update_execution_status(&self, order_id: &str, status: &str) -> Result<(), String> {
-        println!("📊 Updated execution status for {}: {}", order_id, status);
+        println!("📊 Updated execution status for {order_id}: {status}");
         Ok(())
     }
 }
@@ -224,7 +230,7 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn execute_order_on_exchange(&self, signal: &Signal, exchange_name: &str) -> Result<ExecutionResult, ExecutionError> {
         let connectors = self.connectors.read().await;
         let connector = connectors.get(exchange_name)
-            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name)))?;
+            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
         
         let timer = optimizations::NanoTimer::start();
         
@@ -310,7 +316,7 @@ impl UltraLowLatencyExecutionHandler {
                 self.global_metrics.record_failure();
                 
                 // Log error and record monitoring metric
-                let error_msg = format!("{:?}", error);
+                let error_msg = format!("{error:?}");
                 TradingLogger::log_error("execution", "order_placement", &error_msg, Some(&signal.symbol));
                 self.performance_monitor.record_error("execution", "order_placement", &error_msg).await;
                 
@@ -384,7 +390,7 @@ impl UltraLowLatencyExecutionHandler {
 
     /// Execute batch orders in parallel across exchanges (high-performance)
     pub async fn execute_batch_orders_parallel(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
-        use futures::future::{join_all, try_join_all};
+        use futures::future::try_join_all;
         use std::sync::Arc;
         
         // Group signals by exchange
@@ -407,7 +413,7 @@ impl UltraLowLatencyExecutionHandler {
         let mut exchange_futures = Vec::new();
         
         for (exchange_name, exchange_signals) in exchange_groups {
-            if let Some(_) = connectors.get(&exchange_name) {
+            if connectors.get(&exchange_name).is_some() {
                 let connectors_ref = Arc::clone(&connectors);
                 let exchange_name_owned = exchange_name.clone();
                 
@@ -415,7 +421,7 @@ impl UltraLowLatencyExecutionHandler {
                     if let Some(connector) = connectors_ref.get(&exchange_name_owned) {
                         connector.execute_batch_orders_parallel(&exchange_signals).await
                     } else {
-                        Err(ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name_owned)))
+                        Err(ExecutionError::Unknown(format!("Exchange not found: {exchange_name_owned}")))
                     }
                 };
                 
@@ -462,7 +468,7 @@ impl UltraLowLatencyExecutionHandler {
         let mut exchange_futures = Vec::new();
         
         for (exchange_name, exchange_signals) in exchange_groups {
-            if let Some(_) = connectors.get(&exchange_name) {
+            if connectors.get(&exchange_name).is_some() {
                 let connectors_ref = Arc::clone(&connectors);
                 let exchange_name_owned = exchange_name.clone();
                 
@@ -470,7 +476,7 @@ impl UltraLowLatencyExecutionHandler {
                     if let Some(connector) = connectors_ref.get(&exchange_name_owned) {
                         connector.execute_batch_orders_optimized(&exchange_signals, max_parallel_per_exchange).await
                     } else {
-                        Err(ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name_owned)))
+                        Err(ExecutionError::Unknown(format!("Exchange not found: {exchange_name_owned}")))
                     }
                 };
                 
@@ -496,7 +502,7 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn cancel_order_on_exchange(&self, order_id: &str, exchange_name: &str) -> Result<CancelResult, ExecutionError> {
         let connectors = self.connectors.read().await;
         let connector = connectors.get(exchange_name)
-            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {}", exchange_name)))?;
+            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
         
         connector.cancel_order(order_id).await
     }
@@ -546,12 +552,12 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn initialize_optimizations(&self) -> Result<(), ExecutionError> {
         // Set CPU affinity for trading threads
         if let Err(e) = optimizations::set_cpu_affinity(self.core_assignment.primary_execution) {
-            log::warn!("Failed to set CPU affinity: {}", e);
+            log::warn!("Failed to set CPU affinity: {e}");
         }
         
         // Set high process priority
         if let Err(e) = optimizations::set_high_priority() {
-            log::warn!("Failed to set high priority: {}", e);
+            log::warn!("Failed to set high priority: {e}");
         }
         
         // Preallocate memory pools
@@ -578,43 +584,43 @@ impl UltraLowLatencyExecutionHandler {
     /// Get current position for a symbol on an exchange
     pub fn get_position(&self, symbol: &str, exchange: &str) -> Result<Option<position_tracker::Position>, ExecutionError> {
         self.position_tracker.get_position(symbol, exchange)
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Get all current positions
     pub fn get_all_positions(&self) -> Result<HashMap<(String, String), position_tracker::Position>, ExecutionError> {
         self.position_tracker.get_all_positions()
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Get net position for a symbol across all exchanges
     pub fn get_net_position(&self, symbol: &str) -> Result<f64, ExecutionError> {
         self.position_tracker.get_net_position(symbol)
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Get total portfolio PnL
     pub fn get_portfolio_pnl(&self) -> Result<position_tracker::PortfolioPnL, ExecutionError> {
         self.position_tracker.get_total_pnl()
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Get PnL by exchange
     pub fn get_pnl_by_exchange(&self) -> Result<HashMap<String, f64>, ExecutionError> {
         self.position_tracker.get_pnl_by_exchange()
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Update market price for PnL calculations
     pub fn update_market_price(&self, symbol: &str, price: f64) -> Result<(), ExecutionError> {
         self.position_tracker.update_market_price(symbol, price)
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     /// Get positions that need market price updates (stale positions)
     pub fn get_stale_positions(&self, max_age_ms: u64) -> Result<Vec<(String, String)>, ExecutionError> {
         self.position_tracker.get_stale_positions(max_age_ms)
-            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Position tracking error: {e}")))
     }
 
     // Performance monitoring methods
@@ -637,7 +643,7 @@ impl UltraLowLatencyExecutionHandler {
     /// Acknowledge alert by index
     pub async fn acknowledge_alert(&self, alert_index: usize) -> Result<(), ExecutionError> {
         self.performance_monitor.acknowledge_alert(alert_index).await
-            .map_err(|e| ExecutionError::Unknown(format!("Alert acknowledgment error: {}", e)))
+            .map_err(|e| ExecutionError::Unknown(format!("Alert acknowledgment error: {e}")))
     }
 
     /// Record custom performance metric
@@ -676,7 +682,7 @@ impl UltraLowLatencyExecutionHandler {
         let mut handler = Self::new();
         
         // Create Kraken config from legacy parameters
-        let config = ExchangeConfig {
+        let _config = ExchangeConfig {
             name: "Kraken".to_string(),
             api_key: credentials.api_key,
             secret_key: credentials.secret_key,

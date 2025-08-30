@@ -28,7 +28,7 @@ impl PerformanceMonitor {
         // Check for latency threshold violations
         if latency_ns > self.thresholds.max_latency_ns {
             self.create_alert(AlertType::HighLatency, 
-                format!("High latency in {}/{}: {}ns", component, operation, latency_ns)).await;
+                format!("High latency in {component}/{operation}: {latency_ns}ns")).await;
         }
     }
 
@@ -38,7 +38,7 @@ impl PerformanceMonitor {
         metrics.record_error(component, error_type);
 
         self.create_alert(AlertType::Error, 
-            format!("Error in {}: {} - {}", component, error_type, message)).await;
+            format!("Error in {component}: {error_type} - {message}")).await;
     }
 
     /// Record throughput measurement
@@ -49,7 +49,7 @@ impl PerformanceMonitor {
         // Check for throughput threshold violations
         if operations_per_second < self.thresholds.min_throughput {
             self.create_alert(AlertType::LowThroughput, 
-                format!("Low throughput in {}: {:.2} ops/sec", component, operations_per_second)).await;
+                format!("Low throughput in {component}: {operations_per_second:.2} ops/sec")).await;
         }
     }
 
@@ -80,11 +80,11 @@ impl PerformanceMonitor {
 
         // Log alert immediately
         match alert_type {
-            AlertType::Error | AlertType::Critical => log::error!("ALERT: {}", message),
+            AlertType::Error | AlertType::Critical => log::error!("ALERT: {message}"),
             AlertType::HighLatency | AlertType::LowThroughput | AlertType::HighMemoryUsage => {
-                log::warn!("ALERT: {}", message);
+                log::warn!("ALERT: {message}");
             }
-            AlertType::Info => log::info!("ALERT: {}", message),
+            AlertType::Info => log::info!("ALERT: {message}"),
         }
     }
 
@@ -125,7 +125,7 @@ impl PerformanceMonitor {
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
             metrics,
             recent_alerts: alerts,
-            thresholds: self.thresholds.clone(),
+            thresholds: self.thresholds,
         }
     }
 }
@@ -151,7 +151,7 @@ impl PerformanceMetrics {
     }
 
     pub fn record_latency(&mut self, component: &str, operation: &str, latency_ns: u64) {
-        let key = format!("{}::{}", component, operation);
+        let key = format!("{component}::{operation}");
         let entry = self.latencies.entry(key).or_insert_with(ComponentLatency::new);
         entry.record_latency(latency_ns);
         self.last_updated = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -192,6 +192,12 @@ pub struct ComponentLatency {
     pub p99_ns: u64,
     pub count: usize,
     samples: Vec<u64>, // Keep last 1000 samples for percentile calculation
+}
+
+impl Default for ComponentLatency {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ComponentLatency {
@@ -247,6 +253,12 @@ pub struct ErrorStats {
     pub last_error_time: u64,
 }
 
+impl Default for ErrorStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ErrorStats {
     pub fn new() -> Self {
         Self {
@@ -274,6 +286,12 @@ pub struct ThroughputStats {
     pub avg_ops_per_second: f64,
     pub sample_count: usize,
     samples: Vec<f64>,
+}
+
+impl Default for ThroughputStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ThroughputStats {
@@ -310,6 +328,12 @@ pub struct MemoryStats {
     pub avg_bytes: u64,
     pub sample_count: usize,
     samples: Vec<u64>,
+}
+
+impl Default for MemoryStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryStats {

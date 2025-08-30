@@ -99,6 +99,12 @@ pub struct AtomicMetrics {
     pub max_latency_ns: AtomicU64,
 }
 
+impl Default for AtomicMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtomicMetrics {
     pub fn new() -> Self {
         Self {
@@ -172,6 +178,12 @@ pub struct MetricsSnapshot {
 pub struct SPSCQueue<T> {
     sender: Sender<T>,
     receiver: Receiver<T>,
+}
+
+impl<T> Default for SPSCQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> SPSCQueue<T> {

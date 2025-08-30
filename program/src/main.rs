@@ -1,5 +1,4 @@
 use hostbuilder::{
-    HostedObject,
     HostedObjectTrait
 };
 use anyhow::Result;
@@ -21,7 +20,7 @@ async fn main() -> Result<()> {
         "./config/default.toml".to_string()
     });
 
-    logger.log(LogLevel::Info, format!("Using configuration from: {}", config_path)).await.ok();
+    logger.log(LogLevel::Info, format!("Using configuration from: {config_path}")).await.ok();
 
     // Create hosted object using builder pattern
     let engine = hostbuilder::HostedObjectBuilder::new()
@@ -35,7 +34,7 @@ async fn main() -> Result<()> {
             Ok(())
         },
         Err(e) => {
-            logger.log(LogLevel::Error, format!("Signal Engine error: {}", e)).await.ok();
+            logger.log(LogLevel::Error, format!("Signal Engine error: {e}")).await.ok();
             Err(anyhow::anyhow!("Signal Engine failed: {}", e))
         }
     }
