@@ -20,7 +20,7 @@ pub fn simd_calculate_percentiles(latencies: &[f64]) -> MetricsSnapshot {
     }
 
     let mut sorted_latencies = latencies.to_vec();
-    sorted_latencies.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_latencies.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     
     let count = sorted_latencies.len();
     let min_ns = sorted_latencies[0] as u64;
@@ -93,7 +93,7 @@ pub fn simd_calculate_percentiles(latencies: &[f64]) -> MetricsSnapshot {
     }
 
     let mut sorted_latencies = latencies.to_vec();
-    sorted_latencies.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_latencies.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     
     let count = sorted_latencies.len();
     let min_ns = sorted_latencies[0] as u64;

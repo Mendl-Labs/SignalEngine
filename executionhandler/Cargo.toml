@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Core async runtime and utilities
+signalengine = { path = ".." }
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-tungstenite = { version = "0.24.0", features = ["native-tls"] }
 futures-util = "0.3.31"

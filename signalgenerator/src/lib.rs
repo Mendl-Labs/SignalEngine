@@ -236,24 +236,58 @@ impl SignalGenerator {
     }
 
     /// Generate specific signal types
-    pub fn generate_market_buy(&mut self, symbol: &str, quantity: f64) -> Signal {
-        Signal::urgent_market_order(
+    pub fn generate_market_buy(&mut self, symbol: &str, quantity: f64) -> Result<Signal, String> {
+        // Input validation for trading safety
+        if symbol.is_empty() || symbol.len() > 20 {
+            return Err("Symbol must be 1-20 characters long".to_string());
+        }
+        if !symbol.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_') {
+            return Err("Symbol contains invalid characters".to_string());
+        }
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return Err("Quantity must be finite and positive".to_string());
+        }
+        if quantity > 1_000_000.0 {
+            return Err("Quantity exceeds maximum allowed (1M units)".to_string());
+        }
+        if quantity < 0.000001 {
+            return Err("Quantity below minimum precision (1e-6)".to_string());
+        }
+        
+        Ok(Signal::urgent_market_order(
             self.id,
             self.get_symbol_hash(symbol),
             ExchangeId::Binance,
             OrderSide::Buy,
             quantity,
-        )
+        ))
     }
 
-    pub fn generate_market_sell(&mut self, symbol: &str, quantity: f64) -> Signal {
-        Signal::urgent_market_order(
+    pub fn generate_market_sell(&mut self, symbol: &str, quantity: f64) -> Result<Signal, String> {
+        // Input validation for trading safety
+        if symbol.is_empty() || symbol.len() > 20 {
+            return Err("Symbol must be 1-20 characters long".to_string());
+        }
+        if !symbol.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_') {
+            return Err("Symbol contains invalid characters".to_string());
+        }
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return Err("Quantity must be finite and positive".to_string());
+        }
+        if quantity > 1_000_000.0 {
+            return Err("Quantity exceeds maximum allowed (1M units)".to_string());
+        }
+        if quantity < 0.000001 {
+            return Err("Quantity below minimum precision (1e-6)".to_string());
+        }
+        
+        Ok(Signal::urgent_market_order(
             self.id,
             self.get_symbol_hash(symbol),
             ExchangeId::Binance,
             OrderSide::Sell,
             quantity,
-        )
+        ))
     }
 
     pub fn generate_limit_order(

@@ -3,22 +3,25 @@ use hostbuilder::{
 };
 use anyhow::Result;
 use std::env;
-use ultra_logger::{UltraLogger, LogLevel};
+use signalengine::{initialize_signal_engine, SignalEngineLogger, TradingContext};
 
 #[cfg(test)]
 mod performance_tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize ultra-low latency logging
-    let logger = UltraLogger::new("SignalEngine".to_string());
-    logger.log(LogLevel::Info, "Starting Signal Engine...".to_string()).await.ok();
+    // Initialize the entire SignalEngine system with logging
+    initialize_signal_engine().await?;
+    
+    let logger = SignalEngineLogger::new("SignalEngine").await;
 
     // Get configuration path from environment or use default
     let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| {
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(logger.log(LogLevel::Warn, "CONFIG_PATH not set, using default config path".to_string())).ok();
+        tokio::spawn({
+            let logger = logger.clone();
+            async move {
+                logger.warn("CONFIG_PATH not set, using default config path").await;
+            }
         });
         "./config/default.toml".to_string()
     });

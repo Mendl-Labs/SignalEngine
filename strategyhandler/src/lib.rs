@@ -16,8 +16,9 @@ use serde::{Serialize, Deserialize};
 use orderbook::{Orderbook, OrderbookMetrics};
 use ultra_signal::{Signal, SignalAction, ExchangeId, SYMBOLS};
 use smartorderrouter::{UltraFastSmartOrderRouter, ExecutionUrgency, RoutingAlgorithm};
+use signalengine::{SignalEngineLogger, TradingContext, log_trading_signal};
+use std::sync::Arc;
 use tracing::{info, error};
-use ultra_logger::{UltraLogger, LogLevel};
 
 // Re-export ultra_engine types
 pub use strategies::{StrategyId, StrategyRegistry, SymbolHash};
@@ -616,11 +617,15 @@ impl StrategyManager {
     /// Report signal execution back to the store
     pub fn report_execution(&self, signal_id: &str, execution_price: f64, executed_qty: f64, fees: f64) {
         if let Err(e) = self.signal_store.record_execution(signal_id, execution_price, executed_qty, fees) {
-            let logger = UltraLogger::new("StrategyHandler".to_string());
             let signal_id = signal_id.to_string();
             let error_msg = e.to_string();
             tokio::spawn(async move {
-                logger.log(LogLevel::Error, format!("Failed to record execution for signal {}: {}", signal_id, error_msg)).await.ok();
+                if let Ok(logger) = SignalEngineLogger::new("StrategyHandler").await {
+                    let context = TradingContext::new("StrategyHandler")
+                        .with_operation("record_execution")
+                        .with_order_id(&signal_id);
+                    logger.error_ctx(&format!("Failed to record execution: {}", error_msg), context).await;
+                }
             });
         }
     }

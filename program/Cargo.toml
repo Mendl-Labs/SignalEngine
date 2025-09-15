@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.97"
 hostbuilder = { path = "../hostbuilder" }
+signalengine = { path = ".." }
 tokio = "1.44.1"
 # Ultra-low latency logging
 ultra-logger = { workspace = true }

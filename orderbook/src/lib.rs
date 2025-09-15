@@ -620,13 +620,27 @@ impl Orderbook {
     // Method to add a limit bid order - returns order index in the pool
     #[inline]
     pub fn add_limit_bid(&mut self, price: f64, order_id: u64, quantity: f64, timestamp: u64) -> Result<u64, &'static str> {
-        // Validate inputs
-        if quantity <= 0.0 {
-            return Err("Quantity must be positive");
+        // Enhanced validation for trading safety
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return Err("Quantity must be finite and positive");
         }
-        
-        if price <= 0.0 {
-            return Err("Price must be positive");
+        if !price.is_finite() || price <= 0.0 {
+            return Err("Price must be finite and positive");
+        }
+        if quantity > 1_000_000.0 {
+            return Err("Quantity exceeds maximum allowed");
+        }
+        if price > 10_000_000.0 {
+            return Err("Price exceeds maximum allowed");
+        }
+        if quantity < 1e-8 {
+            return Err("Quantity below minimum precision");
+        }
+        if price < 1e-6 {
+            return Err("Price below minimum precision");
+        }
+        if order_id == 0 {
+            return Err("Order ID cannot be zero");
         }
         
         // Convert price to NotNan for the BTreeMap key

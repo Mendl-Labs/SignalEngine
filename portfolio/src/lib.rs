@@ -177,8 +177,11 @@ impl CryptoWallet {
             value_by_exchange.insert(exchange.clone(), exchange_value);
         }
         
-        // Sort positions by market value (descending)
-        positions.sort_by(|a, b| b.market_value.partial_cmp(&a.market_value).unwrap());
+        // Sort positions by market value (descending) - handle NaN values gracefully
+        positions.sort_by(|a, b| {
+            b.market_value.partial_cmp(&a.market_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         
         Ok(PortfolioMetrics {
             total_value,
@@ -305,6 +308,23 @@ impl CryptoWallet {
     
     /// Set market price for a specific symbol
     pub fn set_market_price(&self, symbol: &str, price: f64) -> Result<(), String> {
+        // Input validation for market price updates
+        if symbol.is_empty() || symbol.len() > 20 {
+            return Err("Symbol must be 1-20 characters long".to_string());
+        }
+        if !symbol.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_') {
+            return Err("Symbol contains invalid characters".to_string());
+        }
+        if !price.is_finite() || price <= 0.0 {
+            return Err("Price must be finite and positive".to_string());
+        }
+        if price > 10_000_000.0 {
+            return Err("Price exceeds maximum allowed (10M)".to_string());
+        }
+        if price < 1e-6 {
+            return Err("Price below minimum precision (1e-6)".to_string());
+        }
+        
         let mut market_prices = match self.market_prices.write() {
             Ok(prices) => prices,
             Err(_) => return Err("Failed to acquire market prices write lock".to_string()),

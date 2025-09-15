@@ -244,18 +244,24 @@ unsafe impl Sync for UltraFastSignalQueue {}
 
 impl UltraFastSignalQueue {
     /// Create new queue with power-of-2 capacity for bit masking
-    pub fn new(capacity_pow2: usize) -> Self {
+    pub fn new(capacity_pow2: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         assert!(capacity_pow2.is_power_of_two());
         
-        let layout = std::alloc::Layout::array::<Signal>(capacity_pow2).unwrap();
+        let layout = std::alloc::Layout::array::<Signal>(capacity_pow2)
+            .map_err(|e| format!("Failed to create memory layout for signal queue: {}", e))?;
         let buffer = unsafe { std::alloc::alloc(layout) as *mut Signal };
         
-        // Initialize buffer with zeroed signals
+        // Check for allocation failure
+        if buffer.is_null() {
+            return Err("Failed to allocate memory for signal queue buffer".into());
+        }
+        
+        // Initialize buffer with zeroed signals - this is safe now that we've checked for null
         unsafe {
             std::ptr::write_bytes(buffer, 0, capacity_pow2);
         }
         
-        Self {
+        Ok(Self {
             buffer,
             capacity: capacity_pow2,
             head: AtomicU64::new(0),
@@ -276,8 +282,11 @@ impl UltraFastSignalQueue {
         }
         
         // Store signal and update tail atomically
+        // Safety: We've verified the queue isn't full and the index is within bounds due to masking
+        let index = (tail & self.mask) as usize;
+        debug_assert!(index < self.capacity, "Signal queue index out of bounds");
         unsafe {
-            std::ptr::write(self.buffer.add((tail & self.mask) as usize), signal);
+            std::ptr::write(self.buffer.add(index), signal);
         }
         
         self.tail.store(next_tail, Ordering::Release);
@@ -295,8 +304,11 @@ impl UltraFastSignalQueue {
         }
         
         // Load signal and update head
+        // Safety: We've verified the queue isn't empty and the index is within bounds due to masking
+        let index = (head & self.mask) as usize;
+        debug_assert!(index < self.capacity, "Signal queue index out of bounds");
         let signal = unsafe { 
-            std::ptr::read(self.buffer.add((head & self.mask) as usize))
+            std::ptr::read(self.buffer.add(index))
         };
         
         self.head.store(head.wrapping_add(1), Ordering::Release);
@@ -314,10 +326,13 @@ impl UltraFastSignalQueue {
 
 impl Drop for UltraFastSignalQueue {
     fn drop(&mut self) {
-        let layout = std::alloc::Layout::array::<Signal>(self.capacity).unwrap();
-        unsafe {
-            std::alloc::dealloc(self.buffer as *mut u8, layout);
+        if let Ok(layout) = std::alloc::Layout::array::<Signal>(self.capacity) {
+            unsafe {
+                std::alloc::dealloc(self.buffer as *mut u8, layout);
+            }
         }
+        // If layout creation fails, we can't safely deallocate
+        // This is a memory leak but prevents a crash
     }
 }
 
@@ -349,7 +364,7 @@ mod tests {
     
     #[test] 
     fn test_queue_operations() {
-        let queue = UltraFastSignalQueue::new(1024);
+        let queue = UltraFastSignalQueue::new(1024).expect("Failed to create signal queue");
         
         let signal = Signal::urgent_market_order(
             1,
@@ -362,7 +377,7 @@ mod tests {
         assert!(queue.try_push(signal).is_ok());
         assert_eq!(queue.len(), 1);
         
-        let popped = queue.try_pop().unwrap();
+        let popped = queue.try_pop().expect("Failed to pop signal from queue");
         assert_eq!(popped.id, signal.id);
         assert_eq!(queue.len(), 0);
     }

@@ -21,8 +21,8 @@ impl Position {
     pub fn new(symbol: String, exchange: String) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|_| 0); // Use 0 if system time is before UNIX_EPOCH
 
         Self {
             symbol,
@@ -38,11 +38,28 @@ impl Position {
     }
 
     /// Update position with new fill
-    pub fn update_fill(&mut self, fill_quantity: f64, fill_price: f64, fees: f64) {
+    pub fn update_fill(&mut self, fill_quantity: f64, fill_price: f64, fees: f64) -> Result<(), String> {
+        // Input validation for trading safety
+        if !fill_quantity.is_finite() {
+            return Err("Fill quantity must be finite (not NaN or infinite)".to_string());
+        }
+        if !fill_price.is_finite() || fill_price <= 0.0 {
+            return Err("Fill price must be finite and positive".to_string());
+        }
+        if !fees.is_finite() || fees < 0.0 {
+            return Err("Fees must be finite and non-negative".to_string());
+        }
+        if fill_quantity.abs() > 1_000_000.0 {
+            return Err("Fill quantity exceeds maximum allowed (1M units)".to_string());
+        }
+        if fill_price > 10_000_000.0 {
+            return Err("Fill price exceeds maximum allowed (10M)".to_string());
+        }
+        
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|_| 0); // Use 0 if system time is before UNIX_EPOCH
 
         // Handle position changes
         if self.quantity == 0.0 {
@@ -90,10 +107,19 @@ impl Position {
 
         self.total_fees += fees;
         self.last_updated = timestamp;
+        Ok(())
     }
 
     /// Update unrealized PnL based on current market price
-    pub fn update_unrealized_pnl(&mut self, current_price: f64) {
+    pub fn update_unrealized_pnl(&mut self, current_price: f64) -> Result<(), String> {
+        // Input validation
+        if !current_price.is_finite() || current_price <= 0.0 {
+            return Err("Current price must be finite and positive".to_string());
+        }
+        if current_price > 10_000_000.0 {
+            return Err("Current price exceeds maximum allowed (10M)".to_string());
+        }
+        
         if self.quantity == 0.0 {
             self.unrealized_pnl = 0.0;
         } else {
@@ -106,9 +132,10 @@ impl Position {
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|_| 0); // Use 0 if system time is before UNIX_EPOCH
         self.last_updated = timestamp;
+        Ok(())
     }
 
     /// Get total PnL (realized + unrealized)
@@ -260,8 +287,8 @@ impl PositionTracker {
         let positions = self.positions.read().map_err(|_| "Failed to acquire positions lock")?;
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|_| 0); // Use 0 if system time is before UNIX_EPOCH
 
         let mut stale_positions = Vec::new();
         

@@ -1,5 +1,6 @@
 // Ultra-low latency signal dispatcher for nanosecond trading
 use ultra_signal::{Signal, UltraFastSignalQueue, SignalAction, OrderSide};
+use signalengine::{SignalEngineLogger, TradingContext, log_trading_signal, log_info_async};
 use crossbeam::channel::{Sender, Receiver, bounded, TryRecvError};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,10 +35,10 @@ impl UltraFastSignalDispatcher {
         execution_sender: Sender<Signal>,
         portfolio_sender: Sender<Signal>, 
         risk_sender: Sender<Signal>,
-    ) -> Self {
-        Self {
-            urgent_queue: Arc::new(UltraFastSignalQueue::new(4096)), // 4K urgent signals
-            normal_queue: Arc::new(UltraFastSignalQueue::new(8192)), // 8K normal signals
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            urgent_queue: Arc::new(UltraFastSignalQueue::new(4096)?), // 4K urgent signals
+            normal_queue: Arc::new(UltraFastSignalQueue::new(8192)?), // 8K normal signals
             execution_sender,
             portfolio_sender,
             risk_sender,
@@ -46,7 +47,7 @@ impl UltraFastSignalDispatcher {
             max_latency_ns: AtomicU64::new(0),
             is_running: AtomicBool::new(false),
             batch_buffer: Vec::with_capacity(32), // Batch up to 32 signals
-        }
+        })
     }
 
         /// Ultra-fast batch signal processing using pre-allocated buffer
@@ -151,11 +152,18 @@ impl UltraFastSignalDispatcher {
         thread::spawn(move || {
             // Set thread priority to high for ultra-low latency
             #[cfg(target_os = "windows")]
-            unsafe {
-                use std::os::windows::io::AsRawHandle;
-                let handle = std::process::id();
-                // Note: Actual Windows API calls would go here
-                // winapi::um::processthreadsapi::SetThreadPriority(...);
+            {
+                use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
+                use winapi::um::winbase::THREAD_PRIORITY_TIME_CRITICAL;
+                
+                // SAFETY: GetCurrentThread() returns a pseudo-handle that's always valid
+                let result = unsafe {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL as i32)
+                };
+                
+                if result == 0 {
+                    eprintln!("Warning: Failed to set signal dispatcher thread priority");
+                }
             }
 
             let mut batch_buffer: Vec<Signal> = Vec::with_capacity(32);
@@ -364,14 +372,14 @@ impl SignalDispatcher {
         execution_sender: Sender<Signal>,
         portfolio_sender: Sender<Signal>,
         risk_sender: Sender<Signal>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
             ultra_dispatcher: UltraFastSignalDispatcher::new(
                 execution_sender,
                 portfolio_sender,
                 risk_sender,
-            ),
-        }
+            )?,
+        })
     }
 
     /// Start signal processing

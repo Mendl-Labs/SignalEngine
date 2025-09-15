@@ -7,6 +7,13 @@ pub fn set_cpu_affinity(core_id: usize) -> Result<(), ExecutionError> {
     use std::mem;
     use std::os::unix::thread::JoinHandleExt;
 
+    // Validate core_id is within reasonable bounds (0-255 cores should be sufficient)
+    if core_id >= 256 {
+        return Err(ExecutionError::InvalidParameter(format!(
+            "Core ID {} exceeds maximum supported cores (255)", core_id
+        )));
+    }
+
     unsafe {
         let mut cpu_set: cpu_set_t = mem::zeroed();
         CPU_ZERO(&mut cpu_set);
@@ -34,9 +41,20 @@ pub fn set_cpu_affinity(core_id: usize) -> Result<(), ExecutionError> {
     use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
     use winapi::um::winbase::THREAD_PRIORITY_HIGHEST;
     
+    // Validate core_id is within reasonable bounds
+    if core_id >= 256 {
+        return Err(ExecutionError::InvalidParameter(format!(
+            "Core ID {} exceeds maximum supported cores (255)", core_id
+        )));
+    }
+    
     unsafe {
-        // Windows: Set thread priority instead of affinity (SetThreadAffinityMask not available)
-        let result = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST.try_into().unwrap());
+        // Windows: Set thread priority instead of affinity 
+        // SAFETY: GetCurrentThread() always returns a valid pseudo-handle
+        let result = SetThreadPriority(
+            GetCurrentThread(), 
+            THREAD_PRIORITY_HIGHEST as i32 // Safe conversion instead of try_into().unwrap()
+        );
         
         if result != 0 {
             Ok(())

@@ -5,6 +5,11 @@ pub mod signal;
 pub mod circuit_breaker;
 pub mod position_tracker;
 pub mod monitoring;
+pub mod validation;
+pub mod auth;
+
+use signalengine::{SignalEngineLogger, TradingContext, log_trading_execution};
+use std::sync::Arc;
 
 // Re-export main types and traits for easy access
 pub use core::{
@@ -18,6 +23,8 @@ pub use exchanges::ExchangeFactory;
 pub use signal::{Signal, SignalAction};
 pub use circuit_breaker::{CircuitBreaker, ExchangeCircuitBreakerManager};
 pub use position_tracker::{PositionTracker, Position, PositionSide, PortfolioPnL};
+pub use validation::{TradingValidator, VALIDATOR};
+pub use auth::{TradingAuthenticator, AuthMiddleware, ServiceClaims, AuthError, AUTHENTICATOR};
 pub use monitoring::{PerformanceMonitor, PerformanceMetrics, Alert, AlertType, TradingLogger};
 pub use optimizations::{
     timestamp::{nano_timestamp, NanoTimer},
@@ -80,19 +87,41 @@ impl InMemoryExecutionDatabase {
 impl DatabaseExecutionPersistence for InMemoryExecutionDatabase {
     fn save_execution(&self, execution_data: &ExecutionData) -> Result<(), String> {
         self.executions.lock().unwrap().push(execution_data.clone());
-        println!("💾 Saved execution to database: {} {} {} @ {} (Fee: {}, Latency: {}ns)", 
-            execution_data.side, 
-            execution_data.filled_quantity, 
-            execution_data.symbol, 
-            execution_data.price,
-            execution_data.fee,
-            execution_data.latency_ns
-        );
+        
+        // Note: This is synchronous logging - in production use log_trading_execution macro for async
+        tokio::spawn({
+            let data = execution_data.clone();
+            async move {
+                if let Ok(logger) = signalengine::SignalEngineLogger::new("ExecutionHandler").await {
+                    logger.log_execution(
+                        &data.order_id,
+                        &data.symbol,
+                        &data.exchange,
+                        data.filled_quantity,
+                        data.price,
+                        data.fee,
+                        data.latency_ns
+                    ).await;
+                }
+            }
+        });
+        
         Ok(())
     }
     
     fn update_execution_status(&self, order_id: &str, status: &str) -> Result<(), String> {
-        println!("📊 Updated execution status for {order_id}: {status}");
+        tokio::spawn({
+            let order_id = order_id.to_string();
+            let status = status.to_string();
+            async move {
+                if let Ok(logger) = signalengine::SignalEngineLogger::new("ExecutionHandler").await {
+                    let context = signalengine::TradingContext::new("ExecutionHandler")
+                        .with_operation("status_update")
+                        .with_order_id(&order_id);
+                    logger.info_ctx(&format!("Updated execution status: {}", status), context).await;
+                }
+            }
+        });
         Ok(())
     }
 }
@@ -108,12 +137,14 @@ pub struct UltraLowLatencyExecutionHandler {
     position_tracker: Arc<PositionTracker>,
     performance_monitor: Arc<PerformanceMonitor>,
     execution_database: Option<Arc<dyn DatabaseExecutionPersistence>>,
+    logger: Arc<SignalEngineLogger>,
 }
 
 impl UltraLowLatencyExecutionHandler {
     /// Create a new multi-exchange execution handler
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let core_assignment = optimizations::CoreAssignment::optimal_assignment();
+        let logger = Arc::new(SignalEngineLogger::new("ExecutionHandler").await);
         
         Self {
             connectors: Arc::new(RwLock::new(HashMap::new())),
@@ -124,12 +155,13 @@ impl UltraLowLatencyExecutionHandler {
             position_tracker: Arc::new(PositionTracker::new()),
             performance_monitor: Arc::new(PerformanceMonitor::new(MonitoringThresholds::default())),
             execution_database: None,
+            logger,
         }
     }
 
     /// Create a new execution handler with database integration
-    pub fn new_with_database(database: Arc<dyn DatabaseExecutionPersistence>) -> Self {
-        let mut handler = Self::new();
+    pub async fn new_with_database(database: Arc<dyn DatabaseExecutionPersistence>) -> Self {
+        let mut handler = Self::new().await;
         handler.execution_database = Some(database);
         handler
     }

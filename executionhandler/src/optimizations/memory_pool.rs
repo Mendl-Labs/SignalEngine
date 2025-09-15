@@ -26,33 +26,38 @@ impl OrderPool {
     }
 
     /// Pre-allocate orders for the hot path
-    pub fn preallocate(&mut self, count: usize) {
-        let mut pool = self.pool.lock().unwrap();
+    pub fn preallocate(&mut self, count: usize) -> Result<(), &'static str> {
+        let mut pool = self.pool.lock().map_err(|_| "Failed to acquire memory pool lock")?;
         
         for _ in 0..count.min(self.capacity - self.allocated) {
             unsafe {
                 let ptr = alloc(self.layout) as *mut ExchangeOrder;
                 if !ptr.is_null() {
+                    // Safe to use new_unchecked here since we just verified ptr is not null
                     pool.push_back(NonNull::new_unchecked(ptr));
                     self.allocated += 1;
+                } else {
+                    // Allocation failed - stop trying to avoid memory pressure
+                    break;
                 }
             }
         }
+        Ok(())
     }
 
     /// Get a pooled order object (zero allocation in hot path)
     pub fn get(&self) -> PooledOrder {
         let mut pool = self.pool.lock().unwrap();
         
-        if let Some(mut ptr) = pool.pop_front() {
-            // Use pre-allocated object
+        if let Some(ptr) = pool.pop_front() {
+            // Use pre-allocated object - ptr is guaranteed non-null from pool
             unsafe {
-                let order_ref = ptr.as_mut();
-                // Reset the order to default state
-                std::ptr::write(order_ref, ExchangeOrder::default());
+                let order_ref = ptr.as_ref(); 
+                // Create a default order - safer than ptr::write + ptr::read
+                let default_order = ExchangeOrder::default();
                 
                 PooledOrder {
-                    inner: std::ptr::read(order_ref),
+                    inner: default_order,
                     pool_id: ptr.as_ptr() as usize,
                 }
             }
@@ -68,12 +73,18 @@ impl OrderPool {
     /// Return order object to pool for reuse
     pub fn return_order(&self, order: PooledOrder) {
         if order.pool_id != 0 {
-            // Return to pool
+            // Return to pool - this is unsafe but constrained to known pool addresses
             let mut pool = self.pool.lock().unwrap();
             unsafe {
-                let mut ptr = NonNull::new_unchecked(order.pool_id as *mut ExchangeOrder);
-                std::ptr::write(ptr.as_mut(), order.inner);
-                pool.push_back(ptr);
+                // SAFETY: pool_id came from a valid NonNull pointer from our pool
+                // This is still risky - a safer design would store the NonNull directly
+                let ptr = NonNull::new(order.pool_id as *mut ExchangeOrder);
+                if let Some(mut valid_ptr) = ptr {
+                    // Write the order back to the pooled memory
+                    std::ptr::write(valid_ptr.as_mut(), order.inner);
+                    pool.push_back(valid_ptr);
+                }
+                // If ptr is null, we just drop the order (safer than crashing)
             }
         }
         // If pool_id is 0, object was heap allocated and will be dropped normally

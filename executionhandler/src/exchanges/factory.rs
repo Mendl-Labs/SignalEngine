@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
-use crate::exchanges::{kraken::KrakenConnector, binance::BinanceConnector, coinbase::CoinbaseConnector};
+use crate::exchanges::{kraken::KrakenConnector};
 
 /// Factory for creating exchange connectors
 pub struct ExchangeFactory;
@@ -15,23 +15,13 @@ impl ExchangeFactory {
                 connector.initialize(config).await?;
                 Ok(Box::new(connector))
             }
-            "binance" => {
-                let mut connector = BinanceConnector::new();
-                connector.initialize(config).await?;
-                Ok(Box::new(connector))
-            }
-            "coinbase" | "coinbase_pro" => {
-                let mut connector = CoinbaseConnector::new();
-                connector.initialize(config).await?;
-                Ok(Box::new(connector))
-            }
-            _ => Err(ExecutionError::Unknown(format!("Unsupported exchange: {}", exchange_name)))
+            _ => Err(ExecutionError::Unknown(format!("Unsupported exchange: {}. Only Kraken is currently supported.", exchange_name)))
         }
     }
 
     /// Get list of supported exchanges
     pub fn supported_exchanges() -> Vec<&'static str> {
-        vec!["kraken", "binance", "coinbase"]
+        vec!["kraken"]
     }
 
     /// Create configuration template for an exchange
@@ -39,10 +29,12 @@ impl ExchangeFactory {
         match exchange_name.to_lowercase().as_str() {
             "kraken" => Ok(ExchangeConfig {
                 name: "Kraken".to_string(),
-                api_key: "YOUR_KRAKEN_API_KEY".to_string(),
-                secret_key: "YOUR_KRAKEN_SECRET_KEY".to_string(),
+                api_key: std::env::var("KRAKEN_API_KEY")
+                    .map_err(|_| ExecutionError::Authentication("KRAKEN_API_KEY environment variable not set".to_string()))?,
+                secret_key: std::env::var("KRAKEN_SECRET_KEY")
+                    .map_err(|_| ExecutionError::Authentication("KRAKEN_SECRET_KEY environment variable not set".to_string()))?,
                 passphrase: None,
-                sandbox: true,
+                sandbox: std::env::var("KRAKEN_SANDBOX").unwrap_or_else(|_| "true".to_string()).parse().unwrap_or(true),
                 connection_pool_size: 10,
                 timeout_ms: 5000,
                 rate_limit_per_second: 20,
@@ -51,35 +43,7 @@ impl ExchangeFactory {
                 rest_api_url: Some("https://api.kraken.com".to_string()),
                 custom_headers: HashMap::new(),
             }),
-            "binance" => Ok(ExchangeConfig {
-                name: "Binance".to_string(),
-                api_key: "YOUR_BINANCE_API_KEY".to_string(),
-                secret_key: "YOUR_BINANCE_SECRET_KEY".to_string(),
-                passphrase: None,
-                sandbox: true,
-                connection_pool_size: 15,
-                timeout_ms: 3000,
-                rate_limit_per_second: 100,
-                rate_limit_burst: 200,
-                websocket_url: Some("wss://stream.binance.com:9443".to_string()),
-                rest_api_url: Some("https://api.binance.com".to_string()),
-                custom_headers: HashMap::new(),
-            }),
-            "coinbase" => Ok(ExchangeConfig {
-                name: "Coinbase Pro".to_string(),
-                api_key: "YOUR_COINBASE_API_KEY".to_string(),
-                secret_key: "YOUR_COINBASE_SECRET_KEY".to_string(),
-                passphrase: Some("YOUR_COINBASE_PASSPHRASE".to_string()),
-                sandbox: true,
-                connection_pool_size: 8,
-                timeout_ms: 4000,
-                rate_limit_per_second: 10,
-                rate_limit_burst: 30,
-                websocket_url: Some("wss://ws-feed.pro.coinbase.com".to_string()),
-                rest_api_url: Some("https://api.pro.coinbase.com".to_string()),
-                custom_headers: HashMap::new(),
-            }),
-            _ => Err(ExecutionError::Unknown(format!("Unsupported exchange: {}", exchange_name)))
+            _ => Err(ExecutionError::Unknown(format!("Unsupported exchange: {}. Only Kraken is currently supported.", exchange_name)))
         }
     }
 

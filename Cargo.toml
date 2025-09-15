@@ -17,6 +17,21 @@ members = [
 ]
 resolver = "2"
 
+[package]
+name = "signalengine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "signalengine"
+path = "src/lib.rs"
+
+[dependencies]
+ultra-logger = { workspace = true }
+tokio = { version = "1.45", features = ["full"] }
+serde = { workspace = true }
+serde_json = "1.0"
+
 [workspace.dependencies]
 # Ultra-low latency logging engine
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }
