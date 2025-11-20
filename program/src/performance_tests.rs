@@ -1,7 +1,7 @@
 #[cfg(test)]
-mod performance_tests {
+mod tests {
     use std::time::{Duration, Instant};
-    use tokio;
+    
 
     // Simple performance test for SignalEngine components
     #[tokio::test]
@@ -64,19 +64,19 @@ mod performance_tests {
         
         // Stage 2: Signal Processing (simulated)
         let stage2_start = Instant::now();
-        let _processed = signals.iter().map(|s| process_signal(s)).collect::<Vec<_>>();
+        let _processed = signals.iter().map(process_signal).collect::<Vec<_>>();
         let stage2_time = stage2_start.elapsed();
         println!("   Stage 2 - Signal Processing: {}μs", stage2_time.as_micros());
         
         // Stage 3: Order Routing (simulated)
         let stage3_start = Instant::now();
-        let _routed = signals.iter().map(|s| route_signal(s)).collect::<Vec<_>>();
+        let _routed = signals.iter().map(route_signal).collect::<Vec<_>>();
         let stage3_time = stage3_start.elapsed();
         println!("   Stage 3 - Order Routing: {}μs", stage3_time.as_micros());
         
         // Stage 4: Execution (simulated)
         let stage4_start = Instant::now();
-        let _executed = signals.iter().map(|s| execute_signal(s)).collect::<Vec<_>>();
+        let _executed = signals.iter().map(execute_signal).collect::<Vec<_>>();
         let stage4_time = stage4_start.elapsed();
         println!("   Stage 4 - Execution: {}μs", stage4_time.as_micros());
         
@@ -98,8 +98,8 @@ mod performance_tests {
     // Test helper functions
     #[derive(Clone, Debug)]
     struct TestSignal {
-        id: u32,
-        symbol: String,
+        _id: u32,
+        _symbol: String,
         price: f64,
         quantity: f64,
         timestamp: u64,
@@ -107,8 +107,8 @@ mod performance_tests {
 
     fn create_test_signal(id: u32) -> TestSignal {
         TestSignal {
-            id,
-            symbol: "BTC/USD".to_string(),
+            _id: id,
+            _symbol: "BTC/USD".to_string(),
             price: 50000.0 + (id as f64 * 0.1),
             quantity: 1.0,
             timestamp: std::time::SystemTime::now()

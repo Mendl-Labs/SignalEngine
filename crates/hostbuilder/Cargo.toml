@@ -1,0 +1,37 @@
+[package]
+name = "hostbuilder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.97"
+async-trait = "0.1.88"
+config = { path = "../config" }
+crossbeam = "0.8.4"
+ctrlc = "3.4.7"
+dashmap = "6.1.0"
+datahandler = { path = "../datahandler" }
+dotenv = "0.15.0"
+executionhandler = { path = "../executionhandler" }
+lazy_static = "1.5.0"
+mockall = "0.13.1"
+orderbook = { path = "../orderbook" }
+portfolio = { path = "../portfolio" }
+portfoliohandler = { path = "../portfoliohandler" }
+serde_json = "1.0.140"
+signalgenerator = { path = "../signalgenerator" }
+strategyhandler = { path = "../strategyhandler" }
+tokio = "1.44.1"
+ultra_signal = { path = "../signal" }
+
+# Ultra-low latency logging
+ultra-logger = { workspace = true }
+tracing = "0.1.40"
+
+# Phase 2: Ultra-Fast Order Management Dependencies
+bytes = { workspace = true }
+bincode = { workspace = true }
+futures = { workspace = true }
+atomic = { workspace = true }
+fastrand = { workspace = true }
+serde = { workspace = true }

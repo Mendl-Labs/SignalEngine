@@ -1,42 +1,26 @@
 [workspace]
 members = [
-    "program", 
-    "hostbuilder", 
-    "datahandler", 
-    "portfoliohandler", 
-    "signalgenerator", 
-    "config", 
-    "orderbook", 
-    "portfolio", 
-    "executionhandler", 
-    "smartorderrouter", 
-    "exchangemetricaggregator",
-    "strategyhandler",
-    "signal",
-    "signaldispatcher",
+    "program",
+    "crates/core",
+    "crates/hostbuilder",
+    "crates/datahandler",
+    "crates/portfoliohandler",
+    "crates/signalgenerator",
+    "crates/config",
+    "crates/orderbook",
+    "crates/portfolio",
+    "crates/executionhandler",
+    "crates/smartorderrouter",
+    "crates/exchangemetricaggregator",
+    "crates/strategyhandler",
+    "crates/signal",
+    "crates/signaldispatcher",
 ]
 resolver = "2"
-
-[package]
-name = "signalengine"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-name = "signalengine"
-path = "src/lib.rs"
-
-[dependencies]
-ultra-logger = { workspace = true }
-tokio = { version = "1.45", features = ["full"] }
-serde = { workspace = true }
-serde_json = "1.0"
 
 [workspace.dependencies]
 # Ultra-low latency logging engine
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }
-log-aggregator = { path = "../LoggingEngine/log-aggregator" }
-metrics-collector = { path = "../LoggingEngine/metrics-collector" }
 
 # Ultra-Fast Production Optimizations
 crossbeam = "0.8"

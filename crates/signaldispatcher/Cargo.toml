@@ -1,0 +1,13 @@
+[package]
+name = "signal_dispatcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+signalengine = { package = "signalengine-core", path = "../core" }
+ultra_signal = { path = "../signal" }
+crossbeam = "0.8.4"
+tokio = { version = "1.0", features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase"] }

@@ -1,0 +1,17 @@
+[package]
+name = "signalengine-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "signalengine"
+path = "lib.rs"
+
+[dependencies]
+ultra-logger = { workspace = true }
+tokio = { version = "1.45", features = ["full"] }
+serde = { workspace = true }
+serde_json = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase", "errhandlingapi"] }

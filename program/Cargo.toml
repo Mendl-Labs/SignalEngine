@@ -5,13 +5,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.97"
-hostbuilder = { path = "../hostbuilder" }
-signalengine = { path = ".." }
+hostbuilder = { path = "../crates/hostbuilder" }
+signalengine = { package = "signalengine-core", path = "../crates/core" }
 tokio = "1.44.1"
 # Ultra-low latency logging
 ultra-logger = { workspace = true }
-log-aggregator = { workspace = true }
-metrics-collector = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
