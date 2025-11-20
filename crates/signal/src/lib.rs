@@ -53,10 +53,36 @@ pub enum OrderSide {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExchangeId {
+    // Centralized Exchanges (CEX)
     Binance = 0,
     Coinbase = 1,
     Kraken = 2,
     FTX = 3,
+    
+    // SUI Network DEXs (PRIORITY - Built for HFT)
+    Cetus = 50,              // Leading AMM on SUI with concentrated liquidity
+    Turbos = 51,             // High-performance DEX aggregator
+    Aftermath = 52,          // DeFi hub with trading
+    DeepBook = 53,           // Native SUI CLOB (Central Limit Order Book)
+    
+    // Decentralized Exchanges (DEX) - Ethereum
+    UniswapV3 = 100,
+    SushiSwap = 101,
+    Curve = 102,
+    Balancer = 103,
+    
+    // DEX - Solana
+    JupiterAggregator = 120,
+    Orca = 121,
+    Raydium = 122,
+    
+    // DEX - BSC
+    PancakeSwap = 130,
+    
+    // DEX - Arbitrum/Optimism
+    UniswapV3Arbitrum = 140,
+    UniswapV3Optimism = 141,
+    
     // ... up to 255 exchanges
 }
 
