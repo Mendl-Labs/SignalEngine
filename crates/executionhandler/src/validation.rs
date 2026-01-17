@@ -159,14 +159,15 @@ mod tests {
     fn test_symbol_validation() {
         let validator = TradingValidator::default();
         
-        // Valid symbols
+        // Valid symbols (in whitelist)
         assert!(validator.validate_symbol("BTC/USD").is_ok());
-        assert!(validator.validate_symbol("ETH-USDT").is_ok());
+        assert!(validator.validate_symbol("ETH/USDT").is_ok());
         
         // Invalid symbols
         assert!(validator.validate_symbol("").is_err());
         assert!(validator.validate_symbol("BTC USD").is_err()); // Space not allowed
         assert!(validator.validate_symbol("BTC@USD").is_err()); // @ not allowed
+        assert!(validator.validate_symbol("ETH-USDT").is_err()); // Not in whitelist
     }
     
     #[test]
