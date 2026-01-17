@@ -142,7 +142,15 @@ jobs:
         run: |
           Write-Host "Running tests..."
           cd SignalEngine
-          cargo test --workspace --jobs ${{ env.PARALLEL_JOBS }}
+          # Run datahandler tests with single thread (uses global ORDERBOOKS state)
+          cargo test -p datahandler --jobs ${{ env.PARALLEL_JOBS }} -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[FAIL] Datahandler tests failed!"
+            echo "passed=false" >> $env:GITHUB_OUTPUT
+            exit 1
+          }
+          # Run all other tests in parallel
+          cargo test --workspace --exclude datahandler --jobs ${{ env.PARALLEL_JOBS }}
           if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Tests passed!"
             echo "passed=true" >> $env:GITHUB_OUTPUT
