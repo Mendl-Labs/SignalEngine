@@ -22,3 +22,6 @@ protocol = { path = "../../../MessageBrokerEngine/protocol" }
 subscriber = { path = "../../../MessageBrokerEngine/subscriber" }
 prost = "0.13.5"
 spin_sleep = "1.3.1"
+
+[dev-dependencies]
+serial_test = "3.2"
