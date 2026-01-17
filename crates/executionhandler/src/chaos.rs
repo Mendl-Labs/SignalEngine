@@ -310,15 +310,20 @@ impl NetworkPartition {
 
     /// Check if exchange is partitioned
     pub fn is_partitioned(&self, exchange: &str) -> bool {
-        // Check if partition has expired
-        if let (Some(start), Some(duration)) = (
-            *self.partition_start.read(),
-            *self.partition_duration.read(),
-        ) {
-            if start.elapsed() > duration {
-                self.heal();
-                return false;
+        // Check if partition has expired - read values first to avoid holding locks during heal()
+        let should_heal = {
+            let start = *self.partition_start.read();
+            let duration = *self.partition_duration.read();
+            if let (Some(start), Some(duration)) = (start, duration) {
+                start.elapsed() > duration
+            } else {
+                false
             }
+        };
+        
+        if should_heal {
+            self.heal();
+            return false;
         }
         
         self.partitioned.read().contains(exchange)
