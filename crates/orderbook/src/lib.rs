@@ -1617,11 +1617,11 @@ mod tests {
         // Spawn multiple threads to add orders
         let mut handles = vec![];
         
-        // Add bids from multiple threads
+        // Add bids from multiple threads (order_id must be > 0)
         for i in 0..5 {
             let ob = Arc::clone(&orderbook);
             let handle = thread::spawn(move || {
-                for j in 0..100 {
+                for j in 1..=100 {
                     let order_id = i * 1000 + j;
                     let price = 100.0 - (j as f64 / 100.0);
                     ob.lock().unwrap().add_limit_bid(price, order_id, 1.0, order_id).unwrap();
@@ -1630,11 +1630,11 @@ mod tests {
             handles.push(handle);
         }
         
-        // Add asks from multiple threads
+        // Add asks from multiple threads (order_id must be > 0)
         for i in 5..10 {
             let ob = Arc::clone(&orderbook);
             let handle = thread::spawn(move || {
-                for j in 0..100 {
+                for j in 1..=100 {
                     let order_id = i * 1000 + j;
                     let price = 101.0 + (j as f64 / 100.0);
                     ob.lock().unwrap().add_limit_ask(price, order_id, 1.0, order_id).unwrap();
@@ -1661,8 +1661,8 @@ mod tests {
     fn test_performance_benchmarks() {
         let mut orderbook = Orderbook::new("BTC/USD".to_string(), "Kraken".to_string(), 100000);
         
-        // Add a significant number of orders
-        for i in 0..1000 {
+        // Add a significant number of orders (order_id must be > 0)
+        for i in 1..=1000 {
             let price = 100.0 - (i as f64 / 100.0);
             orderbook.add_limit_bid(price, i, 1.0, i).unwrap();
             
@@ -1694,22 +1694,22 @@ mod tests {
         // Create a small orderbook to test capacity limits
         let mut orderbook = Orderbook::new("BTC/USD".to_string(), "Kraken".to_string(), 5);
         
-        // Should be able to add up to capacity
-        for i in 0..5 {
+        // Should be able to add up to capacity (order_id must be > 0)
+        for i in 1..=5 {
             let result = orderbook.add_limit_bid(100.0, i, 1.0, i);
             assert!(result.is_ok());
         }
         
         // Adding one more should fail with capacity error
-        let result = orderbook.add_limit_bid(100.0, 5, 1.0, 5);
+        let result = orderbook.add_limit_bid(100.0, 6, 1.0, 6);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Order pool capacity exceeded");
         
         // Free up some space
-        orderbook.remove_limit_bid(100.0, 0).unwrap();
+        orderbook.remove_limit_bid(100.0, 1).unwrap();
         
         // Now should be able to add again
-        let result = orderbook.add_limit_bid(100.0, 5, 1.0, 5);
+        let result = orderbook.add_limit_bid(100.0, 7, 1.0, 7);
         assert!(result.is_ok());
     }
     
@@ -1720,22 +1720,22 @@ mod tests {
         // Test negative quantity
         let result = orderbook.add_limit_bid(100.0, 1, -1.0, 1000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Quantity must be positive");
+        assert_eq!(result.unwrap_err(), "Quantity must be finite and positive");
         
         // Test zero quantity
         let result = orderbook.add_limit_bid(100.0, 1, 0.0, 1000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Quantity must be positive");
+        assert_eq!(result.unwrap_err(), "Quantity must be finite and positive");
         
         // Test negative price
         let result = orderbook.add_limit_bid(-100.0, 1, 1.0, 1000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Price must be positive");
+        assert_eq!(result.unwrap_err(), "Price must be finite and positive");
         
-        // Test nan price
+        // Test nan price (caught by is_finite check)
         let result = orderbook.add_limit_bid(f64::NAN, 1, 1.0, 1000);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid price (NaN)");
+        assert_eq!(result.unwrap_err(), "Price must be finite and positive");
     }
     
     #[test]
@@ -1919,14 +1919,14 @@ mod tests {
     fn test_memory_cleanup() {
         let mut orderbook = Orderbook::new("BTC/USD".to_string(), "Kraken".to_string(), 10000);
         
-        // Add and then remove orders
-        for i in 0..100 {
+        // Add and then remove orders (order_id must be > 0)
+        for i in 1..=100 {
             orderbook.add_limit_bid(100.0, i, 1.0, i).unwrap();
             orderbook.add_limit_ask(101.0, i + 100, 1.0, i).unwrap();
         }
         
         // Remove all orders
-        for i in 0..100 {
+        for i in 1..=100 {
             orderbook.remove_limit_bid(100.0, i).unwrap();
             orderbook.remove_limit_ask(101.0, i + 100).unwrap();
         }
@@ -1948,8 +1948,8 @@ mod tests {
     fn test_stress_orderbook_state() {
         let mut orderbook = Orderbook::new("BTC/USD".to_string(), "Kraken".to_string(), 100000);
         
-        // Add a large number of orders at many price levels
-        for i in 0..1000 {
+        // Add a large number of orders at many price levels (order_id must be > 0)
+        for i in 1..=1000 {
             // Add bids at 100 different price levels
             let bid_price = 90.0 + (i % 100) as f64 * 0.1;
             orderbook.add_limit_bid(bid_price, i, 1.0, i).unwrap();
@@ -2044,8 +2044,8 @@ mod tests {
     fn test_large_number_of_price_levels() {
         let mut orderbook = Orderbook::new("BTC/USD".to_string(), "Kraken".to_string(), 100000);
         
-        // Add a large number of unique price levels
-        for i in 0..1000 {
+        // Add a large number of unique price levels (order_id must be > 0)
+        for i in 1..=1000 {
             let bid_price = 100.0 - (i as f64 * 0.01);
             let ask_price = 100.0 + (i as f64 * 0.01);
             
@@ -2059,9 +2059,11 @@ mod tests {
         let update_time = start.elapsed();
         
         // Verify metrics
+        // Best bid: 100.0 - (1 * 0.01) = 99.99
+        // Best ask: 100.0 + (1 * 0.01) = 100.01
         let metrics = orderbook.metrics().unwrap();
-        assert_eq!(metrics.best_bid, 100.0); 
-        assert_eq!(metrics.best_ask, 100.0);
+        assert_eq!(metrics.best_bid, 99.99); 
+        assert_eq!(metrics.best_ask, 100.01);
         assert_eq!(metrics.total_bid_depth, 1000.0);
         assert_eq!(metrics.total_ask_depth, 1000.0);
         
