@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use log::{info, warn, error};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
@@ -336,8 +337,11 @@ impl ShutdownManager {
     pub fn request_shutdown(&self, reason: ShutdownReason) {
         if self.shutdown_requested.swap(true, Ordering::AcqRel) {
             // Already requested
+            warn!("[SHUTDOWN] Shutdown already requested, ignoring duplicate request");
             return;
         }
+        
+        info!("[SHUTDOWN] Shutdown requested: reason={}", reason);
         
         *self.started_at.lock() = Some(Instant::now());
         *self.reason.write() = Some(reason.clone());
@@ -364,8 +368,14 @@ impl ShutdownManager {
     
     /// Set shutdown phase
     fn set_phase(&self, phase: ShutdownPhase) {
+        let old_phase = ShutdownPhase::from(self.phase.load(Ordering::Acquire));
         self.phase.store(phase as u8, Ordering::Release);
         let _ = self.phase_tx.send(phase);
+        
+        let elapsed = self.started_at.lock()
+            .map(|s| s.elapsed().as_millis())
+            .unwrap_or(0);
+        info!("[SHUTDOWN] Phase transition: {} -> {} (elapsed={}ms)", old_phase, phase, elapsed);
     }
     
     /// Execute graceful shutdown
@@ -373,6 +383,11 @@ impl ShutdownManager {
         let config = self.config.read().clone();
         let started = Instant::now();
         let grace_deadline = started + Duration::from_secs(config.grace_period_secs);
+        
+        info!(
+            "[SHUTDOWN] Beginning graceful shutdown: grace_period={}s, cancel_orders={}, close_positions={}",
+            config.grace_period_secs, config.cancel_open_orders, config.close_positions
+        );
         
         let mut result = ShutdownResult {
             success: true,
@@ -389,8 +404,10 @@ impl ShutdownManager {
         // Phase 1: Cancel open orders
         if config.cancel_open_orders {
             self.set_phase(ShutdownPhase::CancellingOrders);
+            let phase_start = Instant::now();
             
             if Instant::now() > grace_deadline {
+                error!("[SHUTDOWN] Grace period expired during order cancellation");
                 result.errors.push("Grace period expired during order cancellation".to_string());
                 result.success = false;
                 result.phase_reached = ShutdownPhase::CancellingOrders;
@@ -400,15 +417,22 @@ impl ShutdownManager {
                     Instant::now() + Duration::from_secs(config.cancel_timeout_secs)
                 );
                 
+                info!("[SHUTDOWN] Cancelling open orders (timeout={}s)", config.cancel_timeout_secs);
                 match self.cancel_all_orders(cancel_deadline, config.max_parallel_cancels).await {
                     Ok((cancelled, failed)) => {
                         result.orders_cancelled = cancelled;
                         result.orders_failed = failed;
+                        info!(
+                            "[SHUTDOWN] Order cancellation complete: cancelled={}, failed={}, duration_ms={}",
+                            cancelled, failed, phase_start.elapsed().as_millis()
+                        );
                         if failed > 0 {
+                            warn!("[SHUTDOWN] {} orders failed to cancel", failed);
                             result.errors.push(format!("Failed to cancel {} orders", failed));
                         }
                     }
                     Err(e) => {
+                        error!("[SHUTDOWN] Order cancellation error: {}", e);
                         result.errors.push(format!("Order cancellation error: {}", e));
                     }
                 }
@@ -418,8 +442,10 @@ impl ShutdownManager {
         // Phase 2: Close positions
         if config.close_positions {
             self.set_phase(ShutdownPhase::ClosingPositions);
+            let phase_start = Instant::now();
             
             if Instant::now() > grace_deadline {
+                error!("[SHUTDOWN] Grace period expired during position closing");
                 result.errors.push("Grace period expired during position closing".to_string());
                 result.success = false;
                 result.phase_reached = ShutdownPhase::ClosingPositions;
@@ -429,16 +455,23 @@ impl ShutdownManager {
                     Instant::now() + Duration::from_secs(config.close_timeout_secs)
                 );
                 
+                info!("[SHUTDOWN] Closing open positions (timeout={}s)", config.close_timeout_secs);
                 match self.close_all_positions(close_deadline).await {
                     Ok((closed, failed)) => {
                         result.positions_closed = closed;
                         result.positions_failed = failed;
+                        info!(
+                            "[SHUTDOWN] Position closing complete: closed={}, failed={}, duration_ms={}",
+                            closed, failed, phase_start.elapsed().as_millis()
+                        );
                         if failed > 0 {
+                            error!("[SHUTDOWN] {} positions failed to close", failed);
                             result.errors.push(format!("Failed to close {} positions", failed));
                             result.success = false;
                         }
                     }
                     Err(e) => {
+                        error!("[SHUTDOWN] Position closing error: {}", e);
                         result.errors.push(format!("Position closing error: {}", e));
                     }
                 }
@@ -448,13 +481,17 @@ impl ShutdownManager {
         // Phase 3: Save checkpoint
         if config.save_checkpoint {
             self.set_phase(ShutdownPhase::SavingState);
+            let phase_start = Instant::now();
             
             if let Some(path) = &config.checkpoint_path {
+                info!("[SHUTDOWN] Saving shutdown checkpoint to {}", path);
                 match self.save_checkpoint(path, &result).await {
                     Ok(_) => {
                         result.checkpoint_saved = true;
+                        info!("[SHUTDOWN] Checkpoint saved in {}ms", phase_start.elapsed().as_millis());
                     }
                     Err(e) => {
+                        error!("[SHUTDOWN] Checkpoint save error: {}", e);
                         result.errors.push(format!("Checkpoint save error: {}", e));
                     }
                 }
@@ -463,21 +500,22 @@ impl ShutdownManager {
         
         // Phase 4: Finalize (includes WAL flush and shutdown)
         self.set_phase(ShutdownPhase::Finalizing);
+        let phase_start = Instant::now();
         
         // Flush and shutdown Order WAL before exit
         if let Some(wal) = self.order_wal.read().clone() {
-            log::info!("Graceful shutdown: Flushing Order WAL...");
+            info!("[SHUTDOWN] Flushing Order WAL...");
             
             // Get incomplete orders for logging
             let incomplete = wal.get_incomplete_orders();
             if !incomplete.is_empty() {
-                log::warn!(
-                    "Graceful shutdown: {} incomplete orders in WAL will be recovered on restart",
+                warn!(
+                    "[SHUTDOWN] {} incomplete orders in WAL will be recovered on restart",
                     incomplete.len()
                 );
                 for order in &incomplete {
-                    log::info!(
-                        "  - Order {} ({}): state={:?}", 
+                    info!(
+                        "[SHUTDOWN]   - Order {} ({}): state={:?}", 
                         order.order_id, order.symbol, order.state
                     );
                 }
@@ -486,25 +524,44 @@ impl ShutdownManager {
             // Flush WAL to ensure all pending writes are persisted
             if let Err(e) = wal.flush().await {
                 result.errors.push(format!("WAL flush error: {}", e));
-                log::error!("Graceful shutdown: Failed to flush WAL: {}", e);
+                error!("[SHUTDOWN] Failed to flush WAL: {}", e);
             } else {
-                log::info!("Graceful shutdown: WAL flushed successfully");
+                info!("[SHUTDOWN] WAL flushed successfully");
             }
             
             // Shutdown WAL writer task
             if let Err(e) = wal.shutdown().await {
                 result.errors.push(format!("WAL shutdown error: {}", e));
-                log::error!("Graceful shutdown: Failed to shutdown WAL: {}", e);
+                error!("[SHUTDOWN] Failed to shutdown WAL: {}", e);
             } else {
-                log::info!("Graceful shutdown: WAL shutdown complete");
+                info!("[SHUTDOWN] WAL shutdown complete");
             }
         }
+        
+        info!(
+            "[SHUTDOWN] Finalization complete in {}ms", 
+            phase_start.elapsed().as_millis()
+        );
         
         // Complete
         self.set_phase(ShutdownPhase::Complete);
         self.shutdown_complete.store(true, Ordering::Release);
         
         result.duration_ms = started.elapsed().as_millis() as u64;
+        
+        // Log final summary
+        if result.success {
+            info!(
+                "[SHUTDOWN] Graceful shutdown SUCCESSFUL: duration={}ms, orders_cancelled={}, positions_closed={}",
+                result.duration_ms, result.orders_cancelled, result.positions_closed
+            );
+        } else {
+            error!(
+                "[SHUTDOWN] Graceful shutdown FAILED: duration={}ms, phase_reached={}, errors={:?}",
+                result.duration_ms, result.phase_reached, result.errors
+            );
+        }
+        
         result
     }
     

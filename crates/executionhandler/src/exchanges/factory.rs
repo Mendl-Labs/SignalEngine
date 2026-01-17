@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use log::{info, warn, error, debug};
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
 use crate::exchanges::{kraken::KrakenConnector};
 
@@ -8,13 +9,30 @@ pub struct ExchangeFactory;
 impl ExchangeFactory {
     /// Create a connector for the specified exchange
     pub async fn create_connector(exchange_name: &str, config: ExchangeConfig) -> Result<Box<dyn ExchangeConnector>, ExecutionError> {
+        info!(
+            "[FACTORY] Creating connector: exchange={}, sandbox={}, pool_size={}, timeout_ms={}",
+            exchange_name, config.sandbox, config.connection_pool_size, config.timeout_ms
+        );
+        
         match exchange_name.to_lowercase().as_str() {
             "kraken" => {
+                debug!("[FACTORY] Initializing Kraken connector");
                 let mut connector = KrakenConnector::new();
-                connector.initialize(config).await?;
-                Ok(Box::new(connector))
+                match connector.initialize(config).await {
+                    Ok(_) => {
+                        info!("[FACTORY] Kraken connector created successfully");
+                        Ok(Box::new(connector))
+                    }
+                    Err(e) => {
+                        error!("[FACTORY] Failed to initialize Kraken connector: {}", e);
+                        Err(e)
+                    }
+                }
             }
-            _ => Err(ExecutionError::Unknown(format!("Unsupported exchange: {}. Only Kraken is currently supported.", exchange_name)))
+            _ => {
+                warn!("[FACTORY] Unsupported exchange requested: {}", exchange_name);
+                Err(ExecutionError::Unknown(format!("Unsupported exchange: {}. Only Kraken is currently supported.", exchange_name)))
+            }
         }
     }
 

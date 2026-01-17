@@ -9,6 +9,7 @@
 //! - Native integration with SUI's object model
 
 use async_trait::async_trait;
+use log::{info, warn, debug, trace};
 use crate::signal::Signal;
 use crate::core::types::*;
 use crate::risk_controls::{KILL_SWITCH, KillReason};
@@ -82,11 +83,11 @@ impl DexConnector for CetusConnector {
         self.wallet = Some(Arc::new(wallet));
         self.config = Some(config);
         
-        println!("✅ Cetus Protocol connector initialized");
-        println!("   Network: {:?}", network_config.rpc_url);
-        println!("   Wallet: {}", self.get_wallet()?.address());
-        println!("   Finality: ~400ms (sub-second)");
-        println!("   Gas: ~$0.0001/tx");
+        info!(
+            "Cetus Protocol connector initialized: network={:?}, wallet={}, finality=~400ms, gas=~$0.0001/tx",
+            network_config.rpc_url,
+            self.get_wallet()?.address()
+        );
         Ok(())
     }
     
@@ -110,18 +111,18 @@ impl DexConnector for CetusConnector {
         }
         let (token_in, token_out) = (parts[0], parts[1]);
         
-        println!("🔄 Executing Cetus swap:");
-        println!("  Signal ID: {}", signal.id);
-        println!("  Pair: {} -> {}", token_in, token_out);
-        println!("  Quantity: {}", signal.quantity);
+        debug!(
+            "Executing Cetus swap: signal_id={}, pair={}->{}, quantity={}",
+            signal.id, token_in, token_out, signal.quantity
+        );
         
         // Query pool information
         let pool = self.query_pool(token_in, token_out).await?;
-        println!("  Pool ID: {}", pool.pool_id);
+        trace!("Cetus pool_id={} for {}/{}", pool.pool_id, token_in, token_out);
         
         // Query gas price
         let gas_price = self.query_gas_price(wallet).await.unwrap_or(1000);
-        println!("  Gas price: {} MIST", gas_price);
+        trace!("Cetus gas_price={} MIST", gas_price);
         
         // Build and execute PTB
         let start = SystemTime::now();
@@ -133,8 +134,10 @@ impl DexConnector for CetusConnector {
         ).await?;
         
         let elapsed = start.duration_since(UNIX_EPOCH).unwrap().as_millis();
-        println!("  ✓ Transaction: {}", tx_digest);
-        println!("  ✓ Execution time: {}ms", elapsed);
+        info!(
+            "Cetus swap completed: tx={}, signal_id={}, execution_time_ms={}",
+            tx_digest, signal.id, elapsed
+        );
         
         // Query transaction effects to get actual gas used
         let tx_result = wallet.get_transaction(&tx_digest).await?;
@@ -209,7 +212,7 @@ impl DexConnector for CetusConnector {
     
     async fn check_transaction(&self, tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
         // TODO: Query SUI for transaction status
-        println!("Checking SUI transaction: {}", tx_hash);
+        trace!("Checking SUI transaction: {}", tx_hash);
         
         // SUI has fast finality - usually confirmed in ~400ms
         Ok(TransactionStatus::Confirmed(1))
@@ -224,7 +227,7 @@ impl DexConnector for CetusConnector {
     
     async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError> {
         // TODO: Query SUI coin balance
-        println!("Getting SUI coin balance: {}", token_address);
+        trace!("Getting SUI coin balance: {}", token_address);
         Ok(1000.0)
     }
     
@@ -289,8 +292,9 @@ impl CetusConnector {
         let slippage_multiplier = 1.0 - (slippage_bps as f64 / 10_000.0);
         let min_amount_out = (expected_out * slippage_multiplier * 1_000_000_000.0) as u64;
         
-        println!("   Expected output: {} (min: {})", expected_out, min_amount_out as f64 / 1_000_000_000.0);
-        println!("   Slippage tolerance: {} bps ({}%)", slippage_bps, slippage_bps as f64 / 100.0);
+        trace!("Cetus swap calculation: expected_out={}, min_out={}, slippage_bps={}",
+            expected_out, min_amount_out as f64 / 1_000_000_000.0, slippage_bps
+        );
         
         // Get gas coins for payment
         let gas_coins = self.get_gas_coins(wallet).await?;
@@ -422,7 +426,7 @@ impl CetusConnector {
         // Get pool address
         let pool_id = self.get_pool_address(token_a, token_b)?;
         
-        println!("   Querying Cetus pool: {}", pool_id);
+        trace!("Querying Cetus pool: {}", pool_id);
         
         // Query pool object from SUI (optional - can fail gracefully)
         let (reserve_a, reserve_b) = match wallet.rpc_call(
@@ -453,7 +457,7 @@ impl CetusConnector {
                 (reserve_a, reserve_b)
             }
             Err(_) => {
-                println!("   ⚠️  Could not query pool reserves, using defaults");
+                warn!("Could not query Cetus pool reserves for {}, using defaults", pool_id);
                 (1_000_000.0, 2_000_000.0)
             }
         };

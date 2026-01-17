@@ -15,6 +15,7 @@
 //! full Sui blockchain integration.
 
 use async_trait::async_trait;
+use log::{warn, debug, trace};
 use crate::signal::Signal;
 use crate::core::types::*;
 use crate::risk_controls::{KILL_SWITCH, KillReason};
@@ -47,9 +48,8 @@ impl JupiterConnector {
 impl DexConnector for JupiterConnector {
     async fn initialize(&mut self, config: DexConfig) -> Result<(), ExecutionError> {
         // ⚠️ STUB WARNING - Log at runtime
-        eprintln!("⚠️  WARNING: JupiterConnector is a STUB implementation!");
-        eprintln!("⚠️  This connector does NOT execute real Solana transactions.");
-        eprintln!("⚠️  For production DEX trading, use CetusConnector or DeepBookConnector.");
+        warn!("JupiterConnector is a STUB implementation - does NOT execute real Solana transactions");
+        warn!("For production DEX trading, use CetusConnector or DeepBookConnector");
         
         if !matches!(config.network, BlockchainNetwork::Solana | BlockchainNetwork::SolanaDevnet) {
             return Err(ExecutionError::Validation(
@@ -60,7 +60,7 @@ impl DexConnector for JupiterConnector {
         // TODO: Initialize Solana RPC client
         self.config = Some(config);
         
-        println!("✅ Jupiter connector initialized (STUB MODE)");
+        debug!("Jupiter connector initialized (STUB MODE)");
         Ok(())
     }
     
@@ -138,7 +138,7 @@ impl DexConnector for JupiterConnector {
     }
     
     async fn check_transaction(&self, tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
-        println!("Checking Solana transaction: {}", tx_hash);
+        trace!("Checking Solana transaction: {}", tx_hash);
         Ok(TransactionStatus::Pending)
     }
     
@@ -147,7 +147,7 @@ impl DexConnector for JupiterConnector {
     }
     
     async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError> {
-        println!("Getting SPL token balance: {}", token_address);
+        trace!("Getting SPL token balance: {}", token_address);
         Ok(1000.0)
     }
     

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use log::{info, warn, error, debug};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -105,12 +106,21 @@ impl ExchangeConnector for KrakenConnector {
         // P0 Safety: Check kill switch before order execution
         if KILL_SWITCH.is_triggered() {
             let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            warn!(
+                "[KRAKEN] Order rejected - kill switch active: signal_id={}, reason={:?}",
+                signal.id, reason
+            );
             return Err(ExecutionError::Rejected(format!(
                 "Kill switch triggered: {:?}. Kraken order halted.", reason
             )));
         }
         
         let timer = NanoTimer::start();
+        
+        debug!(
+            "[KRAKEN] Executing order: id={}, symbol={}, action={:?}, qty={}, price={:?}",
+            signal.id, signal.symbol, signal.action, signal.quantity, signal.price
+        );
         
         // Get pooled order object for zero allocation
         let pooled_order = get_thread_local_order();
@@ -141,10 +151,29 @@ impl ExchangeConnector for KrakenConnector {
                     exec_result.filled_quantity * exec_result.avg_fill_price,
                     exec_result.total_fees,
                 );
+                
+                // Audit log for successful execution
+                info!(
+                    "[KRAKEN] Order executed: id={}, exchange_id={:?}, status={:?}, filled={}/{}, price={}, fees={}, latency_ns={}",
+                    signal.id,
+                    exec_result.exchange_order_id,
+                    exec_result.status,
+                    exec_result.filled_quantity,
+                    signal.quantity,
+                    exec_result.avg_fill_price,
+                    exec_result.total_fees,
+                    latency_ns
+                );
             }
-            Err(_) => {
+            Err(e) => {
                 self.metrics.record_order_failure();
                 self.metrics_collector.record_failure();
+                
+                // Audit log for failed execution
+                error!(
+                    "[KRAKEN] Order failed: id={}, symbol={}, qty={}, error={}, latency_ns={}",
+                    signal.id, signal.symbol, signal.quantity, e, latency_ns
+                );
             }
         }
         
@@ -171,20 +200,50 @@ impl ExchangeConnector for KrakenConnector {
     }
 
     async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
-        let batch_timer = NanoTimer::start();
-        let mut results = Vec::with_capacity(signals.len());
+        use futures::stream::{self, StreamExt};
         
-        // For now, execute sequentially to avoid Send issues
-        // In production, consider using channels or other async-safe patterns
-        for signal in signals {
-            let result = self.execute_order(signal).await?;
-            results.push(result);
+        let batch_timer = NanoTimer::start();
+        
+        // Kraken rate limit: ~15 requests/second for private endpoints
+        // Use buffer_unordered for parallel execution with concurrency limit
+        const MAX_CONCURRENT_ORDERS: usize = 10;
+        
+        // Clone signals to owned values to avoid lifetime issues with async closures
+        let owned_signals: Vec<Signal> = signals.to_vec();
+        
+        let results: Vec<Result<ExecutionResult, ExecutionError>> = stream::iter(owned_signals)
+            .map(|signal| async move {
+                self.execute_order(&signal).await
+            })
+            .buffer_unordered(MAX_CONCURRENT_ORDERS)
+            .collect()
+            .await;
+        
+        // Separate successes and failures
+        let mut successes = Vec::with_capacity(results.len());
+        let mut failure_count = 0;
+        
+        for result in results {
+            match result {
+                Ok(r) => successes.push(r),
+                Err(e) => {
+                    failure_count += 1;
+                    warn!("Batch order failed: {:?}", e);
+                }
+            }
         }
 
         let batch_latency_ns = batch_timer.elapsed_ns();
-        log::debug!("Batch of {} orders completed in {}ns", signals.len(), batch_latency_ns);
+        info!(
+            "Batch of {} orders completed: {} succeeded, {} failed, latency={}ns ({:.2}ms avg/order)",
+            signals.len(),
+            successes.len(),
+            failure_count,
+            batch_latency_ns,
+            (batch_latency_ns as f64 / signals.len() as f64) / 1_000_000.0
+        );
         
-        Ok(results)
+        Ok(successes)
     }
 
     async fn cancel_order(&self, order_id: &str) -> Result<CancelResult, ExecutionError> {
@@ -244,17 +303,29 @@ impl ExchangeConnector for KrakenConnector {
     }
 
     async fn cancel_all_orders(&self) -> Result<Vec<CancelResult>, ExecutionError> {
+        use futures::stream::{self, StreamExt};
+        
         let active_orders = self.active_orders.read().await;
         let order_ids: Vec<String> = active_orders.keys().cloned().collect();
         drop(active_orders);
         
-        let mut results = Vec::new();
-        for order_id in order_ids {
-            match self.cancel_order(&order_id).await {
-                Ok(result) => results.push(result),
-                Err(_) => continue, // Skip failed cancellations
-            }
+        if order_ids.is_empty() {
+            return Ok(Vec::new());
         }
+        
+        // Cancel orders in parallel with concurrency limit
+        const MAX_CONCURRENT_CANCELS: usize = 10;
+        
+        let results: Vec<CancelResult> = stream::iter(order_ids)
+            .map(|order_id| async move {
+                self.cancel_order(&order_id).await
+            })
+            .buffer_unordered(MAX_CONCURRENT_CANCELS)
+            .filter_map(|result| async move { result.ok() })
+            .collect()
+            .await;
+        
+        info!("Cancelled {} orders in parallel", results.len());
         
         Ok(results)
     }

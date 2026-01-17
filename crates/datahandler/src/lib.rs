@@ -24,7 +24,7 @@ use std::{
     thread,
     sync::atomic::{AtomicU64, AtomicBool, Ordering},
 };
-use crossbeam::channel::{Sender, Receiver, unbounded};
+use crossbeam::channel::{Sender, Receiver, bounded};
 use serde::{Serialize, Deserialize};
 
 // Ultra-logger integration
@@ -232,8 +232,12 @@ impl DataHandler {
         
         ultra_info!(format!("Initializing with broker {}:{}", config.address, config.port));
         
-        // Create unbounded channel for market data (ultra-fast, no blocking)
-        let (market_data_sender, market_data_receiver) = unbounded();
+        // Create bounded channel for market data with backpressure
+        // 10,000 capacity provides buffer while preventing unbounded memory growth
+        const MARKET_DATA_CHANNEL_CAPACITY: usize = 10_000;
+        let (market_data_sender, market_data_receiver) = bounded(MARKET_DATA_CHANNEL_CAPACITY);
+        
+        ultra_info!(format!("Created bounded market data channel with capacity={}", MARKET_DATA_CHANNEL_CAPACITY));
         
         // Create subscriber with unique ID
         let subscriber_id = SystemTime::now()

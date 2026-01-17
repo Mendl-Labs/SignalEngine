@@ -1,6 +1,6 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::collections::VecDeque;
 
 use crate::core::types::{ExchangeOrder, PooledOrder};
@@ -83,6 +83,13 @@ impl<T> Drop for MemoryPool<T> {
     }
 }
 
+// SAFETY: MemoryPool is thread-safe because:
+// 1. All access to the internal pool is protected by a Mutex
+// 2. The raw pointers are only accessed while holding the lock
+// 3. Each pointer is either in the pool (available) or loaned out (tracked by pool_id)
+unsafe impl<T: Send> Send for MemoryPool<T> {}
+unsafe impl<T: Send> Sync for MemoryPool<T> {}
+
 /// Memory pool statistics
 #[derive(Debug, Clone)]
 pub struct MemoryPoolStats {
@@ -92,32 +99,29 @@ pub struct MemoryPoolStats {
     pub utilization: f64,
 }
 
-/// Global memory pool instance for order objects
-static mut ORDER_POOL: Option<MemoryPool<ExchangeOrder>> = None;
-static POOL_INIT: std::sync::Once = std::sync::Once::new();
+/// Thread-safe global memory pool using OnceLock (safe alternative to static mut)
+static ORDER_POOL: OnceLock<Mutex<MemoryPool<ExchangeOrder>>> = OnceLock::new();
 
-/// Initialize the global order pool
+/// Initialize the global order pool (thread-safe via OnceLock)
 pub fn initialize_order_pool(capacity: usize) {
-    POOL_INIT.call_once(|| {
-        unsafe {
-            ORDER_POOL = Some(MemoryPool::new(capacity));
-        }
-    });
+    let _ = ORDER_POOL.get_or_init(|| Mutex::new(MemoryPool::new(capacity)));
 }
 
 /// Get an order from the global pool
 pub fn get_pooled_order() -> PooledOrder {
-    unsafe {
-        if let Some(ref pool) = ORDER_POOL {
+    if let Some(pool_mutex) = ORDER_POOL.get() {
+        if let Ok(pool) = pool_mutex.lock() {
             if let Some(mut ptr) = pool.get() {
-                // Reset the order to default state
-                let order_ref = ptr.as_mut();
-                std::ptr::write(order_ref, ExchangeOrder::default());
-                
-                return PooledOrder {
-                    inner: std::ptr::read(order_ref),
-                    pool_id: ptr.as_ptr() as usize,
-                };
+                unsafe {
+                    // Reset the order to default state
+                    let order_ref = ptr.as_mut();
+                    std::ptr::write(order_ref, ExchangeOrder::default());
+                    
+                    return PooledOrder {
+                        inner: std::ptr::read(order_ref),
+                        pool_id: ptr.as_ptr() as usize,
+                    };
+                }
             }
         }
     }
@@ -132,11 +136,13 @@ pub fn get_pooled_order() -> PooledOrder {
 /// Return order to the global pool
 pub fn return_pooled_order(order: PooledOrder) {
     if order.pool_id != 0 {
-        unsafe {
-            if let Some(ref pool) = ORDER_POOL {
-                let mut ptr = NonNull::new_unchecked(order.pool_id as *mut ExchangeOrder);
-                std::ptr::write(ptr.as_mut(), order.inner);
-                pool.return_object(ptr);
+        if let Some(pool_mutex) = ORDER_POOL.get() {
+            if let Ok(pool) = pool_mutex.lock() {
+                unsafe {
+                    let mut ptr = NonNull::new_unchecked(order.pool_id as *mut ExchangeOrder);
+                    std::ptr::write(ptr.as_mut(), order.inner);
+                    pool.return_object(ptr);
+                }
             }
         }
     }

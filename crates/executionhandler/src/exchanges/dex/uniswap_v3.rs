@@ -15,6 +15,7 @@
 //! full Sui blockchain integration.
 
 use async_trait::async_trait;
+use log::{warn, debug, trace};
 use crate::signal::Signal;
 use crate::core::types::*;
 use crate::risk_controls::{KILL_SWITCH, KillReason};
@@ -85,9 +86,8 @@ impl UniswapV3Connector {
 impl DexConnector for UniswapV3Connector {
     async fn initialize(&mut self, config: DexConfig) -> Result<(), ExecutionError> {
         // ⚠️ STUB WARNING - Log at runtime
-        eprintln!("⚠️  WARNING: UniswapV3Connector is a STUB implementation!");
-        eprintln!("⚠️  This connector does NOT execute real blockchain transactions.");
-        eprintln!("⚠️  For production DEX trading, use CetusConnector or DeepBookConnector.");
+        warn!("UniswapV3Connector is a STUB implementation - does NOT execute real blockchain transactions");
+        warn!("For production DEX trading, use CetusConnector or DeepBookConnector");
         
         // Validate network supports Uniswap V3
         if !matches!(
@@ -110,7 +110,7 @@ impl DexConnector for UniswapV3Connector {
         
         self.config = Some(config);
         
-        println!("✅ Uniswap V3 connector initialized (STUB MODE)");
+        debug!("Uniswap V3 connector initialized (STUB MODE)");
         Ok(())
     }
     
@@ -206,7 +206,7 @@ impl DexConnector for UniswapV3Connector {
     
     async fn check_transaction(&self, tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
         // TODO: Query blockchain for transaction status
-        println!("Checking transaction: {}", tx_hash);
+        trace!("Checking transaction: {}", tx_hash);
         Ok(TransactionStatus::Pending)
     }
     
@@ -217,14 +217,13 @@ impl DexConnector for UniswapV3Connector {
     
     async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError> {
         // TODO: Query ERC20 balance
-        println!("Getting balance for token: {}", token_address);
+        trace!("Getting balance for token: {}", token_address);
         Ok(1000.0) // Placeholder
     }
     
     async fn approve_token(&self, token_address: &str, spender: &str, amount: f64) -> Result<String, ExecutionError> {
         // TODO: Send ERC20 approve transaction
-        println!("Approving {} tokens for spender: {}", amount, spender);
-        println!("Token: {}", token_address);
+        trace!("Approving {} tokens for spender: {}, token: {}", amount, spender, token_address);
         Ok("0x0000000000000000000000000000000000000000000000000000000000000000".to_string())
     }
 }

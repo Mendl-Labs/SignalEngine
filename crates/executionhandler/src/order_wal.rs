@@ -51,14 +51,13 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use log::{info, warn, error, debug, trace};
 use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -335,8 +334,14 @@ pub struct WalStats {
 impl OrderWal {
     /// Create a new WAL instance
     pub async fn new(config: WalConfig) -> Result<Arc<Self>, WalError> {
+        info!(
+            "[WAL] Initializing Order WAL: dir={:?}, max_file_size={}, buffer_size={}, sync_mode={:?}",
+            config.wal_dir, config.max_file_size, config.buffer_size, config.sync_mode
+        );
+        
         // Create WAL directory
         tokio::fs::create_dir_all(&config.wal_dir).await?;
+        info!("[WAL] WAL directory created/verified: {:?}", config.wal_dir);
 
         let (write_tx, write_rx) = mpsc::channel(config.buffer_size * 2);
 
@@ -351,12 +356,26 @@ impl OrderWal {
 
         // Start background writer
         let wal_clone = wal.clone();
+        info!("[WAL] Starting background writer task");
         tokio::spawn(async move {
+            info!("[WAL] Writer task started - flush_interval={}ms, buffer_size={}", 
+                wal_clone.config.flush_interval_ms, wal_clone.config.buffer_size);
             wal_clone.run_writer(write_rx).await;
+            info!("[WAL] Writer task exited");
         });
 
         // Recover existing WAL
+        info!("[WAL] Starting WAL recovery");
         wal.recover().await?;
+        
+        let stats = &wal.stats;
+        info!(
+            "[WAL] Initialization complete: sequence={}, active_orders={}, recovered={}, corrupted={}",
+            wal.sequence.load(Ordering::Acquire),
+            wal.orders.len(),
+            stats.entries_recovered.load(Ordering::Relaxed),
+            stats.corrupted_entries.load(Ordering::Relaxed)
+        );
 
         Ok(wal)
     }
@@ -374,6 +393,7 @@ impl OrderWal {
     /// Background writer task
     async fn run_writer(self: Arc<Self>, mut rx: mpsc::Receiver<WriteCommand>) {
         let wal_path = self.current_wal_path();
+        debug!("[WAL] Writer opening file: {:?}", wal_path);
 
         let mut file = match OpenOptions::new()
             .create(true)
@@ -381,9 +401,12 @@ impl OrderWal {
             .open(&wal_path)
             .await
         {
-            Ok(f) => f,
+            Ok(f) => {
+                info!("[WAL] Writer opened file successfully: {:?}", wal_path);
+                f
+            }
             Err(e) => {
-                eprintln!("Failed to open WAL file: {}", e);
+                error!("[WAL] CRITICAL: Failed to open WAL file {:?}: {}", wal_path, e);
                 return;
             }
         };
@@ -397,6 +420,8 @@ impl OrderWal {
                 cmd = rx.recv() => {
                     match cmd {
                         Some(WriteCommand::Append(entry)) => {
+                            trace!("[WAL] Append: order_id={}, state={:?}, seq={}", 
+                                entry.order_id, entry.state, entry.sequence);
                             buffer.push(entry);
                             
                             // Flush if buffer full or sync mode requires it
@@ -404,30 +429,43 @@ impl OrderWal {
                                 || self.config.sync_mode == WalSyncMode::EveryWrite 
                             {
                                 if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
-                                    eprintln!("WAL flush error: {}", e);
+                                    error!("[WAL] Flush error (buffer_full): {} - entries_lost={}", e, buffer.len());
+                                } else {
+                                    trace!("[WAL] Flushed {} entries (buffer full)", buffer.len());
                                 }
                                 last_flush = std::time::Instant::now();
                             }
                         }
                         Some(WriteCommand::Checkpoint) => {
+                            info!("[WAL] Checkpoint requested");
                             // Flush pending writes first
                             if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
-                                eprintln!("WAL flush error before checkpoint: {}", e);
+                                error!("[WAL] Flush error before checkpoint: {}", e);
                             }
                             if let Err(e) = self.write_checkpoint().await {
-                                eprintln!("Checkpoint error: {}", e);
+                                error!("[WAL] Checkpoint write error: {}", e);
+                            } else {
+                                info!("[WAL] Checkpoint written successfully");
                             }
                         }
                         Some(WriteCommand::Flush) => {
+                            debug!("[WAL] Explicit flush requested, entries={}", buffer.len());
                             if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
-                                eprintln!("WAL flush error: {}", e);
+                                error!("[WAL] Explicit flush error: {}", e);
                             }
                             last_flush = std::time::Instant::now();
                         }
                         Some(WriteCommand::Shutdown) | None => {
+                            info!("[WAL] Shutdown command received, performing final flush (entries={})", buffer.len());
                             // Final flush
-                            let _ = self.flush_buffer(&mut file, &mut buffer).await;
-                            let _ = file.sync_all().await;
+                            if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
+                                error!("[WAL] Final flush error: {}", e);
+                            }
+                            if let Err(e) = file.sync_all().await {
+                                error!("[WAL] Final sync error: {}", e);
+                            }
+                            info!("[WAL] Writer shutdown complete, total_bytes_written={}", 
+                                self.stats.bytes_written.load(Ordering::Relaxed));
                             break;
                         }
                     }
@@ -435,8 +473,11 @@ impl OrderWal {
                 _ = tokio::time::sleep(flush_interval) => {
                     // Periodic flush
                     if !buffer.is_empty() && last_flush.elapsed() >= flush_interval {
+                        let entry_count = buffer.len();
                         if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
-                            eprintln!("WAL periodic flush error: {}", e);
+                            error!("[WAL] Periodic flush error: {} - entries_pending={}", e, entry_count);
+                        } else {
+                            debug!("[WAL] Periodic flush: {} entries written", entry_count);
                         }
                         last_flush = std::time::Instant::now();
                     }
@@ -509,9 +550,12 @@ impl OrderWal {
 
     /// Recover WAL state on startup
     async fn recover(&self) -> Result<(), WalError> {
+        let recovery_start = std::time::Instant::now();
+        
         // Try to load checkpoint first
         let checkpoint_path = self.checkpoint_path();
         if checkpoint_path.exists() {
+            info!("[WAL] Loading checkpoint from {:?}", checkpoint_path);
             let json = tokio::fs::read_to_string(&checkpoint_path).await?;
             let checkpoint: Checkpoint = serde_json::from_str(&json)?;
 
@@ -520,7 +564,9 @@ impl OrderWal {
             self.last_checkpoint
                 .store(checkpoint.sequence, Ordering::Release);
 
+            let active_count = checkpoint.active_orders.len();
             for (order_id, entry) in checkpoint.active_orders {
+                debug!("[WAL] Recovered from checkpoint: order_id={}, state={:?}", order_id, entry.state);
                 self.orders.insert(
                     order_id,
                     OrderState {
@@ -529,16 +575,23 @@ impl OrderWal {
                     },
                 );
             }
+            info!("[WAL] Checkpoint loaded: sequence={}, active_orders={}", 
+                checkpoint.sequence, active_count);
+        } else {
+            info!("[WAL] No checkpoint found, starting fresh recovery");
         }
 
         // Replay WAL from last checkpoint
         let wal_path = self.current_wal_path();
         if wal_path.exists() {
+            info!("[WAL] Replaying WAL from {:?}", wal_path);
             let file = tokio::fs::File::open(&wal_path).await?;
             let reader = AsyncBufReader::new(file);
             let mut lines = reader.lines();
 
             let checkpoint_seq = self.last_checkpoint.load(Ordering::Acquire);
+            let mut replayed = 0u64;
+            let mut skipped = 0u64;
 
             while let Some(line) = lines.next_line().await? {
                 if line.is_empty() {
@@ -548,27 +601,38 @@ impl OrderWal {
                 match serde_json::from_str::<WalEntry>(&line) {
                     Ok(entry) => {
                         if entry.sequence <= checkpoint_seq {
+                            skipped += 1;
                             continue; // Already in checkpoint
                         }
 
                         if !entry.verify_checksum() {
                             self.stats.corrupted_entries.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "WAL checksum mismatch at sequence {}, skipping",
-                                entry.sequence
+                            warn!(
+                                "[WAL] Checksum mismatch at sequence {}, order_id={}, skipping",
+                                entry.sequence, entry.order_id
                             );
                             continue;
                         }
 
                         self.apply_entry(entry);
                         self.stats.entries_recovered.fetch_add(1, Ordering::Relaxed);
+                        replayed += 1;
                     }
                     Err(e) => {
-                        eprintln!("WAL parse error: {}, line: {}", e, line);
+                        warn!("[WAL] Parse error during recovery: {}, line_preview={:.100}", e, line);
                         self.stats.corrupted_entries.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
+            
+            info!(
+                "[WAL] WAL replay complete: replayed={}, skipped={}, corrupted={}, duration_ms={}",
+                replayed, skipped, 
+                self.stats.corrupted_entries.load(Ordering::Relaxed),
+                recovery_start.elapsed().as_millis()
+            );
+        } else {
+            info!("[WAL] No WAL file found at {:?}, starting fresh", wal_path);
         }
 
         Ok(())
