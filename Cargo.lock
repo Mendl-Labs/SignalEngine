@@ -521,6 +521,7 @@ dependencies = [
  "futures-util",
  "mockall 0.12.1",
  "native-tls",
+ "once_cell",
  "postgres-native-tls",
  "rand 0.8.5",
  "serde",
@@ -2260,7 +2261,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
+ "ultra-logger",
 ]
 
 [[package]]
@@ -2978,12 +2979,13 @@ dependencies = [
  "libc",
  "memmap2",
  "mockall 0.12.1",
+ "once_cell",
  "parking_lot",
  "prost",
  "prost-build",
  "protocol",
  "spin_sleep",
- "tracing",
+ "ultra-logger",
 ]
 
 [[package]]
