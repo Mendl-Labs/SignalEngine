@@ -97,6 +97,7 @@ winapi = { version = "0.3.9", features = ["winbase", "processthreadsapi", "winnt
 signalgenerator = { path = "../signalgenerator" }
 smartorderrouter = { path = "../smartorderrouter" }
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
+ultra_signal = { path = "../signal" }
 
 [features]
 default = []

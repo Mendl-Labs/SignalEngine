@@ -21,7 +21,7 @@ pub mod rate_limiter;
 pub mod tracing;
 pub mod chaos;
 pub mod audit;
-pub mod secrets;
+pub mod credential_manager;
 pub mod multi_leg;
 pub mod tca;
 pub mod orderbook_reconciliation;
@@ -144,7 +144,7 @@ pub use audit::{
 };
 
 // Secrets management
-pub use secrets::{
+pub use credential_manager::{
     SecretsManager, SecretsConfig, SecretBackend, SecretString,
     ApiCredentials, SecurityEventType, SecurityAuditEntry, SECRETS,
 };
