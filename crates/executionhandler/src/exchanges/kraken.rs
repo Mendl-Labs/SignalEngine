@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::signal::Signal;
+use crate::risk_controls::{KILL_SWITCH, KillReason};
 
 use crate::core::{
     ExchangeConnector, ExchangeAuth, ExchangeWebSocket, NanoOptimized,
     types::*,
+    metrics::MetricsCollector,
 };
 use crate::optimizations::{
     timestamp::{nano_timestamp, NanoTimer},
@@ -28,6 +30,7 @@ pub struct KrakenConnector {
     auth: Option<KrakenAuth>,
     websocket: Option<KrakenWebSocket>,
     metrics: Arc<AtomicMetrics>,
+    metrics_collector: Arc<MetricsCollector>,
     vectorized_metrics: Arc<RwLock<VectorizedMetrics>>,
     _order_updates: Arc<SPSCQueue<OrderUpdate>>,
     active_orders: Arc<RwLock<HashMap<String, OrderStatus>>>,
@@ -48,6 +51,7 @@ impl KrakenConnector {
             auth: None,
             websocket: None,
             metrics: Arc::new(AtomicMetrics::new()),
+            metrics_collector: Arc::new(MetricsCollector::new()),
             vectorized_metrics: Arc::new(RwLock::new(VectorizedMetrics::new(10000))),
             _order_updates: Arc::new(SPSCQueue::<OrderUpdate>::new()),
             active_orders: Arc::new(RwLock::new(HashMap::new())),
@@ -98,6 +102,14 @@ impl ExchangeConnector for KrakenConnector {
     }
 
     async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
+        // P0 Safety: Check kill switch before order execution
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Kraken order halted.", reason
+            )));
+        }
+        
         let timer = NanoTimer::start();
         
         // Get pooled order object for zero allocation
@@ -121,14 +133,35 @@ impl ExchangeConnector for KrakenConnector {
         // Record metrics
         let latency_ns = timer.elapsed_ns();
         match &result {
-            Ok(_) => self.metrics.record_order_success(latency_ns),
-            Err(_) => self.metrics.record_order_failure(),
+            Ok(exec_result) => {
+                self.metrics.record_order_success(latency_ns);
+                // Record with volume and fees for full tracking
+                self.metrics_collector.record_success(
+                    latency_ns,
+                    exec_result.filled_quantity * exec_result.avg_fill_price,
+                    exec_result.total_fees,
+                );
+            }
+            Err(_) => {
+                self.metrics.record_order_failure();
+                self.metrics_collector.record_failure();
+            }
         }
         
         // Add to vectorized metrics
         {
             let mut vm = self.vectorized_metrics.write().await;
             vm.add_latency(latency_ns);
+        }
+        
+        // Update WebSocket status
+        self.metrics_collector.set_websocket_connected(
+            self.websocket.as_ref().is_some_and(|ws| ws.is_connected())
+        );
+        
+        // Update connection pool metrics if available
+        if let Some(config) = &self.config {
+            self.metrics_collector.set_connection_pool(config.connection_pool_size as u64, 1);
         }
         
         result.map(|mut r| {
@@ -199,6 +232,9 @@ impl ExchangeConnector for KrakenConnector {
         
         let _cancel_latency = timer.elapsed_ns();
         
+        // Track cancellation in metrics
+        self.metrics_collector.record_cancellation();
+        
         Ok(CancelResult {
             order_id: order_id.to_string(),
             exchange_order_id: Some(order_id.to_string()),
@@ -223,37 +259,143 @@ impl ExchangeConnector for KrakenConnector {
         Ok(results)
     }
 
+    async fn edit_order(&self, params: EditOrderParams) -> Result<EditResult, ExecutionError> {
+        let timer = NanoTimer::start();
+        
+        let client = self.http_client.as_ref()
+            .ok_or_else(|| ExecutionError::Connection("HTTP client not initialized".to_string()))?;
+        
+        let auth = self.auth.as_ref()
+            .ok_or_else(|| ExecutionError::Authentication("Authentication not initialized".to_string()))?;
+        
+        // Build edit order request body
+        let nonce = nano_timestamp() as u64;
+        let mut body_parts = vec![
+            format!("nonce={}", nonce),
+            format!("txid={}", params.order_id),
+            format!("pair={}", params.pair),
+        ];
+        
+        if let Some(volume) = params.volume {
+            body_parts.push(format!("volume={}", volume));
+        }
+        
+        if let Some(price) = params.price {
+            body_parts.push(format!("price={}", price));
+        }
+        
+        if let Some(price2) = params.price2 {
+            body_parts.push(format!("price2={}", price2));
+        }
+        
+        if let Some(ref oflags) = params.oflags {
+            body_parts.push(format!("oflags={}", oflags));
+        }
+        
+        if params.validate {
+            body_parts.push("validate=true".to_string());
+        }
+        
+        let body = body_parts.join("&");
+        let path = "/0/private/EditOrder";
+        
+        // Sign request
+        let auth_headers = auth.sign_request("POST", path, &body, nonce).await?;
+        
+        // Build request
+        let request_builder = client
+            .post(format!("https://api.kraken.com{}", path))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("API-Key", &auth_headers.headers["API-Key"])
+            .header("API-Sign", &auth_headers.signature)
+            .body(body);
+        
+        // Submit edit request
+        let response = request_builder.send().await
+            .map_err(|e| ExecutionError::NetworkError(e.to_string()))?;
+        
+        let response_text = response.text().await
+            .map_err(|e| ExecutionError::NetworkError(e.to_string()))?;
+        
+        let edit_latency = timer.elapsed_ns();
+        
+        // Parse response
+        let kraken_response: KrakenEditResponse = serde_json::from_str(&response_text)
+            .map_err(|e| ExecutionError::SerializationError(format!("Failed to parse EditOrder response: {}. Response: {}", e, response_text)))?;
+        
+        if !kraken_response.error.is_empty() {
+            return Ok(EditResult {
+                original_order_id: params.order_id,
+                new_order_id: None,
+                status: EditStatus::Failed(kraken_response.error.join(", ")),
+                orders_cancelled: 0,
+                volume: None,
+                price: None,
+                price2: None,
+                description: None,
+                edited_at: nano_timestamp(),
+                latency_ns: edit_latency,
+            });
+        }
+        
+        let result = kraken_response.result.unwrap_or_default();
+        
+        // Determine status
+        let status = match result.status.as_deref() {
+            Some("Ok") => {
+                if params.validate {
+                    EditStatus::Validated
+                } else {
+                    EditStatus::Success
+                }
+            }
+            Some("Err") => EditStatus::Failed(result.error_message.unwrap_or_else(|| "Unknown error".to_string())),
+            _ => EditStatus::Success,
+        };
+        
+        // Update active orders tracking
+        if let EditStatus::Success = status {
+            let mut active_orders = self.active_orders.write().await;
+            // Remove old order
+            active_orders.remove(&params.order_id);
+            // Add new order if we have a new txid
+            if let Some(ref new_txid) = result.txid {
+                active_orders.insert(new_txid.clone(), OrderStatus {
+                    order_id: new_txid.clone(),
+                    exchange_order_id: Some(new_txid.clone()),
+                    status: ExecutionStatus::Pending,
+                    filled_quantity: 0.0,
+                    remaining_quantity: result.volume.as_ref()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0),
+                    avg_fill_price: 0.0,
+                    last_updated: nano_timestamp(),
+                });
+            }
+        }
+        
+        Ok(EditResult {
+            original_order_id: params.order_id,
+            new_order_id: result.txid,
+            status,
+            orders_cancelled: result.orders_cancelled.unwrap_or(0),
+            volume: result.volume,
+            price: result.price,
+            price2: result.price2,
+            description: result.descr.map(|d| d.order),
+            edited_at: nano_timestamp(),
+            latency_ns: edit_latency,
+        })
+    }
+
     async fn get_order_status(&self, order_id: &str) -> Result<Option<OrderStatus>, ExecutionError> {
         let active_orders = self.active_orders.read().await;
         Ok(active_orders.get(order_id).cloned())
     }
 
     fn get_metrics(&self) -> ExecutionMetrics {
-        let atomic_snapshot = self.metrics.get_snapshot();
-        
-        ExecutionMetrics {
-            exchange: self.exchange_name.clone(),
-            total_orders: atomic_snapshot.total_orders,
-            successful_orders: atomic_snapshot.successful_orders,
-            failed_orders: atomic_snapshot.failed_orders,
-            cancelled_orders: 0, // TODO: Track cancelled orders
-            avg_latency_ns: atomic_snapshot.avg_latency_ns,
-            min_latency_ns: atomic_snapshot.min_latency_ns,
-            max_latency_ns: atomic_snapshot.max_latency_ns,
-            p50_latency_ns: 0, // TODO: Calculate from vectorized metrics
-            p95_latency_ns: 0,
-            p99_latency_ns: 0,
-            p999_latency_ns: 0,
-            total_volume: 0.0, // TODO: Track volume
-            total_fees: 0.0,   // TODO: Track fees
-            fill_rate: atomic_snapshot.success_rate,
-            error_rate: 1.0 - atomic_snapshot.success_rate,
-            orders_per_second: 0.0, // TODO: Calculate rate
-            last_updated: nano_timestamp(),
-            websocket_connected: self.websocket.as_ref().is_some_and(|ws| ws.is_connected()),
-            connection_pool_utilization: 0.0, // TODO: Track pool utilization
-            rate_limit_utilization: 0.0,      // TODO: Track rate limiting
-        }
+        // Use MetricsCollector for full tracking (percentiles, volume, fees, rates)
+        self.metrics_collector.get_metrics(self.exchange_name.clone())
     }
 
     async fn subscribe_to_updates(&self, _callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
@@ -460,6 +602,8 @@ impl KrakenConnector {
             submitted_at: submit_timestamp,
             updated_at: now,
             latency_ns: 0, // Will be set by caller
+            exchange_timestamp_ns: None, // MiFID II: Populated from exchange response
+            exchange_sequence: None,
         })
     }
 }
@@ -490,6 +634,47 @@ struct KrakenOrderResult {
 struct KrakenCancelResponse {
     error: Vec<String>,
     _result: Option<serde_json::Value>,
+}
+
+/// Kraken EditOrder response
+#[derive(Debug, Deserialize)]
+struct KrakenEditResponse {
+    error: Vec<String>,
+    result: Option<KrakenEditResult>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct KrakenEditResult {
+    /// Order description
+    descr: Option<KrakenEditDescr>,
+    /// New transaction ID
+    txid: Option<String>,
+    /// New user reference (kept for API completeness)
+    #[allow(dead_code)]
+    newuserref: Option<String>,
+    /// Old user reference (kept for API completeness)
+    #[allow(dead_code)]
+    olduserref: Option<String>,
+    /// Number of orders cancelled (0 or 1)
+    orders_cancelled: Option<u32>,
+    /// Original transaction ID (kept for API completeness)
+    #[allow(dead_code)]
+    originaltxid: Option<String>,
+    /// Status ("Ok" or "Err")
+    status: Option<String>,
+    /// Updated volume
+    volume: Option<String>,
+    /// Updated price
+    price: Option<String>,
+    /// Updated price2
+    price2: Option<String>,
+    /// Error message if status is "Err"
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KrakenEditDescr {
+    order: String,
 }
 
 // Authentication implementation

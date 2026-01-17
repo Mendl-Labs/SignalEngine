@@ -14,9 +14,15 @@ pub struct ExecutionResult {
     pub total_fees: f64,
     pub fills: Vec<ExecutionFill>,
     pub reject_reason: Option<String>,
-    pub submitted_at: u128, // Nanosecond precision
-    pub updated_at: u128,   // Nanosecond precision
+    pub submitted_at: u128, // Nanosecond precision (local)
+    pub updated_at: u128,   // Nanosecond precision (local)
     pub latency_ns: u64,    // Nanosecond latency
+    /// Exchange-provided timestamp for MiFID II compliance (nanoseconds since epoch)
+    #[serde(default)]
+    pub exchange_timestamp_ns: Option<u128>,
+    /// Exchange-provided sequence number
+    #[serde(default)]
+    pub exchange_sequence: Option<u64>,
 }
 
 /// Order execution status
@@ -43,9 +49,16 @@ pub struct ExecutionFill {
     pub price: f64,
     pub fee: f64,
     pub fee_asset: String,
-    pub timestamp: u128, // Nanosecond precision
+    pub timestamp: u128, // Nanosecond precision (local)
     pub trade_id: String,
     pub is_maker: bool,
+    /// Exchange-provided timestamp for MiFID II compliance (nanoseconds since epoch)
+    /// This is the timestamp from the exchange's matching engine, not our local time
+    #[serde(default)]
+    pub exchange_timestamp_ns: Option<u128>,
+    /// Exchange-provided sequence number for ordering
+    #[serde(default)]
+    pub exchange_sequence: Option<u64>,
 }
 
 /// Order side enumeration
@@ -88,6 +101,8 @@ pub enum ExecutionError {
     InvalidParameter(String),
     NetworkError(String),
     SerializationError(String),
+    /// Order rejected due to risk controls (kill switch, circuit breaker, etc.)
+    Rejected(String),
     Unknown(String),
 }
 
@@ -107,6 +122,7 @@ impl std::fmt::Display for ExecutionError {
             ExecutionError::InvalidParameter(msg) => write!(f, "Invalid parameter: {}", msg),
             ExecutionError::NetworkError(msg) => write!(f, "Network error: {}", msg),
             ExecutionError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            ExecutionError::Rejected(msg) => write!(f, "Order rejected: {}", msg),
             ExecutionError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }
@@ -132,6 +148,108 @@ pub enum CancelStatus {
     Failed(String),
 }
 
+/// Parameters for editing an existing order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditOrderParams {
+    /// Original order ID (txid) to edit
+    pub order_id: String,
+    /// Trading pair (e.g., "XBTUSD")
+    pub pair: String,
+    /// New order quantity (optional)
+    pub volume: Option<f64>,
+    /// New limit price (optional)
+    pub price: Option<f64>,
+    /// New secondary price for stop-loss-limit, take-profit-limit, etc. (optional)
+    pub price2: Option<f64>,
+    /// Order flags (e.g., "post" for post-only)
+    pub oflags: Option<String>,
+    /// Validate only, do not submit (default: false)
+    pub validate: bool,
+}
+
+impl EditOrderParams {
+    /// Create new edit params with just the required fields
+    pub fn new(order_id: impl Into<String>, pair: impl Into<String>) -> Self {
+        Self {
+            order_id: order_id.into(),
+            pair: pair.into(),
+            volume: None,
+            price: None,
+            price2: None,
+            oflags: None,
+            validate: false,
+        }
+    }
+    
+    /// Set new volume
+    pub fn with_volume(mut self, volume: f64) -> Self {
+        self.volume = Some(volume);
+        self
+    }
+    
+    /// Set new price
+    pub fn with_price(mut self, price: f64) -> Self {
+        self.price = Some(price);
+        self
+    }
+    
+    /// Set new secondary price
+    pub fn with_price2(mut self, price2: f64) -> Self {
+        self.price2 = Some(price2);
+        self
+    }
+    
+    /// Set order flags
+    pub fn with_oflags(mut self, oflags: impl Into<String>) -> Self {
+        self.oflags = Some(oflags.into());
+        self
+    }
+    
+    /// Set validate only mode
+    pub fn validate_only(mut self) -> Self {
+        self.validate = true;
+        self
+    }
+}
+
+/// Result of editing an order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditResult {
+    /// Original order ID that was edited
+    pub original_order_id: String,
+    /// New order ID after edit (Kraken creates new order)
+    pub new_order_id: Option<String>,
+    /// Edit status
+    pub status: EditStatus,
+    /// Number of orders cancelled (0 or 1)
+    pub orders_cancelled: u32,
+    /// Updated volume
+    pub volume: Option<String>,
+    /// Updated price
+    pub price: Option<String>,
+    /// Updated price2
+    pub price2: Option<String>,
+    /// Order description
+    pub description: Option<String>,
+    /// Timestamp of edit in nanoseconds
+    pub edited_at: u128,
+    /// Latency of edit operation in nanoseconds
+    pub latency_ns: u64,
+}
+
+/// Edit operation status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EditStatus {
+    /// Order successfully edited
+    Success,
+    /// Edit validated but not submitted
+    Validated,
+    /// Original order not found
+    NotFound,
+    /// Edit failed with reason
+    Failed(String),
+}
+
 /// Real-time order status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderStatus {
@@ -153,7 +271,13 @@ pub struct OrderUpdate {
     pub status: ExecutionStatus,
     pub filled_quantity: Option<f64>,
     pub fill_price: Option<f64>,
-    pub timestamp: u128, // Nanosecond precision
+    pub timestamp: u128, // Nanosecond precision (local)
+    /// Exchange-provided timestamp for MiFID II compliance (nanoseconds since epoch)
+    #[serde(default)]
+    pub exchange_timestamp_ns: Option<u128>,
+    /// Exchange-provided sequence number for ordering
+    #[serde(default)]
+    pub exchange_sequence: Option<u64>,
 }
 
 /// Update type enumeration

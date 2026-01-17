@@ -1,0 +1,40 @@
+[package]
+name = "strategyloader"
+version = "0.1.0"
+edition = "2021"
+description = "Strategy loading and management for SignalEngine"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Database (optional) - versions aligned with databaseschema
+diesel = { version = "2.2.2", features = ["postgres", "uuid", "chrono", "numeric", "serde_json"], optional = true }
+diesel-async = { version = "0.5.0", features = ["postgres", "deadpool"], optional = true }
+deadpool = { version = "0.12.1", optional = true }
+bigdecimal = { version = "0.4", features = ["serde"], optional = true }
+
+# Core types
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+
+# Logging
+signalengine = { package = "signalengine-core", path = "../core" }
+ultra-logger = { path = "../../../LoggingEngine/ultra-logger" }
+
+# Concurrency
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# Database schema (shared with BacktestingEngine)
+databaseschema = { path = "../../../databaseschema", optional = true }
+
+[features]
+default = []
+postgres = ["diesel", "diesel-async", "deadpool", "bigdecimal", "databaseschema"]

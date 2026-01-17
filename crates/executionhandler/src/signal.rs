@@ -13,7 +13,7 @@ pub struct Signal {
     pub metadata: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SignalAction {
     Buy,
     Sell,

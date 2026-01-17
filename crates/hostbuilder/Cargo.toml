@@ -26,7 +26,6 @@ ultra_signal = { path = "../signal" }
 
 # Ultra-low latency logging
 ultra-logger = { workspace = true }
-tracing = "0.1.40"
 
 # Phase 2: Ultra-Fast Order Management Dependencies
 bytes = { workspace = true }

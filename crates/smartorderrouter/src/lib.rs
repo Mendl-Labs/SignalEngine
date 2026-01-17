@@ -9,6 +9,9 @@ use dashmap::DashMap;
 use crossbeam::utils::CachePadded;
 
 pub mod database_integration_example;
+pub mod database;
+
+pub use database::{OrderDatabasePersistence, DbPool};
 
 /// Order side enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

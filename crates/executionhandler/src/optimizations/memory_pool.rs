@@ -47,7 +47,11 @@ impl OrderPool {
 
     /// Get a pooled order object (zero allocation in hot path)
     pub fn get(&self) -> PooledOrder {
-        let mut pool = self.pool.lock().unwrap();
+        // Handle potential lock poisoning gracefully
+        let mut pool = self.pool.lock().unwrap_or_else(|poisoned| {
+            // Recover from poisoned lock - another thread panicked while holding the lock
+            poisoned.into_inner()
+        });
         
         if let Some(ptr) = pool.pop_front() {
             // Use pre-allocated object - ptr is guaranteed non-null from pool
@@ -74,7 +78,7 @@ impl OrderPool {
     pub fn return_order(&self, order: PooledOrder) {
         if order.pool_id != 0 {
             // Return to pool - this is unsafe but constrained to known pool addresses
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             unsafe {
                 // SAFETY: pool_id came from a valid NonNull pointer from our pool
                 // This is still risky - a safer design would store the NonNull directly
@@ -92,7 +96,7 @@ impl OrderPool {
 
     /// Get pool statistics
     pub fn stats(&self) -> PoolStats {
-        let pool = self.pool.lock().unwrap();
+        let pool = self.pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         PoolStats {
             capacity: self.capacity,
             allocated: self.allocated,
@@ -104,7 +108,7 @@ impl OrderPool {
 
 impl Drop for OrderPool {
     fn drop(&mut self) {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while let Some(ptr) = pool.pop_front() {
             unsafe {
                 dealloc(ptr.as_ptr() as *mut u8, self.layout);

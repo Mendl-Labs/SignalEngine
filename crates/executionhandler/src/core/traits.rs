@@ -46,6 +46,8 @@ pub trait ExchangeConnector: Send + Sync {
                             .unwrap()
                             .as_nanos(),
                         latency_ns: 0,
+                        exchange_timestamp_ns: None,
+                        exchange_sequence: None,
                     });
                 }
             }
@@ -81,6 +83,8 @@ pub trait ExchangeConnector: Send + Sync {
                             .unwrap()
                             .as_nanos(),
                         latency_ns: 0,
+                        exchange_timestamp_ns: None,
+                        exchange_sequence: None,
                     }
                 }
             }
@@ -114,6 +118,10 @@ pub trait ExchangeConnector: Send + Sync {
 
     /// Cancel all active orders for this exchange
     async fn cancel_all_orders(&self) -> Result<Vec<CancelResult>, ExecutionError>;
+
+    /// Edit/modify an existing order's parameters
+    /// Note: On Kraken, this cancels the original order and creates a new one
+    async fn edit_order(&self, params: EditOrderParams) -> Result<EditResult, ExecutionError>;
 
     /// Get current order status with minimal latency
     async fn get_order_status(&self, order_id: &str) -> Result<Option<OrderStatus>, ExecutionError>;

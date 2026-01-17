@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use crate::signal::Signal;
 use crate::core::types::*;
+use crate::risk_controls::{KILL_SWITCH, KillReason};
 use super::traits::*;
 use super::sui_wallet::{SuiWallet, SuiNetworkConfig};
 use super::sui_ptb::ObjectRef;
@@ -90,6 +91,14 @@ impl DexConnector for CetusConnector {
     }
     
     async fn execute_swap(&self, signal: &Signal) -> Result<DexExecutionResult, ExecutionError> {
+        // P0 Safety: Check kill switch before DEX swap
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Cetus swap halted.", reason
+            )));
+        }
+        
         let wallet = self.get_wallet()?;
         
         // Parse trading pair from signal
@@ -154,6 +163,8 @@ impl DexConnector for CetusConnector {
                 submitted_at: now_ns,
                 updated_at: now_ns,
                 latency_ns: (elapsed as u64) * 1_000_000, // ms to ns
+                exchange_timestamp_ns: Some(now_ns), // On-chain timestamp
+                exchange_sequence: None,
             },
             tx_hash: tx_digest,
             block_number: None,
@@ -318,7 +329,7 @@ impl CetusConnector {
         let config_arg = builder.add_object_input(config_ref);
         
         // Split coins from gas to get exact amount for swap
-        let swap_coin = builder.split_coins(Argument::GasCoin, vec![amount_arg]);
+        let _swap_coin = builder.split_coins(Argument::GasCoin, vec![amount_arg]);
         
         // Call Cetus swap function (swap_a2b or swap_b2a depending on direction)
         let swap_function = if pool.token_a == "SUI" {
@@ -459,6 +470,7 @@ impl CetusConnector {
     }
     
     /// Select coins for swap input
+    #[allow(dead_code)]
     async fn select_coins(&self, coin_type: &str, amount_needed: u64) -> Result<Vec<String>, ExecutionError> {
         let wallet = self.get_wallet()?;
         
@@ -506,6 +518,7 @@ impl CetusConnector {
 }
 
 /// Pool information from Cetus
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CetusPoolInfo {
     pool_id: String,

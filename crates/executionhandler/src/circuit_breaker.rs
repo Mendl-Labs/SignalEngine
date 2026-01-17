@@ -1,3 +1,18 @@
+//! Circuit Breaker v1 (Legacy)
+//!
+//! # ⚠️ DEPRECATED
+//!
+//! This module uses `std::sync::Mutex` which can panic if a thread panics while
+//! holding the lock. Use `circuit_breaker_v2` instead, which uses atomic operations.
+//!
+//! ```rust,ignore
+//! // Instead of:
+//! use executionhandler::circuit_breaker::CircuitBreaker;
+//!
+//! // Use:
+//! use executionhandler::circuit_breaker_v2::CircuitBreakerManager;
+//! ```
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
@@ -11,6 +26,11 @@ pub enum CircuitState {
 }
 
 /// Circuit breaker for managing service failures
+///
+/// # Deprecated
+///
+/// Use `circuit_breaker_v2::CircuitBreakerManager` instead.
+#[deprecated(since = "0.1.0", note = "Use CircuitBreakerManager from circuit_breaker_v2 module - uses atomics instead of Mutex")]
 pub struct CircuitBreaker {
     state: Arc<Mutex<CircuitState>>,
     failure_count: Arc<Mutex<u32>>,

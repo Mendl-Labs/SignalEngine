@@ -1,4 +1,40 @@
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+
+/// Calibrated TSC frequency (cycles per nanosecond)
+/// Lazily initialized on first use
+static TSC_FREQ_GHZ: OnceLock<f64> = OnceLock::new();
+
+/// Get calibrated TSC frequency, or default to 3.0 GHz
+fn get_tsc_freq_ghz() -> f64 {
+    *TSC_FREQ_GHZ.get_or_init(|| {
+        // Try to calibrate by measuring TSC over a known time period
+        #[cfg(target_arch = "x86_64")]
+        {
+            let start_tsc = unsafe { std::arch::x86_64::_rdtsc() };
+            let start_time = std::time::Instant::now();
+            
+            // Spin for ~10ms to get a reasonable sample
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            
+            let end_tsc = unsafe { std::arch::x86_64::_rdtsc() };
+            let elapsed_ns = start_time.elapsed().as_nanos() as f64;
+            
+            if elapsed_ns > 0.0 {
+                let tsc_diff = (end_tsc - start_tsc) as f64;
+                let freq = tsc_diff / elapsed_ns;
+                // Sanity check: should be between 1-6 GHz
+                if freq > 0.5 && freq < 8.0 {
+                    eprintln!("[timestamp] Calibrated TSC frequency: {:.2} GHz", freq);
+                    return freq;
+                }
+            }
+        }
+        // Fallback to typical frequency
+        eprintln!("[timestamp] Using default TSC frequency: 3.0 GHz");
+        3.0
+    })
+}
 
 /// Get nanosecond precision timestamp using the fastest available method
 #[inline(always)]
@@ -50,10 +86,9 @@ impl NanoTimer {
 /// Convert hardware timestamp to nanoseconds (calibrated)
 #[cfg(target_arch = "x86_64")]
 pub fn rdtsc_to_ns(tsc: u64) -> u128 {
-    // This would need calibration based on CPU frequency
-    // For now, using a typical 3GHz processor assumption
-    const TSC_FREQ_GHZ: f64 = 3.0;
-    (tsc as f64 / TSC_FREQ_GHZ) as u128
+    // Use runtime-calibrated TSC frequency
+    let freq = get_tsc_freq_ghz();
+    (tsc as f64 / freq) as u128
 }
 
 /// Busy-wait for precise timing (use sparingly)

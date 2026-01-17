@@ -5,6 +5,7 @@
 
 pub mod logging;
 pub mod logging_guide;
+pub mod system_logging;
 pub mod rdtsc;
 pub mod cache_aligned;
 pub mod simd;
@@ -19,6 +20,16 @@ pub use logging::{
     SignalEngineLogger, 
     TradingContext, 
     initialize_signal_engine_logging,
+};
+
+// Re-export system logging
+pub use system_logging::{
+    SystemLogger,
+    LogCategory,
+    Level as LogLevel,
+    LogEntry,
+    LogMetrics,
+    LOG_METRICS,
 };
 
 // Re-export RDTSC timing utilities

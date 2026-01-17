@@ -77,23 +77,45 @@ pub struct SignalArena {
     layout: Layout,
 }
 
+/// Error type for arena allocation failures
+#[derive(Debug, Clone)]
+pub struct ArenaAllocationError {
+    pub capacity: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for ArenaAllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Arena allocation failed for {} bytes: {}", self.capacity, self.message)
+    }
+}
+
+impl std::error::Error for ArenaAllocationError {}
+
 impl SignalArena {
     /// Create new signal arena with specified capacity (bytes)
-    pub fn new(capacity: usize) -> Self {
+    /// Returns error if allocation fails instead of panicking
+    pub fn new(capacity: usize) -> Result<Self, ArenaAllocationError> {
         let layout = Layout::from_size_align(capacity, 64)
-            .expect("Invalid layout");
+            .map_err(|e| ArenaAllocationError {
+                capacity,
+                message: format!("Invalid layout: {}", e),
+            })?;
         
         let buffer = unsafe { alloc(layout) };
         if buffer.is_null() {
-            panic!("Arena allocation failed");
+            return Err(ArenaAllocationError {
+                capacity,
+                message: "Memory allocation returned null".to_string(),
+            });
         }
         
-        Self {
+        Ok(Self {
             buffer,
             capacity,
             offset: AtomicUsize::new(0),
             layout,
-        }
+        })
     }
     
     /// Allocate space for type T in arena (returns None if full)
@@ -295,7 +317,7 @@ mod tests {
     
     #[test]
     fn test_signal_arena() {
-        let arena = SignalArena::new(1024);
+        let arena = SignalArena::new(1024).expect("Failed to create arena");
         
         // Allocate some u64s
         let ptr1 = arena.allocate::<u64>().expect("Allocation failed");
@@ -317,7 +339,7 @@ mod tests {
     
     #[test]
     fn test_signal_arena_full() {
-        let arena = SignalArena::new(64);
+        let arena = SignalArena::new(64).expect("Failed to create arena");
         
         // Fill arena
         let mut ptrs = Vec::new();

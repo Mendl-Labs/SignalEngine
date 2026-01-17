@@ -1,4 +1,16 @@
 // Ultra-low latency data handler optimized for nanosecond trading
+//! 
+//! This module receives market data from the MessageBroker (published by DataEngine)
+//! and maintains orderbooks for signal generation.
+//!
+//! # Architecture
+//! DataEngine (WebSocket) → MessageBroker → DataHandler (Subscriber) → Strategies
+//!
+//! # Topics
+//! - `market.data.{exchange}.trades` - Trade messages
+//! - `market.data.{exchange}.level3` - Level 3 orderbook updates
+//! - `portfolio.updates.balances` - Balance updates
+
 use dashmap::DashMap;
 use dotenv::dotenv;
 use lazy_static::lazy_static;
@@ -10,11 +22,18 @@ use std::{
     sync::{Arc, RwLock}, 
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     thread,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicBool, Ordering},
 };
 use crossbeam::channel::{Sender, Receiver, unbounded};
 use serde::{Serialize, Deserialize};
+
+// Ultra-logger integration
+use ultra_logger::{ultra_info, ultra_error, ultra_debug};
+
 // Message broker integration
+use subscriber::{UltraFastSubscriber, UltraFastMessage};
+use protocol::broker::messages::{Trade, Orders};
+use prost::Message;
 
 // **ULTRA-LOW LATENCY OPTIMIZATION**: Lock-free orderbook storage
 // RwLock allows multiple concurrent readers with minimal contention
@@ -26,6 +45,37 @@ lazy_static! {
     static ref TOTAL_UPDATES: AtomicU64 = AtomicU64::new(0);
     static ref AVG_UPDATE_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
     static ref ORDERBOOK_ACCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Market data topics from MessageBroker (published by DataEngine)
+pub mod topics {
+    /// Trade data topic pattern: market.data.{exchange}.trades
+    pub const TRADE_TOPIC_PREFIX: &str = "market.data.";
+    pub const TRADE_TOPIC_SUFFIX: &str = ".trades";
+    
+    /// Level 3 orderbook topic pattern: market.data.{exchange}.level3
+    pub const LEVEL3_TOPIC_SUFFIX: &str = ".level3";
+    
+    /// Snapshot topic pattern: market.data.{exchange}.snapshots
+    pub const SNAPSHOT_TOPIC_SUFFIX: &str = ".snapshots";
+    
+    /// Portfolio balance updates
+    pub const PORTFOLIO_BALANCES: &str = "portfolio.updates.balances";
+    
+    /// Build topic name for exchange trades
+    pub fn trades_topic(exchange: &str) -> String {
+        format!("{}{}{}", TRADE_TOPIC_PREFIX, exchange, TRADE_TOPIC_SUFFIX)
+    }
+    
+    /// Build topic name for exchange level3
+    pub fn level3_topic(exchange: &str) -> String {
+        format!("{}{}{}", TRADE_TOPIC_PREFIX, exchange, LEVEL3_TOPIC_SUFFIX)
+    }
+    
+    /// Build topic name for exchange snapshots
+    pub fn snapshots_topic(exchange: &str) -> String {
+        format!("{}{}{}", TRADE_TOPIC_PREFIX, exchange, SNAPSHOT_TOPIC_SUFFIX)
+    }
 }
 
 /// Market data update message
@@ -74,7 +124,47 @@ pub trait DataHandlerTrait {
     fn get_orderbook(&self, symbol: &str, exchange: &str) -> Option<Arc<RwLock<Orderbook>>>;
 }
 
-/// Ultra-fast data handler with lock-free optimizations
+/// Configuration for connecting to the MessageBroker
+#[derive(Clone, Debug)]
+pub struct BrokerConfig {
+    /// Broker address (e.g., "127.0.0.1")
+    pub address: String,
+    /// Broker port
+    pub port: u16,
+    /// Exchanges to subscribe to
+    pub exchanges: Vec<String>,
+    /// Symbols to track
+    pub symbols: Vec<String>,
+    /// TCP no-delay for low latency
+    pub tcp_nodelay: bool,
+    /// Receive buffer size
+    pub receive_buffer_size: usize,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            address: std::env::var("BROKER_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            port: std::env::var("BROKER_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8080),
+            exchanges: vec!["kraken".to_string()],
+            symbols: vec![
+                "BTC/USD".to_string(),
+                "ETH/USD".to_string(),
+                "SOL/USD".to_string(),
+            ],
+            tcp_nodelay: true,
+            receive_buffer_size: 65536,
+        }
+    }
+}
+
+/// Ultra-fast data handler with MessageBroker subscriber
+/// 
+/// Receives market data from MessageBroker (published by DataEngine) instead of
+/// connecting directly to exchanges.
 pub struct DataHandler {
     // Market data channels for ultra-fast distribution
     market_data_sender: Sender<MarketData>,
@@ -83,6 +173,15 @@ pub struct DataHandler {
     // Signal routing for strategy updates
     strategy_signal_sender: Option<Sender<Signal>>,
     
+    // MessageBroker subscriber
+    subscriber: Arc<UltraFastSubscriber>,
+    
+    // Broker configuration
+    broker_config: BrokerConfig,
+    
+    // Subscribed topic names
+    subscribed_topics: Vec<String>,
+    
     // Performance optimization: Pre-allocated buffers
     update_buffer: Vec<MarketDataUpdate>,
     
@@ -90,9 +189,14 @@ pub struct DataHandler {
     symbols: Vec<String>,
     exchanges: Vec<String>,
     
+    // Running state
+    is_running: Arc<AtomicBool>,
+    
     // Lock-free metrics
     updates_processed: AtomicU64,
     avg_processing_time_ns: AtomicU64,
+    messages_received: AtomicU64,
+    deserialize_errors: AtomicU64,
 }
 
 impl Clone for DataHandler {
@@ -101,47 +205,290 @@ impl Clone for DataHandler {
             market_data_sender: self.market_data_sender.clone(),
             market_data_receiver: self.market_data_receiver.clone(),
             strategy_signal_sender: self.strategy_signal_sender.clone(),
+            subscriber: Arc::clone(&self.subscriber),
+            broker_config: self.broker_config.clone(),
+            subscribed_topics: self.subscribed_topics.clone(),
             update_buffer: Vec::with_capacity(self.update_buffer.capacity()),
             symbols: self.symbols.clone(),
             exchanges: self.exchanges.clone(),
+            is_running: Arc::clone(&self.is_running),
             updates_processed: AtomicU64::new(self.updates_processed.load(Ordering::Acquire)),
             avg_processing_time_ns: AtomicU64::new(self.avg_processing_time_ns.load(Ordering::Acquire)),
+            messages_received: AtomicU64::new(self.messages_received.load(Ordering::Acquire)),
+            deserialize_errors: AtomicU64::new(self.deserialize_errors.load(Ordering::Acquire)),
         }
     }
 }
 
 impl DataHandler {
+    /// Create new DataHandler with default configuration
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        Self::with_config(BrokerConfig::default())
+    }
+    
+    /// Create new DataHandler with custom broker configuration
+    pub fn with_config(config: BrokerConfig) -> Result<Self, Box<dyn Error>> {
         dotenv().ok();
+        
+        ultra_info!(format!("Initializing with broker {}:{}", config.address, config.port));
         
         // Create unbounded channel for market data (ultra-fast, no blocking)
         let (market_data_sender, market_data_receiver) = unbounded();
+        
+        // Create subscriber with unique ID
+        let subscriber_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let subscriber = Arc::new(UltraFastSubscriber::new(subscriber_id));
+        
+        ultra_info!(format!("Created MessageBroker subscriber id={}", subscriber_id));
+        
+        // Build topic list for all exchanges
+        let mut subscribed_topics = Vec::new();
+        for exchange in &config.exchanges {
+            subscribed_topics.push(topics::trades_topic(exchange));
+            subscribed_topics.push(topics::level3_topic(exchange));
+        }
+        subscribed_topics.push(topics::PORTFOLIO_BALANCES.to_string());
+        
+        ultra_info!(format!("Configured {} topics: {:?}", subscribed_topics.len(), subscribed_topics));
         
         Ok(Self {
             market_data_sender,
             market_data_receiver,
             strategy_signal_sender: None,
-            update_buffer: Vec::with_capacity(1000), // Pre-allocate for batching
-            symbols: vec![
-                "BTC/USD".to_string(),
-                "ETH/USD".to_string(), 
-                "BNB/USD".to_string(),
-                "SOL/USD".to_string(),
-                "ADA/USD".to_string(),
-            ],
-            exchanges: vec![
-                "binance".to_string(),
-                "coinbase".to_string(),
-                "kraken".to_string(),
-            ],
+            subscriber,
+            broker_config: config.clone(),
+            subscribed_topics,
+            update_buffer: Vec::with_capacity(1000),
+            symbols: config.symbols,
+            exchanges: config.exchanges,
+            is_running: Arc::new(AtomicBool::new(false)),
             updates_processed: AtomicU64::new(0),
             avg_processing_time_ns: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            deserialize_errors: AtomicU64::new(0),
         })
+    }
+    
+    /// Subscribe to all configured topics on the MessageBroker
+    pub async fn subscribe_to_broker(&self) -> Result<(), Box<dyn Error>> {
+        ultra_info!("Subscribing to MessageBroker topics");
+        
+        for topic in &self.subscribed_topics {
+            match self.subscriber.subscribe_to_topic(topic).await {
+                Ok(_) => {
+                    ultra_info!(format!("Subscribed to topic: {}", topic));
+                }
+                Err(e) => {
+                    ultra_error!(format!("Failed to subscribe to topic {}: {:?}", topic, e));
+                    return Err(format!("Failed to subscribe to topic {}: {:?}", topic, e).into());
+                }
+            }
+        }
+        
+        ultra_info!(format!("All {} topic subscriptions complete", self.subscribed_topics.len()));
+        
+        Ok(())
     }
 
     /// Set signal sender for strategy notifications
     pub fn set_strategy_signal_sender(&mut self, sender: Sender<Signal>) {
         self.strategy_signal_sender = Some(sender);
+    }
+    
+    /// Start the subscriber
+    pub fn start(&self) {
+        ultra_info!("Starting message loop");
+        self.subscriber.start();
+        self.is_running.store(true, Ordering::SeqCst);
+    }
+    
+    /// Stop the subscriber
+    pub fn stop(&self) {
+        ultra_info!(format!(
+            "Stopping - final metrics: messages_received={}, updates_processed={}, deserialize_errors={}, avg_latency_ns={}",
+            self.messages_received.load(Ordering::Relaxed),
+            self.updates_processed.load(Ordering::Relaxed),
+            self.deserialize_errors.load(Ordering::Relaxed),
+            self.avg_processing_time_ns.load(Ordering::Relaxed)
+        ));
+        self.subscriber.stop();
+        self.is_running.store(false, Ordering::SeqCst);
+    }
+    
+    /// Check if subscriber is running
+    pub fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
+    
+    /// Process a single message from the MessageBroker
+    fn process_message(&self, message: UltraFastMessage) -> Result<(), Box<dyn Error>> {
+        let topic = message.get_topic();
+        let data = message.get_data();
+        let data_len = data.len();
+        
+        self.messages_received.fetch_add(1, Ordering::Relaxed);
+        
+        // Determine message type based on topic
+        if topic.ends_with(".trades") {
+            // Decode as Trade message
+            match Trade::decode(data) {
+                Ok(trade) => {
+                    self.process_trade(&trade)?;
+                }
+                Err(e) => {
+                    self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                    ultra_error!(format!("Failed to decode Trade: {} (data_len={})", e, data_len));
+                }
+            }
+        } else if topic.ends_with(".level3") {
+            // Decode as Orders message (level 3 orderbook updates)
+            match Orders::decode(data) {
+                Ok(orders) => {
+                    self.process_orderbook_orders(&orders)?;
+                }
+                Err(e) => {
+                    self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                    ultra_error!(format!("Failed to decode Orders: {}", e));
+                }
+            }
+        } else if topic == topics::PORTFOLIO_BALANCES {
+            // Portfolio balance update received
+        }
+        
+        Ok(())
+    }
+    
+    /// Process a trade message and update orderbooks
+    fn process_trade(&self, trade: &Trade) -> Result<(), Box<dyn Error>> {
+        let start_time = ultra_signal::high_precision_timestamp_ns();
+        
+        // Ensure orderbook exists for this symbol/exchange
+        let _orderbook = self.get_or_create_orderbook(&trade.symbol, &trade.exchange);
+        
+        // Generate market data from the trade
+        if let Some(market_data) = self.generate_market_data(&trade.symbol, &trade.exchange) {
+            let _ = self.market_data_sender.try_send(market_data);
+        }
+        
+        // Update performance metrics
+        let latency_ns = ultra_signal::high_precision_timestamp_ns() - start_time;
+        self.update_latency_metrics(latency_ns);
+        
+        // Log performance periodically (every 10000 updates)
+        let total = self.updates_processed.fetch_add(1, Ordering::Relaxed);
+        if total > 0 && total % 10000 == 0 {
+            ultra_info!(format!(
+                "Performance: {} updates, avg_latency={}ns, msgs={}, errors={}",
+                total,
+                self.avg_processing_time_ns.load(Ordering::Relaxed),
+                self.messages_received.load(Ordering::Relaxed),
+                self.deserialize_errors.load(Ordering::Relaxed)
+            ));
+        }
+        
+        Ok(())
+    }
+    
+    /// Process orderbook orders (level 3 updates)
+    fn process_orderbook_orders(&self, orders: &Orders) -> Result<(), Box<dyn Error>> {
+        let start_time = ultra_signal::high_precision_timestamp_ns();
+        
+        for order in &orders.orders {
+            // Ensure orderbook exists (update_orderbook_fast will use it via get_or_create)
+            let _orderbook = self.get_or_create_orderbook(&order.symbol, &order.exchange);
+            
+            // Convert to orderbook update
+            let update = OrderbookUpdate {
+                side: order.side.clone(),
+                price: order.price_level as f64,
+                quantity: order.quantity as f64,
+                timestamp: start_time,
+            };
+            
+            self.update_orderbook_fast(&order.symbol, &order.exchange, &[update])?;
+        }
+        
+        // Update performance metrics
+        let latency_ns = ultra_signal::high_precision_timestamp_ns() - start_time;
+        self.update_latency_metrics(latency_ns);
+        
+        Ok(())
+    }
+    
+    /// Update latency metrics using exponential moving average
+    #[inline]
+    fn update_latency_metrics(&self, latency_ns: u64) {
+        TOTAL_UPDATES.fetch_add(1, Ordering::Relaxed);
+        let current_avg = self.avg_processing_time_ns.load(Ordering::Relaxed);
+        let new_avg = (current_avg * 9 + latency_ns) / 10;
+        self.avg_processing_time_ns.store(new_avg, Ordering::Relaxed);
+    }
+    
+    /// Poll messages from all subscribed topics (non-blocking)
+    pub fn poll_messages(&self, max_messages: usize) -> Vec<UltraFastMessage> {
+        let mut messages = Vec::with_capacity(max_messages);
+        
+        for topic in &self.subscribed_topics {
+            while messages.len() < max_messages {
+                match self.subscriber.get_message_from_topic(topic) {
+                    Some(msg) => messages.push(msg),
+                    None => break,
+                }
+            }
+        }
+        
+        messages
+    }
+    
+    /// Run the message processing loop
+    pub fn run_message_loop(&self) -> Result<(), Box<dyn Error>> {
+        ultra_info!(format!("Starting message processing loop with {} topics", self.subscribed_topics.len()));
+        
+        self.start();
+        
+        let mut last_metrics_log = Instant::now();
+        let metrics_interval = Duration::from_secs(60);
+        
+        while self.is_running() {
+            // Poll for messages
+            let messages = self.poll_messages(100);
+            
+            for msg in messages {
+                if let Err(e) = self.process_message(msg) {
+                    ultra_error!(format!("Error processing message: {}", e));
+                }
+            }
+            
+            // Log periodic metrics
+            if last_metrics_log.elapsed() >= metrics_interval {
+                let (msgs_total, throughput, latency_avg, latency_p99) = self.get_subscriber_stats();
+                ultra_info!(format!(
+                    "Metrics: msgs={} throughput={:.1}/s avg_lat={:.1}μs p99_lat={:.1}μs updates={} errors={}",
+                    msgs_total,
+                    throughput,
+                    latency_avg,
+                    latency_p99,
+                    self.updates_processed.load(Ordering::Relaxed),
+                    self.deserialize_errors.load(Ordering::Relaxed)
+                ));
+                last_metrics_log = Instant::now();
+            }
+            
+            // Brief sleep to prevent CPU spinning when no messages
+            spin_sleep::sleep(Duration::from_micros(100));
+        }
+        
+        ultra_info!("Message processing loop terminated");
+        
+        Ok(())
+    }
+    
+    /// Get subscriber performance stats
+    pub fn get_subscriber_stats(&self) -> (u64, f64, u64, u64) {
+        self.subscriber.get_performance_stats()
     }
 
     /// Get or create orderbook with ultra-fast access
@@ -190,7 +537,7 @@ impl DataHandler {
                     "bid" => {
                         if update.quantity == 0.0 {
                             // Remove bid - simplified since we need order_id
-                            println!("Would remove bid at price {}", update.price);
+                            ultra_debug!(format!("Would remove bid at price {}", update.price));
                         } else {
                             // Add/update bid - simplified
                             let _ = ob.add_limit_bid(update.price, order_id, update.quantity, start_time);
@@ -199,7 +546,7 @@ impl DataHandler {
                     "ask" => {
                         if update.quantity == 0.0 {
                             // Remove ask - simplified since we need order_id
-                            println!("Would remove ask at price {}", update.price);
+                            ultra_debug!(format!("Would remove ask at price {}", update.price));
                         } else {
                             // Add/update ask - simplified
                             let _ = ob.add_limit_ask(update.price, order_id, update.quantity, start_time);
@@ -270,7 +617,7 @@ impl DataHandler {
                     &update.exchange, 
                     &update.orderbook_updates
                 ) {
-                    eprintln!("Orderbook update failed: {}", e);
+                    ultra_error!(format!("Orderbook update failed: {}", e));
                     continue;
                 }
             }
@@ -285,84 +632,6 @@ impl DataHandler {
         }
         
         market_data_batch
-    }
-
-    /// Mock data feed for testing (generates realistic market data)
-    pub fn start_mock_data_feed(&self, symbol: String, exchange: String) -> std::thread::JoinHandle<()> {
-        let orderbook = self.get_or_create_orderbook(&symbol, &exchange);
-        let sender = self.market_data_sender.clone();
-        
-        thread::spawn(move || {
-            let mut price = 50000.0; // Starting BTC price
-            let mut _sequence = 0u64;
-            
-            loop {
-                let start_time = ultra_signal::high_precision_timestamp_ns();
-                
-                // Simulate price movement
-                price += (rand::random::<f64>() - 0.5) * 100.0; // ±$50 random walk
-                price = price.clamp(1000.0, 100000.0); // Keep reasonable bounds
-                
-                let spread = price * 0.001; // 0.1% spread
-                let bid = price - spread / 2.0;
-                let ask = price + spread / 2.0;
-                
-                // Generate orderbook updates
-                let updates = vec![
-                    OrderbookUpdate {
-                        side: "bid".to_string(),
-                        price: bid,
-                        quantity: 10.0 + rand::random::<f64>() * 50.0,
-                        timestamp: start_time,
-                    },
-                    OrderbookUpdate {
-                        side: "ask".to_string(),
-                        price: ask,
-                        quantity: 10.0 + rand::random::<f64>() * 50.0,
-                        timestamp: start_time,
-                    },
-                ];
-                
-                // Update orderbook
-                {
-                    if let Ok(mut ob) = orderbook.write() {
-                        for update in &updates {
-                            let current_time = ultra_signal::high_precision_timestamp_ns();
-                            match update.side.as_str() {
-                                "bid" => {
-                                    let _ = ob.add_limit_bid(update.price, 1, update.quantity, current_time);
-                                }
-                                "ask" => {
-                                    let _ = ob.add_limit_ask(update.price, 1, update.quantity, current_time);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                
-                // Generate market data
-                let market_data = MarketData {
-                    symbol: symbol.clone(),
-                    price,
-                    volume: 1000.0 + rand::random::<f64>() * 10000.0,
-                    timestamp: start_time,
-                    bid,
-                    ask,
-                    spread,
-                    last_trade_size: 0.1 + rand::random::<f64>() * 5.0,
-                    book_pressure: 0.8 + rand::random::<f64>() * 0.4, // 0.8-1.2
-                };
-                
-                // Send to strategies
-                let _ = sender.try_send(market_data);
-                
-                _sequence += 1;
-                
-                // 1000 updates per second (1ms interval)
-                thread::sleep(Duration::from_micros(1000));
-            }
-        })
     }
 
     /// Get market data receiver for strategies
@@ -388,6 +657,8 @@ impl DataHandler {
             orderbook_access_count: ORDERBOOK_ACCESS_COUNT.load(Ordering::Relaxed),
             active_orderbooks: ORDERBOOKS.len(),
             updates_processed: self.updates_processed.load(Ordering::Relaxed),
+            messages_received: self.messages_received.load(Ordering::Relaxed),
+            deserialize_errors: self.deserialize_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -417,33 +688,54 @@ pub struct DataHandlerStats {
     pub orderbook_access_count: u64,
     pub active_orderbooks: usize,
     pub updates_processed: u64,
+    pub messages_received: u64,
+    pub deserialize_errors: u64,
 }
 
 impl DataHandlerTrait for DataHandler {
     fn listen(&mut self) -> Result<(), Box<dyn Error>> {
-        // Start mock data feeds for all symbols/exchanges
-        let mut handles = Vec::new();
+        // Start message loop to receive from MessageBroker
+        ultra_info!("Listening to MessageBroker for market data updates...");
+        ultra_info!(format!("Topics: {:?}", self.subscribed_topics));
+        ultra_info!(format!("Symbols: {:?}", self.symbols));
+        ultra_info!(format!("Exchanges: {:?}", self.exchanges));
         
-        for symbol in &self.symbols.clone() {
-            for exchange in &self.exchanges.clone() {
-                let handle = self.start_mock_data_feed(symbol.clone(), exchange.clone());
-                handles.push(handle);
-            }
-        }
+        // Start the subscriber
+        self.start();
         
-        // Keep main thread alive
-        println!("DataHandler listening for market data updates...");
-        println!("Symbols: {:?}", self.symbols);
-        println!("Exchanges: {:?}", self.exchanges);
-        
-        // Print performance stats every 10 seconds
+        // Main message processing loop
         loop {
-            thread::sleep(Duration::from_secs(10));
-            let stats = self.get_performance_stats();
-            println!("DataHandler Stats: {:?}", stats);
+            // Poll for messages from all subscribed topics
+            let messages = self.poll_messages(100);
             
-            // Cleanup old orderbooks every minute
-            self.cleanup_old_orderbooks(Duration::from_secs(60));
+            for msg in messages {
+                if let Err(e) = self.process_message(msg) {
+                    ultra_error!(format!("Error processing message: {}", e));
+                }
+            }
+            
+            // Print performance stats every 10 seconds (non-blocking check)
+            static LAST_STATS: AtomicU64 = AtomicU64::new(0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let last = LAST_STATS.load(Ordering::Relaxed);
+            
+            if now - last >= 10 {
+                LAST_STATS.store(now, Ordering::Relaxed);
+                let stats = self.get_performance_stats();
+                ultra_info!(format!("Stats: {:?}", stats));
+                ultra_info!(format!("Messages received: {}, Deserialize errors: {}",
+                    self.messages_received.load(Ordering::Relaxed),
+                    self.deserialize_errors.load(Ordering::Relaxed)));
+                
+                // Cleanup old orderbooks
+                self.cleanup_old_orderbooks(Duration::from_secs(60));
+            }
+            
+            // Brief sleep to prevent CPU spinning when no messages
+            spin_sleep::sleep(Duration::from_micros(100));
         }
     }
 
@@ -513,89 +805,6 @@ impl MarketDataAggregator {
     }
 }
 
-/// Ultra-fast price feed simulator for testing
-pub struct PriceFeedSimulator {
-    symbols: Vec<String>,
-    base_prices: std::collections::HashMap<String, f64>,
-    price_volatility: std::collections::HashMap<String, f64>,
-    sender: Sender<MarketData>,
-}
-
-impl PriceFeedSimulator {
-    pub fn new(sender: Sender<MarketData>) -> Self {
-        let mut base_prices = std::collections::HashMap::new();
-        let mut price_volatility = std::collections::HashMap::new();
-        
-        // Setup realistic crypto prices and volatilities
-        base_prices.insert("BTC/USD".to_string(), 50000.0);
-        base_prices.insert("ETH/USD".to_string(), 3000.0);
-        base_prices.insert("BNB/USD".to_string(), 500.0);
-        base_prices.insert("SOL/USD".to_string(), 100.0);
-        base_prices.insert("ADA/USD".to_string(), 0.5);
-        
-        price_volatility.insert("BTC/USD".to_string(), 0.002); // 0.2% per tick
-        price_volatility.insert("ETH/USD".to_string(), 0.003); // 0.3% per tick
-        price_volatility.insert("BNB/USD".to_string(), 0.004); // 0.4% per tick
-        price_volatility.insert("SOL/USD".to_string(), 0.005); // 0.5% per tick
-        price_volatility.insert("ADA/USD".to_string(), 0.006); // 0.6% per tick
-        
-        Self {
-            symbols: base_prices.keys().cloned().collect(),
-            base_prices,
-            price_volatility,
-            sender,
-        }
-    }
-
-    /// Start realistic price simulation
-    pub fn start_simulation(&mut self, update_interval_ms: u64) -> std::thread::JoinHandle<()> {
-        let symbols = self.symbols.clone();
-        let mut prices = self.base_prices.clone();
-        let volatility = self.price_volatility.clone();
-        let sender = self.sender.clone();
-        
-        thread::spawn(move || {
-            let mut _sequence = 0u64;
-            
-            loop {
-                let start_time = ultra_signal::high_precision_timestamp_ns();
-                
-                for symbol in &symbols {
-                    if let (Some(current_price), Some(vol)) = (prices.get_mut(symbol), volatility.get(symbol)) {
-                        // Random walk with realistic volatility
-                        let change = (rand::random::<f64>() - 0.5) * 2.0 * vol * *current_price;
-                        *current_price += change;
-                        *current_price = current_price.max(0.01); // Prevent negative prices
-                        
-                        let spread_pct = 0.001; // 0.1% spread
-                        let spread = *current_price * spread_pct;
-                        let bid = *current_price - spread / 2.0;
-                        let ask = *current_price + spread / 2.0;
-                        
-                        let market_data = MarketData {
-                            symbol: symbol.clone(),
-                            price: *current_price,
-                            volume: 1000.0 + rand::random::<f64>() * 50000.0,
-                            timestamp: start_time,
-                            bid,
-                            ask,
-                            spread,
-                            last_trade_size: 0.01 + rand::random::<f64>() * 10.0,
-                            book_pressure: 0.7 + rand::random::<f64>() * 0.6, // 0.7-1.3
-                        };
-                        
-                        // Send market data to strategies
-                        let _ = sender.try_send(market_data);
-                    }
-                }
-                
-                _sequence += 1;
-                thread::sleep(Duration::from_millis(update_interval_ms));
-            }
-        })
-    }
-}
-
 /// Helper function for external access to orderbooks
 pub fn get_orderbook(symbol: &str, exchange: &str) -> Option<Arc<RwLock<Orderbook>>> {
     let key = (symbol.to_string(), exchange.to_string());
@@ -617,26 +826,6 @@ pub fn get_global_performance_metrics() -> (u64, u64, u64, usize) {
         ORDERBOOK_ACCESS_COUNT.load(Ordering::Relaxed),
         ORDERBOOKS.len(),
     )
-}
-
-/// Simple random number generator for price simulation
-mod rand {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    
-    static SEED: AtomicU64 = AtomicU64::new(1);
-    
-    pub fn random<T>() -> T 
-    where 
-        T: From<f64>
-    {
-        // Simple linear congruential generator for fast random numbers
-        let current = SEED.load(Ordering::Relaxed);
-        let next = current.wrapping_mul(1103515245).wrapping_add(12345);
-        SEED.store(next, Ordering::Relaxed);
-        
-        let normalized = (next as f64) / (u64::MAX as f64);
-        T::from(normalized)
-    }
 }
 
 #[cfg(test)]

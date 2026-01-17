@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use crate::signal::Signal;
 use crate::core::types::*;
+use crate::risk_controls::{KILL_SWITCH, KillReason};
 use super::traits::*;
 use super::sui_wallet::{SuiWallet, SuiNetworkConfig};
 use super::sui_ptb::ObjectRef;
@@ -189,6 +190,14 @@ impl DexConnector for DeepBookConnector {
     }
     
     async fn execute_swap(&self, signal: &Signal) -> Result<DexExecutionResult, ExecutionError> {
+        // P0 Safety: Check kill switch before DEX swap
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. DeepBook swap halted.", reason
+            )));
+        }
+        
         let wallet = self.get_wallet()?;
         
         let parts: Vec<&str> = signal.symbol.split('/').collect();
@@ -260,6 +269,8 @@ impl DexConnector for DeepBookConnector {
                 submitted_at: now_ns,
                 updated_at: now_ns,
                 latency_ns: (elapsed as u64) * 1_000_000,
+                exchange_timestamp_ns: Some(now_ns), // On-chain timestamp
+                exchange_sequence: None,
             },
             tx_hash: tx_digest,
             block_number: None,

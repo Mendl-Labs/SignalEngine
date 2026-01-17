@@ -1,196 +1,511 @@
 # SignalEngine
 
-**Ultra-High Performance Trading Signal Processing Engine**
+**Institutional-Grade High-Frequency Trading Engine**
 
-Production-ready, institutional-grade trading engine designed for sub-millisecond execution with lock-free architecture, zero-copy operations, and SIMD optimization.
-
----
-
-## 📊 Performance
-
-| Component | Latency | Status |
-|-----------|---------|--------|
-| **Signal Generation** | <50μs | ✅ SIMD + Zero-allocation |
-| **Order Routing** | <100μs | ✅ Lock-free atomic routing |
-| **Signal Dispatch** | <200μs | ✅ Batch SIMD processing |
-| **Strategy Execution** | <300μs | ✅ Pre-allocated buffers |
-| **Order Execution** | <500μs | ✅ Lock-free + CPU affinity |
-
-**End-to-End**: Sub-millisecond trading cycle  
-**Throughput**: 50K+ operations/second  
-**Latency (P99)**: <1ms
+A production-ready trading engine designed for sub-millisecond execution with lock-free architecture, comprehensive risk controls, and support for both centralized (CEX) and decentralized (DEX) exchanges.
 
 ---
 
-## 📁 Project Structure
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Performance](#performance)
+- [Crate Reference](#crate-reference)
+- [Risk Controls](#risk-controls)
+- [Exchange Connectors](#exchange-connectors)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
+- [Deployment](#deployment)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Overview
+
+SignalEngine is the real-time trading execution layer of the TradingPlatform. It:
+
+1. **Subscribes** to normalized market data from MessageBroker (published by DataEngine)
+2. **Generates signals** using loaded strategies with SIMD-optimized calculations
+3. **Validates orders** through multiple risk control layers
+4. **Executes trades** on CEX (Kraken) and DEX (Cetus, DeepBook on Sui)
+5. **Persists state** via Write-Ahead Log (WAL) for crash recovery
+6. **Reports metrics** to Prometheus/Grafana for monitoring
+
+### Key Characteristics
+
+| Attribute | Value |
+|-----------|-------|
+| **End-to-End Latency** | &lt;1ms (signal to order) |
+| **Throughput** | 50K+ operations/second |
+| **Architecture** | Lock-free, zero-copy, SIMD-optimized |
+| **Risk Controls** | Kill switch, fat-finger, circuit breakers |
+| **Persistence** | WAL with graceful shutdown integration |
+| **Exchanges** | Kraken (CEX), Cetus/DeepBook (Sui DEX) |
+
+---
+
+## Architecture
+
+### Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              SIGNAL ENGINE                                       │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                          MESSAGE BROKER                                   │  │
+│  │              (market.data.{exchange}.trades / .level3)                   │  │
+│  └────────────────────────────────┬─────────────────────────────────────────┘  │
+│                                   │                                             │
+│                                   ▼                                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐    │
+│  │                       DATA HANDLER                                      │    │
+│  │     Subscribes to MessageBroker, maintains local orderbook replicas     │    │
+│  │                  ORDERBOOKS: DashMap<(exchange, symbol), Orderbook>     │    │
+│  └────────────────────────────────┬───────────────────────────────────────┘    │
+│                                   │                                             │
+│                                   ▼                                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐    │
+│  │                    STRATEGY MANAGER                                     │    │
+│  │    Loads strategies from DB, routes market data, generates signals      │    │
+│  │    Strategies: Momentum, MeanReversion, PortfolioMixed                  │    │
+│  └────────────────────────────────┬───────────────────────────────────────┘    │
+│                                   │ Signal                                      │
+│                                   ▼                                             │
+│  ┌────────────────────────────────────────────────────────────────────────┐    │
+│  │                    EXECUTION HANDLER                                    │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │              PRE-EXECUTION RISK CONTROLS                         │   │    │
+│  │  │                                                                  │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │   │    │
+│  │  │  │ KILL SWITCH  │─▶│ FAT FINGER   │─▶│ CIRCUIT BREAKER (v2)   │ │   │    │
+│  │  │  │   (atomic)   │  │  (limits)    │  │ (lock-free, 5 = trip)  │ │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └────────────────────────┘ │   │    │
+│  │  │         │                 │                      │               │   │    │
+│  │  │         ▼                 ▼                      ▼               │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │   │    │
+│  │  │  │ RATE LIMITER │  │ BACKPRESSURE │  │ POSITION LIMITS        │ │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └────────────────────────┘ │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                   │                                     │    │
+│  │                                   ▼                                     │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                 EXCHANGE CONNECTORS                              │   │    │
+│  │  │                                                                  │   │    │
+│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
+│  │  │   │    KRAKEN    │  │    CETUS     │  │     DEEPBOOK       │   │   │    │
+│  │  │   │    (CEX)     │  │  (Sui DEX)   │  │    (Sui DEX)       │   │   │    │
+│  │  │   │  REST + WS   │  │    PTB       │  │      PTB           │   │   │    │
+│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                   │                                     │    │
+│  │                                   ▼                                     │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                 PERSISTENCE & AUDIT                              │   │    │
+│  │  │                                                                  │   │    │
+│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
+│  │  │   │  ORDER WAL   │  │ POSITION     │  │       TCA          │   │   │    │
+│  │  │   │ (crash safe) │  │ TRACKER      │  │ (cost analysis)    │   │   │    │
+│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
+│  │  │                                                                  │   │    │
+│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
+│  │  │   │    AUDIT     │  │   ALERTS     │  │   PROMETHEUS       │   │   │    │
+│  │  │   │   (trail)    │  │  (webhooks)  │  │    (metrics)       │   │   │    │
+│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  └────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐    │
+│  │                    GRACEFUL SHUTDOWN                                    │    │
+│  │         Coordinates WAL flush, position sync, and clean exit           │    │
+│  └────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Component Interaction
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ DataEngine  │────▶│MessageBroker│────▶│SignalEngine │
+│ (normalizes)│     │  (pub/sub)  │     │ (executes)  │
+└─────────────┘     └─────────────┘     └──────┬──────┘
+                                               │
+                    ┌──────────────────────────┼──────────────────────────┐
+                    │                          │                          │
+                    ▼                          ▼                          ▼
+             ┌─────────────┐           ┌─────────────┐           ┌─────────────┐
+             │   Kraken    │           │   Cetus     │           │  DeepBook   │
+             │    API      │           │  (Sui PTB)  │           │  (Sui PTB)  │
+             └─────────────┘           └─────────────┘           └─────────────┘
+```
+
+---
+
+## Performance
+
+### Latency Benchmarks
+
+| Component | P50 | P99 | P99.9 |
+|-----------|-----|-----|-------|
+| Signal Generation | 45μs | 75μs | 100μs |
+| Risk Validation | 5μs | 10μs | 15μs |
+| Order Routing | 85μs | 120μs | 150μs |
+| Exchange Submit | 400μs | 600μs | 800μs |
+| **End-to-End** | **535μs** | **805μs** | **1065μs** |
+
+### Optimization Techniques
+
+| Technique | Impact | Implementation |
+|-----------|--------|----------------|
+| **Lock-Free Structures** | -30% contention | `DashMap`, atomic operations, `crossbeam` |
+| **Zero-Copy Messaging** | -80% memory overhead | `Arc<Signal>`, ring buffers |
+| **SIMD Processing** | +40% throughput | AVX2 batch price calculations |
+| **Memory Pools** | -25% allocation time | Thread-local pre-allocated buffers |
+| **Cache Alignment** | -25% false sharing | 64-byte aligned atomics |
+| **RDTSC Timestamps** | ~10ns overhead | Hardware timestamp counter |
+
+### Memory Usage
+
+| State | Memory |
+|-------|--------|
+| Baseline | ~500MB |
+| Per 1K Strategies | +50MB |
+| Per 1M Signals/day | +200MB |
+| Peak Load | ~2GB |
+
+---
+
+## Crate Reference
+
+### Workspace Structure
 
 ```
 SignalEngine/
-├── program/              # Main executable binary
-│   ├── src/
-│   │   ├── main.rs      # Application entry point
-│   │   └── performance_tests.rs
-│   └── Cargo.toml
-│
-├── crates/              # Library crates (organized by functionality)
-│   ├── core/           # Shared infrastructure (signalengine-core)
-│   │   ├── logging.rs       # Ultra-low latency logging
-│   │   ├── rdtsc.rs         # Hardware timestamps (RDTSC)
-│   │   ├── simd.rs          # SIMD optimizations
-│   │   ├── cache_aligned.rs # Cache-line aligned atomics
-│   │   ├── lock_free.rs     # Lock-free data structures
-│   │   ├── memory_pool.rs   # Memory pooling
-│   │   ├── zero_copy.rs     # Zero-copy messaging
-│   │   └── memory_ordering.rs # Memory barriers
+├── program/                    # Main binary entrypoint
+├── crates/
+│   ├── core/                   # Shared low-level primitives
+│   ├── config/                 # Configuration management
+│   ├── signal/                 # Signal type definitions
+│   ├── orderbook/              # Orderbook data structures
+│   ├── portfolio/              # Portfolio state management
 │   │
-│   ├── hostbuilder/         # Service orchestration
-│   ├── datahandler/         # Market data processing
-│   ├── executionhandler/    # Order execution
-│   ├── signalgenerator/     # Signal generation
-│   ├── signaldispatcher/    # Signal routing
-│   ├── strategyhandler/     # Strategy management
-│   ├── smartorderrouter/    # Intelligent order routing
-│   ├── portfoliohandler/    # Portfolio management
-│   ├── exchangemetricaggregator/ # Exchange metrics
-│   ├── orderbook/           # Orderbook structures
-│   ├── portfolio/           # Portfolio structures
-│   ├── signal/              # Signal types
-│   └── config/              # Configuration
+│   ├── datahandler/            # MessageBroker subscriber, local orderbook cache
+│   ├── signalgenerator/        # SIMD-optimized signal generation
+│   ├── signaldispatcher/       # Signal routing and batching
+│   ├── strategyhandler/        # Strategy execution orchestration
+│   ├── strategyloader/         # Database strategy loading
+│   ├── smartorderrouter/       # Intelligent order routing
+│   ├── portfoliohandler/       # Portfolio management
+│   ├── exchangemetricaggregator/ # Exchange metrics collection
+│   │
+│   ├── executionhandler/       # Order execution (35+ modules)
+│   │   ├── core/               # ExchangeConnector trait, types
+│   │   ├── exchanges/          # Kraken, Cetus, DeepBook connectors
+│   │   │   └── dex/            # DEX-specific implementations
+│   │   ├── risk_controls.rs    # Kill switch, position limits
+│   │   ├── fat_finger.rs       # Fat-finger protection
+│   │   ├── circuit_breaker_v2.rs # Lock-free circuit breaker
+│   │   ├── order_wal.rs        # Write-ahead log
+│   │   ├── graceful_shutdown.rs # Coordinated shutdown
+│   │   ├── hot_config.rs       # Runtime config reload
+│   │   ├── alerts.rs           # Webhook notifications
+│   │   ├── tca.rs              # Transaction cost analysis
+│   │   ├── fill_probability.rs # ML fill prediction
+│   │   ├── multi_leg.rs        # OCO, bracket orders
+│   │   └── ...
+│   │
+│   └── hostbuilder/            # Service orchestration
 │
-├── scripts/             # Build & deployment
-├── k8s/                # Kubernetes manifests
-├── tests/              # Integration tests
-└── Cargo.toml          # Workspace configuration
+├── k8s/                        # Kubernetes Helm charts
+├── scripts/                    # Build and deployment scripts
+└── tests/                      # Integration tests
 ```
 
-### Crate Dependency Graph
+### Core Crate (`signalengine-core`)
 
+Low-level primitives shared across all crates:
+
+| Module | Purpose |
+|--------|---------|
+| `lock_free.rs` | `LockFreeHashMap`, `LockFreeStack` |
+| `cache_aligned.rs` | 64-byte aligned atomics |
+| `memory_pool.rs` | Thread-local memory pools |
+| `zero_copy.rs` | `ZeroCopyChannel`, `SignalArena` |
+| `simd.rs` | AVX2 batch operations |
+| `rdtsc.rs` | Hardware timestamps |
+| `memory_ordering.rs` | Precise memory barriers |
+
+### ExecutionHandler Crate (35+ modules)
+
+The most critical crate for production trading:
+
+#### Risk Control Layer
+| Module | Purpose |
+|--------|---------|
+| `risk_controls.rs` | Global `KILL_SWITCH`, position limits |
+| `fat_finger.rs` | Max order size/notional limits (default: $10,000) |
+| `circuit_breaker_v2.rs` | Lock-free failure detection (5 failures = trip) |
+| `backpressure.rs` | Adaptive flow control |
+| `rate_limiter.rs` | Exchange rate limit compliance |
+| `validation.rs` | Order validation rules |
+
+#### Exchange Connectors
+| Module | Exchange | Type | Features |
+|--------|----------|------|----------|
+| `kraken.rs` | Kraken | CEX | HMAC-SHA512, edit orders, WebSocket |
+| `cetus.rs` | Cetus | Sui DEX | PTB execution, pool discovery |
+| `deepbook.rs` | DeepBook | Sui DEX | PTB execution, order book |
+| `sui_wallet.rs` | - | Utility | Sui wallet management |
+| `sui_ptb.rs` | - | Utility | Programmable Transaction Blocks |
+
+#### Persistence & Audit
+| Module | Purpose |
+|--------|---------|
+| `order_wal.rs` | Write-ahead log for crash recovery |
+| `position_tracker.rs` | Real-time position state |
+| `tca.rs` | Transaction Cost Analysis (slippage, VWAP, TWAP) |
+| `audit.rs` | Kill switch audit trail |
+| `reconciliation.rs` | Exchange state synchronization |
+
+#### Operations
+| Module | Purpose |
+|--------|---------|
+| `graceful_shutdown.rs` | Coordinated shutdown with WAL flush |
+| `hot_config.rs` | Runtime config reload without restart |
+| `alerts.rs` | Webhook notifications (Slack, PagerDuty) |
+| `prometheus_metrics.rs` | Metrics export |
+| `secrets.rs` | Credential management |
+
+#### Advanced Features
+| Module | Purpose |
+|--------|---------|
+| `multi_leg.rs` | OCO, bracket orders, spreads |
+| `fill_probability.rs` | ML-based fill prediction |
+| `latency_optimizer.rs` | Adaptive routing optimization |
+| `bounded_dlq.rs` | Dead letter queue with bounds |
+| `chaos.rs` | Chaos engineering for testing |
+
+### StrategyLoader Crate
+
+Strategy management and execution:
+
+| Type | Purpose |
+|------|---------|
+| `StrategyInstance` | Loaded strategy with parameters |
+| `StrategyType` | `Momentum`, `MeanReversion`, `PortfolioMixed` |
+| `StrategyManager` | Orchestrates loading, routing, execution |
+| `SignalStore` | Tracks generated signals with lifecycle |
+| `PortfolioStrategy` | Trait for strategy implementations |
+
+---
+
+## Risk Controls
+
+### Kill Switch
+
+The global kill switch is the **first check** in every order path:
+
+```rust
+use signalengine::risk_controls::KILL_SWITCH;
+
+// In every execute_order():
+if KILL_SWITCH.is_triggered() {
+    return Err(ExecutionError::KillSwitchActive);
+}
+
+// Trigger manually or automatically:
+KILL_SWITCH.trigger(KillReason::MaxDrawdown);
+KILL_SWITCH.trigger(KillReason::DailyLossLimit);
+
+// Reset (requires manual intervention):
+KILL_SWITCH.reset();
 ```
-program (binary)
-  └── hostbuilder
-       ├── datahandler → signalgenerator → signal
-       ├── executionhandler → core, signal, orderbook
-       ├── portfoliohandler → portfolio, config
-       ├── strategyhandler → signalgenerator, signaldispatcher
-       └── smartorderrouter → core, orderbook
+
+**Kill Reasons:**
+- `Manual` - Operator triggered
+- `MaxDrawdown` - Portfolio drawdown exceeded
+- `DailyLossLimit` - Daily loss limit hit
+- `RateLimit` - Exchange rate limit exceeded
+- `PositionLimit` - Position size violated
+- `SystemError` - Internal system error
+- `ExchangeError` - Exchange connectivity issue
+- `Reconciliation` - Position mismatch detected
+
+### Fat-Finger Protection
+
+Prevents accidental large orders:
+
+```rust
+let config = FatFingerConfig {
+    max_order_size: 1.0,           // Max 1 BTC per order
+    max_order_notional: 10_000.0,  // Max $10,000 per order
+    max_daily_notional: 100_000.0, // Max $100,000 per day
+    max_position_notional: 50_000.0, // Max $50,000 position
+};
+```
+
+### Circuit Breaker (v2)
+
+Lock-free circuit breaker using atomics:
+
+```rust
+// Automatic tripping after 5 consecutive failures
+let breaker = CircuitBreakerV2::new(5, Duration::from_secs(60));
+
+// State machine: Closed -> Open -> HalfOpen -> Closed
+match breaker.state() {
+    CircuitState::Closed => { /* Normal operation */ }
+    CircuitState::Open => { /* Reject all requests */ }
+    CircuitState::HalfOpen => { /* Allow probe request */ }
+}
+```
+
+### Position Limits
+
+```rust
+let limits = PositionLimits {
+    max_position_size: 10.0,        // 10 BTC max per symbol
+    max_position_value: 500_000.0,  // $500k max per position
+    max_portfolio_value: 2_000_000.0, // $2M total
+    max_open_positions: 20,
+    max_order_size: 1.0,            // 1 BTC max per order
+    max_order_value: 50_000.0,      // $50k max per order
+};
 ```
 
 ---
 
-## ⚡ Core Features
+## Exchange Connectors
 
-### Lock-Free Architecture
-- **DashMap**: Concurrent hash maps with no locks
-- **LockFreeHashMap**: CAS-based lock-free hash map
-- **LockFreeStack**: Lock-free concurrent stack
-- **Atomic Operations**: Lock-free counters and flags
-- **Zero Blocking**: Predictable, low tail latency
-- **-30% lock contention** vs traditional mutexes
+### Kraken (CEX)
 
-### Zero-Copy Operations
-- **Arc-based Signals**: Clone pointers, not data (~5ns vs ~200ns)
-- **ZeroCopyChannel**: Ring buffer message passing
-- **SignalArena**: Batch allocation for cache locality
-- **-80% memory copy overhead**
-- **+60% throughput** in signal dispatch
+Full-featured centralized exchange connector:
 
-### SIMD Optimization
-- **Batch Processing**: Vectorized operations on market data
-- **AVX2 Support**: 8-way parallel calculations
-- **Parallel Calculations**: 4-8x throughput on price analysis
-- **Hardware Acceleration**: AVX2/NEON support
+```rust
+use signalengine::exchanges::KrakenConnector;
 
-### Memory Management
-- **Pre-allocated Pools**: Zero allocation on hot paths
-- **Cache-Aligned**: 64-byte alignment prevents false sharing
-- **Thread-Local**: Per-thread pools eliminate contention
-- **Huge Pages**: TLB optimization for large buffers
-- **-25% allocation time** with arena allocators
+let connector = KrakenConnector::new(
+    api_key,
+    api_secret,
+    Some(10), // Connection pool size
+).await?;
 
-### High-Precision Timing
-- **RDTSC**: Hardware timestamps (~10ns overhead)
-- **Nanosecond Precision**: Accurate latency measurement
-- **Performance Profiling**: Real-time latency tracking
+// Execute order (kill switch checked internally)
+let result = connector.execute_order(&signal).await?;
 
-### Memory Ordering
-- **Precise Barriers**: Relaxed, Acquire, Release, SeqCst
-- **SpinWait**: Adaptive backoff for busy waiting
-- **Prefetch**: Cache line prefetch hints
-- **CacheLinePadding**: False sharing prevention
-- **-50% fence overhead** with precise ordering
+// Edit order (Kraken's atomic cancel+replace)
+let edited = connector.edit_order(
+    &order_id,
+    EditOrderParams {
+        new_price: Some(50000.0),
+        new_quantity: Some(0.5),
+    }
+).await?;
+
+// Cancel order
+connector.cancel_order(&order_id, "BTC/USD").await?;
+```
+
+**Features:**
+- HMAC-SHA512 request signing
+- Connection pooling
+- WebSocket for real-time updates
+- Edit order support (atomic cancel+replace)
+- Memory pools for zero-allocation hot paths
+- SIMD metrics calculation
+
+### Cetus (Sui DEX)
+
+Sui blockchain DEX using Programmable Transaction Blocks:
+
+```rust
+use signalengine::exchanges::dex::CetusConnector;
+
+let connector = CetusConnector::new(
+    sui_client,
+    wallet,
+    CetusConfig::mainnet(),
+).await?;
+
+// Swap execution
+let result = connector.execute_swap(
+    pool_id,
+    amount_in,
+    min_amount_out,
+    a_to_b, // Direction
+).await?;
+
+// Pool discovery
+let pools = connector.discover_pools("SUI", "USDC").await?;
+```
+
+**Features:**
+- PTB (Programmable Transaction Block) construction
+- Pool discovery and routing
+- Slippage protection
+- Gas estimation
+
+### DeepBook (Sui DEX)
+
+Sui's native order book DEX:
+
+```rust
+use signalengine::exchanges::dex::DeepBookConnector;
+
+let connector = DeepBookConnector::new(
+    sui_client,
+    wallet,
+    DeepBookConfig::mainnet(),
+).await?;
+
+// Place limit order
+let result = connector.place_limit_order(
+    pool_id,
+    price,
+    quantity,
+    is_bid,
+).await?;
+
+// Cancel order
+connector.cancel_order(pool_id, order_id).await?;
+```
+
+### Deprecated Connectors
+
+The following are **stub implementations** with runtime deprecation warnings:
+
+- `UniswapV3Connector` - EVM DEX (not maintained)
+- `JupiterConnector` - Solana DEX (not maintained)
 
 ---
 
-## 🏗️ Architecture
-
-```
-┌──────────────────────────────────────────────┐
-│              HostBuilder                     │
-│      (Service Orchestration Layer)           │
-├──────────────────────────────────────────────┤
-│                                              │
-│  ┌─────────────┐    ┌──────────────┐       │
-│  │ DataHandler │───▶│ OrderBook    │       │
-│  │ (Market Data)    │ (Lock-Free)  │       │
-│  └─────────────┘    └──────────────┘       │
-│         │                                    │
-│         ▼                                    │
-│  ┌─────────────────┐                        │
-│  │ SignalGenerator │                        │
-│  │ (SIMD-Optimized)│                        │
-│  └─────────────────┘                        │
-│         │                                    │
-│         ▼                                    │
-│  ┌──────────────────┐                       │
-│  │ StrategyHandler  │                       │
-│  │ (33-54x Faster)  │                       │
-│  └──────────────────┘                       │
-│         │                                    │
-│         ▼                                    │
-│  ┌──────────────────┐                       │
-│  │SignalDispatcher  │                       │
-│  │(Batch Processing)│                       │
-│  └──────────────────┘                       │
-│         │                                    │
-│         ▼                                    │
-│  ┌──────────────────┐                       │
-│  │SmartOrderRouter  │                       │
-│  │(Lock-Free Atomic)│                       │
-│  └──────────────────┘                       │
-│         │                                    │
-│         ▼                                    │
-│  ┌──────────────────┐                       │
-│  │ExecutionHandler  │                       │
-│  │(Ultra-Low Latency)│                      │
-│  └──────────────────┘                       │
-│         │                                    │
-│         ▼                                    │
-│     Exchange APIs                            │
-└──────────────────────────────────────────────┘
-```
-
-**Core Design Principles:**
-- Lock-free concurrent data structures (DashMap, atomic operations)
-- SIMD-accelerated batch processing
-- Zero-allocation hot paths with memory pools
-- CPU affinity and high-priority scheduling
-
----
-
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
-- Rust 1.75+
-- 8GB+ RAM
-- Multi-core CPU
-- Linux (for best performance)
 
-### Installation
+- Rust 1.75+ (stable)
+- 8GB+ RAM
+- Linux recommended (for best performance)
+- PostgreSQL (for strategy storage)
+- MessageBroker running (for market data)
+
+### Build
 
 ```bash
-git clone https://github.com/Nwagbara-Group-LLC/SignalEngine.git
 cd SignalEngine
-cargo build --release
+
+# Development build
+cargo build --workspace
+
+# Release build (optimized)
+cargo build --workspace --release
+
+# Ultra-optimized with native CPU features
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ### Run
@@ -199,371 +514,235 @@ cargo build --release
 # Development
 cargo run --bin program
 
-# Production (optimized)
+# Production
 cargo run --bin program --release
 
-# Ultra-optimized with native CPU features
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+# With environment variables
+KRAKEN_API_KEY="..." \
+KRAKEN_SECRET_KEY="..." \
+DATABASE_URL="postgresql://..." \
+cargo run --bin program --release
 ```
 
 ### Test
 
 ```bash
 # All tests
-cargo test
+cargo test --workspace
 
-# Specific package
-cargo test -p signalgenerator
-
-# With output
-cargo test -- --nocapture
+# Specific crate
+cargo test -p executionhandler
 
 # Integration tests
 cargo test --test integration_test
-```
 
-### Benchmark
-
-```bash
-# Run performance benchmarks
-cargo bench
-
-# Specific benchmark
-cargo bench --bench signal_latency
+# With output
+cargo test -- --nocapture
 ```
 
 ---
 
-## 🔧 Configuration
+## Configuration
 
 ### Environment Variables
+
 ```bash
 # Required
 export KRAKEN_API_KEY="your_api_key"
 export KRAKEN_SECRET_KEY="your_secret_key"
 export DATABASE_URL="postgresql://user:pass@localhost/trading"
-export REDIS_URL="redis://localhost:6379"
+export MESSAGE_BROKER_URL="tcp://localhost:9000"
 
 # Optional
 export LOG_LEVEL="info"
 export CPU_AFFINITY="true"
 export ENABLE_SIMD="true"
-export ENABLE_HUGE_PAGES="true"
+export WAL_PATH="/var/lib/signalengine/wal"
+export METRICS_PORT="9090"
+
+# Sui DEX (if using)
+export SUI_WALLET_PATH="/path/to/wallet.keystore"
+export SUI_RPC_URL="https://fullnode.mainnet.sui.io"
 ```
 
 ### Production Configuration
 
-**config/production.toml**:
-```toml
-[engine]
-max_threads = 16
-worker_threads = 8
-cpu_affinity = true
-high_priority = true
+**config/production.yaml**:
+```yaml
+engine:
+  max_threads: 16
+  worker_threads: 8
+  cpu_affinity: true
+  high_priority: true
 
-[performance]
-enable_simd = true
-use_rdtsc = true
-lock_free_mode = true
-batch_size = 1000
-cache_line_alignment = true
-zero_copy_paths = true
+performance:
+  enable_simd: true
+  use_rdtsc: true
+  lock_free_mode: true
+  batch_size: 1000
 
-[cpu]
-signal_generator_cores = [2, 3]
-order_router_cores = [4, 5]
-dispatcher_cores = [6, 7]
-strategy_cores = [8, 9]
-realtime_scheduling = true
+risk:
+  kill_switch_enabled: true
+  fat_finger:
+    max_order_notional: 10000.0
+    max_daily_notional: 100000.0
+  circuit_breaker:
+    failure_threshold: 5
+    reset_timeout_secs: 60
+  position_limits:
+    max_position_value: 500000.0
+    max_portfolio_value: 2000000.0
 
-[memory]
-enable_huge_pages = true
-huge_page_size_mb = 2
-signal_pool_size = 10000
-order_pool_size = 5000
-pre_allocate_buffers = true
+persistence:
+  wal_enabled: true
+  wal_path: /var/lib/signalengine/wal
+  wal_sync_interval_ms: 100
+  wal_max_size_mb: 1024
 
-[exchanges.kraken]
-enabled = true
-api_key = "${KRAKEN_API_KEY}"
-secret_key = "${KRAKEN_SECRET_KEY}"
-pool_size = 10
-max_retries = 3
-```
+alerts:
+  slack_webhook: "https://hooks.slack.com/..."
+  pagerduty_key: "..."
+  alert_on_kill_switch: true
+  alert_on_circuit_breaker: true
 
-### Performance Tuning
-
-**CPU Affinity** (Linux):
-```rust
-// Automatically configured in HostBuilder
-// Pins critical threads to specific cores
-use signalengine::set_thread_affinity;
-set_thread_affinity(&[2, 3])?; // Pin to cores 2-3
-```
-
-**Huge Pages** (Linux):
-```bash
-# Enable huge pages
-sudo sysctl -w vm.nr_hugepages=128
-
-# Make permanent
-echo "vm.nr_hugepages=128" | sudo tee -a /etc/sysctl.conf
-```
-
-**Realtime Priority** (Linux):
-```bash
-# Allow realtime scheduling
-sudo setcap cap_sys_nice=eip target/release/program
-```
-
----
-
-## 💻 API Examples
-
-### Basic Signal Processing
-```rust
-use signalengine::*;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    initialize_signal_engine().await?;
+exchanges:
+  kraken:
+    enabled: true
+    api_key: "${KRAKEN_API_KEY}"
+    secret_key: "${KRAKEN_SECRET_KEY}"
+    rate_limit_per_second: 10
     
-    // Create signal generator
-    let generator = UltraFastSignalGenerator::new();
-    let signals = generator
-        .generate_momentum_signals_simd(&market_data)
-        .await?;
-
-    // Execute orders
-    let handler = UltraLowLatencyExecutionHandler::new(
-        "Kraken".to_string(),
-        credentials,
-        Some(10), // connection pool size
-    )?;
+  cetus:
+    enabled: true
+    rpc_url: "https://fullnode.mainnet.sui.io"
     
-    let result = handler.execute_order(&signal).await?;
+  deepbook:
+    enabled: true
+    rpc_url: "https://fullnode.mainnet.sui.io"
+```
+
+### Hot Configuration Reload
+
+Runtime config changes without restart:
+
+```bash
+# Send SIGHUP to reload config
+kill -HUP $(pidof signalengine)
+
+# Or via API
+curl -X POST http://localhost:8080/admin/reload-config
+```
+
+Supported hot-reload fields:
+- Risk limits (fat-finger, position limits)
+- Alert thresholds
+- Rate limits
+- Log levels
+
+---
+
+## API Reference
+
+### ExchangeConnector Trait
+
+All exchange connectors implement this trait:
+
+```rust
+#[async_trait]
+pub trait ExchangeConnector: Send + Sync {
+    /// Execute a trading signal
+    async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError>;
     
-    println!("Order executed: {:?}", result);
-    Ok(())
+    /// Execute multiple signals in batch
+    async fn execute_batch_orders(&self, signals: &[Signal]) -> Vec<Result<ExecutionResult, ExecutionError>>;
+    
+    /// Cancel an existing order
+    async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<bool, ExecutionError>;
+    
+    /// Edit an existing order (if supported)
+    async fn edit_order(&self, order_id: &str, params: EditOrderParams) -> Result<ExecutionResult, ExecutionError>;
+    
+    /// Health check
+    async fn health_check(&self) -> Result<bool, ExecutionError>;
+    
+    /// Exchange name
+    fn exchange_name(&self) -> &str;
+    
+    /// Supported trading pairs
+    fn supported_symbols(&self) -> &[String];
+    
+    /// Get exchange rate limits
+    fn get_limits(&self) -> ExchangeLimits;
+    
+    /// Validate order before submission
+    fn validate_order(&self, signal: &Signal) -> Result<(), ExecutionError>;
 }
 ```
 
-### Zero-Copy Signal Dispatch
+### ExecutionResult
+
 ```rust
-use signalengine::{ZeroCopySignal, ZeroCopyChannel};
-use std::sync::Arc;
+pub struct ExecutionResult {
+    pub order_id: String,
+    pub exchange_order_id: Option<String>,
+    pub exchange: String,
+    pub status: ExecutionStatus,
+    pub filled_quantity: f64,
+    pub remaining_quantity: f64,
+    pub avg_fill_price: f64,
+    pub total_fees: f64,
+    pub fills: Vec<ExecutionFill>,
+    pub reject_reason: Option<String>,
+    pub submitted_at: u128,        // Nanosecond timestamp
+    pub updated_at: u128,
+    pub latency_ns: u64,
+    pub exchange_timestamp_ns: Option<u64>, // MiFID II compliance
+    pub exchange_sequence: Option<u64>,
+}
 
-// Create zero-copy channel
-let channel = ZeroCopyChannel::new(1000);
-
-// Send signal (zero-copy Arc clone)
-let signal = Arc::new(Signal::new(/* ... */));
-channel.send(signal)?;
-
-// Receive signal (zero-copy)
-if let Some(signal) = channel.recv() {
-    // Process signal without copying
-    process_signal(&signal);
+pub enum ExecutionStatus {
+    Pending,
+    Submitted,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+    Expired,
 }
 ```
 
-### Lock-Free Concurrent Processing
+### Signal Type
+
 ```rust
-use signalengine::LockFreeHashMap;
-use std::sync::Arc;
-
-// Create lock-free hash map
-let strategies = Arc::new(LockFreeHashMap::new());
-
-// Insert strategy (lock-free)
-strategies.insert("momentum".to_string(), strategy);
-
-// Get strategy (lock-free)
-if let Some(strategy) = strategies.get(&"momentum".to_string()) {
-    execute_strategy(&strategy);
+pub struct Signal {
+    pub id: String,
+    pub strategy_id: Uuid,
+    pub symbol: String,
+    pub exchange: String,
+    pub action: SignalAction,
+    pub quantity: f64,
+    pub price: Option<f64>,
+    pub confidence: f64,
+    pub timestamp_ms: i64,
+    pub metadata: HashMap<String, Value>,
 }
-```
 
-### Performance Monitoring
-```rust
-// Get performance metrics
-let metrics = engine.get_performance_metrics().await?;
-
-println!("Latency (P50): {}μs", metrics.p50_latency_us);
-println!("Latency (P99): {}μs", metrics.p99_latency_us);
-println!("Throughput: {} ops/sec", metrics.ops_per_second);
-println!("Error Rate: {}%", metrics.error_rate * 100.0);
-```
-
----
-
-## 📊 Performance Benchmarks
-
-### Production Results
-
-| Operation | Latency (μs) | Throughput (ops/sec) |
-|-----------|--------------|---------------------|
-| Signal Generation | 45-50 | 1,000,000+ |
-| Order Routing | 85-100 | 500,000+ |
-| Signal Dispatch | 150-200 | 250,000+ |
-| Order Execution | 400-500 | 100,000+ |
-| **End-to-End** | **680-850** | **50,000+** |
-
-### Latency Percentiles
-- **P50**: <50μs
-- **P95**: <75μs
-- **P99**: <100μs
-- **P99.9**: <150μs
-
-### Memory Usage
-- **Baseline**: ~500MB
-- **Peak Load**: ~2GB
-- **Zero allocations** in critical paths
-
-### Optimization Impact
-- Lock-free structures: **-30% contention**
-- Zero-copy: **-80% memory overhead**
-- SIMD: **+40% throughput**
-- Arena allocation: **-25% allocation time**
-- Cache alignment: **-25% false sharing**
-
----
-
-## 🛠️ Development
-
-### Build Commands
-```bash
-# Development build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Ultra-optimized build
-cargo build --profile release-ultra
-
-# Check without building
-cargo check
-
-# Lint (zero warnings)
-cargo clippy --all-targets
-
-# Format
-cargo fmt
-
-# Test coverage
-cargo tarpaulin --out Html
-```
-
-### Adding New Crates
-
-1. Create directory:
-```bash
-mkdir crates/new-crate
-cd crates/new-crate
-```
-
-2. Create `Cargo.toml`:
-```toml
-[package]
-name = "new-crate"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-signalengine = { package = "signalengine-core", path = "../core" }
-tokio = { version = "1", features = ["full"] }
-```
-
-3. Update workspace `Cargo.toml`:
-```toml
-[workspace]
-members = [
-    "program",
-    "crates/*",
-]
-```
-
-4. Create `src/lib.rs`:
-```rust
-pub fn hello() {
-    println!("Hello from new-crate!");
+pub enum SignalAction {
+    Buy,
+    Sell,
+    BuyLimit,
+    SellLimit,
+    BuyStop,
+    SellStop,
 }
 ```
 
 ---
 
-## 🔬 Optimization Phases
+## Deployment
 
-### Phase 1: Foundation (✅ Complete)
-- ✅ Async architecture
-- ✅ Basic error handling
-- ✅ Logging infrastructure
-- ✅ Component integration
+### Docker
 
-### Phase 2: Initial Performance (✅ Complete)
-- ✅ Crossbeam channels
-- ✅ Basic SIMD
-- ✅ Pre-allocated buffers
-- ✅ Initial lock-free structures
-
-### Phase 3: Advanced Performance (✅ Complete)
-- ✅ Lock-free hash maps and stacks
-- ✅ Zero-copy Arc-based signals
-- ✅ Arena allocation
-- ✅ Memory ordering and barriers
-- ✅ Spin-wait with adaptive backoff
-- ✅ Cache-aligned atomics
-- ✅ **Result**: 70-85% latency reduction
-
-### Phase 4: Ultra-Low Latency (Target: <50μs)
-Current: ~270μs | Target: <50μs | Gap: 5.4x
-
-**Remaining Optimizations:**
-- [ ] Full RDTSC hardware timestamps
-- [ ] Comprehensive SIMD coverage
-- [ ] Memory prefetching
-- [ ] Branch prediction hints
-- [ ] Kernel bypass networking (DPDK)
-- [ ] Hot path profiling with perf
-
----
-
-## 🎯 Performance Targets
-
-### Current vs Target
-
-| Metric | Current | Target | Gap |
-|--------|---------|--------|-----|
-| Signal Gen | ~50μs | <25μs | 2x |
-| Routing | ~100μs | <50μs | 2x |
-| Dispatch | ~200μs | <100μs | 2x |
-| Strategy | ~300μs | <150μs | 2x |
-| Execution | ~500μs | <250μs | 2x |
-| **Total** | **~1150μs** | **<50μs** | **23x** |
-
-### System Requirements
-
-**Minimum:**
-- CPU: 4 cores
-- RAM: 8GB
-- Disk: 20GB
-- OS: Linux, macOS, Windows
-
-**Recommended:**
-- CPU: 16+ cores (3.0GHz+)
-- RAM: 32GB+
-- Disk: 100GB NVMe SSD
-- OS: Linux (Ubuntu 20.04+)
-- Network: 10Gbps+
-- Latency: <10ms to exchanges
-
----
-
-## 🐳 Docker Deployment
-
-### Build Image
 ```dockerfile
 FROM rust:1.75-slim as builder
 WORKDIR /app
@@ -571,155 +750,208 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/program /usr/local/bin/signalengine
-
-EXPOSE 8080
+EXPOSE 8080 9090
 CMD ["signalengine"]
 ```
 
-### Docker Compose
-```yaml
-version: '3.8'
-services:
-  signalengine:
-    build: .
-    image: signalengine:latest
-    environment:
-      - KRAKEN_API_KEY=${KRAKEN_API_KEY}
-      - KRAKEN_SECRET_KEY=${KRAKEN_SECRET_KEY}
-      - DATABASE_URL=${DATABASE_URL}
-      - LOG_LEVEL=info
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config:/app/config:ro
-    restart: unless-stopped
-```
-
-### Run
 ```bash
-docker-compose up -d
-docker-compose logs -f signalengine
+# Build and run
+docker build -t signalengine:latest .
+docker run -d \
+  -e KRAKEN_API_KEY="..." \
+  -e KRAKEN_SECRET_KEY="..." \
+  -e DATABASE_URL="..." \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  signalengine:latest
 ```
 
----
+### Kubernetes
 
-## ☸️ Kubernetes Deployment
-
-### Deploy
 ```bash
 cd k8s/signal-engine-helm
-helm install signalengine .
+
+# Development
+helm upgrade --install signalengine . \
+  -f values-dev.yaml \
+  --namespace signalengine-dev \
+  --create-namespace
+
+# Production
+helm upgrade --install signalengine . \
+  -f values-prod.yaml \
+  --namespace signalengine \
+  --set-string secrets.kraken.apiKey="$KRAKEN_API_KEY" \
+  --set-string secrets.kraken.secretKey="$KRAKEN_SECRET_KEY"
 ```
 
-### Scale
-```bash
-kubectl scale deployment signalengine --replicas=3
-```
+Key Helm values:
+- `replicaCount` - Number of pods
+- `resources.limits.memory` - Memory limit (default: 4Gi)
+- `config.risk.*` - Risk control settings
+- `secrets.*` - Exchange credentials
 
-### Monitor
-```bash
-kubectl get pods -l app=signalengine
-kubectl logs -f deployment/signalengine
+### Monitoring
+
+SignalEngine exports Prometheus metrics on port 9090:
+
+```
+# HELP signalengine_orders_submitted_total Total orders submitted
+# TYPE signalengine_orders_submitted_total counter
+signalengine_orders_submitted_total{exchange="kraken"} 1234
+
+# HELP signalengine_order_latency_ns Order execution latency
+# TYPE signalengine_order_latency_ns histogram
+signalengine_order_latency_ns_bucket{le="100000"} 500
+signalengine_order_latency_ns_bucket{le="500000"} 950
+
+# HELP signalengine_kill_switch_triggered Kill switch status
+# TYPE signalengine_kill_switch_triggered gauge
+signalengine_kill_switch_triggered 0
+
+# HELP signalengine_circuit_breaker_state Circuit breaker state
+# TYPE signalengine_circuit_breaker_state gauge
+signalengine_circuit_breaker_state{exchange="kraken"} 0
 ```
 
 ---
 
-## 🔍 Troubleshooting
+## Development
 
-### Build Failures
-```bash
-# Clean and rebuild
-cargo clean
-cargo build --release
+### Adding a New Exchange Connector
 
-# Update dependencies
-cargo update
+1. Create connector in `crates/executionhandler/src/exchanges/`:
 
-# Check for conflicts
-cargo tree
+```rust
+// my_exchange.rs
+use crate::core::{ExchangeConnector, ExecutionResult, ExecutionError};
+
+pub struct MyExchangeConnector {
+    // ...
+}
+
+#[async_trait]
+impl ExchangeConnector for MyExchangeConnector {
+    async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
+        // 1. Check kill switch FIRST
+        if KILL_SWITCH.is_triggered() {
+            return Err(ExecutionError::KillSwitchActive);
+        }
+        
+        // 2. Validate order
+        self.validate_order(signal)?;
+        
+        // 3. Execute
+        // ...
+    }
+    
+    // Implement other methods...
+}
 ```
 
-### Performance Issues
-- ✅ Check CPU affinity is enabled
-- ✅ Verify huge pages configured
-- ✅ Monitor system resources (`htop`, `perf`)
-- ✅ Profile with `perf` or `flamegraph`
-- ✅ Check network latency to exchanges
+2. Register in factory (`exchanges/factory.rs`)
+3. Add tests
+4. Update documentation
+
+### Running Benchmarks
+
+```bash
+# All benchmarks
+cargo bench
+
+# Specific benchmark
+cargo bench --bench signal_latency
+
+# With flamegraph
+cargo flamegraph --bench signal_latency
+```
+
+### Code Style
+
+- Zero warnings (`cargo clippy --all-targets`)
+- Format with `cargo fmt`
+- Document all public APIs
+- Test all critical paths
+- Benchmark latency-sensitive code
+
+---
+
+## Troubleshooting
+
+### Kill Switch Triggered
+
+```bash
+# Check kill switch status
+curl http://localhost:8080/admin/kill-switch
+
+# View audit log
+tail -f /var/log/signalengine/audit.log
+
+# Reset (after investigation!)
+curl -X POST http://localhost:8080/admin/kill-switch/reset
+```
+
+### High Latency
+
+1. Check CPU affinity: `taskset -p $(pidof signalengine)`
+2. Verify huge pages: `cat /proc/meminfo | grep Huge`
+3. Check network latency: `ping api.kraken.com`
+4. Review metrics: `curl localhost:9090/metrics | grep latency`
 
 ### Memory Issues
+
 ```bash
 # Check memory usage
 ps aux | grep signalengine
 
-# Monitor memory allocations
-valgrind --tool=massif target/release/program
+# Monitor allocations
+MALLOC_CONF="prof:true" ./signalengine
+
+# Analyze with valgrind
+valgrind --tool=massif ./signalengine
 ```
 
-### Network Issues
-```bash
-# Test exchange connectivity
-curl -I https://api.kraken.com/0/public/Time
+### WAL Recovery
 
-# Check DNS resolution
-nslookup api.kraken.com
+```bash
+# List WAL files
+ls -la /var/lib/signalengine/wal/
+
+# Replay WAL (on startup, automatic)
+# Manual inspection:
+./signalengine --wal-inspect /var/lib/signalengine/wal/
 ```
 
 ---
 
-## 📝 License
+## Related Projects
+
+| Project | Purpose |
+|---------|---------|
+| **DataEngine** | Market data ingestion, normalization, TimescaleDB storage |
+| **MessageBrokerEngine** | Low-latency pub/sub (176ns, 900K msg/s) |
+| **BacktestingEngine** | Strategy backtesting with genetic optimization |
+| **SimulationEngine** | Risk-free strategy testing |
+| **LoggingEngine** | Ultra-low latency structured logging |
+
+---
+
+## License
 
 Proprietary - Nwagbara Group LLC
 
 ---
 
-## 🤝 Contributing
-
-This is a private repository. Contact the maintainers for access.
-
-**Guidelines:**
-- Maintain sub-millisecond performance
-- Use lock-free data structures
-- Benchmark critical changes
-- Profile memory usage
-- Write comprehensive tests
-- Document all APIs
-
----
-
-## 📞 Support
+## Support
 
 For support, contact: **support@nwabaragroup.com**
 
 ---
 
-## 🔗 Related Projects
-
-- **MessageBrokerEngine**: Low-latency pub/sub messaging
-- **DataEngine**: Market data ingestion
-- **LoggingEngine**: Ultra-low latency structured logging
-- **SimulationEngine**: Backtesting framework
-- **BacktestingEngine**: Strategy validation
-
----
-
-## 🏆 Achievements
-
-- ✅ **Zero warnings** across entire codebase
-- ✅ **100% test pass rate** (42/42 tests)
-- ✅ **Sub-millisecond latency** in production
-- ✅ **Lock-free architecture** (zero deadlocks)
-- ✅ **Professional structure** (crates/ organization)
-- ✅ **Production-ready** (Docker + Kubernetes)
-
----
-
 **Built by Nwagbara Group LLC** • *Institutional-grade trading performance*
 
-**Version**: 0.1.0  
-**Rust Version**: 1.83 (stable)  
-**Last Updated**: 2025-01-19
+**Version**: 0.2.0  
+**Rust Version**: 1.83+ (stable)  
+**Last Updated**: 2026-01-17

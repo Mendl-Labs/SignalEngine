@@ -3,10 +3,36 @@ pub mod exchanges;
 pub mod optimizations;
 pub mod signal;
 pub mod circuit_breaker;
+pub mod circuit_breaker_v2;
 pub mod position_tracker;
 pub mod monitoring;
 pub mod validation;
 pub mod auth;
+pub mod risk_controls;
+pub mod reconciliation;
+pub mod prometheus_metrics;
+pub mod dead_letter_queue;
+pub mod bounded_dlq;
+pub mod metrics_server;
+pub mod backpressure;
+pub mod fill_probability;
+pub mod latency_optimizer;
+pub mod rate_limiter;
+pub mod tracing;
+pub mod chaos;
+pub mod audit;
+pub mod secrets;
+pub mod multi_leg;
+pub mod tca;
+pub mod orderbook_reconciliation;
+pub mod fat_finger;
+pub mod alerts;
+pub mod graceful_shutdown;
+pub mod order_wal;
+pub mod hot_config;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use signalengine::SignalEngineLogger;
 use std::sync::Arc;
@@ -24,7 +50,10 @@ pub use signal::{Signal, SignalAction};
 pub use circuit_breaker::{CircuitBreaker, ExchangeCircuitBreakerManager};
 pub use position_tracker::{PositionTracker, Position, PositionSide, PortfolioPnL};
 pub use validation::{TradingValidator, VALIDATOR};
-pub use auth::{TradingAuthenticator, AuthMiddleware, ServiceClaims, AuthError, AUTHENTICATOR};
+pub use auth::{
+    TradingAuthenticator, AuthMiddleware, ServiceClaims, AuthError, AUTHENTICATOR,
+    AuthRateLimitConfig, FailedAttemptTracker,
+};
 pub use monitoring::{PerformanceMonitor, PerformanceMetrics, Alert, AlertType, TradingLogger};
 pub use optimizations::{
     timestamp::{nano_timestamp, NanoTimer},
@@ -32,6 +61,114 @@ pub use optimizations::{
     cpu_affinity::{set_cpu_affinity, get_optimal_trading_core, CoreAssignment, set_high_priority},
     lock_free::{LockFreeRingBuffer, AtomicMetrics, SPSCQueue},
     simd_metrics::{simd_calculate_percentiles, VectorizedMetrics, LatencyHistogram},
+};
+
+// Risk management and production safety exports
+pub use risk_controls::{
+    KILL_SWITCH, KillSwitch, KillReason, 
+    PositionLimits, PositionLimitChecker,
+    CircuitBreaker as RiskCircuitBreaker, CircuitBreakerConfig,
+    RiskManager,
+};
+pub use reconciliation::{
+    ReconciliationEngine, ExchangeReconciliation, ExchangePosition, 
+    ExchangeOpenOrder, ReconciliationResult, PositionMismatch,
+    startup_reconciliation,
+};
+pub use prometheus_metrics::{
+    METRICS, MetricsRegistry, get_prometheus_metrics, get_metrics_json,
+    inc_orders_submitted, inc_orders_filled, inc_orders_rejected,
+    inc_orders_failed, record_order_latency_us, record_fill_latency_us,
+    set_kill_switch_active, set_circuit_breaker_active, set_total_pnl_usd,
+};
+pub use dead_letter_queue::{
+    DeadLetterQueue, DeadLetterEntry, DeadLetterStatus, FailureCategory,
+    DlqConfig, DlqStats, DlqRetryWorker,
+};
+pub use metrics_server::{
+    start_metrics_server, MetricsServerConfig, MetricsServerHandle,
+};
+pub use backpressure::{
+    BackpressureController, BackpressureConfig, BackpressureError,
+    BackpressurePermit, BackpressureState, BackpressureStats,
+    OverflowPolicy, BACKPRESSURE, acquire_permit, acquire_permit_for_exchange,
+};
+pub use fill_probability::{
+    FillProbabilityModel, FillProbabilityConfig, FillProbabilityEstimate,
+    OrderbookSnapshot, FillFactors, MarketRegime, FILL_MODEL, estimate_fill,
+};
+pub use latency_optimizer::{
+    LatencyOptimizer, LatencyOptimizerConfig, ExchangeLatencyStats,
+    ExchangeHealth, SettlementConfig, RoutingDecision, RoutingReason,
+    ArbTimingResult, LATENCY_OPTIMIZER, record_exchange_latency, get_optimal_route,
+};
+
+// Lock-free circuit breaker (v2 - for hot paths)
+pub use circuit_breaker_v2::{
+    AtomicCircuitBreaker, CircuitBreakerConfig as AtomicCircuitBreakerConfig,
+    CircuitState as AtomicCircuitBreakerState,
+    ExchangeCircuitBreakerManager as AtomicExchangeCircuitBreakerManager,
+    CIRCUIT_BREAKERS as ATOMIC_CIRCUIT_BREAKERS,
+};
+
+// Token bucket rate limiter
+pub use rate_limiter::{
+    AtomicTokenBucket, RateLimiterConfig, SlidingWindowLimiter,
+    ExchangeRateLimiterManager, RATE_LIMITERS,
+};
+
+// Bounded DLQ with overflow policies
+pub use bounded_dlq::{
+    BoundedDeadLetterQueue, BoundedDlqConfig, BoundedDlqStats,
+    DlqOverflowPolicy, EnqueueResult, BOUNDED_DLQ,
+};
+
+// Distributed tracing
+pub use tracing::{
+    TraceId, SpanId, TraceContext, Span, SpanKind, SpanStatus,
+    AttributeValue, SpanEvent, CompletedSpan, SpanExporter,
+    InMemoryExporter, LogExporter, Tracer, ExecutionTraceContext,
+    TRACER, init_tracer, tracer,
+};
+
+// Chaos engineering / fault injection
+pub use chaos::{
+    ChaosMonkey, ChaosConfig, ChaosResult, ChaosStats,
+    NetworkPartition, FaultInjector, CHAOS_MONKEY,
+};
+
+// Audit logging
+pub use audit::{
+    AuditLogger, AuditEntry, AuditEventType, AuditSeverity,
+    AuditBackend, AuditQuery, FileAuditBackend, InMemoryAuditBackend,
+};
+
+// Secrets management
+pub use secrets::{
+    SecretsManager, SecretsConfig, SecretBackend, SecretString,
+    ApiCredentials, SecurityEventType, SecurityAuditEntry, SECRETS,
+};
+
+// Multi-leg order management (OCO, bracket, linked pairs)
+pub use multi_leg::{
+    MultiLegOrderManager, MultiLegType, OrderLeg,
+    LegRole, LegStatus, GroupState, MultiLegEvent, MultiLegStats,
+    BracketParams, OcoParams, LinkedPairParams, MultiLegError,
+};
+
+// Transaction Cost Analysis (TCA)
+pub use tca::{
+    TcaEngine, TcaConfig, TcaAnalysis, TcaError, TcaStatistics,
+    ExecutionRecord, ExecutionUrgency, BenchmarkType, ExecutionGrade,
+    FillAnalysis, MifidReport, Percentiles,
+};
+
+// Orderbook snapshot reconciliation
+pub use orderbook_reconciliation::{
+    OrderbookReconciler, ReconciliationConfig, OrderbookUpdate, UpdateType,
+    ReconciliationResult as OrderbookReconciliationResult, 
+    ReconciliationEvent, SnapshotReason,
+    SymbolStatistics, GlobalStatistics,
 };
 
 use std::collections::HashMap;
@@ -257,6 +394,14 @@ impl UltraLowLatencyExecutionHandler {
 
     /// Execute order on specified exchange
     pub async fn execute_order_on_exchange(&self, signal: &Signal, exchange_name: &str) -> Result<ExecutionResult, ExecutionError> {
+        // P0 Safety: Check kill switch before any order execution
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. All trading halted.", reason
+            )));
+        }
+        
         let connectors = self.connectors.read().await;
         let connector = connectors.get(exchange_name)
             .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
@@ -283,7 +428,10 @@ impl UltraLowLatencyExecutionHandler {
 
         match &result {
             Ok(execution_result) => {
-                self.global_metrics.record_success(latency_ns);
+                // Calculate volume and fees from the execution
+                let volume = execution_result.filled_quantity * execution_result.avg_fill_price;
+                let fees = execution_result.total_fees;
+                self.global_metrics.record_success(latency_ns, volume, fees);
                 
                 // Log successful execution
                 TradingLogger::log_order_execution(
@@ -381,11 +529,27 @@ impl UltraLowLatencyExecutionHandler {
 
     /// Execute batch orders across multiple exchanges (sequential - safe)
     pub async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        // P0 Safety: Check kill switch before any batch execution
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Batch execution halted ({} orders).", 
+                reason, signals.len()
+            )));
+        }
         self.execute_batch_orders_sequential(signals).await
     }
 
     /// Execute batch orders sequentially (conservative approach)
     pub async fn execute_batch_orders_sequential(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+        // P0 Safety: Check kill switch before sequential batch
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Sequential batch halted.", reason
+            )));
+        }
+        
         // Group signals by exchange
         let mut exchange_groups: HashMap<String, Vec<&Signal>> = HashMap::new();
         
@@ -421,6 +585,15 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn execute_batch_orders_parallel(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
         use futures::future::try_join_all;
         use std::sync::Arc;
+        
+        // P0 Safety: Check kill switch before parallel batch
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Parallel batch halted ({} orders).", 
+                reason, signals.len()
+            )));
+        }
         
         // Group signals by exchange
         let mut exchange_groups: HashMap<String, Vec<Signal>> = HashMap::new();
@@ -476,6 +649,15 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn execute_batch_orders_optimized(&self, signals: &[Signal], max_parallel_per_exchange: usize) -> Result<Vec<ExecutionResult>, ExecutionError> {
         use futures::future::try_join_all;
         use std::sync::Arc;
+        
+        // P0 Safety: Check kill switch before optimized batch
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Optimized batch halted ({} orders).", 
+                reason, signals.len()
+            )));
+        }
         
         // Group signals by exchange
         let mut exchange_groups: HashMap<String, Vec<Signal>> = HashMap::new();

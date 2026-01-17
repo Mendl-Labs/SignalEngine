@@ -1,0 +1,581 @@
+# SignalEngine CI/CD Pipeline
+# Builds, tests, and deploys to self-hosted Kubernetes using GHCR for container images
+
+name: SignalEngine CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests'
+        type: boolean
+        default: false
+      skip_api_tests:
+        description: 'Skip exchange API tests'
+        type: boolean
+        default: false
+
+concurrency:
+  group: signal-engine-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  IMAGE_NAME: ghcr.io/nwagbara-group-llc/signal-engine
+  NAMESPACE: signalengine
+  HELM_CHART_PATH: k8s/signal-engine-helm
+  PARALLEL_JOBS: 10
+
+jobs:
+  # ===== VALIDATION & TESTING =====
+  validate:
+    name: Validate & Test
+    runs-on: [self-hosted, windows, x64]
+    timeout-minutes: 60
+    outputs:
+      tests-passed: ${{ steps.test-result.outputs.passed || steps.skip-test-result.outputs.passed }}
+      skip-tests: ${{ steps.check-skip.outputs.skip }}
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+
+      - name: Checkout LoggingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: LoggingEngine
+
+      - name: Checkout MessageBrokerEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: MessageBrokerEngine
+
+      - name: Checkout databaseschema
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/databaseschema
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: databaseschema
+
+      - name: Verify Rust
+        shell: powershell
+        run: |
+          Write-Host "Checking Rust installation..."
+          rustc --version
+          cargo --version
+
+      - name: Check for Skip Tests Flag
+        id: check-skip
+        shell: powershell
+        run: |
+          cd SignalEngine
+          $commitMsg = git log -1 --pretty=%B
+          if ($commitMsg -match '\[skip-tests\]') {
+            Write-Host "[SKIP] [skip-tests] flag detected in commit message"
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Running full validation with tests"
+            echo "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache Target Directory
+        uses: actions/cache@v4
+        with:
+          path: SignalEngine/target
+          key: ${{ runner.os }}-target-signalengine-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-signalengine-
+
+      - name: Fast Check
+        shell: powershell
+        run: |
+          Write-Host "Running fast cargo check..."
+          cd SignalEngine
+          cargo check --workspace --jobs ${{ env.PARALLEL_JOBS }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[FAIL] Cargo check failed"
+            exit 1
+          }
+          Write-Host "[OK] Fast check passed!"
+
+      - name: Build Workspace
+        shell: powershell
+        run: |
+          Write-Host "Building SignalEngine workspace..."
+          cd SignalEngine
+          cargo build --workspace --jobs ${{ env.PARALLEL_JOBS }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[FAIL] Build failed!"
+            exit 1
+          }
+          Write-Host "[OK] Build passed!"
+
+      - name: Run Tests
+        if: steps.check-skip.outputs.skip != 'true' && github.event.inputs.skip_tests != 'true'
+        id: test-result
+        shell: powershell
+        run: |
+          Write-Host "Running tests..."
+          cd SignalEngine
+          cargo test --workspace --jobs ${{ env.PARALLEL_JOBS }}
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Tests passed!"
+            echo "passed=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "[FAIL] Tests failed!"
+            echo "passed=false" >> $env:GITHUB_OUTPUT
+            exit 1
+          }
+
+      - name: Skip Tests
+        if: steps.check-skip.outputs.skip == 'true' || github.event.inputs.skip_tests == 'true'
+        id: skip-test-result
+        shell: powershell
+        run: |
+          Write-Host "[SKIP] Tests skipped"
+          echo "passed=true" >> $env:GITHUB_OUTPUT
+
+  # ===== EXCHANGE API TESTS =====
+  api-tests:
+    name: Exchange API Tests
+    runs-on: [self-hosted, windows, x64]
+    needs: validate
+    if: needs.validate.outputs.tests-passed == 'true' && github.event.inputs.skip_api_tests != 'true'
+    timeout-minutes: 30
+    outputs:
+      tests-passed: ${{ steps.auth-test-result.outputs.passed || steps.skip-auth.outputs.passed }}
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+
+      - name: Checkout LoggingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: LoggingEngine
+
+      - name: Checkout MessageBrokerEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: MessageBrokerEngine
+
+      - name: Checkout databaseschema
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/databaseschema
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: databaseschema
+
+      - name: Verify Rust
+        shell: powershell
+        run: |
+          Write-Host "Checking Rust installation..."
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache Target Directory
+        uses: actions/cache@v4
+        with:
+          path: SignalEngine/target
+          key: ${{ runner.os }}-target-signalengine-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-signalengine-
+
+      - name: Run Public API Tests
+        id: public-test-result
+        shell: powershell
+        run: |
+          Write-Host "Running public exchange API tests..."
+          cd SignalEngine
+          cargo run --example test_exchange_apis -- all
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Public API tests passed!"
+            echo "passed=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "[FAIL] Public API tests failed!"
+            echo "passed=false" >> $env:GITHUB_OUTPUT
+            exit 1
+          }
+
+      - name: Fetch Secrets from Azure Key Vault
+        id: fetch-secrets
+        shell: powershell
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+          AZURE_KEYVAULT_NAME: ${{ secrets.AZURE_KEYVAULT_NAME }}
+        run: |
+          Write-Host "Fetching secrets from Azure Key Vault..."
+          
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:AZURE_CREDENTIALS)) {
+              throw "AZURE_CREDENTIALS secret is empty or not set"
+            }
+            
+            $creds = $env:AZURE_CREDENTIALS | ConvertFrom-Json -ErrorAction Stop
+            
+            if (-not $creds.clientId -or -not $creds.clientSecret -or -not $creds.tenantId) {
+              throw "Invalid Azure credentials format"
+            }
+            
+            Write-Host "[OK] Azure credentials parsed successfully"
+          } catch {
+            Write-Error "Failed to parse Azure credentials: $($_.Exception.Message)"
+            exit 1
+          }
+          
+          try {
+            Write-Host "[INFO] Authenticating with Azure..."
+            az login --service-principal --username $creds.clientId --password $creds.clientSecret --tenant $creds.tenantId --output json 2>&1 | Out-Null
+            
+            if ($LASTEXITCODE -ne 0) {
+              throw "Azure CLI login failed"
+            }
+            
+            Write-Host "[OK] Successfully authenticated with Azure"
+          } catch {
+            Write-Error "Azure authentication failed: $_"
+            exit 1
+          }
+          
+          # Fetch Kraken API credentials
+          $krakenApiKey = az keyvault secret show --vault-name $env:AZURE_KEYVAULT_NAME --name kraken-api-key --query value -o tsv
+          $krakenSecretKey = az keyvault secret show --vault-name $env:AZURE_KEYVAULT_NAME --name kraken-secret-key --query value -o tsv
+          
+          if ([string]::IsNullOrWhiteSpace($krakenApiKey) -or [string]::IsNullOrWhiteSpace($krakenSecretKey)) {
+            Write-Host "[WARN] Kraken credentials not found in Key Vault, skipping authenticated tests"
+            echo "has_kraken_creds=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "[OK] Kraken credentials retrieved"
+            # Mask secrets in logs
+            Write-Host "::add-mask::$krakenApiKey"
+            Write-Host "::add-mask::$krakenSecretKey"
+            # Export for next step
+            echo "KRAKEN_API_KEY=$krakenApiKey" >> $env:GITHUB_ENV
+            echo "KRAKEN_SECRET_KEY=$krakenSecretKey" >> $env:GITHUB_ENV
+            echo "has_kraken_creds=true" >> $env:GITHUB_OUTPUT
+          }
+          
+          # Logout
+          az logout 2>&1 | Out-Null
+          Write-Host "[OK] Azure logout complete"
+
+      - name: Run Authenticated API Tests
+        if: steps.fetch-secrets.outputs.has_kraken_creds == 'true'
+        id: auth-test-result
+        shell: powershell
+        run: |
+          Write-Host "Running authenticated exchange API tests..."
+          cd SignalEngine
+          cargo run --example test_exchange_apis_authenticated -- all
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Authenticated API tests passed!"
+            echo "passed=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "[FAIL] Authenticated API tests failed!"
+            echo "passed=false" >> $env:GITHUB_OUTPUT
+            exit 1
+          }
+
+      - name: Skip Authenticated Tests
+        if: steps.fetch-secrets.outputs.has_kraken_creds != 'true'
+        id: skip-auth
+        shell: powershell
+        run: |
+          Write-Host "[SKIP] Authenticated API tests skipped (no credentials)"
+          echo "passed=true" >> $env:GITHUB_OUTPUT
+
+  # ===== BUILD & PUSH =====
+  build:
+    name: Build & Push
+    runs-on: [self-hosted, windows, x64]
+    needs: [validate, api-tests]
+    if: |
+      always() &&
+      needs.validate.outputs.tests-passed == 'true' &&
+      (needs.api-tests.result == 'success' || needs.api-tests.result == 'skipped')
+    timeout-minutes: 45
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+          fetch-depth: 0
+
+      - name: Checkout LoggingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: LoggingEngine
+          fetch-depth: 0
+
+      - name: Checkout MessageBrokerEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: MessageBrokerEngine
+          fetch-depth: 0
+
+      - name: Checkout databaseschema
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/databaseschema
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: databaseschema
+          fetch-depth: 0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Image
+        shell: powershell
+        run: |
+          Write-Host "Building Docker image..."
+          $startTime = Get-Date
+          
+          $requiredDeps = @("LoggingEngine", "MessageBrokerEngine", "databaseschema")
+          foreach ($dep in $requiredDeps) {
+            if (Test-Path $dep) {
+              Write-Host "[OK] Dependency found: $dep"
+            } else {
+              Write-Host "[ERROR] Missing: $dep"
+              exit 1
+            }
+          }
+          
+          # Get dependency commit SHAs for cache busting
+          $loggingSha = (git -C LoggingEngine rev-parse --short HEAD)
+          $brokerSha = (git -C MessageBrokerEngine rev-parse --short HEAD)
+          $dbSha = (git -C databaseschema rev-parse --short HEAD)
+          Write-Host "[INFO] Dependency versions: LoggingEngine=$loggingSha, MessageBrokerEngine=$brokerSha, databaseschema=$dbSha"
+          
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          Write-Host "[INFO] Building with immutable tag: $shortSha"
+          
+          docker build --tag ${{ env.IMAGE_NAME }}:$shortSha --file SignalEngine/Dockerfile --build-arg LOGGING_ENGINE_SHA=$loggingSha --build-arg BROKER_ENGINE_SHA=$brokerSha --build-arg DB_SCHEMA_SHA=$dbSha --progress=plain .
+          
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker build failed"
+          }
+          
+          $buildDuration = (Get-Date) - $startTime
+          Write-Host "[OK] Build completed in $([math]::Round($buildDuration.TotalMinutes, 1)) minutes"
+          
+          Write-Host "[PUSH] Pushing image..."
+          docker push ${{ env.IMAGE_NAME }}:$shortSha
+          Write-Host "[OK] Pushed image with immutable tag: $shortSha"
+
+      - name: Security Scan
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          Write-Host "[SCAN] Running security scan with Trivy..."
+          if (-not (Test-Path "trivy.exe")) {
+            Write-Host "Installing Trivy..."
+            Invoke-WebRequest -Uri "https://github.com/aquasecurity/trivy/releases/download/v0.48.3/trivy_0.48.3_windows-64bit.zip" -OutFile "trivy.zip"
+            Expand-Archive trivy.zip -Force
+            Move-Item trivy/trivy.exe . -Force
+            Remove-Item trivy.zip, trivy -Recurse -Force
+          }
+          .\trivy.exe image --severity HIGH,CRITICAL --exit-code 0 --format table ${{ env.IMAGE_NAME }}:$shortSha
+          Write-Host "[OK] Security scan complete"
+
+      - name: Build Summary
+        shell: powershell
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Build Summary"
+          Write-Host "=========================================="
+          Write-Host "Image: ${{ env.IMAGE_NAME }}"
+          Write-Host "Tag: $shortSha"
+          Write-Host "Pull: docker pull ${{ env.IMAGE_NAME }}:$shortSha"
+          Write-Host "=========================================="
+
+  # ===== DEPLOY TO KUBERNETES =====
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: [self-hosted, windows, x64]
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+
+      - name: Check Kubernetes Connection
+        shell: powershell
+        run: |
+          Write-Host "Verifying Kubernetes connection..."
+          kubectl cluster-info
+          kubectl get nodes
+          Write-Host "[OK] Kubernetes connection verified"
+
+      - name: Fetch Secrets from Azure Key Vault
+        shell: powershell
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+          AZURE_KEYVAULT_NAME: ${{ secrets.AZURE_KEYVAULT_NAME }}
+        run: |
+          Write-Host "Fetching secrets from Azure Key Vault..."
+          
+          $creds = $env:AZURE_CREDENTIALS | ConvertFrom-Json
+          az login --service-principal --username $creds.clientId --password $creds.clientSecret --tenant $creds.tenantId --output json 2>&1 | Out-Null
+          
+          $secretNames = @(
+            "POSTGRES-HOST","POSTGRES-PORT","POSTGRES-USER","POSTGRES-PASSWORD","POSTGRES-DB",
+            "ELASTIC-CLOUD-ENDPOINT","ELASTIC-CLOUD-USERNAME","ELASTIC-CLOUD-PASSWORD",
+            "kraken-api-key","kraken-secret-key"
+          )
+          
+          Write-Host "[INFO] Fetching $($secretNames.Count) secrets..."
+          
+          foreach ($secretName in $secretNames) {
+            $envName = $secretName -replace "-", "_"
+            $value = az keyvault secret show --vault-name $env:AZURE_KEYVAULT_NAME --name $secretName --query value -o tsv 2>&1
+            
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($value)) {
+              Write-Host "::add-mask::$value"
+              [Environment]::SetEnvironmentVariable($envName, $value, "Process")
+              Write-Host "[OK] Retrieved: $secretName"
+            } else {
+              Write-Host "[WARN] Failed to retrieve: $secretName"
+            }
+          }
+          
+          az logout 2>&1 | Out-Null
+          Write-Host "[OK] Secrets fetched successfully"
+
+      - name: Create/Update Kubernetes Secrets
+        shell: powershell
+        run: |
+          Write-Host "Creating Kubernetes secrets..."
+          
+          # Ensure namespace exists
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create database secret
+          kubectl create secret generic signalengine-db-secret `
+            --namespace ${{ env.NAMESPACE }} `
+            --from-literal=host=$env:POSTGRES_HOST `
+            --from-literal=port=$env:POSTGRES_PORT `
+            --from-literal=username=$env:POSTGRES_USER `
+            --from-literal=password=$env:POSTGRES_PASSWORD `
+            --from-literal=database=$env:POSTGRES_DB `
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create Kraken API secret
+          kubectl create secret generic signalengine-kraken-secret `
+            --namespace ${{ env.NAMESPACE }} `
+            --from-literal=api-key=$env:kraken_api_key `
+            --from-literal=secret-key=$env:kraken_secret_key `
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create Elastic secret
+          kubectl create secret generic signalengine-elastic-secret `
+            --namespace ${{ env.NAMESPACE }} `
+            --from-literal=endpoint=$env:ELASTIC_CLOUD_ENDPOINT `
+            --from-literal=username=$env:ELASTIC_CLOUD_USERNAME `
+            --from-literal=password=$env:ELASTIC_CLOUD_PASSWORD `
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          Write-Host "[OK] Kubernetes secrets created"
+
+      - name: Deploy with Helm
+        shell: powershell
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          
+          Write-Host "Deploying SignalEngine to Kubernetes..."
+          
+          helm upgrade --install signal-engine SignalEngine/${{ env.HELM_CHART_PATH }} `
+            --namespace ${{ env.NAMESPACE }} `
+            --set image.repository=${{ env.IMAGE_NAME }} `
+            --set image.tag=$shortSha `
+            --wait `
+            --timeout 10m
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[FAIL] Helm deployment failed!"
+            exit 1
+          }
+          
+          Write-Host "[OK] Deployment successful!"
+
+      - name: Verify Deployment
+        shell: powershell
+        run: |
+          Write-Host "Verifying deployment..."
+          
+          kubectl rollout status deployment/signal-engine --namespace ${{ env.NAMESPACE }} --timeout=300s
+          
+          Write-Host ""
+          Write-Host "Pod Status:"
+          kubectl get pods --namespace ${{ env.NAMESPACE }} -l app=signal-engine
+          
+          Write-Host ""
+          Write-Host "[OK] Deployment verified!"
+
+      - name: Deployment Summary
+        shell: powershell
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Deployment Summary"
+          Write-Host "=========================================="
+          Write-Host "Namespace: ${{ env.NAMESPACE }}"
+          Write-Host "Image: ${{ env.IMAGE_NAME }}:$shortSha"
+          Write-Host "Status: Deployed"
+          Write-Host "=========================================="

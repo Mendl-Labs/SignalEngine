@@ -1,73 +1,254 @@
-use executionhandler::UltraLowLatencyExecutionHandler;
+use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
+use executionhandler::signal::{Signal as ExecSignal, SignalAction as ExecSignalAction};
+use executionhandler::core::MetricsCollector;
+use executionhandler::optimizations::timestamp::{nano_timestamp, NanoTimer};
 use ultra_signal::{Signal, OrderSide}; // Import Signal and OrderSide directly from ultra_signal
-// TODO: Phase 2 integration - ultra_production_order_manager not yet available
-// use ultra_production_order_manager::{SignalEngineUltraOrderManager, UltraFastOrder, OrderType, OrderPriority};
 
-// Temporary stub types until ultra_production_order_manager is available
-#[derive(Debug, Clone)]
+/// Order type for ultra-fast processing
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderType {
     Market,
     Limit,
 }
 
-#[derive(Debug, Clone)]
+/// Order priority levels
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderPriority {
+    /// Critical orders - process immediately, skip validation
     Critical,
+    /// High priority - process next
     High,
+    /// Normal priority - standard queue
     Normal,
 }
 
+/// Result of an ultra-fast order processing
 #[derive(Debug, Clone)]
 pub struct OrderResult {
+    pub order_id: String,
     pub processing_time_ns: u64,
     pub success: bool,
+    pub filled_quantity: f64,
+    pub avg_price: f64,
+    pub fees: f64,
+    pub error: Option<String>,
 }
 
-// Stub for SignalEngineUltraOrderManager
-pub struct SignalEngineUltraOrderManager;
-
-impl SignalEngineUltraOrderManager {
-    pub async fn new() -> Result<Self> {
-        Ok(Self)
-    }
-    
-    // Stub method for processing signal orders
-    pub async fn process_signal_order(
-        &self,
-        _symbol: &str,
-        _exchange: &str,
-        _side: OrderSide,
-        _order_type: OrderType,
-        _amount: f64,
-        _price: f64,
-        _strategy_id: u16,
-        _priority: OrderPriority,
-    ) -> Result<OrderResult> {
-        // TODO: Implement actual order processing when ultra_production_order_manager is available
-        Ok(OrderResult {
-            processing_time_ns: 600, // simulate 0.6μs
-            success: true,
-        })
-    }
-    
-    // Stub method for performance metrics - returns tuple-like values via array access simulation
-    pub fn get_ultra_performance_metrics(&self) -> PerformanceMetrics {
-        // TODO: Implement actual metrics collection
-        PerformanceMetrics {
-            processed_count: 1000,
-            avg_time_ns: 650.0,
-            success_rate: 99.5,
-            peak_orders_per_sec: 150000,
-        }
-    }
-}
-
+/// Performance metrics for the ultra order manager
 #[derive(Debug, Clone)]
 pub struct PerformanceMetrics {
     pub processed_count: u64,
     pub avg_time_ns: f64,
+    pub min_time_ns: u64,
+    pub max_time_ns: u64,
     pub success_rate: f64,
     pub peak_orders_per_sec: u64,
+    pub total_volume: f64,
+    pub total_fees: f64,
+}
+
+/// Ultra-fast order manager for sub-microsecond signal processing
+/// 
+/// This manager wraps the execution handler with optimized batching,
+/// priority queuing, and lock-free metrics collection for HFT workloads.
+pub struct SignalEngineUltraOrderManager {
+    execution_handler: Arc<tokio::sync::RwLock<UltraLowLatencyExecutionHandler>>,
+    metrics: Arc<MetricsCollector>,
+    /// Pre-allocated signal buffer for batch processing
+    batch_buffer: tokio::sync::Mutex<Vec<(ExecSignal, OrderPriority)>>,
+    batch_size: usize,
+}
+
+impl SignalEngineUltraOrderManager {
+    /// Create a new ultra order manager
+    pub async fn new() -> Result<Self> {
+        let execution_handler = UltraLowLatencyExecutionHandler::new().await;
+        
+        Ok(Self {
+            execution_handler: Arc::new(tokio::sync::RwLock::new(execution_handler)),
+            metrics: Arc::new(MetricsCollector::new()),
+            batch_buffer: tokio::sync::Mutex::new(Vec::with_capacity(100)),
+            batch_size: 50, // Process in batches of 50
+        })
+    }
+    
+    /// Create with custom batch size
+    pub async fn with_batch_size(batch_size: usize) -> Result<Self> {
+        let mut manager = Self::new().await?;
+        manager.batch_size = batch_size;
+        Ok(manager)
+    }
+    
+    /// Get a reference to the underlying execution handler for configuration
+    pub fn execution_handler(&self) -> &Arc<tokio::sync::RwLock<UltraLowLatencyExecutionHandler>> {
+        &self.execution_handler
+    }
+    
+    /// Process a signal order with ultra-low latency
+    #[inline]
+    pub async fn process_signal_order(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        side: OrderSide,
+        order_type: OrderType,
+        amount: f64,
+        price: f64,
+        strategy_id: u16,
+        priority: OrderPriority,
+    ) -> Result<OrderResult> {
+        let timer = NanoTimer::start();
+        let order_id = format!("ultra_{}_{}", strategy_id, nano_timestamp());
+        
+        // Build the signal using execution handler's Signal type
+        let signal = ExecSignal {
+            id: order_id.clone(),
+            strategy_id: strategy_id.to_string(),
+            symbol: symbol.to_string(),
+            exchange: exchange.to_string(),
+            action: match (side, order_type) {
+                (OrderSide::Buy, OrderType::Market) => ExecSignalAction::Buy,
+                (OrderSide::Buy, OrderType::Limit) => ExecSignalAction::BuyLimit,
+                (OrderSide::Sell, OrderType::Market) => ExecSignalAction::Sell,
+                (OrderSide::Sell, OrderType::Limit) => ExecSignalAction::SellLimit,
+            },
+            quantity: amount,
+            price: if order_type == OrderType::Limit { Some(price) } else { None },
+            confidence: match priority {
+                OrderPriority::Critical => 1.0,
+                OrderPriority::High => 0.8,
+                OrderPriority::Normal => 0.5,
+            },
+            timestamp: nano_timestamp() as u64,
+            metadata: std::collections::HashMap::new(),
+        };
+        
+        // Execute through the handler
+        let handler = self.execution_handler.read().await;
+        let result = handler.execute_order(&signal).await;
+        let processing_time_ns = timer.elapsed_ns();
+        
+        match result {
+            Ok(exec_result) => {
+                let volume = exec_result.filled_quantity * exec_result.avg_fill_price;
+                let fees = exec_result.total_fees;
+                
+                // Record success with full metrics
+                self.metrics.record_success(processing_time_ns, volume, fees);
+                
+                Ok(OrderResult {
+                    order_id: exec_result.order_id,
+                    processing_time_ns,
+                    success: matches!(exec_result.status, ExecutionStatus::Filled | ExecutionStatus::PartiallyFilled),
+                    filled_quantity: exec_result.filled_quantity,
+                    avg_price: exec_result.avg_fill_price,
+                    fees,
+                    error: exec_result.reject_reason,
+                })
+            }
+            Err(e) => {
+                self.metrics.record_failure();
+                
+                Ok(OrderResult {
+                    order_id,
+                    processing_time_ns,
+                    success: false,
+                    filled_quantity: 0.0,
+                    avg_price: 0.0,
+                    fees: 0.0,
+                    error: Some(format!("{:?}", e)),
+                })
+            }
+        }
+    }
+    
+    /// Convert ultra_signal::Signal to executionhandler::Signal
+    fn convert_to_exec_signal(signal: &Signal) -> ExecSignal {
+        ExecSignal {
+            id: signal.id.to_string(),
+            strategy_id: signal.strategy_id.to_string(),
+            symbol: format!("symbol_{}", signal.symbol_hash), // Symbol hash to string
+            exchange: format!("exchange_{}", signal.exchange_id),
+            action: match signal.side {
+                OrderSide::Buy => ExecSignalAction::Buy,
+                OrderSide::Sell => ExecSignalAction::Sell,
+            },
+            quantity: signal.quantity,
+            price: Some(signal.price),
+            confidence: signal.confidence as f64,
+            timestamp: signal.timestamp_ns as u64,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Queue a signal for batch processing (lower latency for non-critical orders)
+    pub async fn queue_signal(&self, signal: Signal, priority: OrderPriority) {
+        let exec_signal = Self::convert_to_exec_signal(&signal);
+        let mut buffer = self.batch_buffer.lock().await;
+        buffer.push((exec_signal, priority));
+        
+        // Flush if batch is full
+        if buffer.len() >= self.batch_size {
+            let signals: Vec<_> = buffer.drain(..).collect();
+            drop(buffer); // Release lock before processing
+            self.process_batch(signals).await;
+        }
+    }
+    
+    /// Process a batch of queued signals
+    async fn process_batch(&self, mut signals: Vec<(ExecSignal, OrderPriority)>) {
+        // Sort by priority (Critical first)
+        signals.sort_by(|a, b| {
+            let priority_ord = |p: &OrderPriority| match p {
+                OrderPriority::Critical => 0,
+                OrderPriority::High => 1,
+                OrderPriority::Normal => 2,
+            };
+            priority_ord(&a.1).cmp(&priority_ord(&b.1))
+        });
+        
+        let handler = self.execution_handler.read().await;
+        let plain_signals: Vec<ExecSignal> = signals.into_iter().map(|(s, _)| s).collect();
+        
+        // Use optimized batch execution
+        let _ = handler.execute_batch_orders_optimized(&plain_signals, 10).await;
+    }
+    
+    /// Flush any queued signals immediately
+    pub async fn flush(&self) {
+        let mut buffer = self.batch_buffer.lock().await;
+        if !buffer.is_empty() {
+            let signals: Vec<_> = buffer.drain(..).collect();
+            drop(buffer);
+            self.process_batch(signals).await;
+        }
+    }
+    
+    /// Get performance metrics
+    pub fn get_ultra_performance_metrics(&self) -> PerformanceMetrics {
+        let metrics = self.metrics.get_metrics("ultra_order_manager".to_string());
+        
+        PerformanceMetrics {
+            processed_count: metrics.total_orders,
+            avg_time_ns: metrics.avg_latency_ns as f64,
+            min_time_ns: metrics.min_latency_ns,
+            max_time_ns: metrics.max_latency_ns,
+            success_rate: metrics.fill_rate * 100.0,
+            peak_orders_per_sec: self.metrics.get_peak_orders_per_second(),
+            total_volume: metrics.total_volume,
+            total_fees: metrics.total_fees,
+        }
+    }
+    
+    /// Get detailed execution metrics
+    pub fn get_detailed_metrics(&self) -> executionhandler::ExecutionMetrics {
+        self.metrics.get_metrics("ultra_order_manager".to_string())
+    }
+    
+    /// Reset all metrics
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+    }
 }
 use crossbeam::channel::{bounded, Receiver, Sender};
 use anyhow::Result;
@@ -83,7 +264,7 @@ use std::{env, error::Error, sync::{Arc, RwLock}, collections::HashMap};
 use tokio::sync::broadcast;
 use orderbook::Orderbook;
 use portfolio::CryptoWallet;
-use tracing::{info, warn};
+use ultra_logger::{ultra_info, ultra_warn, ultra_error};
 
 // Re-export the global storage from datahandler and portfoliohandler
 pub use datahandler::ORDERBOOKS;
@@ -102,7 +283,7 @@ pub struct HostedObject {
     // Signal routing
     signal_tx: Option<Sender<Signal>>,
     signal_rx: Option<Receiver<Signal>>,
-    // Strategy manager
+    // Strategy manager (live trading)
     strategy_manager: Option<StrategyManager>,
     // Phase 2: Ultra-fast order management (853x faster)
     ultra_order_manager: Option<Arc<SignalEngineUltraOrderManager>>,
@@ -146,7 +327,7 @@ impl HostedObject {
     }
 
     /// Create handlers from configuration
-    async fn create_handlers() -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler), Box<dyn Error>> {
+    async fn create_handlers() -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler, Config), Box<dyn Error>> {
         // Load environment variables
         dotenv().ok();
         
@@ -167,10 +348,48 @@ impl HostedObject {
         // Create strategy handler
         let strategyhandler = Self::create_strategy_manager(&config)?;
         
-        // Create execution handler last (after await)
-        let execution_handler = UltraLowLatencyExecutionHandler::new().await;
+        // Create execution handler and initialize exchanges from config
+        let mut execution_handler = UltraLowLatencyExecutionHandler::new().await;
         
-        Ok((datahandler, portfoliohandler, strategyhandler, execution_handler))
+        // Load exchanges from YAML configuration
+        for exchange_config in &config.exchanges {
+            if !exchange_config.enabled {
+                ultra_info!(format!("Skipping disabled exchange: {}", exchange_config.name));
+                continue;
+            }
+            
+            // Convert config::ExchangeConfig to executionhandler::ExchangeConfig
+            let exec_config = Self::convert_exchange_config(exchange_config);
+            
+            match execution_handler.add_exchange(exchange_config.name.clone(), exec_config).await {
+                Ok(_) => {
+                    ultra_info!(format!("✅ Initialized exchange from config: {}", exchange_config.name));
+                }
+                Err(e) => {
+                    ultra_warn!(format!("⚠️ Failed to initialize exchange {}: {:?}", exchange_config.name, e));
+                }
+            }
+        }
+        
+        Ok((datahandler, portfoliohandler, strategyhandler, execution_handler, config))
+    }
+    
+    /// Convert YAML config ExchangeConfig to execution handler ExchangeConfig
+    fn convert_exchange_config(yaml_config: &config::ExchangeConfig) -> executionhandler::core::types::ExchangeConfig {
+        executionhandler::core::types::ExchangeConfig {
+            name: yaml_config.name.clone(),
+            api_key: yaml_config.api_key.clone().unwrap_or_default(),
+            secret_key: yaml_config.secret_key.clone().unwrap_or_default(),
+            passphrase: None,
+            sandbox: yaml_config.sandbox,
+            connection_pool_size: 10, // Default pool size
+            timeout_ms: yaml_config.timeout.as_millis() as u64,
+            rate_limit_per_second: yaml_config.rate_limits.orders_per_second,
+            rate_limit_burst: yaml_config.rate_limits.requests_per_second,
+            websocket_url: None, // Exchange-specific, will be set by connector
+            rest_api_url: None,
+            custom_headers: std::collections::HashMap::new(),
+        }
     }
 
     /// Create the strategy manager from configuration
@@ -256,24 +475,23 @@ impl HostedObject {
 
     /// Run all handlers concurrently
     pub async fn run_async(&mut self) -> Result<(), Box<dyn Error>> {
-        info!("Starting HostedObject...");
+        ultra_info!("Starting HostedObject...");
         
         if self.is_running {
             return Err("HostedObject is already running".into());
         }
         
-        // Create handlers
-        let (datahandler, portfoliohandler, strategyhandler, execution_handler) = Self::create_handlers().await?;
+        // Create handlers (exchanges are loaded from YAML config inside create_handlers)
+        let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers().await?;
         
-        // Initialize strategy manager
-        let config = Config::default();
+        // Initialize strategy manager with the loaded config
         self.strategy_manager = Some(Self::create_strategy_manager(&config)?);
         
         // Phase 2: Initialize ultra-fast order manager (853x faster processing)
-        info!("🚀 Initializing Phase 2 Ultra-Fast Order Manager...");
+        ultra_info!("🚀 Initializing Phase 2 Ultra-Fast Order Manager...");
         let ultra_order_manager = SignalEngineUltraOrderManager::new().await?;
         self.ultra_order_manager = Some(Arc::new(ultra_order_manager));
-        info!("✅ Phase 2 Ultra-Fast Order Manager initialized - target 0.6μs processing");
+        ultra_info!("✅ Phase 2 Ultra-Fast Order Manager initialized - target 0.6μs processing");
         
         // Initialize default strategies
         self.initialize_default_strategies().await?;
@@ -290,12 +508,12 @@ impl HostedObject {
         let _data_shutdown_rx = shutdown_tx.subscribe(); // For future use when handlers support interruption
         let data_health_tx_clone = data_health_tx.clone();
         let _data_handle = tokio::task::spawn_blocking(move || {
-            println!("Starting DataHandler...");
+            ultra_logger::ultra_info!("Starting DataHandler...");
             let mut handler = datahandler;
             // Note: In a real implementation, the handler.listen() should be interruptible
             // For now, we just run it and report errors
             if let Err(e) = handler.listen() {
-                eprintln!("DataHandler error: {e:?}");
+                ultra_logger::ultra_error!(format!("DataHandler error: {e:?}"));
                 let _ = data_health_tx_clone.blocking_send(Err(format!("DataHandler failed: {e:?}")));
             }
         });
@@ -304,24 +522,27 @@ impl HostedObject {
         let _portfolio_shutdown_rx = shutdown_tx.subscribe(); // For future use when handlers support interruption
         let portfolio_health_tx_clone = portfolio_health_tx.clone();
         let _portfolio_handle = tokio::task::spawn_blocking(move || {
-            println!("Starting PortfolioHandler...");
+            ultra_logger::ultra_info!("Starting PortfolioHandler...");
             let mut handler = portfoliohandler;
             // Note: In a real implementation, the handler.listen() should be interruptible
             if let Err(e) = handler.listen() {
-                eprintln!("PortfolioHandler error: {e:?}");
+                ultra_logger::ultra_error!(format!("PortfolioHandler error: {e:?}"));
                 let _ = portfolio_health_tx_clone.blocking_send(Err(format!("PortfolioHandler failed: {e:?}")));
             }
         });
         
         // Initialize execution handler
-        println!("Initializing ExecutionHandler...");
+        ultra_info!("Initializing ExecutionHandler...");
         execution_handler.initialize_optimizations().await?;
         
         // Set up ultra-fast signal routing using Phase 2 order manager
         if let Some(signal_rx) = self.signal_rx.take() {
-            let ultra_order_manager = self.ultra_order_manager.clone().unwrap();
+            let Some(ultra_order_manager) = self.ultra_order_manager.clone() else {
+                ultra_warn!("Ultra order manager not initialized, skipping signal routing");
+                return Ok(());
+            };
             tokio::spawn(async move {
-                info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
+                ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
                 let mut signal_count = 0u64;
                 
                 while let Ok(signal) = signal_rx.recv() {
@@ -362,29 +583,29 @@ impl HostedObject {
                         Ok(result) => {
                             // Log ultra-fast performance every 100 orders
                             if signal_count % 100 == 0 {
-                                info!("⚡ Phase 2 ultra-fast order {}: {}ns ({:.3}μs) - Success: {}", 
+                                ultra_logger::ultra_info!(format!("⚡ Phase 2 ultra-fast order {}: {}ns ({:.3}μs) - Success: {}", 
                                       signal_count, 
                                       result.processing_time_ns,
                                       result.processing_time_ns as f64 / 1000.0,
-                                      result.success);
+                                      result.success));
                             }
                             
                             // Log performance metrics every 1000 orders
                             if signal_count % 1000 == 0 {
                                 let metrics = ultra_order_manager.get_ultra_performance_metrics();
-                                info!("📊 Phase 2 metrics: {} processed, {:.2}μs avg, {:.1}% success, {} orders/sec peak",
+                                ultra_logger::ultra_info!(format!("📊 Phase 2 metrics: {} processed, {:.2}μs avg, {:.1}% success, {} orders/sec peak",
                                       metrics.processed_count, 
                                       metrics.avg_time_ns / 1000.0, 
                                       metrics.success_rate, 
-                                      metrics.peak_orders_per_sec);
+                                      metrics.peak_orders_per_sec));
                             }
                         }
                         Err(e) => {
-                            warn!("Ultra-fast order processing failed: {}", e);
+                            ultra_logger::ultra_warn!(format!("Ultra-fast order processing failed: {}", e));
                         }
                     }
                 }
-                info!("Phase 2 ultra-fast signal processing loop ended");
+                ultra_logger::ultra_info!("Phase 2 ultra-fast signal processing loop ended");
             });
         }
         
@@ -393,11 +614,10 @@ impl HostedObject {
             strategyhandler.add_signal_route("default".to_string(), signal_tx.clone());
         }
         
-        // TODO: Add exchanges to execution handler based on configuration
-        // For now, we'll add this as a placeholder for future implementation
+        // Exchanges are now loaded from YAML config in create_handlers()
         
         // Strategy manager is already created and configured
-        println!("StrategyManager created and configured");
+        ultra_info!("StrategyManager created and configured");
         
         self.is_running = true;
         
@@ -405,36 +625,36 @@ impl HostedObject {
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
-            println!("\nReceived shutdown signal...");
+            ultra_logger::ultra_info!("Received shutdown signal...");
             let _ = shutdown_tx_clone.send(());
         });
         
         // Monitor loop - wait for shutdown or handler failures
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                println!("Shutdown signal received");
+                ultra_info!("Shutdown signal received");
             }
             health_result = data_health_rx.recv() => {
                 if let Some(Err(e)) = health_result {
-                    eprintln!("Data handler health check failed: {e}");
+                    ultra_error!(format!("Data handler health check failed: {e}"));
                 }
             }
             health_result = portfolio_health_rx.recv() => {
                 if let Some(Err(e)) = health_result {
-                    eprintln!("Portfolio handler health check failed: {e}");
+                    ultra_error!(format!("Portfolio handler health check failed: {e}"));
                 }
             }
         }
         
         // Graceful shutdown
-        println!("Shutting down HostedObject...");
+        ultra_info!("Shutting down HostedObject...");
         
         // Strategy manager shutdown is simplified - no explicit stop method
-        println!("Strategy manager shutdown initiated");
+        ultra_info!("Strategy manager shutdown initiated");
         
         // Signal handlers to stop (would need to implement proper shutdown in handlers)
         // For now, we'll interrupt the threads after a timeout
-        println!("Waiting for handlers to complete...");
+        ultra_info!("Waiting for handlers to complete...");
         
         // Give handlers time to finish current work
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -444,18 +664,18 @@ impl HostedObject {
         
         self.is_running = false;
         
-        println!("HostedObject shutdown complete");
+        ultra_info!("HostedObject shutdown complete");
         Ok(())
     }
 
     /// Log final metrics from strategy manager
     fn log_final_metrics_from_manager(_strategyhandler: &StrategyManager) {
         // Simplified metrics logging - just basic info
-        println!("\n=== Final System Metrics ===");
-        println!("Strategy manager shutdown completed");
+        ultra_info!("=== Final System Metrics ===");
+        ultra_info!("Strategy manager shutdown completed");
         
         // Simplified metrics - just confirm shutdown
-        println!("All strategy components shut down successfully");
+        ultra_info!("All strategy components shut down successfully");
     }
 
     /// Get shared orderbooks (returns the same type as ORDERBOOKS)

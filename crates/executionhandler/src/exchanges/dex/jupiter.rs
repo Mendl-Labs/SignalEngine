@@ -2,14 +2,31 @@
 //!
 //! Jupiter is the leading DEX aggregator on Solana, routing through
 //! Orca, Raydium, Serum, and other Solana DEXs for best prices.
+//!
+//! # ⚠️ EXPERIMENTAL / STUB IMPLEMENTATION
+//!
+//! **WARNING**: This connector is a non-functional stub. Key limitations:
+//! - No actual Solana RPC interaction (solana-client TODO)
+//! - No wallet signing implementation
+//! - No Jupiter API integration
+//! - Not suitable for production use
+//!
+//! For production DEX trading, see `cetus.rs` and `deepbook.rs` which have
+//! full Sui blockchain integration.
 
 use async_trait::async_trait;
 use crate::signal::Signal;
 use crate::core::types::*;
+use crate::risk_controls::{KILL_SWITCH, KillReason};
 use super::traits::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Jupiter aggregator connector
+///
+/// # ⚠️ Experimental
+///
+/// This is a stub implementation. Do not use in production.
+#[deprecated(since = "0.1.0", note = "Stub implementation - use CetusConnector or DeepBookConnector for production DEX trading")]
 pub struct JupiterConnector {
     config: Option<DexConfig>,
     // TODO: Add solana-client
@@ -26,8 +43,14 @@ impl JupiterConnector {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl DexConnector for JupiterConnector {
     async fn initialize(&mut self, config: DexConfig) -> Result<(), ExecutionError> {
+        // ⚠️ STUB WARNING - Log at runtime
+        eprintln!("⚠️  WARNING: JupiterConnector is a STUB implementation!");
+        eprintln!("⚠️  This connector does NOT execute real Solana transactions.");
+        eprintln!("⚠️  For production DEX trading, use CetusConnector or DeepBookConnector.");
+        
         if !matches!(config.network, BlockchainNetwork::Solana | BlockchainNetwork::SolanaDevnet) {
             return Err(ExecutionError::Validation(
                 format!("Jupiter only works on Solana, got {:?}", config.network)
@@ -37,11 +60,19 @@ impl DexConnector for JupiterConnector {
         // TODO: Initialize Solana RPC client
         self.config = Some(config);
         
-        println!("✅ Jupiter connector initialized");
+        println!("✅ Jupiter connector initialized (STUB MODE)");
         Ok(())
     }
     
     async fn execute_swap(&self, signal: &Signal) -> Result<DexExecutionResult, ExecutionError> {
+        // P0 Safety: Check kill switch before DEX swap
+        if KILL_SWITCH.is_triggered() {
+            let reason = KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual);
+            return Err(ExecutionError::Rejected(format!(
+                "Kill switch triggered: {:?}. Jupiter swap halted.", reason
+            )));
+        }
+        
         let _config = self.config.as_ref()
             .ok_or_else(|| ExecutionError::Validation("Not initialized".to_string()))?;
         
@@ -67,6 +98,8 @@ impl DexConnector for JupiterConnector {
                 submitted_at: now_ns,
                 updated_at: now_ns,
                 latency_ns: 400_000_000, // ~400ms Solana finality
+                exchange_timestamp_ns: Some(now_ns), // On-chain timestamp
+                exchange_sequence: None,
             },
             tx_hash: "SolanaTransactionSignature".to_string(),
             block_number: None,

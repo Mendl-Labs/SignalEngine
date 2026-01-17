@@ -28,7 +28,8 @@ pub struct PortfolioHandler {
 impl PortfolioHandler {
     pub async fn new(topic_names: &[&str]) -> Result<Self, Box<dyn Error>> {
         dotenv().ok();
-        let config_path = env::var("CONFIG_PATH").expect("CONFIG_PATH must be set");
+        let config_path = env::var("CONFIG_PATH")
+            .map_err(|_| "CONFIG_PATH environment variable must be set. Set it to the path of your config file.")?;
         let config = Config::new(&config_path)?;
         let addr = format!("{}:{}", config.message_broker.address, config.message_broker.port);
         let connection_config = ConnectionConfig::new(&addr);
