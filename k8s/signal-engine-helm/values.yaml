@@ -274,17 +274,8 @@ volumeMounts:
   - name: tmp-volume
     mountPath: /tmp
 
-# Volumes (using emptyDir for dev - use PVC in production)
-volumes:
-  - name: config-volume
-    configMap:
-      name: signal-engine-config
-  - name: data-volume
-    emptyDir: {}  # Use emptyDir for dev, PVC in production
-  - name: logs-volume
-    emptyDir: {}
-  - name: tmp-volume
-    emptyDir: {}
+# Volumes (now defined in deployment template with proper naming)
+# volumes section removed - configmap name is templated in deployment.yaml
 
 # ==============================================================================
 # Environment Variables & Configuration
