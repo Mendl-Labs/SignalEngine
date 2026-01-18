@@ -219,22 +219,25 @@ readinessProbe:
 # ==============================================================================
 # Autoscaling Configuration
 # ==============================================================================
+# NOTE: Autoscaling disabled by default because custom metrics require 
+# metrics-server and custom metrics adapter to be installed in the cluster.
+# Enable only when prometheus-adapter or KEDA is configured.
 
 autoscaling:
-  enabled: true
+  enabled: false
   minReplicas: 2
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 80
-  # Custom metrics for trading-specific scaling
-  customMetrics:
-    - type: Pods
-      pods:
-        metric:
-          name: signal_processing_rate
-        target:
-          type: AverageValue
-          averageValue: "1000"  # Signals per second
+  # Custom metrics for trading-specific scaling (requires prometheus-adapter)
+  # customMetrics:
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: signal_processing_rate
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "1000"  # Signals per second
 
 # Vertical Pod Autoscaler
 vpa:
