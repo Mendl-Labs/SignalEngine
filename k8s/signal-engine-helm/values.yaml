@@ -244,9 +244,9 @@ vpa:
   enabled: false
   updateMode: "Auto"  # Auto, Initial, Off
 
-# Pod Disruption Budget
+# Pod Disruption Budget (disabled for dev - enable in production)
 podDisruptionBudget:
-  enabled: true
+  enabled: false
   minAvailable: 1
   # maxUnavailable: 25%
 
@@ -254,10 +254,10 @@ podDisruptionBudget:
 # Storage Configuration
 # ==============================================================================
 
-# Persistent volumes
+# Persistent volumes (disabled for dev - PVC volume mount uses emptyDir instead)
 persistence:
-  enabled: true
-  storageClass: "fast-ssd"  # Use fast storage for trading data
+  enabled: false  # Disabled for dev - enable in production
+  storageClass: ""  # Use default cluster storage class
   accessMode: ReadWriteOnce
   size: 100Gi
   annotations: {}
@@ -274,14 +274,13 @@ volumeMounts:
   - name: tmp-volume
     mountPath: /tmp
 
-# Volumes
+# Volumes (using emptyDir for dev - use PVC in production)
 volumes:
   - name: config-volume
     configMap:
       name: signal-engine-config
   - name: data-volume
-    persistentVolumeClaim:
-      claimName: signal-engine-data
+    emptyDir: {}  # Use emptyDir for dev, PVC in production
   - name: logs-volume
     emptyDir: {}
   - name: tmp-volume
@@ -467,19 +466,11 @@ secrets:
 # Performance & Optimization
 # ==============================================================================
 
-# Node selection
-nodeSelector:
-  # Select high-performance nodes
-  node-type: "compute-optimized"
-  # Ensure nodes have fast networking
-  network-tier: "premium"
+# Node selection (empty for compatibility with any cluster)
+nodeSelector: {}
 
-# Pod tolerations
-tolerations:
-  - key: "dedicated"
-    operator: "Equal"
-    value: "trading"
-    effect: "NoSchedule"
+# Pod tolerations (empty for compatibility with any cluster)
+tolerations: []
 
 # Pod affinity and anti-affinity
 affinity:
@@ -496,16 +487,11 @@ affinity:
           topologyKey: kubernetes.io/hostname
 
 # Priority class for critical trading workloads
-priorityClassName: "trading-critical"
+# Set to "" for compatibility with clusters that don't have custom PriorityClasses
+priorityClassName: ""
 
-# Topology spread constraints
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: kubernetes.io/hostname
-    whenUnsatisfiable: DoNotSchedule
-    labelSelector:
-      matchLabels:
-        app.kubernetes.io/name: signal-engine-helm
+# Topology spread constraints (empty for single-node dev cluster)
+topologySpreadConstraints: []
 
 # ==============================================================================
 # Monitoring & Observability
