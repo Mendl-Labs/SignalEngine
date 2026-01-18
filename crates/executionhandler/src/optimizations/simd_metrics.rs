@@ -1,9 +1,9 @@
 use crate::core::types::MetricsSnapshot;
 
 /// SIMD-accelerated metrics calculations for high-performance monitoring
-#[cfg(target_feature = "avx2")]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub fn simd_calculate_percentiles(latencies: &[f64]) -> MetricsSnapshot {
-    use ::*;
+    use std::arch::x86_64::*;
     
     if latencies.is_empty() {
         return MetricsSnapshot {
@@ -49,9 +49,9 @@ pub fn simd_calculate_percentiles(latencies: &[f64]) -> MetricsSnapshot {
 }
 
 /// SIMD-accelerated sum calculation using AVX2
-#[cfg(target_feature = "avx2")]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 unsafe fn simd_sum(values: &[f64]) -> f64 {
-    use ::*;
+    use std::arch::x86_64::*;
     
     let mut sum = _mm256_setzero_pd();
     let len = values.len();
@@ -75,8 +75,8 @@ unsafe fn simd_sum(values: &[f64]) -> f64 {
     simd_sum + remainder_sum
 }
 
-/// Fallback implementation for non-AVX2 systems
-#[cfg(not(target_feature = "avx2"))]
+/// Fallback implementation for non-AVX2 systems or non-x86_64 architectures
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub fn simd_calculate_percentiles(latencies: &[f64]) -> MetricsSnapshot {
     if latencies.is_empty() {
         return MetricsSnapshot {

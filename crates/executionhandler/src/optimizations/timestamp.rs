@@ -42,7 +42,7 @@ pub fn nano_timestamp() -> u128 {
     // Use hardware timestamp counter for maximum precision on x86_64
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe { ::ultra_signal::high_precision_timestamp_ns() as u128 }
+        unsafe { ultra_signal::high_precision_timestamp_ns() as u128 }
     }
     
     #[cfg(not(target_arch = "x86_64"))]
