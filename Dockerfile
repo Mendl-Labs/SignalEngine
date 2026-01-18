@@ -53,8 +53,8 @@ RUN adduser --disabled-password --gecos "" --home "/nonexistent" --shell "/sbin/
 # Copy the built application from the build stage
 COPY --from=build /bin/signal-engine /usr/local/bin/signal-engine
 
-# Copy configuration files from SignalEngine
-COPY --from=build /app/SignalEngine/config/ /etc/signal-engine/config/
+# Create config directory (config is managed via K8s ConfigMaps in production)
+RUN mkdir -p /etc/signal-engine/config
 
 # Ensure the binary is executable
 RUN chmod +x /usr/local/bin/signal-engine
