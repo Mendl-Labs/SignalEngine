@@ -20,8 +20,8 @@
 //! - ERROR: Failures requiring attention
 //!
 //! # Usage
-//! ```rust
-//! use signalengine_core::system_logging::{SystemLogger, LogCategory};
+//! ```rust,ignore
+//! use signalengine::system_logging::{SystemLogger, LogCategory};
 //! 
 //! let logger = SystemLogger::new("MyComponent");
 //! logger.info(LogCategory::Strategy, "Strategy initialized", &[("id", "123")]);
