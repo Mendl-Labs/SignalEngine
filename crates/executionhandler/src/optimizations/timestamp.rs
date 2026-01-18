@@ -39,19 +39,14 @@ fn get_tsc_freq_ghz() -> f64 {
 /// Get nanosecond precision timestamp using the fastest available method
 #[inline(always)]
 pub fn nano_timestamp() -> u128 {
-    // Use hardware timestamp counter for maximum precision on x86_64
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { ultra_signal::high_precision_timestamp_ns() as u128 }
-    }
+    // Use std::time::Instant for high-precision monotonic timing
+    // This avoids cross-crate dependency issues and provides nanosecond precision
+    use std::time::Instant;
+    use std::sync::OnceLock;
     
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    }
+    static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+    let start = START_INSTANT.get_or_init(|| Instant::now());
+    start.elapsed().as_nanos()
 }
 
 /// High-resolution timer for latency measurements

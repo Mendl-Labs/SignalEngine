@@ -929,7 +929,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ultra-logger",
- "ultra_signal",
  "uuid",
  "winapi",
  "zeroize",
