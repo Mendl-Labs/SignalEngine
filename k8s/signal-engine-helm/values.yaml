@@ -505,16 +505,16 @@ monitoring:
   prometheus:
     enabled: true
     port: 9090
-    # Service monitor for Prometheus operator
+    # Service monitor for Prometheus operator (requires prometheus-operator CRDs)
     serviceMonitor:
-      enabled: true
+      enabled: false  # Set to true if prometheus-operator is installed
       interval: 15s
       path: /metrics
       labels:
         app: signal-engine
-    # Prometheus rules
+    # Prometheus rules (requires prometheus-operator CRDs)
     rules:
-      enabled: true
+      enabled: false  # Set to true if prometheus-operator is installed
     
   # Health checks
   health_check_enabled: true
