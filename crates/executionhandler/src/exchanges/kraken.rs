@@ -763,26 +763,28 @@ impl KrakenAuth {
 #[async_trait]
 impl ExchangeAuth for KrakenAuth {
     async fn sign_request(&self, _method: &str, path: &str, body: &str, timestamp: u64) -> Result<AuthHeaders, ExecutionError> {
+        // Kraken signature: HMAC-SHA512(path + SHA256(nonce + body), base64_decode(secret))
+        // Note: body already contains "nonce={timestamp}&..."
         let nonce = timestamp.to_string();
-        let post_data = format!("nonce={}&{}", nonce, body);
         
-        // Create SHA256 hash of nonce + POST data
+        // SHA256(nonce + body) - concatenate nonce string with body string
         let mut hasher = Sha256::new();
-        hasher.update(post_data.as_bytes());
+        hasher.update(format!("{}{}", nonce, body).as_bytes());
         let hash_digest = hasher.finalize();
         
-        // Create HMAC-SHA512 signature
+        // Decode base64 secret
         let secret_decoded = base64::engine::general_purpose::STANDARD
             .decode(&self.secret_key)
             .map_err(|e| ExecutionError::Authentication(format!("Invalid secret key: {}", e)))?;
         
+        // HMAC-SHA512(path + sha256_bytes)
         let mut mac = Hmac::<Sha512>::new_from_slice(&secret_decoded)
             .map_err(|e| ExecutionError::Authentication(format!("HMAC error: {}", e)))?;
         
-        let message = format!("{}{}", path, std::str::from_utf8(&hash_digest)
-            .map_err(|e| ExecutionError::Authentication(format!("UTF8 error: {}", e)))?);
+        // Concatenate path bytes + SHA256 hash bytes
+        mac.update(path.as_bytes());
+        mac.update(&hash_digest);
         
-        mac.update(message.as_bytes());
         let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
         
         let mut headers = HashMap::new();

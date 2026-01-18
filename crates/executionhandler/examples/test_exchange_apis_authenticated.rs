@@ -138,10 +138,12 @@ async fn test_kraken_authenticated(
     println!("   [1/2] Fetching account balance...");
     let start = Instant::now();
 
+    // Use nanoseconds for nonce - must be higher than any previously used nonce for this API key
+    // DataEngine uses nanoseconds, so we must too to avoid "Invalid nonce" errors
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64;
+        .as_nanos() as u64;
 
     let path = "/0/private/Balance";
     let body = format!("nonce={}", nonce);
@@ -196,10 +198,11 @@ async fn test_kraken_authenticated(
     println!("   [2/2] Fetching open orders...");
     let start = Instant::now();
 
+    // Use nanoseconds for nonce - must be higher than any previously used nonce
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64;
+        .as_nanos() as u64;
 
     let path = "/0/private/OpenOrders";
     let body = format!("nonce={}", nonce);
