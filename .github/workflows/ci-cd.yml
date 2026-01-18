@@ -316,12 +316,34 @@ jobs:
         run: |
           Write-Host "Running authenticated exchange API tests..."
           cd SignalEngine
-          cargo run --example test_exchange_apis_authenticated -- all
-          if ($LASTEXITCODE -eq 0) {
+          
+          # Retry up to 3 times for transient nonce errors
+          $maxRetries = 3
+          $retryCount = 0
+          $success = $false
+          
+          while (-not $success -and $retryCount -lt $maxRetries) {
+            $retryCount++
+            Write-Host "Attempt $retryCount of $maxRetries..."
+            
+            # Add small delay between retries to allow nonce to advance
+            if ($retryCount -gt 1) {
+              Start-Sleep -Seconds 2
+            }
+            
+            cargo run --example test_exchange_apis_authenticated -- all
+            if ($LASTEXITCODE -eq 0) {
+              $success = $true
+            } else {
+              Write-Host "[WARN] Attempt $retryCount failed (may be transient nonce error)"
+            }
+          }
+          
+          if ($success) {
             Write-Host "[OK] Authenticated API tests passed!"
             echo "passed=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "[FAIL] Authenticated API tests failed!"
+            Write-Host "[FAIL] Authenticated API tests failed after $maxRetries attempts!"
             echo "passed=false" >> $env:GITHUB_OUTPUT
             exit 1
           }
