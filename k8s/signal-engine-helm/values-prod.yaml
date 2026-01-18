@@ -1,0 +1,80 @@
+# ==============================================================================
+# SignalEngine - Production Values Override
+# ==============================================================================
+# Usage: helm upgrade --install signal-engine ./signal-engine-helm -f values-prod.yaml
+
+global:
+  environment: prod
+
+# Production replica count for high availability
+replicaCount: 3
+
+# Production-grade resource allocation
+resources:
+  limits:
+    cpu: "8000m"
+    memory: "16Gi"
+    ephemeral-storage: "20Gi"
+  requests:
+    cpu: "4000m"
+    memory: "8Gi"
+    ephemeral-storage: "10Gi"
+
+# Enable autoscaling for production
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Enable Pod Disruption Budget for production
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Production storage with fast SSD
+persistence:
+  enabled: true
+  storageClass: "fast-ssd"
+  size: 500Gi
+
+# Production node selection
+nodeSelector:
+  node-type: "compute-optimized"
+  network-tier: "premium"
+
+# Production tolerations
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "trading"
+    effect: "NoSchedule"
+
+# Production priority class
+priorityClassName: "trading-critical"
+
+# Production topology spread
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: signal-engine-helm
+
+# Enable monitoring in production
+monitoring:
+  prometheus:
+    serviceMonitor:
+      enabled: true
+    rules:
+      enabled: true
+  alerting_enabled: true
+
+# Production logging
+logging:
+  level: "warn"
+  elasticsearch:
+    enabled: true
+    endpoint: "http://elasticsearch:9200"
