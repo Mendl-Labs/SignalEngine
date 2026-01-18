@@ -174,35 +174,43 @@ resources:
 # ==============================================================================
 # Health Checks & Probes
 # ==============================================================================
+# SignalEngine runs as a background trading engine without HTTP endpoints.
+# Using exec probes to check if the process is running (same pattern as DataEngine).
 
-# Startup probe (for slow-starting containers)
+# Startup probe - verify process starts successfully
 startupProbe:
-  httpGet:
-    path: /health/startup
-    port: 8080
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
   initialDelaySeconds: 10
-  periodSeconds: 10
-  timeoutSeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
   failureThreshold: 30
   successThreshold: 1
 
-# Liveness probe
+# Liveness probe - verify process is still running
 livenessProbe:
-  httpGet:
-    path: /health/live
-    port: 8080
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
   initialDelaySeconds: 30
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 3
   successThreshold: 1
 
-# Readiness probe
+# Readiness probe - verify process is ready to handle signals
 readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 8080
-  initialDelaySeconds: 5
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 10
   periodSeconds: 5
   timeoutSeconds: 3
   failureThreshold: 3
