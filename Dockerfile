@@ -59,19 +59,15 @@ RUN mkdir -p /etc/signal-engine/config
 # Ensure the binary is executable
 RUN chmod +x /usr/local/bin/signal-engine
 
-# Create health check script
-RUN echo '#!/bin/bash\ncurl -f http://localhost:8080/health || exit 1' > /usr/local/bin/health-check && \
-    chmod +x /usr/local/bin/health-check
-
 # Switch to non-privileged user
 USER appuser
 
-# Expose ports for HTTP API and metrics
-EXPOSE 8080 9090
+# Expose ports for metrics (no HTTP API - SignalEngine is a background trading engine)
+EXPOSE 9090
 
-# Health check
+# Health check using pgrep (SignalEngine doesn't have HTTP endpoints)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD ["/usr/local/bin/health-check"]
+  CMD pgrep signal-engine || exit 1
 
 # Set the command to run the application
 ENTRYPOINT ["/usr/local/bin/signal-engine"]
