@@ -618,11 +618,15 @@ jobs:
             Write-Host ""
             Write-Host "=== Pod Logs (if available) ==="
             $pods = kubectl get pods -n ${{ env.NAMESPACE }} -l app.kubernetes.io/name=signal-engine-helm -o jsonpath='{.items[*].metadata.name}'
-            foreach ($pod in $pods.Split(' ')) {
-              if ($pod) {
-                Write-Host "--- Logs for $pod ---"
-                kubectl logs -n ${{ env.NAMESPACE }} $pod --tail=50 2>&1
+            if ($pods) {
+              foreach ($pod in $pods.Split(' ')) {
+                if ($pod) {
+                  Write-Host "--- Logs for $pod ---"
+                  kubectl logs -n ${{ env.NAMESPACE }} $pod --tail=50 2>&1
+                }
               }
+            } else {
+              Write-Host "[INFO] No pods found with label app.kubernetes.io/name=signal-engine-helm"
             }
             # Don't fail the build - just warn
             Write-Host "[WARN] Pods may still be starting - check cluster manually if issues persist"
