@@ -78,3 +78,40 @@ logging:
   elasticsearch:
     enabled: true
     endpoint: "http://elasticsearch:9200"
+
+# Production health probes (real signal-engine binary)
+startupProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+  successThreshold: 1
+
+livenessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1

@@ -174,8 +174,8 @@ resources:
 # ==============================================================================
 # Health Checks & Probes
 # ==============================================================================
-# SignalEngine runs as a background trading engine without HTTP endpoints.
-# Using exec probes to check if the process is running (same pattern as DataEngine).
+# For dev/test: Using busybox, check for the shell process
+# For production: Change to pgrep signal-engine when using the real image
 
 # Startup probe - verify process starts successfully
 startupProbe:
@@ -183,8 +183,8 @@ startupProbe:
     command:
       - /bin/sh
       - -c
-      - pgrep signal-engine
-  initialDelaySeconds: 10
+      - pgrep -f "sleep 30"  # Dev: check busybox loop; Prod: change to signal-engine
+  initialDelaySeconds: 5
   periodSeconds: 5
   timeoutSeconds: 3
   failureThreshold: 30
@@ -196,8 +196,8 @@ livenessProbe:
     command:
       - /bin/sh
       - -c
-      - pgrep signal-engine
-  initialDelaySeconds: 30
+      - pgrep -f "sleep 30"  # Dev: check busybox loop; Prod: change to signal-engine
+  initialDelaySeconds: 10
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 3
@@ -209,8 +209,8 @@ readinessProbe:
     command:
       - /bin/sh
       - -c
-      - pgrep signal-engine
-  initialDelaySeconds: 10
+      - pgrep -f "sleep 30"  # Dev: check busybox loop; Prod: change to signal-engine
+  initialDelaySeconds: 5
   periodSeconds: 5
   timeoutSeconds: 3
   failureThreshold: 3
