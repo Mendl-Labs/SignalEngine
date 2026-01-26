@@ -563,7 +563,6 @@ mod tests {
             }],
             portfolio_risk: PortfolioRiskLimits::default(),
             enabled: true,
-            paper_trading: true,
             description: None,
             metadata: Default::default(),
         }

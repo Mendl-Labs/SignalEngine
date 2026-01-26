@@ -2538,6 +2538,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "publisher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crossbeam",
+ "libc",
+ "mockall 0.12.1",
+ "once_cell",
+ "parking_lot",
+ "prost",
+ "prost-build",
+ "protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "ultra-logger",
+ "winapi",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3289,14 +3311,19 @@ dependencies = [
  "bigdecimal 0.4.9",
  "chrono",
  "crossbeam",
+ "dashmap 5.5.3",
  "databaseschema",
  "deadpool 0.12.3",
  "diesel",
  "diesel-async",
  "parking_lot",
+ "prost",
+ "protocol",
+ "publisher",
  "serde",
  "serde_json",
  "signalengine-core",
+ "subscriber",
  "thiserror 1.0.69",
  "tokio",
  "ultra-logger",

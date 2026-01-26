@@ -10,16 +10,15 @@ A production-ready trading engine designed for sub-millisecond execution with lo
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-- [Performance](#performance)
-- [Crate Reference](#crate-reference)
+- [Workspace Crates](#workspace-crates)
+- [Data Flow](#data-flow)
 - [Risk Controls](#risk-controls)
 - [Exchange Connectors](#exchange-connectors)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
-- [API Reference](#api-reference)
-- [Deployment](#deployment)
-- [Development](#development)
-- [Troubleshooting](#troubleshooting)
+- [Performance](#performance)
+- [Kubernetes Deployment](#kubernetes-deployment)
+- [Environment Variables](#environment-variables)
 
 ---
 
@@ -27,111 +26,90 @@ A production-ready trading engine designed for sub-millisecond execution with lo
 
 SignalEngine is the real-time trading execution layer of the TradingPlatform. It:
 
-1. **Subscribes** to normalized market data from MessageBroker (published by DataEngine)
-2. **Generates signals** using loaded strategies with SIMD-optimized calculations
-3. **Validates orders** through multiple risk control layers
-4. **Executes trades** on CEX (Kraken) and DEX (Cetus, DeepBook on Sui)
-5. **Persists state** via Write-Ahead Log (WAL) for crash recovery
-6. **Reports metrics** to Prometheus/Grafana for monitoring
+1. **Subscribes** to market data from MessageBroker (published by DataEngine)
+2. **Loads strategies** from database with optimized parameters from BacktestingEngine
+3. **Generates signals** using SIMD-optimized calculations
+4. **Validates orders** through multiple risk control layers
+5. **Executes trades** on CEX (Kraken) and DEX (Cetus, DeepBook on Sui)
+6. **Tracks positions** with real-time P&L and audit trail
 
 ### Key Characteristics
 
 | Attribute | Value |
 |-----------|-------|
-| **End-to-End Latency** | &lt;1ms (signal to order) |
+| **End-to-End Latency** | <1ms (signal to order) |
 | **Throughput** | 50K+ operations/second |
 | **Architecture** | Lock-free, zero-copy, SIMD-optimized |
 | **Risk Controls** | Kill switch, fat-finger, circuit breakers |
-| **Persistence** | WAL with graceful shutdown integration |
+| **Persistence** | WAL with graceful shutdown |
 | **Exchanges** | Kraken (CEX), Cetus/DeepBook (Sui DEX) |
 
 ---
 
 ## Architecture
 
-### Data Flow
+### High-Level Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              SIGNAL ENGINE                                       │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │                          MESSAGE BROKER                                   │  │
-│  │              (market.data.{exchange}.trades / .level3)                   │  │
-│  └────────────────────────────────┬─────────────────────────────────────────┘  │
-│                                   │                                             │
-│                                   ▼                                             │
-│  ┌────────────────────────────────────────────────────────────────────────┐    │
-│  │                       DATA HANDLER                                      │    │
-│  │     Subscribes to MessageBroker, maintains local orderbook replicas     │    │
-│  │                  ORDERBOOKS: DashMap<(exchange, symbol), Orderbook>     │    │
-│  └────────────────────────────────┬───────────────────────────────────────┘    │
-│                                   │                                             │
-│                                   ▼                                             │
-│  ┌────────────────────────────────────────────────────────────────────────┐    │
-│  │                    STRATEGY MANAGER                                     │    │
-│  │    Loads strategies from DB, routes market data, generates signals      │    │
-│  │    Strategies: Momentum, MeanReversion, PortfolioMixed                  │    │
-│  └────────────────────────────────┬───────────────────────────────────────┘    │
-│                                   │ Signal                                      │
-│                                   ▼                                             │
-│  ┌────────────────────────────────────────────────────────────────────────┐    │
-│  │                    EXECUTION HANDLER                                    │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
-│  │  │              PRE-EXECUTION RISK CONTROLS                         │   │    │
-│  │  │                                                                  │   │    │
-│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │   │    │
-│  │  │  │ KILL SWITCH  │─▶│ FAT FINGER   │─▶│ CIRCUIT BREAKER (v2)   │ │   │    │
-│  │  │  │   (atomic)   │  │  (limits)    │  │ (lock-free, 5 = trip)  │ │   │    │
-│  │  │  └──────────────┘  └──────────────┘  └────────────────────────┘ │   │    │
-│  │  │         │                 │                      │               │   │    │
-│  │  │         ▼                 ▼                      ▼               │   │    │
-│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │   │    │
-│  │  │  │ RATE LIMITER │  │ BACKPRESSURE │  │ POSITION LIMITS        │ │   │    │
-│  │  │  └──────────────┘  └──────────────┘  └────────────────────────┘ │   │    │
-│  │  └─────────────────────────────────────────────────────────────────┘   │    │
-│  │                                   │                                     │    │
-│  │                                   ▼                                     │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
-│  │  │                 EXCHANGE CONNECTORS                              │   │    │
-│  │  │                                                                  │   │    │
-│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
-│  │  │   │    KRAKEN    │  │    CETUS     │  │     DEEPBOOK       │   │   │    │
-│  │  │   │    (CEX)     │  │  (Sui DEX)   │  │    (Sui DEX)       │   │   │    │
-│  │  │   │  REST + WS   │  │    PTB       │  │      PTB           │   │   │    │
-│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
-│  │  └─────────────────────────────────────────────────────────────────┘   │    │
-│  │                                   │                                     │    │
-│  │                                   ▼                                     │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
-│  │  │                 PERSISTENCE & AUDIT                              │   │    │
-│  │  │                                                                  │   │    │
-│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
-│  │  │   │  ORDER WAL   │  │ POSITION     │  │       TCA          │   │   │    │
-│  │  │   │ (crash safe) │  │ TRACKER      │  │ (cost analysis)    │   │   │    │
-│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
-│  │  │                                                                  │   │    │
-│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │   │    │
-│  │  │   │    AUDIT     │  │   ALERTS     │  │   PROMETHEUS       │   │   │    │
-│  │  │   │   (trail)    │  │  (webhooks)  │  │    (metrics)       │   │   │    │
-│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘   │   │    │
-│  │  └─────────────────────────────────────────────────────────────────┘   │    │
-│  └────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                 │
-│  ┌────────────────────────────────────────────────────────────────────────┐    │
-│  │                    GRACEFUL SHUTDOWN                                    │    │
-│  │         Coordinates WAL flush, position sync, and clean exit           │    │
-│  └────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              SIGNAL ENGINE                                   │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                       MESSAGE BROKER                                    │ │
+│  │              (market_data.{exchange}.{symbol})                         │ │
+│  └────────────────────────────────┬───────────────────────────────────────┘ │
+│                                   │                                          │
+│                                   ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                       DATA HANDLER                                      │ │
+│  │     Subscribes to MessageBroker, maintains local orderbook replicas     │ │
+│  │              ORDERBOOKS: DashMap<(exchange, symbol), Orderbook>         │ │
+│  └────────────────────────────────┬───────────────────────────────────────┘ │
+│                                   │                                          │
+│                                   ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    STRATEGY MANAGER                                     │ │
+│  │    Loads strategies from DB, routes market data, generates signals      │ │
+│  └────────────────────────────────┬───────────────────────────────────────┘ │
+│                                   │ Signal                                   │
+│                                   ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    EXECUTION HANDLER                                    │ │
+│  │                                                                         │ │
+│  │  ┌───────────────────────────────────────────────────────────────────┐ │ │
+│  │  │              PRE-EXECUTION RISK CONTROLS                           │ │ │
+│  │  │                                                                    │ │ │
+│  │  │  KILL SWITCH ─▶ FAT FINGER ─▶ CIRCUIT BREAKER ─▶ RATE LIMITER    │ │ │
+│  │  │    (atomic)      (limits)      (lock-free)        (token bucket)  │ │ │
+│  │  └───────────────────────────────────────────────────────────────────┘ │ │
+│  │                              │                                          │ │
+│  │                              ▼                                          │ │
+│  │  ┌───────────────────────────────────────────────────────────────────┐ │ │
+│  │  │                 EXCHANGE CONNECTORS                                │ │ │
+│  │  │                                                                    │ │ │
+│  │  │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐     │ │ │
+│  │  │   │    KRAKEN    │  │    CETUS     │  │     DEEPBOOK       │     │ │ │
+│  │  │   │    (CEX)     │  │  (Sui DEX)   │  │    (Sui DEX)       │     │ │ │
+│  │  │   │  REST + WS   │  │    PTB       │  │      PTB           │     │ │ │
+│  │  │   └──────────────┘  └──────────────┘  └────────────────────┘     │ │ │
+│  │  └───────────────────────────────────────────────────────────────────┘ │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    PERSISTENCE & AUDIT                                  │ │
+│  │                                                                         │ │
+│  │   ORDER WAL        POSITION TRACKER      TCA           PROMETHEUS      │ │
+│  │   (crash safe)     (real-time P&L)       (cost)        (metrics)       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Component Interaction
+### Integration with TradingPlatform
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │ DataEngine  │────▶│MessageBroker│────▶│SignalEngine │
-│ (normalizes)│     │  (pub/sub)  │     │ (executes)  │
+│ (WebSocket) │     │  (pub/sub)  │     │ (executes)  │
 └─────────────┘     └─────────────┘     └──────┬──────┘
                                                │
                     ┌──────────────────────────┼──────────────────────────┐
@@ -145,341 +123,161 @@ SignalEngine is the real-time trading execution layer of the TradingPlatform. It
 
 ---
 
-## Performance
+## Workspace Crates
 
-### Latency Benchmarks
+Located in `crates/`:
 
-| Component | P50 | P99 | P99.9 |
-|-----------|-----|-----|-------|
-| Signal Generation | 45μs | 75μs | 100μs |
-| Risk Validation | 5μs | 10μs | 15μs |
-| Order Routing | 85μs | 120μs | 150μs |
-| Exchange Submit | 400μs | 600μs | 800μs |
-| **End-to-End** | **535μs** | **805μs** | **1065μs** |
-
-### Optimization Techniques
-
-| Technique | Impact | Implementation |
-|-----------|--------|----------------|
-| **Lock-Free Structures** | -30% contention | `DashMap`, atomic operations, `crossbeam` |
-| **Zero-Copy Messaging** | -80% memory overhead | `Arc<Signal>`, ring buffers |
-| **SIMD Processing** | +40% throughput | AVX2 batch price calculations |
-| **Memory Pools** | -25% allocation time | Thread-local pre-allocated buffers |
-| **Cache Alignment** | -25% false sharing | 64-byte aligned atomics |
-| **RDTSC Timestamps** | ~10ns overhead | Hardware timestamp counter |
-
-### Memory Usage
-
-| State | Memory |
-|-------|--------|
-| Baseline | ~500MB |
-| Per 1K Strategies | +50MB |
-| Per 1M Signals/day | +200MB |
-| Peak Load | ~2GB |
+| Crate | Purpose |
+|-------|---------|
+| `core/` | Lock-free primitives, SIMD operations, cache-aligned structures |
+| `datahandler/` | MessageBroker subscription, orderbook replication (DashMap) |
+| `strategyloader/` | Database strategy loading from PostgreSQL |
+| `strategyhandler/` | Strategy execution orchestration, signal routing |
+| `signalgenerator/` | SIMD-optimized signal generation |
+| `signaldispatcher/` | Signal routing and batching |
+| `executionhandler/` | Pre-execution risk, CEX/DEX connectors |
+| `portfoliohandler/` | Position tracking, P&L calculation |
+| `smartorderrouter/` | Multi-venue execution optimization |
+| `exchangemetricaggregator/` | Exchange performance metrics collection |
+| `orderbook/` | Lock-free orderbook implementation |
+| `config/` | Configuration management |
+| `hostbuilder/` | Dependency injection and service orchestration |
 
 ---
 
-## Crate Reference
+## Data Flow
 
-### Workspace Structure
+### Strategy Deployment Flow
 
 ```
-SignalEngine/
-├── program/                    # Main binary entrypoint
-├── crates/
-│   ├── core/                   # Shared low-level primitives
-│   ├── config/                 # Configuration management
-│   ├── signal/                 # Signal type definitions
-│   ├── orderbook/              # Orderbook data structures
-│   ├── portfolio/              # Portfolio state management
-│   │
-│   ├── datahandler/            # MessageBroker subscriber, local orderbook cache
-│   ├── signalgenerator/        # SIMD-optimized signal generation
-│   ├── signaldispatcher/       # Signal routing and batching
-│   ├── strategyhandler/        # Strategy execution orchestration
-│   ├── strategyloader/         # Database strategy loading
-│   ├── smartorderrouter/       # Intelligent order routing
-│   ├── portfoliohandler/       # Portfolio management
-│   ├── exchangemetricaggregator/ # Exchange metrics collection
-│   │
-│   ├── executionhandler/       # Order execution (35+ modules)
-│   │   ├── core/               # ExchangeConnector trait, types
-│   │   ├── exchanges/          # Kraken, Cetus, DeepBook connectors
-│   │   │   └── dex/            # DEX-specific implementations
-│   │   ├── risk_controls.rs    # Kill switch, position limits
-│   │   ├── fat_finger.rs       # Fat-finger protection
-│   │   ├── circuit_breaker_v2.rs # Lock-free circuit breaker
-│   │   ├── order_wal.rs        # Write-ahead log
-│   │   ├── graceful_shutdown.rs # Coordinated shutdown
-│   │   ├── hot_config.rs       # Runtime config reload
-│   │   ├── alerts.rs           # Webhook notifications
-│   │   ├── tca.rs              # Transaction cost analysis
-│   │   ├── fill_probability.rs # ML fill prediction
-│   │   ├── multi_leg.rs        # OCO, bracket orders
-│   │   └── ...
-│   │
-│   └── hostbuilder/            # Service orchestration
-│
-├── k8s/                        # Kubernetes Helm charts
-├── scripts/                    # Build and deployment scripts
-└── tests/                      # Integration tests
+1. BacktestingEngine optimizes strategy parameters
+         │
+         ▼
+2. Optimized strategy saved to PostgreSQL
+         │
+         ▼
+3. SignalEngine StrategyLoader loads strategy from DB
+         │
+         ▼
+4. SignalEngine publishes MarketDataSubscribe to MessageBroker
+   {
+     "exchange": "kraken",
+     "symbol": "XBTUSD",
+     "data_types": ["trades", "orderbook"]
+   }
+         │
+         ▼
+5. DataEngine receives subscription, connects to exchange WebSocket
+         │
+         ▼
+6. Real-time data flows:
+   Exchange → DataEngine → MessageBroker → SignalEngine
+         │
+         ▼
+7. SignalEngine DataHandler updates local orderbook
+         │
+         ▼
+8. StrategyManager runs strategy logic
+         │
+         ▼
+9. SignalGenerator produces trading signal
+         │
+         ▼
+10. ExecutionHandler validates through risk controls
+         │
+         ▼
+11. Exchange connector submits order
 ```
 
-### Core Crate (`signalengine-core`)
+### Signal Processing Pipeline
 
-Low-level primitives shared across all crates:
-
-| Module | Purpose |
-|--------|---------|
-| `lock_free.rs` | `LockFreeHashMap`, `LockFreeStack` |
-| `cache_aligned.rs` | 64-byte aligned atomics |
-| `memory_pool.rs` | Thread-local memory pools |
-| `zero_copy.rs` | `ZeroCopyChannel`, `SignalArena` |
-| `simd.rs` | AVX2 batch operations |
-| `rdtsc.rs` | Hardware timestamps |
-| `memory_ordering.rs` | Precise memory barriers |
-
-### ExecutionHandler Crate (35+ modules)
-
-The most critical crate for production trading:
-
-#### Risk Control Layer
-| Module | Purpose |
-|--------|---------|
-| `risk_controls.rs` | Global `KILL_SWITCH`, position limits |
-| `fat_finger.rs` | Max order size/notional limits (default: $10,000) |
-| `circuit_breaker_v2.rs` | Lock-free failure detection (5 failures = trip) |
-| `backpressure.rs` | Adaptive flow control |
-| `rate_limiter.rs` | Exchange rate limit compliance |
-| `validation.rs` | Order validation rules |
-
-#### Exchange Connectors
-| Module | Exchange | Type | Features |
-|--------|----------|------|----------|
-| `kraken.rs` | Kraken | CEX | HMAC-SHA512, edit orders, WebSocket |
-| `cetus.rs` | Cetus | Sui DEX | PTB execution, pool discovery |
-| `deepbook.rs` | DeepBook | Sui DEX | PTB execution, order book |
-| `sui_wallet.rs` | - | Utility | Sui wallet management |
-| `sui_ptb.rs` | - | Utility | Programmable Transaction Blocks |
-
-#### Persistence & Audit
-| Module | Purpose |
-|--------|---------|
-| `order_wal.rs` | Write-ahead log for crash recovery |
-| `position_tracker.rs` | Real-time position state |
-| `tca.rs` | Transaction Cost Analysis (slippage, VWAP, TWAP) |
-| `audit.rs` | Kill switch audit trail |
-| `reconciliation.rs` | Exchange state synchronization |
-
-#### Operations
-| Module | Purpose |
-|--------|---------|
-| `graceful_shutdown.rs` | Coordinated shutdown with WAL flush |
-| `hot_config.rs` | Runtime config reload without restart |
-| `alerts.rs` | Webhook notifications (Slack, PagerDuty) |
-| `prometheus_metrics.rs` | Metrics export |
-| `secrets.rs` | Credential management |
-
-#### Advanced Features
-| Module | Purpose |
-|--------|---------|
-| `multi_leg.rs` | OCO, bracket orders, spreads |
-| `fill_probability.rs` | ML-based fill prediction |
-| `latency_optimizer.rs` | Adaptive routing optimization |
-| `bounded_dlq.rs` | Dead letter queue with bounds |
-| `chaos.rs` | Chaos engineering for testing |
-
-### StrategyLoader Crate
-
-Strategy management and execution:
-
-| Type | Purpose |
-|------|---------|
-| `StrategyInstance` | Loaded strategy with parameters |
-| `StrategyType` | `Momentum`, `MeanReversion`, `PortfolioMixed` |
-| `StrategyManager` | Orchestrates loading, routing, execution |
-| `SignalStore` | Tracks generated signals with lifecycle |
-| `PortfolioStrategy` | Trait for strategy implementations |
+```
+Market Data ──▶ DataHandler ──▶ StrategyManager ──▶ SignalGenerator
+                    │                │                    │
+                    ▼                ▼                    ▼
+              Orderbook         Strategy            SIMD-optimized
+              (DashMap)         Instance            calculations
+                                                         │
+                                                         ▼
+                                                  SignalDispatcher
+                                                         │
+                                                         ▼
+                                                  ExecutionHandler
+                                                         │
+                    ┌────────────────────────────────────┼────────────────────────────────────┐
+                    │                                    │                                    │
+                    ▼                                    ▼                                    ▼
+              Kill Switch                          Fat Finger                         Circuit Breaker
+              (if triggered,                       (size/price                        (error rate
+               reject all)                          limits)                            threshold)
+                    │                                    │                                    │
+                    └────────────────────────────────────┼────────────────────────────────────┘
+                                                         │
+                                                         ▼
+                                                  Exchange Connector
+```
 
 ---
 
 ## Risk Controls
 
-### Kill Switch
+### Pre-Execution Risk Stack
 
-The global kill switch is the **first check** in every order path:
+| Control | Type | Description |
+|---------|------|-------------|
+| **Kill Switch** | Atomic boolean | Emergency halt all trading |
+| **Fat Finger** | Limits | Max order size, price deviation |
+| **Circuit Breaker** | Lock-free counter | Trips after N consecutive errors |
+| **Rate Limiter** | Token bucket | Exchange API rate limiting |
+| **Position Limits** | Per-symbol | Maximum position per instrument |
+| **Daily Loss Limit** | Aggregate | Stop trading if daily P&L exceeds limit |
+
+### Configuration
 
 ```rust
-use signalengine::risk_controls::KILL_SWITCH;
-
-// In every execute_order():
-if KILL_SWITCH.is_triggered() {
-    return Err(ExecutionError::KillSwitchActive);
+RiskConfig {
+    kill_switch_enabled: bool,
+    max_order_size: f64,
+    max_price_deviation_pct: f64,
+    circuit_breaker_threshold: u32,  // Trip after N errors
+    circuit_breaker_reset_secs: u64,
+    daily_loss_limit: f64,
+    position_limit_per_symbol: f64,
 }
-
-// Trigger manually or automatically:
-KILL_SWITCH.trigger(KillReason::MaxDrawdown);
-KILL_SWITCH.trigger(KillReason::DailyLossLimit);
-
-// Reset (requires manual intervention):
-KILL_SWITCH.reset();
-```
-
-**Kill Reasons:**
-- `Manual` - Operator triggered
-- `MaxDrawdown` - Portfolio drawdown exceeded
-- `DailyLossLimit` - Daily loss limit hit
-- `RateLimit` - Exchange rate limit exceeded
-- `PositionLimit` - Position size violated
-- `SystemError` - Internal system error
-- `ExchangeError` - Exchange connectivity issue
-- `Reconciliation` - Position mismatch detected
-
-### Fat-Finger Protection
-
-Prevents accidental large orders:
-
-```rust
-let config = FatFingerConfig {
-    max_order_size: 1.0,           // Max 1 BTC per order
-    max_order_notional: 10_000.0,  // Max $10,000 per order
-    max_daily_notional: 100_000.0, // Max $100,000 per day
-    max_position_notional: 50_000.0, // Max $50,000 position
-};
-```
-
-### Circuit Breaker (v2)
-
-Lock-free circuit breaker using atomics:
-
-```rust
-// Automatic tripping after 5 consecutive failures
-let breaker = CircuitBreakerV2::new(5, Duration::from_secs(60));
-
-// State machine: Closed -> Open -> HalfOpen -> Closed
-match breaker.state() {
-    CircuitState::Closed => { /* Normal operation */ }
-    CircuitState::Open => { /* Reject all requests */ }
-    CircuitState::HalfOpen => { /* Allow probe request */ }
-}
-```
-
-### Position Limits
-
-```rust
-let limits = PositionLimits {
-    max_position_size: 10.0,        // 10 BTC max per symbol
-    max_position_value: 500_000.0,  // $500k max per position
-    max_portfolio_value: 2_000_000.0, // $2M total
-    max_open_positions: 20,
-    max_order_size: 1.0,            // 1 BTC max per order
-    max_order_value: 50_000.0,      // $50k max per order
-};
 ```
 
 ---
 
 ## Exchange Connectors
 
-### Kraken (CEX)
+### CEX: Kraken
 
-Full-featured centralized exchange connector:
+Located in `crates/executionhandler/src/kraken/`:
 
-```rust
-use signalengine::exchanges::KrakenConnector;
+- **REST API** for order submission/cancellation
+- **WebSocket** for execution reports
+- Authenticated endpoints with API key/secret
+- Rate limiting compliance
 
-let connector = KrakenConnector::new(
-    api_key,
-    api_secret,
-    Some(10), // Connection pool size
-).await?;
+### DEX: Sui Network
 
-// Execute order (kill switch checked internally)
-let result = connector.execute_order(&signal).await?;
+Located in `crates/executionhandler/src/dex/`:
 
-// Edit order (Kraken's atomic cancel+replace)
-let edited = connector.edit_order(
-    &order_id,
-    EditOrderParams {
-        new_price: Some(50000.0),
-        new_quantity: Some(0.5),
-    }
-).await?;
+**Cetus (AMM):**
+- Programmable Transaction Blocks (PTB)
+- Atomic swap execution
+- Liquidity pool interaction
 
-// Cancel order
-connector.cancel_order(&order_id, "BTC/USD").await?;
-```
+**DeepBook (CLOB):**
+- Programmable Transaction Blocks (PTB)
+- Limit order placement
+- Order matching on-chain
 
-**Features:**
-- HMAC-SHA512 request signing
-- Connection pooling
-- WebSocket for real-time updates
-- Edit order support (atomic cancel+replace)
-- Memory pools for zero-allocation hot paths
-- SIMD metrics calculation
+### Adding New Exchanges
 
-### Cetus (Sui DEX)
-
-Sui blockchain DEX using Programmable Transaction Blocks:
-
-```rust
-use signalengine::exchanges::dex::CetusConnector;
-
-let connector = CetusConnector::new(
-    sui_client,
-    wallet,
-    CetusConfig::mainnet(),
-).await?;
-
-// Swap execution
-let result = connector.execute_swap(
-    pool_id,
-    amount_in,
-    min_amount_out,
-    a_to_b, // Direction
-).await?;
-
-// Pool discovery
-let pools = connector.discover_pools("SUI", "USDC").await?;
-```
-
-**Features:**
-- PTB (Programmable Transaction Block) construction
-- Pool discovery and routing
-- Slippage protection
-- Gas estimation
-
-### DeepBook (Sui DEX)
-
-Sui's native order book DEX:
-
-```rust
-use signalengine::exchanges::dex::DeepBookConnector;
-
-let connector = DeepBookConnector::new(
-    sui_client,
-    wallet,
-    DeepBookConfig::mainnet(),
-).await?;
-
-// Place limit order
-let result = connector.place_limit_order(
-    pool_id,
-    price,
-    quantity,
-    is_bid,
-).await?;
-
-// Cancel order
-connector.cancel_order(pool_id, order_id).await?;
-```
-
-### Deprecated Connectors
-
-The following are **stub implementations** with runtime deprecation warnings:
-
-- `UniswapV3Connector` - EVM DEX (not maintained)
-- `JupiterConnector` - Solana DEX (not maintained)
+1. Create connector in `crates/executionhandler/src/`
+2. Implement `ExchangeConnector` trait
+3. Register in SmartOrderRouter
 
 ---
 
@@ -487,471 +285,212 @@ The following are **stub implementations** with runtime deprecation warnings:
 
 ### Prerequisites
 
-- Rust 1.75+ (stable)
-- 8GB+ RAM
-- Linux recommended (for best performance)
+- Rust 1.82+
+- MessageBrokerEngine running
 - PostgreSQL (for strategy storage)
-- MessageBroker running (for market data)
+- Exchange API credentials
 
 ### Build
 
-```bash
+```powershell
 cd SignalEngine
 
 # Development build
 cargo build --workspace
 
-# Release build (optimized)
-cargo build --workspace --release
-
-# Ultra-optimized with native CPU features
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+# Release with ultra optimizations
+cargo build --workspace --profile release-ultra
 ```
 
 ### Run
 
-```bash
-# Development
+```powershell
+# Set environment variables
+$env:MESSAGE_BROKER_URL = "tcp://localhost:9000"
+$env:DATABASE_URL = "postgresql://user:pass@localhost/trading"
+$env:KRAKEN_API_KEY = "your-api-key"
+$env:KRAKEN_API_SECRET = "your-api-secret"
+
+# Run SignalEngine
 cargo run --bin program
-
-# Production
-cargo run --bin program --release
-
-# With environment variables
-KRAKEN_API_KEY="..." \
-KRAKEN_SECRET_KEY="..." \
-DATABASE_URL="postgresql://..." \
-cargo run --bin program --release
-```
-
-### Test
-
-```bash
-# All tests
-cargo test --workspace
-
-# Specific crate
-cargo test -p executionhandler
-
-# Integration tests
-cargo test --test integration_test
-
-# With output
-cargo test -- --nocapture
 ```
 
 ---
 
 ## Configuration
 
-### Environment Variables
+### Main Configuration (`config/`)
 
-```bash
-# Required
-export KRAKEN_API_KEY="your_api_key"
-export KRAKEN_SECRET_KEY="your_secret_key"
-export DATABASE_URL="postgresql://user:pass@localhost/trading"
-export MESSAGE_BROKER_URL="tcp://localhost:9000"
-
-# Optional
-export LOG_LEVEL="info"
-export CPU_AFFINITY="true"
-export ENABLE_SIMD="true"
-export WAL_PATH="/var/lib/signalengine/wal"
-export METRICS_PORT="9090"
-
-# Sui DEX (if using)
-export SUI_WALLET_PATH="/path/to/wallet.keystore"
-export SUI_RPC_URL="https://fullnode.mainnet.sui.io"
-```
-
-### Production Configuration
-
-**config/production.yaml**:
 ```yaml
-engine:
-  max_threads: 16
-  worker_threads: 8
-  cpu_affinity: true
-  high_priority: true
+message_broker:
+  url: "tcp://localhost:9000"
+  market_data_prefix: "market_data"
+  subscription_topic: "market_data.subscriptions"
 
-performance:
-  enable_simd: true
-  use_rdtsc: true
-  lock_free_mode: true
-  batch_size: 1000
+database:
+  url: "postgresql://localhost/trading"
+  max_connections: 10
 
 risk:
-  kill_switch_enabled: true
-  fat_finger:
-    max_order_notional: 10000.0
-    max_daily_notional: 100000.0
-  circuit_breaker:
-    failure_threshold: 5
-    reset_timeout_secs: 60
-  position_limits:
-    max_position_value: 500000.0
-    max_portfolio_value: 2000000.0
-
-persistence:
-  wal_enabled: true
-  wal_path: /var/lib/signalengine/wal
-  wal_sync_interval_ms: 100
-  wal_max_size_mb: 1024
-
-alerts:
-  slack_webhook: "https://hooks.slack.com/..."
-  pagerduty_key: "..."
-  alert_on_kill_switch: true
-  alert_on_circuit_breaker: true
+  kill_switch_enabled: false
+  max_order_size: 10.0
+  max_price_deviation_pct: 5.0
+  circuit_breaker_threshold: 5
+  daily_loss_limit: 10000.0
 
 exchanges:
   kraken:
     enabled: true
-    api_key: "${KRAKEN_API_KEY}"
-    secret_key: "${KRAKEN_SECRET_KEY}"
-    rate_limit_per_second: 10
-    
-  cetus:
+    api_key_env: "KRAKEN_API_KEY"
+    api_secret_env: "KRAKEN_API_SECRET"
+  
+  sui:
     enabled: true
-    rpc_url: "https://fullnode.mainnet.sui.io"
-    
-  deepbook:
-    enabled: true
-    rpc_url: "https://fullnode.mainnet.sui.io"
+    network: "mainnet"  # or "testnet", "devnet"
+    wallet_path: "~/.sui/sui_config/sui.keystore"
 ```
-
-### Hot Configuration Reload
-
-Runtime config changes without restart:
-
-```bash
-# Send SIGHUP to reload config
-kill -HUP $(pidof signalengine)
-
-# Or via API
-curl -X POST http://localhost:8080/admin/reload-config
-```
-
-Supported hot-reload fields:
-- Risk limits (fat-finger, position limits)
-- Alert thresholds
-- Rate limits
-- Log levels
 
 ---
 
-## API Reference
+## Performance
 
-### ExchangeConnector Trait
+### Latency Benchmarks
 
-All exchange connectors implement this trait:
+| Operation | p50 | p99 | p99.9 |
+|-----------|-----|-----|-------|
+| Signal Generation | 50μs | 150μs | 500μs |
+| Risk Validation | 10μs | 50μs | 100μs |
+| Order Submission (CEX) | 5ms | 20ms | 50ms |
+| Order Submission (DEX) | 500ms | 1s | 2s |
+| End-to-End | <1ms | 5ms | 20ms |
 
+### Key Optimizations
+
+**Lock-Free Patterns:**
 ```rust
-#[async_trait]
-pub trait ExchangeConnector: Send + Sync {
-    /// Execute a trading signal
-    async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError>;
-    
-    /// Execute multiple signals in batch
-    async fn execute_batch_orders(&self, signals: &[Signal]) -> Vec<Result<ExecutionResult, ExecutionError>>;
-    
-    /// Cancel an existing order
-    async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<bool, ExecutionError>;
-    
-    /// Edit an existing order (if supported)
-    async fn edit_order(&self, order_id: &str, params: EditOrderParams) -> Result<ExecutionResult, ExecutionError>;
-    
-    /// Health check
-    async fn health_check(&self) -> Result<bool, ExecutionError>;
-    
-    /// Exchange name
-    fn exchange_name(&self) -> &str;
-    
-    /// Supported trading pairs
-    fn supported_symbols(&self) -> &[String];
-    
-    /// Get exchange rate limits
-    fn get_limits(&self) -> ExchangeLimits;
-    
-    /// Validate order before submission
-    fn validate_order(&self, signal: &Signal) -> Result<(), ExecutionError>;
-}
+// ✅ Use DashMap for concurrent access
+use dashmap::DashMap;
+let orderbooks: DashMap<(String, String), Orderbook> = DashMap::new();
+
+// ✅ Use crossbeam for queues
+use crossbeam::queue::ArrayQueue;
+
+// ❌ Avoid Mutex in hot paths
+use std::sync::Mutex;  // DON'T use in latency-critical code
 ```
 
-### ExecutionResult
-
+**SIMD Operations:**
 ```rust
-pub struct ExecutionResult {
-    pub order_id: String,
-    pub exchange_order_id: Option<String>,
-    pub exchange: String,
-    pub status: ExecutionStatus,
-    pub filled_quantity: f64,
-    pub remaining_quantity: f64,
-    pub avg_fill_price: f64,
-    pub total_fees: f64,
-    pub fills: Vec<ExecutionFill>,
-    pub reject_reason: Option<String>,
-    pub submitted_at: u128,        // Nanosecond timestamp
-    pub updated_at: u128,
-    pub latency_ns: u64,
-    pub exchange_timestamp_ns: Option<u64>, // MiFID II compliance
-    pub exchange_sequence: Option<u64>,
-}
+use signalengine_core::simd::{price_diff, returns, sma};
 
-pub enum ExecutionStatus {
-    Pending,
-    Submitted,
-    PartiallyFilled,
-    Filled,
-    Cancelled,
-    Rejected,
-    Expired,
-}
+// Vectorized calculations
+let diffs = price_diff(&prices);
+let ret = returns(&prices);
+let moving_avg = sma(&prices, 20);
 ```
 
-### Signal Type
-
+**Cache-Line Alignment:**
 ```rust
-pub struct Signal {
-    pub id: String,
-    pub strategy_id: Uuid,
-    pub symbol: String,
-    pub exchange: String,
-    pub action: SignalAction,
-    pub quantity: f64,
-    pub price: Option<f64>,
-    pub confidence: f64,
-    pub timestamp_ms: i64,
-    pub metadata: HashMap<String, Value>,
-}
-
-pub enum SignalAction {
-    Buy,
-    Sell,
-    BuyLimit,
-    SellLimit,
-    BuyStop,
-    SellStop,
+#[repr(C, align(64))]
+pub struct CacheAlignedAtomicU64 {
+    value: AtomicU64,
+    _padding: [u8; 56],
 }
 ```
 
 ---
 
-## Deployment
+## Kubernetes Deployment
 
-### Docker
+### Helm Install
 
-```dockerfile
-FROM rust:1.75-slim as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/program /usr/local/bin/signalengine
-EXPOSE 8080 9090
-CMD ["signalengine"]
-```
-
-```bash
-# Build and run
-docker build -t signalengine:latest .
-docker run -d \
-  -e KRAKEN_API_KEY="..." \
-  -e KRAKEN_SECRET_KEY="..." \
-  -e DATABASE_URL="..." \
-  -p 8080:8080 \
-  -p 9090:9090 \
-  signalengine:latest
-```
-
-### Kubernetes
-
-```bash
-cd k8s/signal-engine-helm
-
+```powershell
 # Development
-helm upgrade --install signalengine . \
-  -f values-dev.yaml \
-  --namespace signalengine-dev \
-  --create-namespace
+helm upgrade --install signal-engine ./k8s/signal-engine-helm `
+  -f values-dev.yaml --namespace signalengine-dev --create-namespace
 
 # Production
-helm upgrade --install signalengine . \
-  -f values-prod.yaml \
-  --namespace signalengine \
-  --set-string secrets.kraken.apiKey="$KRAKEN_API_KEY" \
-  --set-string secrets.kraken.secretKey="$KRAKEN_SECRET_KEY"
+helm upgrade --install signal-engine ./k8s/signal-engine-helm `
+  -f values-prod.yaml --namespace signalengine `
+  --set-string secrets.krakenApiKey="$KRAKEN_API_KEY" `
+  --set-string secrets.krakenApiSecret="$KRAKEN_API_SECRET"
 ```
 
-Key Helm values:
-- `replicaCount` - Number of pods
-- `resources.limits.memory` - Memory limit (default: 4Gi)
-- `config.risk.*` - Risk control settings
-- `secrets.*` - Exchange credentials
+### Key Helm Values
 
-### Monitoring
+| Value | Description | Default |
+|-------|-------------|---------|
+| `replicaCount` | Number of replicas | 2 |
+| `resources.limits.memory` | Memory limit | 4Gi |
+| `resources.limits.cpu` | CPU limit | 2 |
+| `messageBroker.url` | MessageBroker connection | tcp://message-broker:9000 |
 
-SignalEngine exports Prometheus metrics on port 9090:
+---
 
-```
-# HELP signalengine_orders_submitted_total Total orders submitted
-# TYPE signalengine_orders_submitted_total counter
-signalengine_orders_submitted_total{exchange="kraken"} 1234
+## Environment Variables
 
-# HELP signalengine_order_latency_ns Order execution latency
-# TYPE signalengine_order_latency_ns histogram
-signalengine_order_latency_ns_bucket{le="100000"} 500
-signalengine_order_latency_ns_bucket{le="500000"} 950
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `MESSAGE_BROKER_URL` | MessageBroker connection URL | Yes |
+| `DATABASE_URL` | PostgreSQL connection URL | Yes |
+| `KRAKEN_API_KEY` | Kraken API key | For CEX trading |
+| `KRAKEN_API_SECRET` | Kraken API secret | For CEX trading |
+| `SUI_WALLET_PATH` | Path to Sui wallet keystore | For DEX trading |
+| `RUST_LOG` | Log level (info, debug, trace) | No |
 
-# HELP signalengine_kill_switch_triggered Kill switch status
-# TYPE signalengine_kill_switch_triggered gauge
-signalengine_kill_switch_triggered 0
+---
 
-# HELP signalengine_circuit_breaker_state Circuit breaker state
-# TYPE signalengine_circuit_breaker_state gauge
-signalengine_circuit_breaker_state{exchange="kraken"} 0
+## Testing
+
+```powershell
+# Unit tests
+cargo test --workspace
+
+# Integration tests (requires MessageBroker + DB)
+cargo test --workspace -- --ignored
+
+# Run DEX connector tests (Sui devnet)
+cargo run --example test_dex_devnet -- both
+
+# Benchmarks
+cargo bench --package signalengine-core
 ```
 
 ---
 
-## Development
+## Key Files
 
-### Adding a New Exchange Connector
-
-1. Create connector in `crates/executionhandler/src/exchanges/`:
-
-```rust
-// my_exchange.rs
-use crate::core::{ExchangeConnector, ExecutionResult, ExecutionError};
-
-pub struct MyExchangeConnector {
-    // ...
-}
-
-#[async_trait]
-impl ExchangeConnector for MyExchangeConnector {
-    async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
-        // 1. Check kill switch FIRST
-        if KILL_SWITCH.is_triggered() {
-            return Err(ExecutionError::KillSwitchActive);
-        }
-        
-        // 2. Validate order
-        self.validate_order(signal)?;
-        
-        // 3. Execute
-        // ...
-    }
-    
-    // Implement other methods...
-}
-```
-
-2. Register in factory (`exchanges/factory.rs`)
-3. Add tests
-4. Update documentation
-
-### Running Benchmarks
-
-```bash
-# All benchmarks
-cargo bench
-
-# Specific benchmark
-cargo bench --bench signal_latency
-
-# With flamegraph
-cargo flamegraph --bench signal_latency
-```
-
-### Code Style
-
-- Zero warnings (`cargo clippy --all-targets`)
-- Format with `cargo fmt`
-- Document all public APIs
-- Test all critical paths
-- Benchmark latency-sensitive code
+| File | Purpose |
+|------|---------|
+| `program/src/main.rs` | Entry point |
+| `crates/core/src/lib.rs` | Lock-free primitives, SIMD |
+| `crates/datahandler/src/lib.rs` | MessageBroker subscription |
+| `crates/strategyhandler/src/lib.rs` | Strategy orchestration |
+| `crates/executionhandler/src/lib.rs` | Risk controls, connectors |
+| `crates/executionhandler/src/kraken/` | Kraken CEX connector |
+| `crates/executionhandler/src/dex/` | Sui DEX connectors |
 
 ---
 
 ## Troubleshooting
 
-### Kill Switch Triggered
-
-```bash
-# Check kill switch status
-curl http://localhost:8080/admin/kill-switch
-
-# View audit log
-tail -f /var/log/signalengine/audit.log
-
-# Reset (after investigation!)
-curl -X POST http://localhost:8080/admin/kill-switch/reset
-```
-
 ### High Latency
 
-1. Check CPU affinity: `taskset -p $(pidof signalengine)`
-2. Verify huge pages: `cat /proc/meminfo | grep Huge`
-3. Check network latency: `ping api.kraken.com`
-4. Review metrics: `curl localhost:9090/metrics | grep latency`
+1. Check MessageBroker connection latency
+2. Verify orderbook updates aren't backed up
+3. Review risk control processing time
+4. Check exchange API response times
 
-### Memory Issues
+### Order Rejections
 
-```bash
-# Check memory usage
-ps aux | grep signalengine
+1. Check risk control logs for rejection reason
+2. Verify position limits aren't exceeded
+3. Confirm exchange credentials are valid
+4. Check circuit breaker status
 
-# Monitor allocations
-MALLOC_CONF="prof:true" ./signalengine
+### DEX Transaction Failures
 
-# Analyze with valgrind
-valgrind --tool=massif ./signalengine
-```
-
-### WAL Recovery
-
-```bash
-# List WAL files
-ls -la /var/lib/signalengine/wal/
-
-# Replay WAL (on startup, automatic)
-# Manual inspection:
-./signalengine --wal-inspect /var/lib/signalengine/wal/
-```
-
----
-
-## Related Projects
-
-| Project | Purpose |
-|---------|---------|
-| **DataEngine** | Market data ingestion, normalization, TimescaleDB storage |
-| **MessageBrokerEngine** | Low-latency pub/sub (176ns, 900K msg/s) |
-| **BacktestingEngine** | Strategy backtesting with genetic optimization |
-| **SimulationEngine** | Risk-free strategy testing |
-| **LoggingEngine** | Ultra-low latency structured logging |
-
----
-
-## License
-
-Proprietary - Nwagbara Group LLC
-
----
-
-## Support
-
-For support, contact: **support@nwabaragroup.com**
-
----
-
-**Built by Nwagbara Group LLC** • *Institutional-grade trading performance*
-
-**Version**: 0.2.0  
-**Rust Version**: 1.83+ (stable)  
-**Last Updated**: 2026-01-17
+1. Verify Sui wallet has sufficient balance
+2. Check gas budget configuration
+3. Review transaction simulation results
+4. Confirm network (mainnet/testnet/devnet)

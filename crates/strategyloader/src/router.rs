@@ -130,7 +130,6 @@ mod tests {
             parameters: StrategyParameters::Momentum(MomentumParams::default()),
             portfolio_risk: PortfolioRiskLimits::default(),
             enabled: true,
-            paper_trading: true,
             description: None,
             metadata: HashMap::new(),
         }

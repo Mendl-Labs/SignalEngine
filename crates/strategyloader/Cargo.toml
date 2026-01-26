@@ -31,6 +31,13 @@ ultra-logger = { path = "../../../LoggingEngine/ultra-logger" }
 # Concurrency
 crossbeam = "0.8"
 parking_lot = "0.12"
+dashmap = "5.5"
+
+# Message broker for deployment events
+protocol = { path = "../../../MessageBrokerEngine/protocol" }
+publisher = { path = "../../../MessageBrokerEngine/publisher" }
+subscriber = { path = "../../../MessageBrokerEngine/subscriber" }
+prost = "0.13"
 
 # Database schema (shared with BacktestingEngine)
 databaseschema = { path = "../../../databaseschema", optional = true }

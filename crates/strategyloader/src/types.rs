@@ -66,9 +66,6 @@ pub struct StrategyInstance {
     /// Whether this strategy is enabled for trading
     pub enabled: bool,
     
-    /// Whether to run in paper trading mode
-    pub paper_trading: bool,
-    
     /// Optional description
     pub description: Option<String>,
     

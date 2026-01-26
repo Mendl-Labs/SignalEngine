@@ -9,6 +9,7 @@
 //! - `TradingAsset`: A single tradeable asset within a strategy  
 //! - `StrategyLoader`: Trait for loading strategies from various sources
 //! - `DatabaseStrategyLoader`: Loads strategies from PostgreSQL
+//! - `DeploymentSubscriber`: Hot-loads strategies from message broker events
 //! - `MarketDataRouter`: Routes market data to subscribed strategies
 //! - `StrategyStateRegistry`: Manages per-strategy execution state
 //! - `PortfolioStrategy`: Trait for parameterized strategy execution
@@ -21,6 +22,7 @@ pub mod router;
 pub mod state;
 pub mod strategy;
 pub mod manager;
+pub mod deployment_subscriber;
 
 #[cfg(feature = "postgres")]
 pub mod database_loader;
@@ -36,6 +38,10 @@ pub use strategy::{
     MomentumStrategy, MeanReversionStrategy, StrategyFactory
 };
 pub use manager::{StrategyManager, SignalStore, SignalInfo, SignalStatus, ManagerMetrics};
+pub use deployment_subscriber::{
+    DeploymentSubscriber, DeployedStrategy, DeploymentEvent, DeploymentSubscriberError,
+    topics as deployment_topics,
+};
 
 #[cfg(feature = "postgres")]
 pub use database_loader::DatabaseStrategyLoader;

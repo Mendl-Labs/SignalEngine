@@ -64,11 +64,6 @@ impl DatabaseStrategyLoader {
         // Extract portfolio risk limits
         let portfolio_risk = Self::parse_portfolio_risk(&params_json);
         
-        // Check if paper trading from metadata or default to true for safety
-        let paper_trading = params_json.get("paper_trading")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        
         // Build metadata from performance summary
         let mut metadata = std::collections::HashMap::new();
         if let Some(perf) = instance.performance_summary {
@@ -87,7 +82,6 @@ impl DatabaseStrategyLoader {
             parameters: strategy_params,
             portfolio_risk,
             enabled: strategy.is_active,
-            paper_trading,
             description: instance.description.or(strategy.description),
             metadata,
         })

@@ -22,6 +22,8 @@ pub mod tracing;
 pub mod chaos;
 pub mod audit;
 pub mod credential_manager;
+pub mod saas_credential_vault;
+pub mod permission_validator;
 pub mod multi_leg;
 pub mod tca;
 pub mod orderbook_reconciliation;
