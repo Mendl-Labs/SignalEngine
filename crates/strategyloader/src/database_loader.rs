@@ -1,7 +1,14 @@
 //! Database strategy loader - loads strategies from PostgreSQL
 //!
 //! Connects to the same database as BacktestingEngine to load
-//! optimized strategies from the `strategies` and `strategy_instances` tables.
+//! deployed strategies from the `deployed_strategies` and `backtest_results` tables.
+//!
+//! ## New Architecture (2026)
+//! 
+//! Previously loaded from `strategies` + `strategy_instances` tables.
+//! Now loads from:
+//! - `deployed_strategies` - User-deployed strategies with status tracking
+//! - `backtest_results` - Source backtest with strategy_metrics (parameters)
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -11,7 +18,9 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use ultra_logger::{ultra_warn, ultra_info};
 
 use databaseschema::models::strategy::{Strategy, StrategyInstance as DbStrategyInstance};
-use databaseschema::schema::{strategies, strategy_instances};
+use databaseschema::models::deployed_strategy::DeployedStrategy;
+use databaseschema::models::backtest_result::BacktestResult;
+use databaseschema::schema::{strategies, strategy_instances, deployed_strategies, backtest_results};
 
 use crate::types::*;
 use crate::loader::StrategyLoader;
@@ -83,6 +92,77 @@ impl DatabaseStrategyLoader {
             portfolio_risk,
             enabled: strategy.is_active,
             description: instance.description.or(strategy.description),
+            metadata,
+        })
+    }
+    
+    /// Convert DeployedStrategy + BacktestResult to our StrategyInstance
+    /// This is the NEW conversion for the deployed_strategies architecture
+    fn convert_deployment_to_strategy_instance(
+        deployment: DeployedStrategy,
+        backtest: BacktestResult,
+    ) -> Result<crate::types::StrategyInstance> {
+        use bigdecimal::ToPrimitive;
+        
+        // Get strategy params from backtest_results.strategy_metrics JSON
+        let strategy_metrics = backtest.strategy_metrics.unwrap_or(serde_json::json!({}));
+        
+        // Extract optimized_params from strategy_metrics
+        let params_json = strategy_metrics.get("optimized_params")
+            .cloned()
+            .unwrap_or_else(|| strategy_metrics.clone());
+        
+        // Determine strategy type from backtest.strategy_name
+        // Default to PortfolioMixed if we can't parse it
+        let strategy_type: StrategyType = backtest.strategy_name.parse()
+            .unwrap_or(StrategyType::PortfolioMixed);
+        
+        // Extract assets from parameters or use backtest symbol
+        let assets = Self::parse_assets(&params_json).unwrap_or_else(|_| {
+            vec![TradingAsset {
+                symbol: backtest.symbol.clone(),
+                exchange: deployment.exchange_targets.first()
+                    .and_then(|e| e.clone())
+                    .unwrap_or_else(|| "kraken".to_string()),
+                weight: 1.0,
+                risk_limits: AssetRiskLimits::default(),
+            }]
+        });
+        
+        // Extract strategy-specific parameters
+        let strategy_params = Self::parse_strategy_params(strategy_type, &params_json)
+            .unwrap_or_else(|_| StrategyParameters::Generic(GenericParams {
+                params: Default::default(),
+            }));
+        
+        // Extract portfolio risk limits, override with deployment capital
+        let mut portfolio_risk = Self::parse_portfolio_risk(&params_json);
+        portfolio_risk.max_total_exposure = deployment.capital_allocation
+            .to_f64()
+            .unwrap_or(portfolio_risk.max_total_exposure);
+        
+        // Build metadata with deployment and backtest info
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("deployment_id".to_string(), serde_json::json!(deployment.id.to_string()));
+        metadata.insert("backtest_result_id".to_string(), serde_json::json!(backtest.id.to_string()));
+        metadata.insert("deployed_at".to_string(), serde_json::json!(deployment.deployed_at.to_rfc3339()));
+        metadata.insert("backtest_sharpe".to_string(), serde_json::json!(
+            backtest.sharpe_ratio.as_ref().and_then(|s| s.to_f64())
+        ));
+        metadata.insert("backtest_max_drawdown".to_string(), serde_json::json!(
+            backtest.max_drawdown.to_f64()
+        ));
+        
+        Ok(crate::types::StrategyInstance {
+            id: deployment.id,  // Use deployment ID as the instance ID
+            name: deployment.deployment_name,
+            strategy_type,
+            version: "1.0".to_string(),  // Deployments don't have versions
+            assets,
+            parameters: strategy_params,
+            portfolio_risk,
+            enabled: deployment.status == "active",
+            description: deployment.notes,
             metadata,
         })
     }
@@ -341,29 +421,30 @@ impl StrategyLoader for DatabaseStrategyLoader {
         let mut conn = self.pool.get().await
             .map_err(|e| StrategyLoaderError::Connection(e.to_string()))?;
         
-        // Load all active strategies with their instances
-        let results: Vec<(Strategy, DbStrategyInstance)> = strategies::table
-            .inner_join(strategy_instances::table.on(
-                strategy_instances::strategy_id.eq(strategies::id)
+        // Load all active deployments with their backtest results
+        // This is the NEW architecture using deployed_strategies table
+        let deployments: Vec<(DeployedStrategy, BacktestResult)> = deployed_strategies::table
+            .inner_join(backtest_results::table.on(
+                deployed_strategies::backtest_result_id.eq(backtest_results::id)
             ))
-            .filter(strategies::is_active.eq(true))
-            .select((Strategy::as_select(), DbStrategyInstance::as_select()))
+            .filter(deployed_strategies::status.eq("active"))
+            .select((DeployedStrategy::as_select(), BacktestResult::as_select()))
             .load(&mut conn)
             .await
             .map_err(|e| StrategyLoaderError::Database(e.to_string()))?;
         
         let mut strategies_list = Vec::new();
         
-        for (strategy, instance) in results {
-            match Self::convert_to_strategy_instance(strategy, instance) {
+        for (deployment, backtest) in deployments {
+            match Self::convert_deployment_to_strategy_instance(deployment, backtest) {
                 Ok(si) => strategies_list.push(si),
                 Err(e) => {
-                    ultra_warn!(format!("Failed to parse strategy: {}", e));
+                    ultra_warn!(format!("Failed to parse deployed strategy: {}", e));
                 }
             }
         }
         
-        ultra_info!(format!("Loaded {} active strategies from database", strategies_list.len()));
+        ultra_info!(format!("Loaded {} active deployments from database", strategies_list.len()));
         Ok(strategies_list)
     }
     
@@ -371,44 +452,46 @@ impl StrategyLoader for DatabaseStrategyLoader {
         let mut conn = self.pool.get().await
             .map_err(|e| StrategyLoaderError::Connection(e.to_string()))?;
         
-        let result: Option<(Strategy, DbStrategyInstance)> = strategies::table
-            .inner_join(strategy_instances::table.on(
-                strategy_instances::strategy_id.eq(strategies::id)
+        // Load deployment by ID (new architecture)
+        let result: Option<(DeployedStrategy, BacktestResult)> = deployed_strategies::table
+            .inner_join(backtest_results::table.on(
+                deployed_strategies::backtest_result_id.eq(backtest_results::id)
             ))
-            .filter(strategy_instances::id.eq(id))
-            .select((Strategy::as_select(), DbStrategyInstance::as_select()))
+            .filter(deployed_strategies::id.eq(id))
+            .select((DeployedStrategy::as_select(), BacktestResult::as_select()))
             .first(&mut conn)
             .await
             .optional()
             .map_err(|e| StrategyLoaderError::Database(e.to_string()))?;
         
         match result {
-            Some((strategy, instance)) => {
-                Ok(Some(Self::convert_to_strategy_instance(strategy, instance)?))
+            Some((deployment, backtest)) => {
+                Ok(Some(Self::convert_deployment_to_strategy_instance(deployment, backtest)?))
             }
             None => Ok(None),
         }
     }
     
-    async fn load_strategy_by_name(&self, name: &str, version: &str) -> Result<Option<crate::types::StrategyInstance>> {
+    async fn load_strategy_by_name(&self, name: &str, _version: &str) -> Result<Option<crate::types::StrategyInstance>> {
         let mut conn = self.pool.get().await
             .map_err(|e| StrategyLoaderError::Connection(e.to_string()))?;
         
-        let result: Option<(Strategy, DbStrategyInstance)> = strategies::table
-            .inner_join(strategy_instances::table.on(
-                strategy_instances::strategy_id.eq(strategies::id)
+        // Load deployment by name (new architecture)
+        let result: Option<(DeployedStrategy, BacktestResult)> = deployed_strategies::table
+            .inner_join(backtest_results::table.on(
+                deployed_strategies::backtest_result_id.eq(backtest_results::id)
             ))
-            .filter(strategies::strategy_name.eq(name))
-            .filter(strategies::version.eq(version))
-            .select((Strategy::as_select(), DbStrategyInstance::as_select()))
+            .filter(deployed_strategies::deployment_name.eq(name))
+            .filter(deployed_strategies::status.eq("active"))
+            .select((DeployedStrategy::as_select(), BacktestResult::as_select()))
             .first(&mut conn)
             .await
             .optional()
             .map_err(|e| StrategyLoaderError::Database(e.to_string()))?;
         
         match result {
-            Some((strategy, instance)) => {
-                Ok(Some(Self::convert_to_strategy_instance(strategy, instance)?))
+            Some((deployment, backtest)) => {
+                Ok(Some(Self::convert_deployment_to_strategy_instance(deployment, backtest)?))
             }
             None => Ok(None),
         }
