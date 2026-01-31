@@ -22,6 +22,7 @@ pub mod tracing;
 pub mod chaos;
 pub mod audit;
 pub mod credential_manager;
+pub mod database_credentials;
 pub mod saas_credential_vault;
 pub mod permission_validator;
 pub mod multi_leg;
@@ -32,6 +33,7 @@ pub mod alerts;
 pub mod graceful_shutdown;
 pub mod order_wal;
 pub mod hot_config;
+pub mod multi_tenant;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -151,6 +153,11 @@ pub use credential_manager::{
     ApiCredentials, SecurityEventType, SecurityAuditEntry, SECRETS,
 };
 
+// Database-backed credentials (from exchange_credentials table)
+pub use database_credentials::{
+    DatabaseCredentialProvider, DecryptedCredential, decrypt_credential_value,
+};
+
 // Multi-leg order management (OCO, bracket, linked pairs)
 pub use multi_leg::{
     MultiLegOrderManager, MultiLegType, OrderLeg,
@@ -171,6 +178,13 @@ pub use orderbook_reconciliation::{
     ReconciliationResult as OrderbookReconciliationResult, 
     ReconciliationEvent, SnapshotReason,
     SymbolStatistics, GlobalStatistics,
+};
+
+// Multi-tenant SaaS execution (aligned with BacktestingEngine tiers)
+pub use multi_tenant::{
+    MultiTenantExecutionHandler, SubscriptionTier, TenantContext,
+    FairScheduler, TenantStats, GlobalStats, PendingOrder,
+    TenantRateLimiter, MultiTenantExecutionResult,
 };
 
 use std::collections::HashMap;
@@ -368,6 +382,68 @@ impl UltraLowLatencyExecutionHandler {
         }
         
         Ok(())
+    }
+    
+    /// Add an exchange connector from database-stored credentials
+    /// 
+    /// This is the primary method for production use - loads credentials stored 
+    /// via the Settings UI and creates a properly configured connector.
+    pub async fn add_exchange_from_credential(
+        &mut self, 
+        credential: &smartorderrouter::ExchangeCredential
+    ) -> Result<(), ExecutionError> {
+        let connector = ExchangeFactory::create_connector_from_credential(credential).await?;
+        
+        let mut connectors = self.connectors.write().await;
+        connectors.insert(credential.exchange.clone(), connector);
+        
+        // Set first exchange as default if none set
+        if self.default_exchange.is_none() {
+            self.default_exchange = Some(credential.exchange.clone());
+        }
+        
+        log::info!(
+            "[EXECUTION] Added exchange '{}' from credential '{}' (testnet={})",
+            credential.exchange, credential.label, credential.is_testnet
+        );
+        
+        Ok(())
+    }
+    
+    /// Initialize all exchanges from database credentials for a tenant
+    /// 
+    /// Call this at startup to load all configured exchange credentials from the
+    /// database and initialize connectors for live trading.
+    pub async fn initialize_from_database(
+        &mut self,
+        pool: &smartorderrouter::DbPool,
+        tenant_id: uuid::Uuid,
+    ) -> Result<usize, ExecutionError> {
+        let credentials = smartorderrouter::load_exchange_credentials(pool, tenant_id)
+            .await
+            .map_err(|e| ExecutionError::Unknown(format!("Failed to load credentials: {}", e)))?;
+        
+        let mut initialized_count = 0;
+        for credential in &credentials {
+            match self.add_exchange_from_credential(credential).await {
+                Ok(_) => {
+                    initialized_count += 1;
+                }
+                Err(e) => {
+                    log::error!(
+                        "[EXECUTION] Failed to initialize exchange '{}' from credential '{}': {}",
+                        credential.exchange, credential.label, e
+                    );
+                }
+            }
+        }
+        
+        log::info!(
+            "[EXECUTION] Initialized {}/{} exchanges from database for tenant {}",
+            initialized_count, credentials.len(), tenant_id
+        );
+        
+        Ok(initialized_count)
     }
 
     /// Remove an exchange connector

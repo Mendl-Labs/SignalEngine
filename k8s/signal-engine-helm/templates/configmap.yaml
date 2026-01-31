@@ -8,6 +8,9 @@ metadata:
     {{- include "signal-engine-helm.labels" . | nindent 4 }}
     app.kubernetes.io/component: configuration
 data:
+  # Tenant ID for multi-tenant credential loading from database
+  tenant-id: {{ .Values.config.tenantId | default "" | quote }}
+  
   {{- if .Values.configMap.data }}
   {{- range $key, $value := .Values.configMap.data }}
   {{ $key }}: |

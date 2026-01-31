@@ -326,6 +326,10 @@ config:
   environment: "development"
   log_level: "info"
   
+  # Tenant ID for multi-tenant credential loading from database
+  # Set this to your tenant UUID to enable loading exchange credentials from the database
+  tenantId: ""
+  
   # Message broker configuration
   message_broker:
     address: "localhost"

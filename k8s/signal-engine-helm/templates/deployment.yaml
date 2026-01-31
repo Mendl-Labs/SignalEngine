@@ -78,6 +78,46 @@ spec:
             - name: {{ .name }}
               value: {{ .value | quote }}
             {{- end }}
+            # Database connection - constructed from secrets created by CI/CD from Azure Key Vault
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)"
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: host
+                  optional: true
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: port
+                  optional: true
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: username
+                  optional: true
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: password
+                  optional: true
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: database
+                  optional: true
+            # Tenant ID for multi-tenant credential loading
+            - name: TENANT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "signal-engine-helm.fullname" . }}-config
+                  key: tenant-id
+                  optional: true
             # System environment variables
             - name: POD_NAME
               valueFrom:

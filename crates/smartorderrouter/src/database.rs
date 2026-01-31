@@ -11,6 +11,8 @@ use uuid::Uuid;
 use tokio::sync::RwLock;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool;
+use diesel::prelude::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use databaseschema::{
     models::strategy_order::{
@@ -18,16 +20,31 @@ use databaseschema::{
         OrderStatus, OrderSide as DbOrderSide, OrderType as DbOrderType,
         TimeInForce as DbTimeInForce, ExecutionUrgency as DbExecutionUrgency,
     },
+    models::trade_history::NewTradeRecord,
     ops::strategy_order_ops::{
         StrategyOrderOps, StrategyOrderFillOps, StrategyOrderStateChangeOps,
         StrategyOrderWorkflow,
     },
+    ops::trade_history_ops,
 };
 
 use crate::{SmartOrderRoute, ChildOrder, OrderSide, OrderType, TimeInForce, ExecutionUrgency, RouteStatus};
 
 /// Type alias for the database pool
 pub type DbPool = deadpool::Pool<AsyncPgConnection>;
+
+/// Create a new database connection pool from a DATABASE_URL
+pub async fn create_pool(database_url: &str) -> Result<DbPool> {
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    
+    let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    let pool = deadpool::Pool::builder(config)
+        .max_size(10)
+        .build()
+        .context("Failed to create database pool")?;
+    
+    Ok(pool)
+}
 
 /// Database persistence layer for SmartOrderRouter
 pub struct OrderDatabasePersistence {
@@ -190,6 +207,85 @@ impl OrderDatabasePersistence {
         Ok(())
     }
 
+    /// Record a fill for an order AND persist to trade_history table
+    /// This is the preferred method for live trading as it updates both tables
+    pub async fn record_fill_with_trade_history(
+        &self,
+        order_unique_id: &str,
+        fill_id: &str,
+        quantity: f64,
+        price: f64,
+        fees: f64,
+        tenant_id: Uuid,
+        deployment_id: Uuid,
+        exchange: &str,
+        symbol: &str,
+        side: &str,
+        realized_pnl: Option<f64>,
+    ) -> Result<()> {
+        let mut conn = self.pool.get().await
+            .context("Failed to get database connection")?;
+
+        // Look up the order by unique_id
+        let order = StrategyOrderOps::get_order_by_unique_id(&mut conn, order_unique_id.to_string())
+            .await
+            .context("Failed to lookup order")?
+            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", order_unique_id))?;
+
+        // Record strategy_order_fill
+        let fill = NewStrategyOrderFill {
+            order_id: order.id,
+            fill_id: fill_id.to_string(),
+            trade_id: None,
+            quantity: BigDecimal::try_from(quantity).unwrap_or_else(|_| BigDecimal::from(0)),
+            price: BigDecimal::try_from(price).unwrap_or_else(|_| BigDecimal::from(0)),
+            fees: Some(BigDecimal::try_from(fees).unwrap_or_else(|_| BigDecimal::from(0))),
+            fee_currency: Some("USD".to_string()),
+            bid_price: None,
+            ask_price: None,
+            mid_price: None,
+            spread_bps: None,
+            is_maker: None,
+            liquidity_flag: None,
+            fill_timestamp: Utc::now(),
+        };
+
+        StrategyOrderFillOps::create_fill(&mut conn, fill)
+            .await
+            .context("Failed to record fill")?;
+
+        // Also record to trade_history for dashboard analytics
+        let qty_bd = BigDecimal::try_from(quantity).unwrap_or_else(|_| BigDecimal::from(0));
+        let price_bd = BigDecimal::try_from(price).unwrap_or_else(|_| BigDecimal::from(0));
+        let fees_bd = BigDecimal::try_from(fees).unwrap_or_else(|_| BigDecimal::from(0));
+        let realized_pnl_bd = realized_pnl.and_then(|p| BigDecimal::try_from(p).ok());
+        let now = Utc::now();
+
+        let trade_record = NewTradeRecord {
+            tenant_id,
+            deployment_id,
+            exchange: exchange.to_string(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            quantity: qty_bd.clone(),
+            price: price_bd.clone(),
+            quote_currency: "USD".to_string(),
+            value: &qty_bd * &price_bd,
+            commission: fees_bd,
+            commission_asset: "USD".to_string(),
+            realized_pnl: realized_pnl_bd,
+            exchange_trade_id: fill_id.to_string(),
+            exchange_order_id: order_unique_id.to_string(),
+            executed_at: now,
+        };
+
+        trade_history_ops::insert_trade(&mut conn, trade_record)
+            .await
+            .context("Failed to record trade to trade_history")?;
+
+        Ok(())
+    }
+
     /// Update order status with state change tracking
     pub async fn update_order_status(
         &self,
@@ -323,6 +419,147 @@ fn convert_route_status(status: RouteStatus) -> OrderStatus {
     }
 }
 
+// ============================================================================
+// Exchange Credentials Loading
+// ============================================================================
+
+/// Decrypt a credential value (matches BacktestingEngine encryption format)
+fn decrypt_credential_value(encrypted: &str) -> Option<String> {
+    if let Some(encoded) = encrypted.strip_prefix("enc:") {
+        STANDARD.decode(encoded).ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    } else {
+        None
+    }
+}
+
+/// Decrypted credential for use in trading
+#[derive(Debug, Clone)]
+pub struct ExchangeCredential {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub exchange: String,
+    pub label: String,
+    pub api_key: String,
+    pub api_secret: String,
+    pub passphrase: Option<String>,
+    pub is_testnet: bool,
+    pub is_enabled: bool,
+}
+
+/// Load exchange credentials for a tenant from the database
+pub async fn load_exchange_credentials(
+    pool: &DbPool,
+    tenant_id: Uuid,
+) -> Result<Vec<ExchangeCredential>> {
+    use databaseschema::schema::exchange_credentials;
+    use diesel_async::RunQueryDsl;
+
+    let mut conn = pool.get().await
+        .context("Failed to get database connection")?;
+
+    // Query all enabled credentials for this tenant
+    let query = exchange_credentials::table
+        .filter(exchange_credentials::tenant_id.eq(tenant_id))
+        .filter(exchange_credentials::is_enabled.eq(true))
+        .select((
+            exchange_credentials::id,
+            exchange_credentials::tenant_id,
+            exchange_credentials::exchange,
+            exchange_credentials::label,
+            exchange_credentials::api_key_encrypted,
+            exchange_credentials::api_secret_encrypted,
+            exchange_credentials::passphrase_encrypted,
+            exchange_credentials::is_testnet,
+            exchange_credentials::is_enabled,
+        ));
+    
+    let rows: Vec<(Uuid, Uuid, String, String, String, String, Option<String>, bool, bool)> = 
+        RunQueryDsl::load(query, &mut conn)
+            .await
+            .context("Failed to load exchange credentials")?;
+
+    // Decrypt and convert
+    let credentials: Vec<ExchangeCredential> = rows
+        .into_iter()
+        .filter_map(|(id, tenant_id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
+            // Decrypt values
+            let api_key = decrypt_credential_value(&api_key_enc)?;
+            let api_secret = decrypt_credential_value(&api_secret_enc)?;
+            let passphrase = passphrase_enc.as_ref().and_then(|p| decrypt_credential_value(p));
+
+            Some(ExchangeCredential {
+                id,
+                tenant_id,
+                exchange,
+                label,
+                api_key,
+                api_secret,
+                passphrase,
+                is_testnet,
+                is_enabled,
+            })
+        })
+        .collect();
+
+    Ok(credentials)
+}
+
+/// Load credentials for a specific exchange
+pub async fn load_credentials_for_exchange(
+    pool: &DbPool,
+    tenant_id: Uuid,
+    exchange: &str,
+) -> Result<Option<ExchangeCredential>> {
+    use databaseschema::schema::exchange_credentials;
+    use diesel_async::RunQueryDsl;
+
+    let mut conn = pool.get().await
+        .context("Failed to get database connection")?;
+
+    let query = exchange_credentials::table
+        .filter(exchange_credentials::tenant_id.eq(tenant_id))
+        .filter(exchange_credentials::exchange.eq(exchange.to_lowercase()))
+        .filter(exchange_credentials::is_enabled.eq(true))
+        .select((
+            exchange_credentials::id,
+            exchange_credentials::tenant_id,
+            exchange_credentials::exchange,
+            exchange_credentials::label,
+            exchange_credentials::api_key_encrypted,
+            exchange_credentials::api_secret_encrypted,
+            exchange_credentials::passphrase_encrypted,
+            exchange_credentials::is_testnet,
+            exchange_credentials::is_enabled,
+        ));
+
+    let row: Option<(Uuid, Uuid, String, String, String, String, Option<String>, bool, bool)> = 
+        RunQueryDsl::first(query, &mut conn)
+            .await
+            .optional()
+            .context("Failed to query exchange credentials")?;
+
+    let credential = row.and_then(|(id, tenant_id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
+        let api_key = decrypt_credential_value(&api_key_enc)?;
+        let api_secret = decrypt_credential_value(&api_secret_enc)?;
+        let passphrase = passphrase_enc.as_ref().and_then(|p| decrypt_credential_value(p));
+
+        Some(ExchangeCredential {
+            id,
+            tenant_id,
+            exchange,
+            label,
+            api_key,
+            api_secret,
+            passphrase,
+            is_testnet,
+            is_enabled,
+        })
+    });
+
+    Ok(credential)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +575,17 @@ mod tests {
         assert!(matches!(convert_route_status(RouteStatus::Pending), OrderStatus::Pending));
         assert!(matches!(convert_route_status(RouteStatus::Filled), OrderStatus::Filled));
         assert!(matches!(convert_route_status(RouteStatus::Cancelled), OrderStatus::Cancelled));
+    }
+    
+    #[test]
+    fn test_decrypt_credential_value() {
+        let original = "my-api-key-123";
+        let encrypted = format!("enc:{}", STANDARD.encode(original));
+        
+        let decrypted = decrypt_credential_value(&encrypted);
+        assert_eq!(decrypted, Some(original.to_string()));
+        
+        // Invalid format should return None
+        assert_eq!(decrypt_credential_value("not-encrypted"), None);
     }
 }

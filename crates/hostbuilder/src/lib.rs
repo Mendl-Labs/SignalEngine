@@ -351,7 +351,40 @@ impl HostedObject {
         // Create execution handler and initialize exchanges from config
         let mut execution_handler = UltraLowLatencyExecutionHandler::new().await;
         
-        // Load exchanges from YAML configuration
+        // ======================================================================
+        // Load exchange credentials from database (stored via Settings UI)
+        // ======================================================================
+        if let Ok(database_url) = env::var("DATABASE_URL") {
+            if let Ok(tenant_id_str) = env::var("TENANT_ID") {
+                if let Ok(tenant_id) = uuid::Uuid::parse_str(&tenant_id_str) {
+                    match smartorderrouter::database::create_pool(&database_url).await {
+                        Ok(pool) => {
+                            match execution_handler.initialize_from_database(&pool, tenant_id).await {
+                                Ok(count) => {
+                                    ultra_info!(format!("✅ Loaded {} exchange(s) from database credentials", count));
+                                }
+                                Err(e) => {
+                                    ultra_warn!(format!("⚠️ Failed to load database credentials: {:?}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            ultra_warn!(format!("⚠️ Could not connect to database for credentials: {}", e));
+                        }
+                    }
+                } else {
+                    ultra_warn!("⚠️ TENANT_ID is not a valid UUID");
+                }
+            } else {
+                ultra_info!("ℹ️ TENANT_ID not set, skipping database credential loading");
+            }
+        } else {
+            ultra_info!("ℹ️ DATABASE_URL not set, using only YAML config for exchanges");
+        }
+        
+        // ======================================================================
+        // Also load exchanges from YAML configuration (fallback/override)
+        // ======================================================================
         for exchange_config in &config.exchanges {
             if !exchange_config.enabled {
                 ultra_info!(format!("Skipping disabled exchange: {}", exchange_config.name));

@@ -11,7 +11,14 @@ use crossbeam::utils::CachePadded;
 pub mod database_integration_example;
 pub mod database;
 
-pub use database::{OrderDatabasePersistence, DbPool};
+pub use database::{
+    OrderDatabasePersistence, 
+    DbPool,
+    ExchangeCredential,
+    load_exchange_credentials,
+    load_credentials_for_exchange,
+    create_pool,
+};
 
 /// Order side enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

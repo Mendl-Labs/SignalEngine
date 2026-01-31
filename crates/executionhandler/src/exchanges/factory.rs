@@ -3,6 +3,7 @@ use log::{info, warn, error, debug};
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
 use crate::exchanges::kraken::KrakenConnector;
 use crate::exchanges::generic::{GenericConnector, ExchangePreset};
+use smartorderrouter::ExchangeCredential;
 
 /// Factory for creating exchange connectors
 pub struct ExchangeFactory;
@@ -157,5 +158,67 @@ impl ExchangeFactory {
         }
         
         Ok(())
+    }
+    
+    /// Create a connector from database-stored credentials
+    /// 
+    /// This is the primary method for production use - loads credentials from the
+    /// database (stored via the UI) and creates a properly configured connector.
+    pub async fn create_connector_from_credential(
+        credential: &ExchangeCredential,
+    ) -> Result<Box<dyn ExchangeConnector>, ExecutionError> {
+        info!(
+            "[FACTORY] Creating connector from database credential: exchange={}, label={}, testnet={}",
+            credential.exchange, credential.label, credential.is_testnet
+        );
+        
+        // Map exchange name to get the preset
+        let exchange_lower = credential.exchange.to_lowercase();
+        let preset = ExchangePreset::from_name(&exchange_lower)
+            .ok_or_else(|| ExecutionError::Unknown(format!(
+                "Unsupported exchange: {}. Supported: {}",
+                credential.exchange,
+                Self::supported_exchanges().join(", ")
+            )))?;
+        
+        let definition = preset.definition();
+        
+        // Build config from credential
+        let config = ExchangeConfig {
+            name: credential.exchange.clone(),
+            api_key: credential.api_key.clone(),
+            secret_key: credential.api_secret.clone(),
+            passphrase: credential.passphrase.clone(),
+            sandbox: credential.is_testnet,
+            connection_pool_size: 10,
+            timeout_ms: 5000,
+            rate_limit_per_second: definition.rate_limits.requests_per_second,
+            rate_limit_burst: definition.rate_limits.burst,
+            websocket_url: Some(definition.endpoints.websocket_url.clone()),
+            rest_api_url: Some(definition.endpoints.rest_url.clone()),
+            custom_headers: HashMap::new(),
+        };
+        
+        // Validate the config
+        Self::validate_config(&config)?;
+        
+        // Create the connector using the generic connector
+        let mut connector = GenericConnector::new(preset);
+        match connector.initialize(config).await {
+            Ok(_) => {
+                info!(
+                    "[FACTORY] {} connector created successfully from credential '{}'", 
+                    credential.exchange, credential.label
+                );
+                Ok(Box::new(connector))
+            }
+            Err(e) => {
+                error!(
+                    "[FACTORY] Failed to initialize {} connector from credential '{}': {}", 
+                    credential.exchange, credential.label, e
+                );
+                Err(e)
+            }
+        }
     }
 }

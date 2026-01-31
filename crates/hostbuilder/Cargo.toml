@@ -20,9 +20,11 @@ portfolio = { path = "../portfolio" }
 portfoliohandler = { path = "../portfoliohandler" }
 serde_json = "1.0.140"
 signalgenerator = { path = "../signalgenerator" }
+smartorderrouter = { path = "../smartorderrouter" }
 strategyhandler = { path = "../strategyhandler" }
 tokio = "1.44.1"
 ultra_signal = { path = "../signal" }
+uuid = { version = "1.0", features = ["v4"] }
 
 # Ultra-low latency logging
 ultra-logger = { workspace = true }

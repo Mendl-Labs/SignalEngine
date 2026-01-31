@@ -1281,10 +1281,12 @@ dependencies = [
  "serde",
  "serde_json",
  "signalgenerator",
+ "smartorderrouter",
  "strategyhandler",
  "tokio",
  "ultra-logger",
  "ultra_signal",
+ "uuid",
 ]
 
 [[package]]
@@ -3196,12 +3198,14 @@ name = "smartorderrouter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bigdecimal 0.4.9",
  "chrono",
  "crossbeam",
  "dashmap 5.5.3",
  "databaseschema",
  "deadpool 0.10.0",
+ "diesel",
  "diesel-async",
  "exchangemetricaggregator",
  "serde",
