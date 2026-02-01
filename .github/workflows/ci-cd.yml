@@ -355,9 +355,14 @@ jobs:
             Write-Host "[ERROR] SignalEngine/crates directory not found!"
           }
           
-          # Debug: Show .dockerignore content
-          Write-Host "[DEBUG] .dockerignore content:"
-          Get-Content ".dockerignore"
+          # Debug: Verify no .dockerignore at context root (this is intentional - passing builds had none)
+          Write-Host "[DEBUG] Checking .dockerignore at context root:"
+          if (Test-Path ".dockerignore") {
+            Write-Host "[WARNING] .dockerignore exists at context root - this may cause issues!"
+            Get-Content ".dockerignore"
+          } else {
+            Write-Host "[OK] No .dockerignore at context root (matching passing build configuration)"
+          }
           
           # Get dependency commit SHAs for cache busting
           $loggingSha = (git -C LoggingEngine rev-parse --short HEAD)
