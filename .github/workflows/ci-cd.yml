@@ -293,27 +293,36 @@ jobs:
       - name: Setup Docker Context
         shell: powershell
         run: |
-          # IMPORTANT: Do NOT create a .dockerignore file
+          # IMPORTANT: Do NOT create a .dockerignore file at workspace root
           # The last passing build (Jan 18) had NO .dockerignore and context was 763KB
           # When we added .dockerignore, context dropped to 34-65KB causing build failures
           # Docker's default behavior (include everything) works correctly for our multi-repo setup
           
-          # Remove any existing .dockerignore to ensure clean state (like passing builds)
-          if (Test-Path ".dockerignore") {
-            Write-Host "[DEBUG] Removing existing .dockerignore to match passing build configuration"
-            Remove-Item ".dockerignore" -Force
-          }
+          Write-Host "[DEBUG] Current directory: $(Get-Location)"
+          Write-Host "[DEBUG] Checking for .dockerignore files..."
           
-          # Verify no .dockerignore exists
+          # Remove any existing .dockerignore at workspace root (force removal even if read-only)
           if (Test-Path ".dockerignore") {
-            Write-Host "[ERROR] .dockerignore still exists!"
-            exit 1
+            Write-Host "[DEBUG] Found .dockerignore at workspace root, removing..."
+            $file = Get-Item ".dockerignore" -Force
+            Write-Host "[DEBUG] File attributes: $($file.Attributes)"
+            # Remove read-only attribute if present
+            if ($file.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+              $file.Attributes = $file.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+            }
+            Remove-Item ".dockerignore" -Force -ErrorAction Stop
+            Write-Host "[OK] Removed .dockerignore from workspace root"
+          } else {
+            Write-Host "[OK] No .dockerignore at workspace root"
           }
-          Write-Host "[OK] No .dockerignore - using Docker's default include-all behavior"
           
           # Debug: Show current directory structure
           Write-Host "[DEBUG] Build context structure:"
           Get-ChildItem -Directory | ForEach-Object { Write-Host "  DIR: $($_.Name)" }
+          
+          # List any .dockerignore files in subdirectories (these are OK, Docker only reads from context root)
+          Write-Host "[DEBUG] .dockerignore files in subdirectories (these don't affect build):"
+          Get-ChildItem -Recurse -Filter ".dockerignore" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
 
       - name: Build & Push Image
         shell: powershell
