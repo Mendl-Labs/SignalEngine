@@ -25,6 +25,16 @@ WORKDIR /app
 # Copy the entire TradingPlatform workspace (context is at TradingPlatform root)
 COPY . ./
 
+# Debug: verify file structure
+RUN echo "=== Verifying workspace structure ===" && \
+    ls -la /app/ && \
+    echo "=== databaseschema ===" && \
+    ls -la /app/databaseschema/ && \
+    echo "=== SignalEngine/crates/smartorderrouter ===" && \
+    ls -la /app/SignalEngine/crates/smartorderrouter/ && \
+    echo "=== Cargo.toml files ===" && \
+    cat /app/SignalEngine/crates/smartorderrouter/Cargo.toml
+
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
