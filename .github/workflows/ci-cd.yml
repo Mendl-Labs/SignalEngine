@@ -290,40 +290,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create .dockerignore
+      - name: Setup Docker Context
         shell: powershell
         run: |
-          # Create minimal .dockerignore - only exclude build artifacts and non-essential files
-          # IMPORTANT: Docker's .dockerignore does NOT support negation patterns like gitignore
-          # So we only exclude what we definitely don't need, and include everything else
-          $lines = @(
-            "# Git directories (large, not needed)"
-            "**/.git"
-            ""
-            "# Build artifacts (will be rebuilt in container)"
-            "**/target"
-            "**/.cargo"
-            ""
-            "# IDE files"
-            "**/.idea"
-            "**/.vscode"
-            ""
-            "# OS files"
-            "**/.DS_Store"
-            "**/Thumbs.db"
-            ""
-            "# Not needed for build"
-            "SimulationEngine"
-            "scripts"
-            "deepbook-ts"
-            "deepbook-test"
-            "combined"
-            ""
-            "# Log files"
-            "**/*.log"
-          )
-          $lines | Set-Content -Path ".dockerignore" -Encoding utf8
-          Write-Host "[OK] Created .dockerignore at workspace root"
+          # Copy .dockerignore from SignalEngine to build context root
+          # This is required because the build context is the parent directory
+          # (TradingPlatform/) which contains sibling dependencies
+          Copy-Item -Path "SignalEngine/.dockerignore" -Destination ".dockerignore" -Force
+          Write-Host "[OK] Copied .dockerignore to build context root"
           Write-Host "Contents:"
           Get-Content ".dockerignore"
 

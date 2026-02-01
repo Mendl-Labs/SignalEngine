@@ -1,0 +1,30 @@
+# .dockerignore for SignalEngine Docker builds
+# Context: This file is copied to the build context root (TradingPlatform/)
+# because SignalEngine depends on sibling directories (LoggingEngine, databaseschema, etc.)
+
+# Git directories (large, not needed for build)
+**/.git
+
+# Build artifacts (will be rebuilt in container)
+**/target
+**/.cargo
+
+# IDE and editor files
+**/.idea
+**/.vscode
+**/*.swp
+**/*.swo
+
+# OS generated files
+**/.DS_Store
+**/Thumbs.db
+
+# Not needed for SignalEngine build
+SimulationEngine
+scripts
+deepbook-ts
+deepbook-test
+combined
+
+# Log files
+**/*.log
