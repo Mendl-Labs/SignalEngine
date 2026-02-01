@@ -293,6 +293,12 @@ jobs:
       - name: Setup Docker Context
         shell: powershell
         run: |
+          # Remove any existing .dockerignore to ensure clean state
+          if (Test-Path ".dockerignore") {
+            Write-Host "[DEBUG] Removing existing .dockerignore"
+            Remove-Item ".dockerignore" -Force
+          }
+          
           # Copy .dockerignore from SignalEngine to build context root
           # This is required because the build context is the parent directory
           # (TradingPlatform/) which contains sibling dependencies
@@ -300,6 +306,20 @@ jobs:
           Write-Host "[OK] Copied .dockerignore to build context root"
           Write-Host "Contents:"
           Get-Content ".dockerignore"
+          
+          # Debug: Show current directory structure (excluding target dirs)
+          Write-Host "[DEBUG] Build context structure:"
+          Get-ChildItem -Directory | ForEach-Object { Write-Host "  DIR: $($_.Name)" }
+          
+          # Debug: Show SignalEngine Rust files count
+          $rsFiles = Get-ChildItem -Path "SignalEngine" -Filter "*.rs" -Recurse -ErrorAction SilentlyContinue
+          Write-Host "[DEBUG] SignalEngine .rs files count: $($rsFiles.Count)"
+          
+          # Debug: Show key Cargo.toml files
+          Write-Host "[DEBUG] Key Cargo.toml files:"
+          @("SignalEngine/Cargo.toml", "SignalEngine/crates/smartorderrouter/Cargo.toml", "databaseschema/Cargo.toml", "LoggingEngine/ultra-logger/Cargo.toml") | ForEach-Object {
+            if (Test-Path $_) { Write-Host "  [OK] $_" } else { Write-Host "  [MISSING] $_" }
+          }
 
       - name: Build & Push Image
         shell: powershell
