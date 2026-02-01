@@ -344,7 +344,6 @@ jobs:
             "**/.travis.yml"
             ""
             "# Benchmarks and examples"
-            "**/benches"
             "**/examples"
             ""
             "# README and docs"
