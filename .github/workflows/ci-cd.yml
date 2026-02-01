@@ -290,6 +290,97 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Create .dockerignore
+        shell: powershell
+        run: |
+          # Create .dockerignore at workspace root to control Docker context
+          $dockerignore = @"
+# Git directories
+**/.git
+**/.gitignore
+**/.gitattributes
+
+# Build artifacts and caches
+**/target/debug
+**/target/release
+**/target/.rustc_info.json
+**/target/.cargo-lock
+**/.cargo
+
+# IDE and editor files
+**/.idea
+**/.vscode
+**/*.swp
+**/*.swo
+*~
+
+# OS generated files
+**/.DS_Store
+**/Thumbs.db
+**/*.tmp
+**/*.temp
+
+# Test artifacts
+**/*.log
+**/test-results
+**/__pycache__
+
+# Documentation build outputs
+**/docs/_build
+**/site
+
+# Kubernetes and deployment configs (not needed in image)
+**/k8s
+**/deployment
+**/*.yaml
+**/*.yml
+!**/Cargo.toml
+
+# Docker files (avoid recursion)
+**/Dockerfile*
+**/docker-compose*
+**/compose.yaml
+
+# CI/CD files
+**/.github
+**/.gitlab-ci.yml
+**/.travis.yml
+
+# Benchmarks and examples (not needed in production image)
+**/benches
+**/examples
+
+# README and docs
+**/*.md
+**/LICENSE
+
+# Node modules (for any JS tooling)
+**/node_modules
+
+# Python virtual environments
+**/.venv
+**/venv
+
+# Simulation engine (benchmarking tool only)
+SimulationEngine/
+
+# Scripts directory (dev utilities)
+scripts/
+
+# Test directories
+**/tests
+
+# Allow all Rust source files explicitly
+!**/*.rs
+!**/Cargo.toml
+!**/Cargo.lock
+"@
+          $dockerignore | Out-File -FilePath ".dockerignore" -Encoding utf8
+          Write-Host "[OK] Created .dockerignore at workspace root"
+          Write-Host "--- .dockerignore contents ---"
+          Get-Content ".dockerignore"
+          Write-Host "--- end ---"
+
       - name: Build & Push Image
         shell: powershell
         run: |
