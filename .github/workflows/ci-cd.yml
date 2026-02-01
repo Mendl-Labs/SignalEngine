@@ -168,15 +168,17 @@ jobs:
           Write-Host "[SKIP] Tests skipped"
           echo "passed=true" >> $env:GITHUB_OUTPUT
 
-  # ===== EXCHANGE API TESTS =====
+  # ===== PUBLIC API TESTS =====
+  # Tests public exchange endpoints (ticker, orderbook) - no credentials needed
+  # Authenticated API tests removed: SaaS platform uses tenant credentials, not CI credentials
   api-tests:
-    name: Exchange API Tests
+    name: Public API Tests
     runs-on: [self-hosted, windows, x64]
     needs: validate
     if: needs.validate.outputs.tests-passed == 'true' && github.event.inputs.skip_api_tests != 'true'
-    timeout-minutes: 30
+    timeout-minutes: 15
     outputs:
-      tests-passed: ${{ steps.auth-test-result.outputs.passed || steps.skip-auth.outputs.passed }}
+      tests-passed: ${{ steps.public-test-result.outputs.passed }}
     steps:
       - name: Checkout SignalEngine
         uses: actions/checkout@v4
@@ -204,13 +206,6 @@ jobs:
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: databaseschema
 
-      - name: Verify Rust
-        shell: powershell
-        run: |
-          Write-Host "Checking Rust installation..."
-          rustc --version
-          cargo --version
-
       - name: Cache Cargo Registry
         uses: actions/cache@v4
         with:
@@ -235,7 +230,7 @@ jobs:
         id: public-test-result
         shell: powershell
         run: |
-          Write-Host "Running public exchange API tests..."
+          Write-Host "Running public exchange API tests (no credentials required)..."
           cd SignalEngine
           cargo run --example test_exchange_apis -- all
           if ($LASTEXITCODE -eq 0) {
@@ -246,115 +241,6 @@ jobs:
             echo "passed=false" >> $env:GITHUB_OUTPUT
             exit 1
           }
-
-      - name: Fetch Secrets from Azure Key Vault
-        id: fetch-secrets
-        shell: powershell
-        env:
-          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
-          AZURE_KEYVAULT_NAME: ${{ secrets.AZURE_KEYVAULT_NAME }}
-        run: |
-          Write-Host "Fetching secrets from Azure Key Vault..."
-          
-          try {
-            if ([string]::IsNullOrWhiteSpace($env:AZURE_CREDENTIALS)) {
-              throw "AZURE_CREDENTIALS secret is empty or not set"
-            }
-            
-            $creds = $env:AZURE_CREDENTIALS | ConvertFrom-Json -ErrorAction Stop
-            
-            if (-not $creds.clientId -or -not $creds.clientSecret -or -not $creds.tenantId) {
-              throw "Invalid Azure credentials format"
-            }
-            
-            Write-Host "[OK] Azure credentials parsed successfully"
-          } catch {
-            Write-Error "Failed to parse Azure credentials: $($_.Exception.Message)"
-            exit 1
-          }
-          
-          try {
-            Write-Host "[INFO] Authenticating with Azure..."
-            az login --service-principal --username $creds.clientId --password $creds.clientSecret --tenant $creds.tenantId --output json 2>&1 | Out-Null
-            
-            if ($LASTEXITCODE -ne 0) {
-              throw "Azure CLI login failed"
-            }
-            
-            Write-Host "[OK] Successfully authenticated with Azure"
-          } catch {
-            Write-Error "Azure authentication failed: $_"
-            exit 1
-          }
-          
-          # Fetch Kraken API credentials
-          $krakenApiKey = az keyvault secret show --vault-name $env:AZURE_KEYVAULT_NAME --name kraken-api-key --query value -o tsv
-          $krakenSecretKey = az keyvault secret show --vault-name $env:AZURE_KEYVAULT_NAME --name kraken-secret-key --query value -o tsv
-          
-          if ([string]::IsNullOrWhiteSpace($krakenApiKey) -or [string]::IsNullOrWhiteSpace($krakenSecretKey)) {
-            Write-Host "[WARN] Kraken credentials not found in Key Vault, skipping authenticated tests"
-            echo "has_kraken_creds=false" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "[OK] Kraken credentials retrieved"
-            # Mask secrets in logs
-            Write-Host "::add-mask::$krakenApiKey"
-            Write-Host "::add-mask::$krakenSecretKey"
-            # Export for next step
-            echo "KRAKEN_API_KEY=$krakenApiKey" >> $env:GITHUB_ENV
-            echo "KRAKEN_SECRET_KEY=$krakenSecretKey" >> $env:GITHUB_ENV
-            echo "has_kraken_creds=true" >> $env:GITHUB_OUTPUT
-          }
-          
-          # Logout
-          az logout 2>&1 | Out-Null
-          Write-Host "[OK] Azure logout complete"
-
-      - name: Run Authenticated API Tests
-        if: steps.fetch-secrets.outputs.has_kraken_creds == 'true'
-        id: auth-test-result
-        shell: powershell
-        run: |
-          Write-Host "Running authenticated exchange API tests..."
-          cd SignalEngine
-          
-          # Retry up to 3 times for transient nonce errors
-          $maxRetries = 3
-          $retryCount = 0
-          $success = $false
-          
-          while (-not $success -and $retryCount -lt $maxRetries) {
-            $retryCount++
-            Write-Host "Attempt $retryCount of $maxRetries..."
-            
-            # Add small delay between retries to allow nonce to advance
-            if ($retryCount -gt 1) {
-              Start-Sleep -Seconds 2
-            }
-            
-            cargo run --example test_exchange_apis_authenticated -- all
-            if ($LASTEXITCODE -eq 0) {
-              $success = $true
-            } else {
-              Write-Host "[WARN] Attempt $retryCount failed (may be transient nonce error)"
-            }
-          }
-          
-          if ($success) {
-            Write-Host "[OK] Authenticated API tests passed!"
-            echo "passed=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "[FAIL] Authenticated API tests failed after $maxRetries attempts!"
-            echo "passed=false" >> $env:GITHUB_OUTPUT
-            exit 1
-          }
-
-      - name: Skip Authenticated Tests
-        if: steps.fetch-secrets.outputs.has_kraken_creds != 'true'
-        id: skip-auth
-        shell: powershell
-        run: |
-          Write-Host "[SKIP] Authenticated API tests skipped (no credentials)"
-          echo "passed=true" >> $env:GITHUB_OUTPUT
 
   # ===== BUILD & PUSH =====
   build:
