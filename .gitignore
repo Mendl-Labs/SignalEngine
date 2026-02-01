@@ -72,6 +72,13 @@ helm/**/values-*.yaml
 **/*api-key*
 **/kraken-credentials.yaml
 
+# Exception: Allow credential-related source code files (not actual credentials)
+!**/*credential*.rs
+!**/*credentials*.rs
+!**/credential_manager.rs
+!**/database_credentials.rs
+!**/saas_credential_vault.rs
+
 # Trading platform specific
 config/production.yaml
 config/staging.yaml
