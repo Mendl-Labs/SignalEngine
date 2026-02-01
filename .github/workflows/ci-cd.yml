@@ -293,83 +293,34 @@ jobs:
       - name: Create .dockerignore
         shell: powershell
         run: |
-          # Create .dockerignore at workspace root to control Docker context
-          # Using Set-Content with array to avoid YAML escaping issues
+          # Create minimal .dockerignore - only exclude build artifacts and non-essential files
+          # IMPORTANT: Docker's .dockerignore does NOT support negation patterns like gitignore
+          # So we only exclude what we definitely don't need, and include everything else
           $lines = @(
-            "# Git directories"
+            "# Git directories (large, not needed)"
             "**/.git"
-            "**/.gitignore"
-            "**/.gitattributes"
             ""
-            "# Build artifacts and caches"
-            "**/target/debug"
-            "**/target/release"
-            "**/target/.rustc_info.json"
-            "**/target/.cargo-lock"
+            "# Build artifacts (will be rebuilt in container)"
+            "**/target"
             "**/.cargo"
             ""
-            "# IDE and editor files"
+            "# IDE files"
             "**/.idea"
             "**/.vscode"
-            "**/*.swp"
-            "**/*.swo"
             ""
-            "# OS generated files"
+            "# OS files"
             "**/.DS_Store"
             "**/Thumbs.db"
-            "**/*.tmp"
-            "**/*.temp"
             ""
-            "# Test artifacts"
+            "# Not needed for build"
+            "SimulationEngine"
+            "scripts"
+            "deepbook-ts"
+            "deepbook-test"
+            "combined"
+            ""
+            "# Log files"
             "**/*.log"
-            "**/test-results"
-            "**/__pycache__"
-            ""
-            "# Documentation build outputs"
-            "**/docs/_build"
-            "**/site"
-            ""
-            "# Kubernetes and deployment configs"
-            "**/k8s"
-            "**/deployment"
-            ""
-            "# Docker files"
-            "**/Dockerfile*"
-            "**/docker-compose*"
-            "**/compose.yaml"
-            ""
-            "# CI/CD files"
-            "**/.github"
-            "**/.gitlab-ci.yml"
-            "**/.travis.yml"
-            ""
-            "# Benchmarks and examples"
-            "**/examples"
-            ""
-            "# README and docs"
-            "**/*.md"
-            "**/LICENSE"
-            ""
-            "# Node modules"
-            "**/node_modules"
-            ""
-            "# Python virtual environments"
-            "**/.venv"
-            "**/venv"
-            ""
-            "# Simulation engine (benchmarking tool only)"
-            "SimulationEngine/"
-            ""
-            "# Scripts directory"
-            "scripts/"
-            ""
-            "# Test directories"
-            "**/tests"
-            ""
-            "# Allow all Rust source files explicitly"
-            "!**/*.rs"
-            "!**/Cargo.toml"
-            "!**/Cargo.lock"
           )
           $lines | Set-Content -Path ".dockerignore" -Encoding utf8
           Write-Host "[OK] Created .dockerignore at workspace root"
@@ -391,6 +342,25 @@ jobs:
               exit 1
             }
           }
+          
+          # Verify SignalEngine crates exist before Docker build
+          Write-Host "[DEBUG] Checking SignalEngine crates..."
+          $cratesPath = "SignalEngine/crates"
+          if (Test-Path $cratesPath) {
+            Get-ChildItem -Path $cratesPath -Directory | ForEach-Object { Write-Host "[CRATE] $($_.Name)" }
+            if (Test-Path "$cratesPath/smartorderrouter") {
+              Write-Host "[OK] smartorderrouter crate found"
+              Get-ChildItem -Path "$cratesPath/smartorderrouter" -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+            } else {
+              Write-Host "[ERROR] smartorderrouter crate NOT found!"
+            }
+          } else {
+            Write-Host "[ERROR] SignalEngine/crates directory not found!"
+          }
+          
+          # Debug: Show .dockerignore content
+          Write-Host "[DEBUG] .dockerignore content:"
+          Get-Content ".dockerignore"
           
           # Get dependency commit SHAs for cache busting
           $loggingSha = (git -C LoggingEngine rev-parse --short HEAD)
