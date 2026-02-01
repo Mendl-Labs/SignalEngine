@@ -25,18 +25,14 @@ WORKDIR /app
 # Copy the entire TradingPlatform workspace (context is at TradingPlatform root)
 COPY . ./
 
-# Debug: verify file structure
-RUN echo "=== Verifying workspace structure ===" && \
-    ls -la /app/ && \
-    echo "=== databaseschema ===" && \
-    ls -la /app/databaseschema/ && \
-    echo "=== SignalEngine/crates/smartorderrouter ===" && \
-    ls -la /app/SignalEngine/crates/smartorderrouter/ && \
-    echo "=== Cargo.toml files ===" && \
-    cat /app/SignalEngine/crates/smartorderrouter/Cargo.toml
-
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
+
+# Debug: verify cargo can resolve dependencies
+RUN echo "=== Checking cargo dependency resolution ===" && \
+    cargo metadata --format-version=1 2>&1 | head -100 || echo "cargo metadata failed" && \
+    echo "=== Checking if databaseschema is in dependency graph ===" && \
+    cargo tree -p smartorderrouter 2>&1 | head -50 || echo "cargo tree failed"
 
 # Build the SignalEngine program
 RUN cargo build --locked --release --bin program && \
