@@ -33,9 +33,14 @@ COPY SignalEngine/ ./SignalEngine/
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build smartorderrouter first (it has external deps), then workspace
-RUN cargo build --release -p smartorderrouter && \
-    cargo build --release --workspace && \
+# Build workspace - list all crates explicitly to ensure dependency order
+RUN cargo build --release \
+    -p databaseschema \
+    -p smartorderrouter \
+    -p executionhandler \
+    -p hostbuilder \
+    -p strategyhandler \
+    -p program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
