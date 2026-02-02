@@ -22,25 +22,14 @@ ENV RUST_BACKTRACE=0
 # Set the working directory inside the container
 WORKDIR /app
 
-# Copy dependencies explicitly (matching BacktestingEngine pattern)
-COPY databaseschema/ ./databaseschema/
-COPY LoggingEngine/ ./LoggingEngine/
-COPY MessageBrokerEngine/ ./MessageBrokerEngine/
-
-# Copy SignalEngine
-COPY SignalEngine/ ./SignalEngine/
+# Copy the entire TradingPlatform workspace (context is at TradingPlatform root)
+COPY . ./
 
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build workspace - list all crates explicitly to ensure dependency order
-RUN cargo build --release \
-    -p databaseschema \
-    -p smartorderrouter \
-    -p executionhandler \
-    -p hostbuilder \
-    -p strategyhandler \
-    -p program && \
+# Build the SignalEngine program
+RUN cargo build --locked --release --bin program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
