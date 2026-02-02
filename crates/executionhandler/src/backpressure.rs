@@ -163,7 +163,7 @@ impl BackpressureController {
 
     /// Try to acquire permission to process a request
     /// Returns Ok(permit) if allowed, Err if rejected
-    pub async fn try_acquire(&self) -> Result<BackpressurePermit, BackpressureError> {
+    pub async fn try_acquire(&self) -> Result<BackpressurePermit<'_>, BackpressureError> {
         let current_depth = self.queue_depth.load(Ordering::Relaxed);
         
         // Check hard limit
@@ -236,7 +236,7 @@ impl BackpressureController {
     pub async fn try_acquire_for_exchange(
         &self,
         exchange: &str
-    ) -> Result<BackpressurePermit, BackpressureError> {
+    ) -> Result<BackpressurePermit<'_>, BackpressureError> {
         // Check exchange-specific pressure
         if let Some(ex_pressure) = self.exchange_pressure.get(exchange) {
             let ex_depth = ex_pressure.queue_depth.load(Ordering::Relaxed);

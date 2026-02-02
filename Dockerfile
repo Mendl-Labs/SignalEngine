@@ -29,10 +29,13 @@ COPY . ./
 WORKDIR /app/SignalEngine
 
 # Debug: verify cargo can resolve dependencies
-RUN echo "=== Checking cargo dependency resolution ===" && \
-    cargo metadata --format-version=1 2>&1 | head -100 || echo "cargo metadata failed" && \
-    echo "=== Checking if databaseschema is in dependency graph ===" && \
-    cargo tree -p smartorderrouter 2>&1 | head -50 || echo "cargo tree failed"
+RUN echo "=== Checking databaseschema structure ===" && \
+    ls -la /app/databaseschema/ && \
+    ls -la /app/databaseschema/src/ && \
+    head -50 /app/databaseschema/src/lib.rs && \
+    echo "=== Checking cargo dependency resolution ===" && \
+    cargo tree -p smartorderrouter 2>&1 | head -100 && \
+    echo "=== End of cargo tree ==="
 
 # Build the SignalEngine program
 RUN cargo build --locked --release --bin program && \
