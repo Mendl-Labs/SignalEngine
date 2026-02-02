@@ -28,14 +28,20 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Debug: verify cargo can resolve dependencies
-RUN echo "=== Checking databaseschema structure ===" && \
+# Debug: verify workspace structure
+RUN echo "=== Checking SignalEngine workspace ===" && \
+    cat Cargo.toml && \
+    echo "=== Checking executionhandler dependencies ===" && \
+    cat crates/executionhandler/Cargo.toml | grep -A5 "Local dependencies" && \
+    echo "=== Checking smartorderrouter exists ===" && \
+    ls -la crates/smartorderrouter/ && \
+    cat crates/smartorderrouter/Cargo.toml && \
+    echo "=== Checking databaseschema ===" && \
     ls -la /app/databaseschema/ && \
-    ls -la /app/databaseschema/src/ && \
-    head -50 /app/databaseschema/src/lib.rs && \
-    echo "=== Checking cargo dependency resolution ===" && \
-    cargo tree -p smartorderrouter 2>&1 | head -100 && \
-    echo "=== End of cargo tree ==="
+    cat /app/databaseschema/Cargo.toml && \
+    echo "=== Testing cargo check on smartorderrouter ===" && \
+    cargo check -p smartorderrouter 2>&1 || echo "smartorderrouter check failed" && \
+    echo "=== End of debug ==="
 
 # Build the SignalEngine program
 RUN cargo build --locked --release --bin program && \
