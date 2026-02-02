@@ -28,8 +28,8 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build the SignalEngine program
-RUN cargo build --locked --release --bin program && \
+# Build the SignalEngine program (without --locked to allow fresh resolution)
+RUN cargo build --release --bin program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
