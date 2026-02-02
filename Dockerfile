@@ -29,7 +29,7 @@ COPY . ./
 WORKDIR /app/SignalEngine
 
 # Build the SignalEngine program
-RUN cargo build --locked --release --bin program && \
+RUN cargo build --release --bin program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
