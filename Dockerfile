@@ -28,6 +28,14 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
+# Debug: Check what executionhandler's Cargo.toml actually contains
+RUN echo "=== executionhandler Cargo.toml ===" && \
+    cat crates/executionhandler/Cargo.toml | grep -A2 "smartorderrouter" && \
+    echo "=== Does smartorderrouter directory exist? ===" && \
+    ls -la crates/smartorderrouter/ && \
+    echo "=== Check cargo tree for executionhandler ===" && \
+    cargo tree -p executionhandler 2>&1 | grep -i "smart\|error" | head -10
+
 # Build the SignalEngine program
 RUN cargo build --release --bin program && \
     cp target/release/program /bin/signal-engine
