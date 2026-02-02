@@ -28,10 +28,9 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build smartorderrouter first in the SAME RUN command to ensure cargo resolves it
-# Then build the main program - this keeps cargo's dependency resolution intact
-RUN cargo build --release -p smartorderrouter && \
-    cargo build --release --bin program && \
+# Build the entire workspace first, then the specific binary
+# This ensures all workspace crates are compiled together
+RUN cargo build --release --workspace && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
