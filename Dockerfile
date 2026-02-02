@@ -33,20 +33,14 @@ RUN echo "=== DEBUG: Contents of /app ===" && \
     echo "=== DEBUG: Looking for SignalEngine ===" && \
     ls -la /app/SignalEngine/ 2>/dev/null || echo "WARNING: /app/SignalEngine NOT FOUND!" && \
     echo "=== DEBUG: Looking for smartorderrouter ===" && \
-    ls -la /app/SignalEngine/crates/smartorderrouter/ 2>/dev/null || echo "WARNING: smartorderrouter NOT FOUND!" && \
-    echo "=== DEBUG: databaseschema Cargo.toml ===" && \
-    cat /app/databaseschema/Cargo.toml && \
-    echo "=== DEBUG: smartorderrouter Cargo.toml ===" && \
-    cat /app/SignalEngine/crates/smartorderrouter/Cargo.toml && \
-    echo "=== DEBUG: Testing cargo check on smartorderrouter ===" && \
-    cd /app/SignalEngine && cargo check -p smartorderrouter 2>&1 || echo "CARGO CHECK FAILED"
+    ls -la /app/SignalEngine/crates/smartorderrouter/ 2>/dev/null || echo "WARNING: smartorderrouter NOT FOUND!"
 
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build the entire workspace first, then the specific binary
-# This ensures all workspace crates are compiled together
-RUN cargo build --release --workspace && \
+# First build smartorderrouter explicitly (and its databaseschema dependency), then build the full workspace
+RUN cargo build --release -p smartorderrouter && \
+    cargo build --release --workspace && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
