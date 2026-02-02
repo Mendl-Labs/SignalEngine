@@ -685,7 +685,7 @@ version = "2.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "229850a212cd9b84d4f0290ad9d294afc0ae70fccaa8949dbe8b43ffafa1e20c"
 dependencies = [
- "bigdecimal 0.4.10",
+ "bigdecimal 0.3.1",
  "bitflags 2.10.0",
  "byteorder",
  "chrono",

@@ -28,15 +28,6 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Debug: Check cargo metadata to understand dependency resolution
-RUN echo "=== Checking cargo metadata for smartorderrouter ===" && \
-    cargo metadata --format-version=1 2>&1 | grep -A20 '"name": "smartorderrouter"' | head -30 && \
-    echo "=== Checking if executionhandler depends on smartorderrouter ===" && \
-    cargo tree -p executionhandler 2>&1 | grep -i smart && \
-    echo "=== Checking workspace members ===" && \
-    cargo metadata --format-version=1 --no-deps 2>&1 | grep -o '"crates/[^"]*"' | head -20 && \
-    echo "=== End of metadata debug ==="
-
 # Build the SignalEngine program
 RUN cargo build --locked --release --bin program && \
     cp target/release/program /bin/signal-engine

@@ -23,6 +23,10 @@ resolver = "2"
 # Ultra-low latency logging engine
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }
 
+# Internal workspace crates
+smartorderrouter = { path = "crates/smartorderrouter" }
+databaseschema = { path = "../databaseschema" }
+
 # Ultra-Fast Production Optimizations
 crossbeam = "0.8"
 dashmap = "5.0"
