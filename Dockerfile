@@ -25,6 +25,16 @@ WORKDIR /app
 # Copy the entire TradingPlatform workspace (context is at TradingPlatform root)
 COPY . ./
 
+# Debug: List what's in /app after COPY
+RUN echo "=== DEBUG: Contents of /app ===" && \
+    ls -la /app/ && \
+    echo "=== DEBUG: Looking for databaseschema ===" && \
+    ls -la /app/databaseschema/ 2>/dev/null || echo "WARNING: /app/databaseschema NOT FOUND!" && \
+    echo "=== DEBUG: Looking for SignalEngine ===" && \
+    ls -la /app/SignalEngine/ 2>/dev/null || echo "WARNING: /app/SignalEngine NOT FOUND!" && \
+    echo "=== DEBUG: Looking for smartorderrouter ===" && \
+    ls -la /app/SignalEngine/crates/smartorderrouter/ 2>/dev/null || echo "WARNING: smartorderrouter NOT FOUND!"
+
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
