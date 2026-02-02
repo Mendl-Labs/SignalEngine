@@ -28,16 +28,10 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Debug: Check cargo can find and parse smartorderrouter
-RUN echo "=== Contents of smartorderrouter/Cargo.toml ===" && \
-    cat crates/smartorderrouter/Cargo.toml && \
-    echo "=== Checking databaseschema path ===" && \
-    ls -la /app/databaseschema/ 2>&1 || echo "databaseschema NOT FOUND" && \
-    echo "=== Try cargo check on smartorderrouter ===" && \
-    cargo check -p smartorderrouter 2>&1 | tail -20
-
-# Build the SignalEngine program
-RUN cargo build --release --bin program && \
+# Build smartorderrouter first in the SAME RUN command to ensure cargo resolves it
+# Then build the main program - this keeps cargo's dependency resolution intact
+RUN cargo build --release -p smartorderrouter && \
+    cargo build --release --bin program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
