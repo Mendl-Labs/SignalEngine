@@ -95,7 +95,7 @@ winapi = { version = "0.3.9", features = ["winbase", "processthreadsapi", "winnt
 
 # Local dependencies
 signalgenerator = { path = "../signalgenerator" }
-smartorderrouter.workspace = true
+smartorderrouter = { path = "../smartorderrouter" }
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 
 [features]
