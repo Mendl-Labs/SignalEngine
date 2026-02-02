@@ -373,7 +373,7 @@ jobs:
           $shortSha = "${{ github.sha }}".Substring(0, 7)
           Write-Host "[INFO] Building with immutable tag: $shortSha"
           
-          docker build --tag ${{ env.IMAGE_NAME }}:$shortSha --file SignalEngine/Dockerfile --build-arg LOGGING_ENGINE_SHA=$loggingSha --build-arg BROKER_ENGINE_SHA=$brokerSha --build-arg DB_SCHEMA_SHA=$dbSha --progress=plain .
+          docker build --no-cache --tag ${{ env.IMAGE_NAME }}:$shortSha --file SignalEngine/Dockerfile --build-arg LOGGING_ENGINE_SHA=$loggingSha --build-arg BROKER_ENGINE_SHA=$brokerSha --build-arg DB_SCHEMA_SHA=$dbSha --progress=plain .
           
           if ($LASTEXITCODE -ne 0) {
             throw "Docker build failed"
