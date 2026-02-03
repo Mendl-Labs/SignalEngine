@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set performance-optimized environment variables
@@ -42,6 +43,7 @@ RUN apt-get update && apt-get install -y \
     net-tools \
     procps \
     libssl-dev \
+    libpq5 \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
