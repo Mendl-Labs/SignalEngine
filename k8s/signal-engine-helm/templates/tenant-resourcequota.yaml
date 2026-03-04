@@ -1,0 +1,33 @@
+{{- if .Values.tenantResources.enabled }}
+# =============================================================================
+# Per-Tenant ResourceQuota — SignalEngine
+# Enforces hard limits on compute resources per tenant namespace.
+# =============================================================================
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-tenant-quota
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-quota
+    mendll.com/tenant-id: {{ .Values.tenantResources.tenantId | quote }}
+    mendll.com/tier: {{ .Values.tenantResources.tier | quote }}
+spec:
+  hard:
+    {{- $tier := .Values.tenantResources.tier | default "free" }}
+    {{- $profile := index .Values.tenantResources.profiles $tier }}
+    requests.cpu: {{ $profile.maxCpu | quote }}
+    requests.memory: {{ $profile.maxMemory | quote }}
+    limits.cpu: {{ $profile.maxCpuLimit | quote }}
+    limits.memory: {{ $profile.maxMemoryLimit | quote }}
+    pods: {{ $profile.maxPods | quote }}
+    persistentvolumeclaims: {{ $profile.maxPVCs | default "1" | quote }}
+    services: {{ $profile.maxServices | default "3" | quote }}
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+    {{- if $profile.maxEphemeralStorage }}
+    requests.ephemeral-storage: {{ $profile.maxEphemeralStorage | quote }}
+    limits.ephemeral-storage: {{ $profile.maxEphemeralStorage | quote }}
+    {{- end }}
+{{- end }}

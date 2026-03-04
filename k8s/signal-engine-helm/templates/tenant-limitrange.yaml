@@ -1,0 +1,37 @@
+{{- if .Values.tenantResources.enabled }}
+# =============================================================================
+# Per-Tenant LimitRange — SignalEngine
+# Sets default and max resource limits for pods in a tenant namespace.
+# =============================================================================
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-tenant-limits
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tenant-limits
+    mendll.com/tenant-id: {{ .Values.tenantResources.tenantId | quote }}
+    mendll.com/tier: {{ .Values.tenantResources.tier | quote }}
+spec:
+  limits:
+    {{- $tier := .Values.tenantResources.tier | default "free" }}
+    {{- $profile := index .Values.tenantResources.profiles $tier }}
+    - type: Container
+      default:
+        cpu: {{ $profile.defaultContainerCpuLimit | quote }}
+        memory: {{ $profile.defaultContainerMemoryLimit | quote }}
+      defaultRequest:
+        cpu: {{ $profile.defaultContainerCpuRequest | quote }}
+        memory: {{ $profile.defaultContainerMemoryRequest | quote }}
+      max:
+        cpu: {{ $profile.maxContainerCpu | quote }}
+        memory: {{ $profile.maxContainerMemory | quote }}
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+    - type: Pod
+      max:
+        cpu: {{ $profile.maxPodCpu | quote }}
+        memory: {{ $profile.maxPodMemory | quote }}
+{{- end }}

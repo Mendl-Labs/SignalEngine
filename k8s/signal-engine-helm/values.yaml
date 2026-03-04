@@ -649,3 +649,88 @@ testing:
     enabled: false
     duration: "10m"
     rate: "1000rps"
+
+# =============================================================================
+# Per-Tenant Resource Isolation
+# =============================================================================
+# Deploy per-tenant with: helm install tenant-<id> . --namespace tenant-<id>
+#   --set tenantResources.enabled=true --set tenantResources.tenantId=<uuid>
+#   --set tenantResources.tier=<free|starter|professional|enterprise>
+
+tenantResources:
+  enabled: false
+  tenantId: ""
+  tier: "free"
+
+  profiles:
+    free:
+      maxCpu: "2"
+      maxMemory: "4Gi"
+      maxCpuLimit: "4"
+      maxMemoryLimit: "8Gi"
+      maxPods: "3"
+      maxPVCs: "1"
+      maxServices: "2"
+      maxEphemeralStorage: "5Gi"
+      defaultContainerCpuRequest: "250m"
+      defaultContainerCpuLimit: "1000m"
+      defaultContainerMemoryRequest: "512Mi"
+      defaultContainerMemoryLimit: "2Gi"
+      maxContainerCpu: "2000m"
+      maxContainerMemory: "4Gi"
+      maxPodCpu: "2000m"
+      maxPodMemory: "4Gi"
+
+    starter:
+      maxCpu: "4"
+      maxMemory: "16Gi"
+      maxCpuLimit: "8"
+      maxMemoryLimit: "32Gi"
+      maxPods: "5"
+      maxPVCs: "2"
+      maxServices: "3"
+      maxEphemeralStorage: "10Gi"
+      defaultContainerCpuRequest: "500m"
+      defaultContainerCpuLimit: "2000m"
+      defaultContainerMemoryRequest: "1Gi"
+      defaultContainerMemoryLimit: "4Gi"
+      maxContainerCpu: "4000m"
+      maxContainerMemory: "8Gi"
+      maxPodCpu: "4000m"
+      maxPodMemory: "8Gi"
+
+    professional:
+      maxCpu: "16"
+      maxMemory: "64Gi"
+      maxCpuLimit: "32"
+      maxMemoryLimit: "128Gi"
+      maxPods: "10"
+      maxPVCs: "5"
+      maxServices: "5"
+      maxEphemeralStorage: "25Gi"
+      defaultContainerCpuRequest: "1000m"
+      defaultContainerCpuLimit: "4000m"
+      defaultContainerMemoryRequest: "4Gi"
+      defaultContainerMemoryLimit: "8Gi"
+      maxContainerCpu: "8000m"
+      maxContainerMemory: "32Gi"
+      maxPodCpu: "8000m"
+      maxPodMemory: "32Gi"
+
+    enterprise:
+      maxCpu: "64"
+      maxMemory: "256Gi"
+      maxCpuLimit: "128"
+      maxMemoryLimit: "512Gi"
+      maxPods: "25"
+      maxPVCs: "10"
+      maxServices: "10"
+      maxEphemeralStorage: "100Gi"
+      defaultContainerCpuRequest: "2000m"
+      defaultContainerCpuLimit: "8000m"
+      defaultContainerMemoryRequest: "8Gi"
+      defaultContainerMemoryLimit: "32Gi"
+      maxContainerCpu: "16000m"
+      maxContainerMemory: "64Gi"
+      maxPodCpu: "16000m"
+      maxPodMemory: "64Gi"
