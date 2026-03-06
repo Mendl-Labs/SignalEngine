@@ -552,7 +552,7 @@ mod tests {
         StrategyInstance {
             id: Uuid::new_v4(),
             name: "Test Strategy".into(),
-            strategy_type: StrategyType::Momentum,
+            strategy_type: StrategyType::Custom,
             version: "1.0.0".into(),
             parameters: StrategyParameters::Momentum(MomentumParams::default()),
             assets: vec![TradingAsset {

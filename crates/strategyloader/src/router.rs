@@ -119,7 +119,7 @@ mod tests {
         StrategyInstance {
             id: Uuid::new_v4(),
             name: name.to_string(),
-            strategy_type: StrategyType::Momentum,
+            strategy_type: StrategyType::Custom,
             version: "1.0".to_string(),
             assets: assets.into_iter().map(|(s, e)| TradingAsset {
                 symbol: s.to_string(),

@@ -488,8 +488,8 @@ mod tests {
     fn create_test_momentum_instance() -> StrategyInstance {
         StrategyInstance {
             id: Uuid::new_v4(),
-            name: "Test Momentum".into(),
-            strategy_type: StrategyType::Momentum,
+            name: "Test Custom".into(),
+            strategy_type: StrategyType::Custom,
             version: "1.0.0".into(),
             parameters: StrategyParameters::Momentum(MomentumParams {
                 momentum_threshold_pct: 0.5,

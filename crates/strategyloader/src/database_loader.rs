@@ -274,135 +274,17 @@ impl DatabaseStrategyLoader {
     }
     
     /// Parse strategy-specific parameters based on type
+    /// 
+    /// Custom Python strategies use Generic params since their parameters
+    /// are defined in the Python source code, not built-in structs.
     fn parse_strategy_params(
         strategy_type: StrategyType,
         params: &serde_json::Value,
     ) -> Result<StrategyParameters> {
         match strategy_type {
-            StrategyType::Momentum => {
-                Ok(StrategyParameters::Momentum(MomentumParams {
-                    momentum_threshold_pct: params.get("momentum_threshold_pct")
-                        .or_else(|| params.get("threshold_pct"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5),
-                    momentum_lookback_ms: params.get("momentum_lookback_ms")
-                        .or_else(|| params.get("lookback_ms"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(60_000),
-                    imbalance_threshold: params.get("imbalance_threshold")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.3),
-                    position_size_pct: params.get("position_size_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.10),
-                    take_profit_pct: params.get("take_profit_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.8),
-                    stop_loss_pct: params.get("stop_loss_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5),
-                    min_trade_interval_ms: params.get("min_trade_interval_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(1000),
-                    use_volume_confirmation: params.get("use_volume_confirmation")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    volume_multiplier: params.get("volume_multiplier")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.5),
-                }))
-            }
-            StrategyType::MeanReversion => {
-                Ok(StrategyParameters::MeanReversion(MeanReversionParams {
-                    zscore_entry_threshold: params.get("zscore_entry_threshold")
-                        .or_else(|| params.get("entry_threshold"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(2.0),
-                    zscore_exit_threshold: params.get("zscore_exit_threshold")
-                        .or_else(|| params.get("exit_threshold"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5),
-                    lookback_ms: params.get("lookback_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(300_000),
-                    position_size_pct: params.get("position_size_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.10),
-                    max_holding_time_ms: params.get("max_holding_time_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(3_600_000),
-                    stop_loss_pct: params.get("stop_loss_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0),
-                    take_profit_pct: params.get("take_profit_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5),
-                    use_bollinger_bands: params.get("use_bollinger_bands")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    bollinger_std: params.get("bollinger_std")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(2.0),
-                }))
-            }
-            StrategyType::MarketMaking => {
-                Ok(StrategyParameters::MarketMaking(MarketMakingParams {
-                    risk_aversion: params.get("risk_aversion")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.1),
-                    inventory_target: params.get("inventory_target")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
-                    order_size: params.get("order_size")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(100.0),
-                    window_ms: params.get("window_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(1000),
-                    min_quote_lifetime_ms: params.get("min_quote_lifetime_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(100),
-                    fee_rate: params.get("fee_rate")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.001),
-                    volatility_cap: params.get("volatility_cap")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.2),
-                    max_spread_pct: params.get("max_spread_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.02),
-                    min_spread_pct: params.get("min_spread_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.001),
-                }))
-            }
-            StrategyType::Arbitrage => {
-                Ok(StrategyParameters::Arbitrage(ArbitrageParams {
-                    min_spread_pct: params.get("min_spread_pct")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.002),
-                    max_execution_time_ms: params.get("max_execution_time_ms")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(500),
-                    position_size: params.get("position_size")
-                        .or_else(|| params.get("leg_size"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(100.0),
-                    include_fees: params.get("include_fees")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    primary_exchange: params.get("primary_exchange")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("kraken")
-                        .to_string(),
-                    secondary_exchange: params.get("secondary_exchange")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("binance")
-                        .to_string(),
-                }))
-            }
-            StrategyType::PortfolioMixed => {
-                // For mixed strategies, store all params as generic
+            StrategyType::Custom | StrategyType::CustomMarketMaking | StrategyType::PortfolioMixed => {
+                // All strategy types now use generic params - parameters are defined
+                // in the Python strategy source code, not in typed structs
                 Ok(StrategyParameters::Generic(GenericParams {
                     params: params.as_object()
                         .map(|obj| obj.iter()

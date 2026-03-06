@@ -11,16 +11,16 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyType {
-    Momentum,
-    MeanReversion,
+    Custom,
+    CustomMarketMaking,
     PortfolioMixed,
 }
 
 impl std::fmt::Display for StrategyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StrategyType::Momentum => write!(f, "momentum"),
-            StrategyType::MeanReversion => write!(f, "mean_reversion"),
+            StrategyType::Custom => write!(f, "custom"),
+            StrategyType::CustomMarketMaking => write!(f, "custom_market_making"),
             StrategyType::PortfolioMixed => write!(f, "portfolio_mixed"),
         }
     }
@@ -31,10 +31,10 @@ impl std::str::FromStr for StrategyType {
     
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "momentum" => Ok(StrategyType::Momentum),
-            "mean_reversion" | "meanreversion" => Ok(StrategyType::MeanReversion),
+            "custom" | "momentum" | "mean_reversion" | "meanreversion" | "arbitrage" | "liquidity_sweep" => Ok(StrategyType::Custom),
+            "custom_market_making" | "custommarketmaking" | "market_making" | "marketmaking" => Ok(StrategyType::CustomMarketMaking),
             "portfolio_mixed" | "portfoliomixed" => Ok(StrategyType::PortfolioMixed),
-            _ => Err(format!("Unknown strategy type: {}", s)),
+            _ => Ok(StrategyType::Custom),
         }
     }
 }
@@ -344,8 +344,12 @@ mod tests {
     
     #[test]
     fn test_strategy_type_parsing() {
-        assert_eq!("momentum".parse::<StrategyType>().unwrap(), StrategyType::Momentum);
-        assert_eq!("mean_reversion".parse::<StrategyType>().unwrap(), StrategyType::MeanReversion);
+        // Legacy names map to Custom
+        assert_eq!("momentum".parse::<StrategyType>().unwrap(), StrategyType::Custom);
+        assert_eq!("mean_reversion".parse::<StrategyType>().unwrap(), StrategyType::Custom);
+        // New names
+        assert_eq!("custom".parse::<StrategyType>().unwrap(), StrategyType::Custom);
+        assert_eq!("custom_market_making".parse::<StrategyType>().unwrap(), StrategyType::CustomMarketMaking);
         assert_eq!("portfolio_mixed".parse::<StrategyType>().unwrap(), StrategyType::PortfolioMixed);
     }
     
