@@ -170,7 +170,7 @@ impl Config {
     /// Apply environment variable overrides
     pub fn apply_environment_overrides(&mut self) {
         // Database-like environment variables
-        if let Ok(mb_address) = std::env::var("MESSAGE_BROKER_ADDRESS") {
+        if let Ok(mb_address) = std::env::var("MESSAGE_BROKER_HOST").or_else(|_| std::env::var("MESSAGE_BROKER_ADDRESS")) {
             self.message_broker.address = mb_address;
         }
         if let Ok(mb_port) = std::env::var("MESSAGE_BROKER_PORT") {
@@ -251,7 +251,7 @@ impl Default for Config {
             environment: Environment::Development,
             message_broker: MessageBroker {
                 address: "localhost".to_string(),
-                port: 5672,
+                port: 8080,
                 max_connections: 10,
                 buffer_size: 8192,
                 compression_enabled: true,

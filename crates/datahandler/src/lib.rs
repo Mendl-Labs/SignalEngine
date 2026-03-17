@@ -144,8 +144,8 @@ pub struct BrokerConfig {
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
-            address: std::env::var("BROKER_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            port: std::env::var("BROKER_PORT")
+            address: std::env::var("MESSAGE_BROKER_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            port: std::env::var("MESSAGE_BROKER_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
