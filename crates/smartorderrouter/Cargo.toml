@@ -20,3 +20,4 @@ crossbeam = "0.8"
 diesel-async = { version = "0.5", features = ["postgres", "deadpool"] }
 diesel = { version = "2.2", features = ["postgres", "uuid"] }
 base64 = "0.22"
+log = "0.4"

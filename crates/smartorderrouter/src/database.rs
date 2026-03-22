@@ -560,6 +560,99 @@ pub async fn load_credentials_for_exchange(
     Ok(credential)
 }
 
+// ============================================================================
+// Background SOR Database Writer
+// ============================================================================
+
+/// Events that can be sent to the background SOR writer.
+#[derive(Debug)]
+pub enum SorDbEvent {
+    PersistRoute {
+        route: crate::SmartOrderRoute,
+        strategy_name: String,
+    },
+    RecordFill {
+        order_unique_id: String,
+        fill_id: String,
+        quantity: f64,
+        price: f64,
+        fees: f64,
+    },
+    UpdateStatus {
+        order_unique_id: String,
+        new_status: RouteStatus,
+        reason: Option<String>,
+    },
+}
+
+/// A bounded-channel wrapper around [`OrderDatabasePersistence`] that keeps
+/// database I/O off the order execution hot path.
+///
+/// All sends are `try_send` — if the channel is full, the event is dropped
+/// and an overflow counter is incremented so callers can observe back-pressure.
+pub struct BackgroundSorWriter {
+    sender: tokio::sync::mpsc::Sender<SorDbEvent>,
+    overflow: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BackgroundSorWriter {
+    /// Create the writer and spawn its background drain task.
+    ///
+    /// * `persistence` – the real DB persistence layer.
+    /// * `channel_capacity` – bounded channel size (default: 5000).
+    pub fn spawn(persistence: Arc<OrderDatabasePersistence>, channel_capacity: usize) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SorDbEvent>(channel_capacity);
+        let overflow = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let overflow_clone = Arc::clone(&overflow);
+
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    SorDbEvent::PersistRoute { route, strategy_name } => {
+                        if let Err(e) = persistence.persist_route(&route, &strategy_name).await {
+                            log::error!("[SOR-WRITER] Failed to persist route {}: {}", route.id, e);
+                        }
+                    }
+                    SorDbEvent::RecordFill { order_unique_id, fill_id, quantity, price, fees } => {
+                        if let Err(e) = persistence.record_fill(&order_unique_id, &fill_id, quantity, price, fees).await {
+                            log::error!("[SOR-WRITER] Failed to record fill {}: {}", fill_id, e);
+                        }
+                    }
+                    SorDbEvent::UpdateStatus { order_unique_id, new_status, reason } => {
+                        if let Err(e) = persistence.update_order_status(&order_unique_id, new_status, reason.as_deref()).await {
+                            log::error!("[SOR-WRITER] Failed to update status for {}: {}", order_unique_id, e);
+                        }
+                    }
+                }
+            }
+            // Channel closed — graceful shutdown
+            let overflow_count = overflow_clone.load(std::sync::atomic::Ordering::Relaxed);
+            if overflow_count > 0 {
+                log::warn!("[SOR-WRITER] Shutting down. Total overflow (dropped events): {}", overflow_count);
+            }
+            log::info!("[SOR-WRITER] Background SOR writer shut down cleanly.");
+        });
+
+        Self { sender: tx, overflow }
+    }
+
+    /// Non-blocking send. Returns `true` if enqueued, `false` if dropped.
+    pub fn try_send(&self, event: SorDbEvent) -> bool {
+        match self.sender.try_send(event) {
+            Ok(_) => true,
+            Err(_) => {
+                self.overflow.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Number of events dropped due to channel full.
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

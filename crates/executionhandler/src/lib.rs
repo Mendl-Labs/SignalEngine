@@ -34,6 +34,7 @@ pub mod graceful_shutdown;
 pub mod order_wal;
 pub mod hot_config;
 pub mod multi_tenant;
+pub mod portfolio_snapshotter;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -187,6 +188,9 @@ pub use multi_tenant::{
     TenantRateLimiter, MultiTenantExecutionResult,
 };
 
+// Periodic portfolio PnL snapshotter (off-hot-path persistence)
+pub use portfolio_snapshotter::{PortfolioSnapshotter, PortfolioSnapshotterConfig};
+
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::monitoring::MonitoringThresholds;
@@ -287,7 +291,32 @@ pub struct UltraLowLatencyExecutionHandler {
     position_tracker: Arc<PositionTracker>,
     performance_monitor: Arc<PerformanceMonitor>,
     execution_database: Option<Arc<dyn DatabaseExecutionPersistence>>,
+    /// Bounded channel sender for off-hot-path execution logging.
+    /// Sends are non-blocking (try_send) so the trading loop is never stalled.
+    execution_log_sender: Option<tokio::sync::mpsc::Sender<ExecutionData>>,
+    /// Tracks how many executions were dropped due to a full channel.
+    execution_log_overflow: Arc<std::sync::atomic::AtomicU64>,
     _logger: Arc<SignalEngineLogger>,
+}
+
+/// Configuration for the background execution writer.
+pub struct ExecutionWriterConfig {
+    /// Max entries buffered before back-pressure drop.  Default: 10 000.
+    pub channel_capacity: usize,
+    /// Number of records accumulated before a batch flush.  Default: 50.
+    pub batch_size: usize,
+    /// Max time between flushes (even when batch is not full).  Default: 1 s.
+    pub flush_interval: std::time::Duration,
+}
+
+impl Default for ExecutionWriterConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: 10_000,
+            batch_size: 50,
+            flush_interval: std::time::Duration::from_secs(1),
+        }
+    }
 }
 
 impl UltraLowLatencyExecutionHandler {
@@ -305,66 +334,152 @@ impl UltraLowLatencyExecutionHandler {
             position_tracker: Arc::new(PositionTracker::new()),
             performance_monitor: Arc::new(PerformanceMonitor::new(MonitoringThresholds::default())),
             execution_database: None,
+            execution_log_sender: None,
+            execution_log_overflow: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             _logger: logger,
         }
     }
 
-    /// Create a new execution handler with database integration
+    /// Create a new execution handler with database integration.
+    ///
+    /// Spawns a background writer task that batches execution records off the
+    /// hot path.  The writer flushes on interval, batch-size threshold, **and**
+    /// on graceful shutdown (when the sender half is dropped).
     pub async fn new_with_database(database: Arc<dyn DatabaseExecutionPersistence>) -> Self {
+        Self::new_with_database_config(database, ExecutionWriterConfig::default()).await
+    }
+
+    /// Create a new execution handler with database integration and custom writer config.
+    pub async fn new_with_database_config(
+        database: Arc<dyn DatabaseExecutionPersistence>,
+        config: ExecutionWriterConfig,
+    ) -> Self {
         let mut handler = Self::new().await;
-        handler.execution_database = Some(database);
+        let overflow_counter = Arc::clone(&handler.execution_log_overflow);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ExecutionData>(config.channel_capacity);
+        handler.execution_log_sender = Some(tx);
+        handler.execution_database = Some(Arc::clone(&database));
+        Self::spawn_background_writer(database, rx, config, overflow_counter);
         handler
     }
 
-    /// Save execution details to database
-    fn save_execution_to_database(&self, signal: &Signal, execution_result: &ExecutionResult, exchange_name: &str, latency_ns: u64) {
-        if let Some(ref database) = self.execution_database {
-            // Save each fill as a separate execution record
-            for fill in &execution_result.fills {
-                let execution_data = ExecutionData {
-                    order_id: execution_result.order_id.clone(),
-                    exchange: exchange_name.to_string(),
-                    symbol: signal.symbol.clone(),
-                    side: match signal.action {
-                        SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "Buy".to_string(),
-                        SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => "Sell".to_string(),
-                    },
-                    quantity: signal.quantity,
-                    filled_quantity: fill.quantity,
-                    price: fill.price,
-                    fee: fill.fee,
-                    status: format!("{:?}", execution_result.status),
-                    executed_at: Utc::now(),
-                    latency_ns,
-                };
-                
-                if let Err(e) = database.save_execution(&execution_data) {
-                    TradingLogger::log_error("database", "save_execution", &e, Some(&signal.symbol));
+    /// Returns the number of execution records dropped because the channel was full.
+    pub fn execution_log_overflow_count(&self) -> u64 {
+        self.execution_log_overflow.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Spawn a background task that drains the execution channel in batches
+    /// and persists to the database.  Flushes remaining records when the
+    /// channel closes (graceful shutdown).
+    fn spawn_background_writer(
+        database: Arc<dyn DatabaseExecutionPersistence>,
+        mut rx: tokio::sync::mpsc::Receiver<ExecutionData>,
+        config: ExecutionWriterConfig,
+        overflow_counter: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        tokio::spawn(async move {
+            let mut batch: Vec<ExecutionData> = Vec::with_capacity(config.batch_size);
+            let mut flush_interval = tokio::time::interval(config.flush_interval);
+            flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    maybe_item = rx.recv() => {
+                        match maybe_item {
+                            Some(data) => {
+                                batch.push(data);
+                                if batch.len() >= config.batch_size {
+                                    Self::flush_batch(&database, &mut batch);
+                                }
+                            }
+                            None => {
+                                // Channel closed — final flush before exit
+                                if !batch.is_empty() {
+                                    Self::flush_batch(&database, &mut batch);
+                                }
+                                let overflow = overflow_counter.load(std::sync::atomic::Ordering::Relaxed);
+                                if overflow > 0 {
+                                    log::warn!(
+                                        "[EXECUTION-WRITER] Shutting down. Total overflows (dropped records): {}",
+                                        overflow
+                                    );
+                                }
+                                log::info!("[EXECUTION-WRITER] Background writer shut down cleanly.");
+                                return;
+                            }
+                        }
+                    }
+                    _ = flush_interval.tick() => {
+                        if !batch.is_empty() {
+                            Self::flush_batch(&database, &mut batch);
+                        }
+                        // Periodically report overflow metrics
+                        let overflow = overflow_counter.load(std::sync::atomic::Ordering::Relaxed);
+                        if overflow > 0 {
+                            log::warn!(
+                                "[EXECUTION-WRITER] Execution log overflow count: {}",
+                                overflow
+                            );
+                        }
+                    }
                 }
             }
-            
-            // If no fills but execution happened (pending order), save the order placement
-            if execution_result.fills.is_empty() {
-                let execution_data = ExecutionData {
-                    order_id: execution_result.order_id.clone(),
-                    exchange: exchange_name.to_string(),
-                    symbol: signal.symbol.clone(),
-                    side: match signal.action {
-                        SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "Buy".to_string(),
-                        SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => "Sell".to_string(),
-                    },
-                    quantity: signal.quantity,
-                    filled_quantity: 0.0,
-                    price: signal.price.unwrap_or(0.0),
-                    fee: 0.0,
-                    status: format!("{:?}", execution_result.status),
-                    executed_at: Utc::now(),
-                    latency_ns,
-                };
-                
-                if let Err(e) = database.save_execution(&execution_data) {
-                    TradingLogger::log_error("database", "save_execution", &e, Some(&signal.symbol));
-                }
+        });
+    }
+
+    /// Persist a batch of execution records to the database.
+    fn flush_batch(database: &Arc<dyn DatabaseExecutionPersistence>, batch: &mut Vec<ExecutionData>) {
+        for data in batch.drain(..) {
+            if let Err(e) = database.save_execution(&data) {
+                log::error!(
+                    "[EXECUTION-WRITER] Failed to persist execution {}: {}",
+                    data.order_id, e
+                );
+            }
+        }
+    }
+
+    /// Enqueue execution details for background persistence (non-blocking).
+    fn save_execution_to_database(&self, signal: &Signal, execution_result: &ExecutionResult, exchange_name: &str, latency_ns: u64) {
+        let sender = match self.execution_log_sender {
+            Some(ref s) => s,
+            None => return, // No background writer configured
+        };
+
+        let build_data = |fill_qty: f64, fill_price: f64, fill_fee: f64, status: &str| -> ExecutionData {
+            ExecutionData {
+                order_id: execution_result.order_id.clone(),
+                exchange: exchange_name.to_string(),
+                symbol: signal.symbol.clone(),
+                side: match signal.action {
+                    SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "Buy".to_string(),
+                    SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => "Sell".to_string(),
+                },
+                quantity: signal.quantity,
+                filled_quantity: fill_qty,
+                price: fill_price,
+                fee: fill_fee,
+                status: status.to_string(),
+                executed_at: Utc::now(),
+                latency_ns,
+            }
+        };
+
+        let status = format!("{:?}", execution_result.status);
+
+        // Send each fill as a separate execution record (non-blocking try_send)
+        for fill in &execution_result.fills {
+            let data = build_data(fill.quantity, fill.price, fill.fee, &status);
+            if sender.try_send(data).is_err() {
+                self.execution_log_overflow.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // If no fills, save the order placement record
+        if execution_result.fills.is_empty() {
+            let data = build_data(0.0, signal.price.unwrap_or(0.0), 0.0, &status);
+            if sender.try_send(data).is_err() {
+                self.execution_log_overflow.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

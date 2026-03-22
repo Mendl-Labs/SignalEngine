@@ -18,6 +18,8 @@ pub use database::{
     load_exchange_credentials,
     load_credentials_for_exchange,
     create_pool,
+    BackgroundSorWriter,
+    SorDbEvent,
 };
 
 /// Order side enumeration
