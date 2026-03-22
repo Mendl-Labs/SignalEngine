@@ -69,6 +69,9 @@ pub struct StrategyInstance {
     /// Optional description
     pub description: Option<String>,
     
+    /// Python source code (for custom strategies loaded from backtest)
+    pub python_source: Option<String>,
+    
     /// Additional metadata
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,

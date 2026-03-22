@@ -131,6 +131,7 @@ mod tests {
             portfolio_risk: PortfolioRiskLimits::default(),
             enabled: true,
             description: None,
+            python_source: None,
             metadata: HashMap::new(),
         }
     }

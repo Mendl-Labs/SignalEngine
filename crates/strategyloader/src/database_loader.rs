@@ -92,6 +92,7 @@ impl DatabaseStrategyLoader {
             portfolio_risk,
             enabled: strategy.is_active,
             description: instance.description.or(strategy.description),
+            python_source: None,
             metadata,
         })
     }
@@ -135,11 +136,20 @@ impl DatabaseStrategyLoader {
                 params: Default::default(),
             }));
         
-        // Extract portfolio risk limits, override with deployment capital
+        // Extract portfolio risk limits, override with deployment capital and DB risk columns
         let mut portfolio_risk = Self::parse_portfolio_risk(&params_json);
         portfolio_risk.max_total_exposure = deployment.capital_allocation
             .to_f64()
             .unwrap_or(portfolio_risk.max_total_exposure);
+        if let Some(ref v) = deployment.max_daily_loss {
+            if let Some(f) = v.to_f64() { portfolio_risk.max_daily_loss = f; }
+        }
+        if let Some(ref v) = deployment.max_drawdown_pct {
+            if let Some(f) = v.to_f64() { portfolio_risk.max_drawdown_pct = f; }
+        }
+        if let Some(mins) = deployment.cooldown_minutes {
+            portfolio_risk.cooldown_minutes = mins as u32;
+        }
         
         // Build metadata with deployment and backtest info
         let mut metadata = std::collections::HashMap::new();
@@ -155,14 +165,15 @@ impl DatabaseStrategyLoader {
         
         Ok(crate::types::StrategyInstance {
             id: deployment.id,  // Use deployment ID as the instance ID
-            name: deployment.deployment_name,
+            name: deployment.name,
             strategy_type,
             version: "1.0".to_string(),  // Deployments don't have versions
             assets,
             parameters: strategy_params,
             portfolio_risk,
-            enabled: deployment.status == "active",
-            description: deployment.notes,
+            enabled: deployment.is_active,
+            description: deployment.description,
+            python_source: backtest.python_source_code,
             metadata,
         })
     }
@@ -309,7 +320,7 @@ impl StrategyLoader for DatabaseStrategyLoader {
             .inner_join(backtest_results::table.on(
                 deployed_strategies::backtest_result_id.eq(backtest_results::id)
             ))
-            .filter(deployed_strategies::status.eq("active"))
+            .filter(deployed_strategies::is_active.eq(true))
             .select((DeployedStrategy::as_select(), BacktestResult::as_select()))
             .load(&mut conn)
             .await
@@ -363,8 +374,8 @@ impl StrategyLoader for DatabaseStrategyLoader {
             .inner_join(backtest_results::table.on(
                 deployed_strategies::backtest_result_id.eq(backtest_results::id)
             ))
-            .filter(deployed_strategies::deployment_name.eq(name))
-            .filter(deployed_strategies::status.eq("active"))
+            .filter(deployed_strategies::name.eq(name))
+            .filter(deployed_strategies::is_active.eq(true))
             .select((DeployedStrategy::as_select(), BacktestResult::as_select()))
             .first(&mut conn)
             .await

@@ -35,6 +35,7 @@ pub mod order_wal;
 pub mod hot_config;
 pub mod multi_tenant;
 pub mod portfolio_snapshotter;
+pub mod paper_connector;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -52,6 +53,7 @@ pub use core::{
 
 pub use exchanges::ExchangeFactory;
 pub use signal::{Signal, SignalAction};
+pub use paper_connector::{PaperTradingConnector, PaperTradingConfig};
 pub use circuit_breaker::{CircuitBreaker, ExchangeCircuitBreakerManager};
 pub use position_tracker::{PositionTracker, Position, PositionSide, PortfolioPnL};
 pub use validation::{TradingValidator, VALIDATOR};

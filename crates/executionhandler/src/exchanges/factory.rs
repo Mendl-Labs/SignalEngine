@@ -3,6 +3,7 @@ use log::{info, warn, error, debug};
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
 use crate::exchanges::kraken::KrakenConnector;
 use crate::exchanges::generic::{GenericConnector, ExchangePreset};
+use crate::paper_connector::{PaperTradingConnector, PaperTradingConfig};
 use smartorderrouter::ExchangeCredential;
 
 /// Factory for creating exchange connectors
@@ -20,6 +21,13 @@ impl ExchangeFactory {
         );
         
         let exchange_lower = exchange_name.to_lowercase();
+        
+        // Paper trading connector — no real exchange needed
+        if exchange_lower == "paper" {
+            info!("[FACTORY] Creating paper trading connector");
+            let connector = PaperTradingConnector::new(PaperTradingConfig::default());
+            return Ok(Box::new(connector));
+        }
         
         // Check if this is a supported exchange using the generic connector
         if let Some(preset) = ExchangePreset::from_name(&exchange_lower) {
@@ -75,6 +83,7 @@ impl ExchangeFactory {
             "okx",
             "gemini",
             "deribit",
+            "paper",
         ]
     }
 
