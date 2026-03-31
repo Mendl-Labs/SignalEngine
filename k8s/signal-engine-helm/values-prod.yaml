@@ -1,85 +1,64 @@
 # ==============================================================================
-# SignalEngine - Production Values Override
+# SignalEngine Production Values — Hetzner k3s single-node
 # ==============================================================================
-# Usage: helm upgrade --install signal-engine ./signal-engine-helm -f values-prod.yaml
 
 global:
   environment: prod
 
-# Production replica count for high availability
-replicaCount: 3
+replicaCount: 1
 
-# Production-grade resource allocation
+image:
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-secret
+
 resources:
-  limits:
-    cpu: "8000m"
-    memory: "16Gi"
-    ephemeral-storage: "20Gi"
   requests:
-    cpu: "4000m"
-    memory: "8Gi"
-    ephemeral-storage: "10Gi"
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 4000m
+    memory: 8Gi
 
-# Enable autoscaling for production
-autoscaling:
-  enabled: true
-  minReplicas: 3
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 70
-  targetMemoryUtilizationPercentage: 80
-
-# Enable Pod Disruption Budget for production
-podDisruptionBudget:
-  enabled: true
-  minAvailable: 2
-
-# Production storage with fast SSD
+# Storage
 persistence:
   enabled: true
-  storageClass: "fast-ssd"
-  size: 500Gi
+  storageClass: "local-path"
+  size: 20Gi
 
-# Production node selection
-nodeSelector:
-  node-type: "compute-optimized"
-  network-tier: "premium"
+# Disable cloud-only features
+autoscaling:
+  enabled: false
 
-# Production tolerations
-tolerations:
-  - key: "dedicated"
-    operator: "Equal"
-    value: "trading"
-    effect: "NoSchedule"
+podDisruptionBudget:
+  enabled: false
 
-# Production priority class
-priorityClassName: "trading-critical"
+networkPolicy:
+  enabled: false
 
-# Production topology spread
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: kubernetes.io/hostname
-    whenUnsatisfiable: DoNotSchedule
-    labelSelector:
-      matchLabels:
-        app.kubernetes.io/name: signal-engine-helm
+# No special node selectors for single-node
+nodeSelector: {}
+tolerations: []
+priorityClassName: ""
+topologySpreadConstraints: []
 
-# Enable monitoring in production
+# Monitoring — disable ServiceMonitor (no Prometheus operator CRDs)
 monitoring:
   prometheus:
     serviceMonitor:
-      enabled: true
+      enabled: false
     rules:
-      enabled: true
-  alerting_enabled: true
+      enabled: false
+  alerting_enabled: false
 
-# Production logging
+# Logging — disable Elasticsearch (optional)
 logging:
-  level: "warn"
+  level: "info"
   elasticsearch:
-    enabled: true
-    endpoint: "http://elasticsearch:9200"
+    enabled: false
 
-# Production health probes (real signal-engine binary)
+# Health probes
 startupProbe:
   exec:
     command:
@@ -115,3 +94,5 @@ readinessProbe:
   timeoutSeconds: 3
   failureThreshold: 3
   successThreshold: 1
+
+affinity: {}

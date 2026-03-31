@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Set performance-optimized environment variables
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C codegen-units=1 -C panic=abort"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C codegen-units=1 -C panic=abort"
 ENV RUST_BACKTRACE=0
 
 # Set the working directory inside the container
@@ -30,7 +30,7 @@ COPY . ./
 WORKDIR /app/SignalEngine
 
 # Build the SignalEngine program
-RUN cargo build --locked --release --bin program && \
+RUN cargo build --release --bin program && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
