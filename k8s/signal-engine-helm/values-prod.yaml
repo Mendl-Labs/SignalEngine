@@ -100,3 +100,16 @@ readinessProbe:
   successThreshold: 1
 
 affinity: {}
+
+# Override env to add CONFIG_PATH
+env:
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: RUST_LOG
+    value: "signal_engine=info"
+  - name: ENVIRONMENT
+    value: "prod"
+  - name: TZ
+    value: "UTC"
+  - name: CONFIG_PATH
+    value: "/etc/signal-engine/config.toml"
