@@ -10,6 +10,10 @@ replicaCount: 1
 image:
   pullPolicy: IfNotPresent
 
+# Override test command from default values — use Dockerfile CMD
+command: []
+args: []
+
 imagePullSecrets:
   - name: ghcr-secret
 
