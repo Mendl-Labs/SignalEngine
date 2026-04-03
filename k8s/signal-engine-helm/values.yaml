@@ -655,15 +655,15 @@ testing:
 # =============================================================================
 # Deploy per-tenant with: helm install tenant-<id> . --namespace tenant-<id>
 #   --set tenantResources.enabled=true --set tenantResources.tenantId=<uuid>
-#   --set tenantResources.tier=<free|starter|professional|enterprise>
+#   --set tenantResources.tier=<explorer|trader|professional|institution|enterprise>
 
 tenantResources:
   enabled: false
   tenantId: ""
-  tier: "free"
+  tier: "explorer"
 
   profiles:
-    free:
+    explorer:
       maxCpu: "2"
       maxMemory: "4Gi"
       maxCpuLimit: "4"
@@ -681,7 +681,7 @@ tenantResources:
       maxPodCpu: "2000m"
       maxPodMemory: "4Gi"
 
-    starter:
+    trader:
       maxCpu: "4"
       maxMemory: "16Gi"
       maxCpuLimit: "8"
@@ -717,7 +717,7 @@ tenantResources:
       maxPodCpu: "8000m"
       maxPodMemory: "32Gi"
 
-    enterprise:
+    institution:
       maxCpu: "64"
       maxMemory: "256Gi"
       maxCpuLimit: "128"
@@ -734,3 +734,21 @@ tenantResources:
       maxContainerMemory: "64Gi"
       maxPodCpu: "16000m"
       maxPodMemory: "64Gi"
+
+    enterprise:
+      maxCpu: "128"
+      maxMemory: "512Gi"
+      maxCpuLimit: "256"
+      maxMemoryLimit: "1Ti"
+      maxPods: "50"
+      maxPVCs: "20"
+      maxServices: "20"
+      maxEphemeralStorage: "250Gi"
+      defaultContainerCpuRequest: "4000m"
+      defaultContainerCpuLimit: "16000m"
+      defaultContainerMemoryRequest: "16Gi"
+      defaultContainerMemoryLimit: "64Gi"
+      maxContainerCpu: "32000m"
+      maxContainerMemory: "128Gi"
+      maxPodCpu: "32000m"
+      maxPodMemory: "128Gi"

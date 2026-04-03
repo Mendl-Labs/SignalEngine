@@ -15,7 +15,7 @@ metadata:
     mendll.com/tier: {{ .Values.tenantResources.tier | quote }}
 spec:
   hard:
-    {{- $tier := .Values.tenantResources.tier | default "free" }}
+    {{- $tier := .Values.tenantResources.tier | default "explorer" }}
     {{- $profile := index .Values.tenantResources.profiles $tier }}
     requests.cpu: {{ $profile.maxCpu | quote }}
     requests.memory: {{ $profile.maxMemory | quote }}

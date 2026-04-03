@@ -11,7 +11,7 @@
 //! │                                                                     │
 //! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
 //! │  │ TenantCtx A │  │ TenantCtx B │  │ TenantCtx C │  ...          │
-//! │  │ (Pro)       │  │ (Free)      │  │ (Enterprise)│               │
+//! │  │ (Pro)       │  │ (Free)      │  │ (Live)      │               │
 //! │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
 //! │         │                │                │                       │
 //! │         └────────┬───────┴────────┬───────┘                       │
@@ -52,15 +52,16 @@ use smartorderrouter::{ExchangeCredential, DbPool, load_exchange_credentials};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscriptionTier {
-    Free,
-    Starter,
+    Explorer,
+    Trader,
     Professional,
+    Institution,
     Enterprise,
 }
 
 impl Default for SubscriptionTier {
     fn default() -> Self {
-        Self::Free
+        Self::Explorer
     }
 }
 
@@ -68,19 +69,21 @@ impl SubscriptionTier {
     /// Orders per minute limit for this tier
     pub fn orders_per_minute(&self) -> u64 {
         match self {
-            Self::Free => 10,           // 10 orders/min - testing only
-            Self::Starter => 100,       // 100 orders/min - casual trading
-            Self::Professional => 1_000, // 1000 orders/min - active trading
-            Self::Enterprise => 10_000,  // 10K orders/min - HFT
+            Self::Explorer => 10,           // 10 orders/min - paper trading only
+            Self::Trader => 100,            // 100 orders/min - basic live
+            Self::Professional => 1_000,    // 1000 orders/min - active trading
+            Self::Institution => 10_000,    // 10K orders/min - institutional
+            Self::Enterprise => 100_000,    // 100K orders/min - HFT
         }
     }
 
     /// Maximum concurrent strategies
     pub fn max_strategies(&self) -> usize {
         match self {
-            Self::Free => 1,
-            Self::Starter => 5,
-            Self::Professional => 25,
+            Self::Explorer => 3,
+            Self::Trader => 25,
+            Self::Professional => 100,
+            Self::Institution => 500,
             Self::Enterprise => usize::MAX, // Unlimited
         }
     }
@@ -88,9 +91,10 @@ impl SubscriptionTier {
     /// Maximum exchanges (API keys) allowed
     pub fn max_exchanges(&self) -> usize {
         match self {
-            Self::Free => 1,
-            Self::Starter => 3,
-            Self::Professional => 10,
+            Self::Explorer => 1,
+            Self::Trader => 1,
+            Self::Professional => 3,
+            Self::Institution => 10,
             Self::Enterprise => usize::MAX,
         }
     }
@@ -98,9 +102,10 @@ impl SubscriptionTier {
     /// Fair scheduler weight (higher = more priority)
     pub fn scheduler_weight(&self) -> u32 {
         match self {
-            Self::Free => 1,
-            Self::Starter => 3,
+            Self::Explorer => 1,
+            Self::Trader => 5,
             Self::Professional => 10,
+            Self::Institution => 25,
             Self::Enterprise => 50,
         }
     }
@@ -108,20 +113,26 @@ impl SubscriptionTier {
     /// Target latency SLA in microseconds (0 = best effort)
     pub fn latency_sla_us(&self) -> u64 {
         match self {
-            Self::Free => 0,          // Best effort, no SLA
-            Self::Starter => 100_000, // 100ms
+            Self::Explorer => 0,          // Best effort, no SLA
+            Self::Trader => 50_000,       // 50ms
             Self::Professional => 10_000, // 10ms
-            Self::Enterprise => 1_000,    // 1ms
+            Self::Institution => 1_000,   // 1ms
+            Self::Enterprise => 100,      // 100μs
         }
     }
 
     /// Parse from database tier string
     pub fn from_db_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "starter" => Self::Starter,
-            "professional" | "pro" => Self::Professional,
+            "trader" => Self::Trader,
+            "professional" => Self::Professional,
+            "institution" => Self::Institution,
             "enterprise" => Self::Enterprise,
-            _ => Self::Free,
+            // Backward compat
+            "free" => Self::Explorer,
+            "pro" => Self::Professional,
+            "live" => Self::Institution,
+            _ => Self::Explorer,
         }
     }
 }
@@ -129,9 +140,10 @@ impl SubscriptionTier {
 impl std::fmt::Display for SubscriptionTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Free => write!(f, "free"),
-            Self::Starter => write!(f, "starter"),
+            Self::Explorer => write!(f, "explorer"),
+            Self::Trader => write!(f, "trader"),
             Self::Professional => write!(f, "professional"),
+            Self::Institution => write!(f, "institution"),
             Self::Enterprise => write!(f, "enterprise"),
         }
     }
@@ -742,14 +754,14 @@ mod tests {
 
     #[test]
     fn test_subscription_tier_limits() {
-        assert_eq!(SubscriptionTier::Free.orders_per_minute(), 10);
+        assert_eq!(SubscriptionTier::Explorer.orders_per_minute(), 10);
         assert_eq!(SubscriptionTier::Professional.orders_per_minute(), 1000);
         assert_eq!(SubscriptionTier::Enterprise.max_exchanges(), usize::MAX);
     }
 
     #[test]
     fn test_rate_limiter() {
-        let mut limiter = TenantRateLimiter::new(SubscriptionTier::Free);
+        let mut limiter = TenantRateLimiter::new(SubscriptionTier::Explorer);
         
         // Should allow up to 10 orders
         for _ in 0..10 {
@@ -763,10 +775,10 @@ mod tests {
     #[test]
     fn test_fair_scheduler_weights() {
         let scheduler = FairScheduler::new();
-        let t1 = Uuid::new_v4(); // Free
+        let t1 = Uuid::new_v4(); // Explorer
         let t2 = Uuid::new_v4(); // Enterprise
         
-        scheduler.register_tenant(t1, SubscriptionTier::Free);
+        scheduler.register_tenant(t1, SubscriptionTier::Explorer);
         scheduler.register_tenant(t2, SubscriptionTier::Enterprise);
         
         // Enterprise should be selected first (50 credits vs 1)
