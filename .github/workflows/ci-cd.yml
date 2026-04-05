@@ -141,6 +141,26 @@ jobs:
         id: skip-test-result
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
+      - name: Install cargo-tarpaulin
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo install cargo-tarpaulin --locked || true
+
+      - name: Run Rust Coverage
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          cd SignalEngine
+          cargo tarpaulin --workspace --out xml --output-dir ./coverage --timeout 300
+
+      - name: Upload Coverage to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: signalengine
+          files: SignalEngine/coverage/cobertura.xml
+          fail_ci_if_error: false
+
   build:
     name: Build & Push
     runs-on: ubuntu-latest
