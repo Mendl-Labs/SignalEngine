@@ -334,6 +334,8 @@ jobs:
           fi
           echo "[OK] Azure credentials parsed successfully"
 
+          SUBSCRIPTION_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.subscriptionId // empty')
+
           echo "[INFO] Authenticating with Azure..."
           az login --service-principal \
             --username "$CLIENT_ID" \
@@ -341,6 +343,13 @@ jobs:
             --tenant "$TENANT_ID" \
             --output none
           echo "[OK] Successfully authenticated with Azure"
+
+          # Set subscription if provided in credentials
+          if [ -n "${SUBSCRIPTION_ID:-}" ]; then
+            az account set --subscription "$SUBSCRIPTION_ID"
+            echo "[OK] Set subscription to $SUBSCRIPTION_ID"
+          fi
+          echo "[INFO] Active subscription: $(az account show --query '{name:name, id:id}' -o tsv)"
 
           # Required secrets
           REQUIRED_SECRETS=(
@@ -356,8 +365,8 @@ jobs:
           echo "[INFO] Fetching required secrets..."
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
             ENV_NAME="${SECRET_NAME//-/_}"
-            VALUE=$(az keyvault secret show --vault-name "$AZURE_KEYVAULT_NAME" --name "$SECRET_NAME" --query value -o tsv 2>&1) || {
-              echo "::error::[FAIL] Failed to fetch required secret $SECRET_NAME"
+            VALUE=$(az keyvault secret show --vault-name "$AZURE_KEYVAULT_NAME" --name "$SECRET_NAME" --query value -o tsv) || {
+              echo "::error::[FAIL] Failed to fetch required secret $SECRET_NAME from vault $AZURE_KEYVAULT_NAME"
               exit 1
             }
             if [ -z "$VALUE" ]; then
