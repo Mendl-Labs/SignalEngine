@@ -23,8 +23,9 @@ impl ExchangeFactory {
         let exchange_lower = exchange_name.to_lowercase();
         
         // Paper trading connector — no real exchange needed
-        if exchange_lower == "paper" {
-            info!("[FACTORY] Creating paper trading connector");
+        // Matches "paper" or "paper_<instance_id>" for per-deployment isolation
+        if exchange_lower == "paper" || exchange_lower.starts_with("paper_") {
+            info!("[FACTORY] Creating paper trading connector for: {}", exchange_name);
             let connector = PaperTradingConnector::new(PaperTradingConfig::default());
             return Ok(Box::new(connector));
         }

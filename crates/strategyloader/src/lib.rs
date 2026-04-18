@@ -27,6 +27,9 @@ pub mod deployment_subscriber;
 #[cfg(feature = "postgres")]
 pub mod database_loader;
 
+#[cfg(feature = "postgres")]
+pub mod paper_trade_writer;
+
 // Re-exports
 pub use types::*;
 pub use loader::{StrategyLoader, ChainedStrategyLoader};
@@ -45,3 +48,6 @@ pub use deployment_subscriber::{
 
 #[cfg(feature = "postgres")]
 pub use database_loader::DatabaseStrategyLoader;
+
+#[cfg(feature = "postgres")]
+pub use paper_trade_writer::{PaperTradeWriter, PaperFillEvent};
