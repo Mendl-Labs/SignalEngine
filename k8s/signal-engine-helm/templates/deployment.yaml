@@ -35,7 +35,7 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        version: {{ .Values.image.tag | default .Chart.AppVersion }}
+        version: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
