@@ -281,7 +281,7 @@ jobs:
 
   deploy:
     name: Deploy to Kubernetes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     needs: build
     if: github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
