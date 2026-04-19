@@ -302,7 +302,7 @@ enum WriteCommand {
     Append(WalEntry),
     Checkpoint,
     Flush,
-    Shutdown,
+    Shutdown(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Order Write-Ahead Log
@@ -455,7 +455,7 @@ impl OrderWal {
                             }
                             last_flush = std::time::Instant::now();
                         }
-                        Some(WriteCommand::Shutdown) | None => {
+                        Some(WriteCommand::Shutdown(done_tx)) => {
                             info!("[WAL] Shutdown command received, performing final flush (entries={})", buffer.len());
                             // Final flush
                             if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
@@ -466,6 +466,17 @@ impl OrderWal {
                             }
                             info!("[WAL] Writer shutdown complete, total_bytes_written={}", 
                                 self.stats.bytes_written.load(Ordering::Relaxed));
+                            let _ = done_tx.send(());
+                            break;
+                        }
+                        None => {
+                            info!("[WAL] Channel closed, performing final flush (entries={})", buffer.len());
+                            if let Err(e) = self.flush_buffer(&mut file, &mut buffer).await {
+                                error!("[WAL] Final flush error: {}", e);
+                            }
+                            if let Err(e) = file.sync_all().await {
+                                error!("[WAL] Final sync error: {}", e);
+                            }
                             break;
                         }
                     }
@@ -864,10 +875,13 @@ impl OrderWal {
 
     /// Shutdown the WAL gracefully
     pub async fn shutdown(&self) -> Result<(), WalError> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         self.write_tx
-            .send(WriteCommand::Shutdown)
+            .send(WriteCommand::Shutdown(done_tx))
             .await
-            .map_err(|_| WalError::ChannelClosed)
+            .map_err(|_| WalError::ChannelClosed)?;
+        let _ = done_rx.await;
+        Ok(())
     }
 }
 
@@ -1032,7 +1046,6 @@ mod tests {
                 .unwrap();
             wal.log_submitted("order-1").await.unwrap();
             wal.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
             wal.shutdown().await.unwrap();
         }
 
