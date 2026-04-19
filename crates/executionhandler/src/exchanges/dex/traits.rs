@@ -260,3 +260,120 @@ pub enum TransactionStatus {
     Failed(u32),         // Error code
     Dropped,             // Transaction dropped from mempool
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === BlockchainNetwork ===
+
+    #[test]
+    fn test_chain_id_evm_networks() {
+        assert_eq!(BlockchainNetwork::Ethereum.chain_id(), Some(1));
+        assert_eq!(BlockchainNetwork::Arbitrum.chain_id(), Some(42161));
+        assert_eq!(BlockchainNetwork::Optimism.chain_id(), Some(10));
+        assert_eq!(BlockchainNetwork::Polygon.chain_id(), Some(137));
+        assert_eq!(BlockchainNetwork::BSC.chain_id(), Some(56));
+        assert_eq!(BlockchainNetwork::Avalanche.chain_id(), Some(43114));
+        assert_eq!(BlockchainNetwork::Base.chain_id(), Some(8453));
+        assert_eq!(BlockchainNetwork::EthereumGoerli.chain_id(), Some(5));
+    }
+
+    #[test]
+    fn test_chain_id_non_evm_returns_none() {
+        assert_eq!(BlockchainNetwork::Sui.chain_id(), None);
+        assert_eq!(BlockchainNetwork::SuiTestnet.chain_id(), None);
+        assert_eq!(BlockchainNetwork::SuiDevnet.chain_id(), None);
+        assert_eq!(BlockchainNetwork::Solana.chain_id(), None);
+        assert_eq!(BlockchainNetwork::SolanaDevnet.chain_id(), None);
+    }
+
+    #[test]
+    fn test_is_evm() {
+        assert!(BlockchainNetwork::Ethereum.is_evm());
+        assert!(BlockchainNetwork::Arbitrum.is_evm());
+        assert!(BlockchainNetwork::Base.is_evm());
+        assert!(!BlockchainNetwork::Sui.is_evm());
+        assert!(!BlockchainNetwork::Solana.is_evm());
+    }
+
+    #[test]
+    fn test_is_sui() {
+        assert!(BlockchainNetwork::Sui.is_sui());
+        assert!(BlockchainNetwork::SuiTestnet.is_sui());
+        assert!(BlockchainNetwork::SuiDevnet.is_sui());
+        assert!(!BlockchainNetwork::Ethereum.is_sui());
+        assert!(!BlockchainNetwork::Solana.is_sui());
+    }
+
+    #[test]
+    fn test_rpc_url_non_empty() {
+        let networks = [
+            BlockchainNetwork::Sui, BlockchainNetwork::SuiTestnet, BlockchainNetwork::SuiDevnet,
+            BlockchainNetwork::Ethereum, BlockchainNetwork::Arbitrum, BlockchainNetwork::Solana,
+        ];
+        for net in &networks {
+            assert!(!net.rpc_url().is_empty(), "{:?} has empty rpc_url", net);
+            assert!(net.rpc_url().starts_with("https://"), "{:?} rpc_url not https", net);
+        }
+    }
+
+    #[test]
+    fn test_finality_time_sui_fastest() {
+        assert_eq!(BlockchainNetwork::Sui.finality_time_ms(), 400);
+        assert!(BlockchainNetwork::Sui.finality_time_ms() < BlockchainNetwork::Ethereum.finality_time_ms());
+        assert_eq!(BlockchainNetwork::Ethereum.finality_time_ms(), 12_000);
+    }
+
+    // === DexConfig ===
+
+    #[test]
+    fn test_dex_config_default() {
+        let cfg = DexConfig::default();
+        assert_eq!(cfg.exchange_name, "Cetus");
+        assert_eq!(cfg.network, BlockchainNetwork::Sui);
+        assert_eq!(cfg.slippage_bps, 30);
+        assert!(cfg.wallet_private_key.is_empty());
+        assert!(!cfg.rpc_url.is_empty());
+        assert_eq!(cfg.min_confirmations, 1);
+    }
+
+    // === DexQuote, GasEstimate, TransactionStatus ===
+
+    #[test]
+    fn test_dex_quote_construction() {
+        let q = DexQuote {
+            token_in: "SUI".into(),
+            token_out: "USDC".into(),
+            amount_in: 100.0,
+            expected_amount_out: 99.7,
+            minimum_amount_out: 99.4,
+            price_impact_bps: 15,
+            route: vec!["SUI".into(), "USDC".into()],
+            estimated_gas: 10_000,
+            timestamp_ns: 123456,
+        };
+        assert_eq!(q.route.len(), 2);
+        assert!(q.expected_amount_out > q.minimum_amount_out);
+    }
+
+    #[test]
+    fn test_gas_estimate_construction() {
+        let g = GasEstimate {
+            gas_limit: 100_000,
+            base_fee: 1_000,
+            priority_fee: 0,
+            max_fee: 1_000,
+            estimated_cost_usd: 0.0001,
+        };
+        assert!(g.estimated_cost_usd < 0.01);
+    }
+
+    #[test]
+    fn test_transaction_status_variants() {
+        assert_eq!(TransactionStatus::Pending, TransactionStatus::Pending);
+        assert_eq!(TransactionStatus::Confirmed(1), TransactionStatus::Confirmed(1));
+        assert_ne!(TransactionStatus::Confirmed(1), TransactionStatus::Confirmed(2));
+        assert_eq!(TransactionStatus::Dropped, TransactionStatus::Dropped);
+    }
+}

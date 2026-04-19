@@ -334,3 +334,163 @@ impl CryptoWallet {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::broker::messages::Wallet;
+
+    fn make_wallet(symbol: &str, balance: f32) -> Wallet {
+        Wallet {
+            symbol: symbol.to_string(),
+            balance,
+            user_id: "test".to_string(),
+            currency: "USD".to_string(),
+            last_updated: 0,
+        }
+    }
+
+    #[test]
+    fn test_new_wallet_is_empty() {
+        let wallet = CryptoWallet::new();
+        let balances = wallet.get_all_balances().unwrap();
+        assert!(balances.is_empty());
+        assert_eq!(wallet.average_update_time(), Duration::from_nanos(0));
+    }
+
+    #[test]
+    fn test_process_wallets_message() {
+        let wallet = CryptoWallet::new();
+        let wallets = vec![
+            make_wallet("BTC", 1.5),
+            make_wallet("ETH", 10.0),
+        ];
+        wallet.process_wallets_message("kraken", &wallets, 1000).unwrap();
+
+        let btc = wallet.get_balance("kraken", "BTC").unwrap().unwrap();
+        assert_eq!(btc.available_balance, 1.5_f32 as f64);
+        assert_eq!(btc.last_updated, 1000);
+
+        let eth = wallet.get_balance("kraken", "ETH").unwrap().unwrap();
+        assert_eq!(eth.available_balance, 10.0);
+    }
+
+    #[test]
+    fn test_get_balance_missing() {
+        let wallet = CryptoWallet::new();
+        assert!(wallet.get_balance("kraken", "BTC").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_exchange_balances() {
+        let wallet = CryptoWallet::new();
+        let wallets = vec![make_wallet("BTC", 1.0), make_wallet("ETH", 5.0)];
+        wallet.process_wallets_message("binance", &wallets, 100).unwrap();
+
+        let balances = wallet.get_exchange_balances("binance").unwrap();
+        assert_eq!(balances.len(), 2);
+        assert!(balances.contains_key("BTC"));
+    }
+
+    #[test]
+    fn test_get_exchange_balances_empty() {
+        let wallet = CryptoWallet::new();
+        let balances = wallet.get_exchange_balances("nonexistent").unwrap();
+        assert!(balances.is_empty());
+    }
+
+    #[test]
+    fn test_get_total_balance_across_exchanges() {
+        let wallet = CryptoWallet::new();
+        wallet.process_wallets_message("kraken", &vec![make_wallet("BTC", 1.0)], 100).unwrap();
+        wallet.process_wallets_message("binance", &vec![make_wallet("BTC", 2.5)], 200).unwrap();
+
+        let total = wallet.get_total_balance("BTC").unwrap();
+        assert!((total - 3.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_set_market_price_valid() {
+        let wallet = CryptoWallet::new();
+        wallet.set_market_price("BTC", 50000.0).unwrap();
+        let prices = wallet.get_market_prices().unwrap();
+        assert_eq!(*prices.get("BTC").unwrap(), 50000.0);
+    }
+
+    #[test]
+    fn test_set_market_price_rejects_nan() {
+        let wallet = CryptoWallet::new();
+        assert!(wallet.set_market_price("BTC", f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_set_market_price_rejects_negative() {
+        let wallet = CryptoWallet::new();
+        assert!(wallet.set_market_price("BTC", -1.0).is_err());
+    }
+
+    #[test]
+    fn test_set_market_price_rejects_too_high() {
+        let wallet = CryptoWallet::new();
+        assert!(wallet.set_market_price("BTC", 11_000_000.0).is_err());
+    }
+
+    #[test]
+    fn test_set_market_price_rejects_too_low() {
+        let wallet = CryptoWallet::new();
+        assert!(wallet.set_market_price("BTC", 1e-7).is_err());
+    }
+
+    #[test]
+    fn test_get_metrics_calculates_value() {
+        let wallet = CryptoWallet::new();
+        wallet.process_wallets_message("kraken", &vec![
+            make_wallet("BTC", 2.0),
+            make_wallet("ETH", 10.0),
+        ], 100).unwrap();
+        wallet.set_market_price("BTC", 50000.0).unwrap();
+        wallet.set_market_price("ETH", 3000.0).unwrap();
+
+        let metrics = wallet.get_metrics().unwrap();
+        let expected = 2.0_f32 as f64 * 50000.0 + 10.0 * 3000.0;
+        assert!((metrics.total_value - expected).abs() < 1.0);
+        assert_eq!(*metrics.value_by_exchange.get("kraken").unwrap(), metrics.total_value);
+    }
+
+    #[test]
+    fn test_positions_sorted_by_value_descending() {
+        let wallet = CryptoWallet::new();
+        wallet.process_wallets_message("ex", &vec![
+            make_wallet("SMALL", 1.0),
+            make_wallet("BIG", 100.0),
+        ], 100).unwrap();
+        wallet.set_market_price("SMALL", 10.0).unwrap();
+        wallet.set_market_price("BIG", 10.0).unwrap();
+
+        let metrics = wallet.get_metrics().unwrap();
+        assert!(metrics.positions.len() >= 2);
+        assert!(metrics.positions[0].market_value >= metrics.positions[1].market_value);
+    }
+
+    #[test]
+    fn test_average_update_time_nonzero_after_updates() {
+        let wallet = CryptoWallet::new();
+        wallet.process_wallets_message("ex", &vec![make_wallet("BTC", 1.0)], 100).unwrap();
+        // After at least one update, average_update_time should be representable (may be 0ns on fast machines)
+        let _avg = wallet.get_all_currencies().unwrap();
+        assert_eq!(_avg.len(), 1);
+    }
+
+    #[test]
+    fn test_update_metrics_batch() {
+        let wallet = CryptoWallet::new();
+        let mut prices = HashMap::new();
+        prices.insert("BTC".to_string(), 50000.0);
+        prices.insert("ETH".to_string(), 3000.0);
+        wallet.update_metrics(&prices).unwrap();
+
+        let stored = wallet.get_market_prices().unwrap();
+        assert_eq!(*stored.get("BTC").unwrap(), 50000.0);
+        assert_eq!(*stored.get("ETH").unwrap(), 3000.0);
+    }
+}

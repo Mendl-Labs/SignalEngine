@@ -349,3 +349,251 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // ========== Config::default() ==========
+
+    #[test]
+    fn test_default_config_is_valid() {
+        let cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.environment, Environment::Development);
+        assert!(!cfg.strategies.is_empty());
+        assert!(!cfg.exchanges.is_empty());
+        assert!(cfg.performance.worker_threads > 0);
+    }
+
+    // ========== Config::new() ==========
+
+    #[test]
+    fn test_config_new_valid_yaml() {
+        let yaml = r#"
+environment: Production
+message_broker:
+  address: "localhost"
+  port: 9090
+  max_connections: 5
+  buffer_size: 4096
+  compression_enabled: false
+  batch_size: 500
+  flush_interval:
+    secs: 0
+    nanos: 100000000
+publish_topics: ["orders.btc"]
+subscribe_topics: ["market_data.orderbook"]
+topic_routing: {}
+strategies:
+  - id: "strat_1"
+    name: "Test Strategy"
+    strategy_type: "Momentum"
+    enabled: true
+    symbols: ["BTC/USD"]
+    exchanges: ["kraken"]
+    parameters: {}
+    risk_limits:
+      max_position_size: 5.0
+      max_order_size: 1.0
+      max_daily_loss: 500.0
+      max_position_value: 25000.0
+exchanges:
+  - name: "kraken"
+    enabled: true
+    sandbox: false
+    rate_limits:
+      orders_per_second: 10
+      requests_per_second: 50
+      window_size:
+        secs: 60
+        nanos: 0
+    timeout:
+      secs: 30
+      nanos: 0
+performance:
+  worker_threads: 2
+  cpu_affinity_enabled: false
+  cpu_cores: []
+  memory_limit_mb: 512
+  latency_threshold_us: 100
+  metrics_enabled: true
+  metrics_interval:
+    secs: 60
+    nanos: 0
+  simd_enabled: false
+security:
+  api_key_required: false
+  request_signing_required: false
+  rate_limiting_enabled: true
+  max_requests_per_minute: 1000
+  blocked_ips: []
+  allowed_ips: []
+  encryption_enabled: false
+monitoring:
+  health_check_enabled: true
+  health_check_interval:
+    secs: 30
+    nanos: 0
+  metrics_retention_days: 7
+  alerting_enabled: false
+  alert_thresholds:
+    latency_us: 1000.0
+    error_rate_percent: 5.0
+    cpu_usage_percent: 80.0
+    memory_usage_percent: 85.0
+    connection_failures: 10
+  prometheus_enabled: false
+  prometheus_port: 9090
+logging:
+  level: "info"
+  format: "json"
+  output: ["stdout"]
+  max_file_size_mb: 100
+  max_files: 5
+  structured_logging: true
+"#;
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        tmpfile.write_all(yaml.as_bytes()).unwrap();
+        tmpfile.flush().unwrap();
+
+        let cfg = Config::new(tmpfile.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.environment, Environment::Production);
+        assert_eq!(cfg.message_broker.port, 9090);
+    }
+
+    #[test]
+    fn test_config_new_invalid_yaml() {
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        tmpfile.write_all(b"{{{{not: valid: yaml::::").unwrap();
+        tmpfile.flush().unwrap();
+
+        let result = Config::new(tmpfile.path().to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_new_missing_file() {
+        let result = Config::new("/nonexistent/path/to/config.yaml");
+        assert!(result.is_err());
+    }
+
+    // ========== validate() ==========
+
+    #[test]
+    fn test_validate_empty_broker_address() {
+        let mut cfg = Config::default();
+        cfg.message_broker.address = "".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("address"));
+    }
+
+    #[test]
+    fn test_validate_zero_port() {
+        let mut cfg = Config::default();
+        cfg.message_broker.port = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn test_validate_empty_strategy_id() {
+        let mut cfg = Config::default();
+        cfg.strategies[0].id = "".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Strategy ID"));
+    }
+
+    #[test]
+    fn test_validate_empty_symbols() {
+        let mut cfg = Config::default();
+        cfg.strategies[0].symbols.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("symbol"));
+    }
+
+    #[test]
+    fn test_validate_empty_exchange_name() {
+        let mut cfg = Config::default();
+        cfg.exchanges[0].name = "".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Exchange name"));
+    }
+
+    #[test]
+    fn test_validate_zero_worker_threads() {
+        let mut cfg = Config::default();
+        cfg.performance.worker_threads = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Worker threads"));
+    }
+
+    // ========== apply_environment_overrides() ==========
+
+    #[test]
+    fn test_apply_environment_overrides() {
+        let mut cfg = Config::default();
+        
+        // Set env vars, apply, then clean up
+        std::env::set_var("MESSAGE_BROKER_HOST", "override-host");
+        std::env::set_var("ENVIRONMENT", "production");
+        std::env::set_var("LOG_LEVEL", "debug");
+        
+        cfg.apply_environment_overrides();
+        
+        // Clean up
+        std::env::remove_var("MESSAGE_BROKER_HOST");
+        std::env::remove_var("ENVIRONMENT");
+        std::env::remove_var("LOG_LEVEL");
+        
+        assert_eq!(cfg.message_broker.address, "override-host");
+        assert_eq!(cfg.environment, Environment::Production);
+        assert_eq!(cfg.logging.level, "debug");
+    }
+
+    // ========== Environment enum ==========
+
+    #[test]
+    fn test_environment_serde_roundtrip() {
+        for env in [Environment::Development, Environment::Testing, Environment::Staging, Environment::Production] {
+            let json = serde_json::to_string(&env).unwrap();
+            let deser: Environment = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser, env);
+        }
+    }
+
+    #[test]
+    fn test_environment_default() {
+        assert_eq!(Environment::default(), Environment::Development);
+    }
+
+    // ========== Nested structs serde ==========
+
+    #[test]
+    fn test_risk_limits_serde() {
+        let rl = RiskLimits {
+            max_position_size: 10.0,
+            max_order_size: 1.0,
+            max_daily_loss: 1000.0,
+            max_position_value: 50000.0,
+        };
+        let json = serde_json::to_string(&rl).unwrap();
+        let deser: RiskLimits = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.max_position_size, 10.0);
+    }
+
+    #[test]
+    fn test_alert_thresholds_serde() {
+        let at = AlertThresholds {
+            latency_us: 1000.0,
+            error_rate_percent: 5.0,
+            cpu_usage_percent: 80.0,
+            memory_usage_percent: 85.0,
+            connection_failures: 10,
+        };
+        let json = serde_json::to_string(&at).unwrap();
+        let deser: AlertThresholds = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.connection_failures, 10);
+    }
+}

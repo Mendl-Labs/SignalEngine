@@ -89,9 +89,9 @@ smartorderrouter = { path = "../smartorderrouter" }
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 
 # Database (for portfolio snapshotter — off-hot-path only)
-databaseschema = { path = "../../../databaseschema" }
-diesel-async = { version = "0.5.0", features = ["deadpool", "postgres"] }
-bigdecimal = { version = "0.4", features = ["serde"] }
+databaseschema = { path = "../../../databaseschema", optional = true }
+diesel-async = { version = "0.5.0", features = ["deadpool", "postgres"], optional = true }
+bigdecimal = { version = "0.4", features = ["serde"], optional = true }
 
 # SimulationEngine (for paper trading connector)
 simulation-engine = { path = "../../../SimulationEngine" }
@@ -107,6 +107,7 @@ winapi = { version = "0.3.9", features = ["winbase", "processthreadsapi", "winnt
 [features]
 default = []
 testing = []
+postgres = ["databaseschema", "diesel-async", "bigdecimal", "smartorderrouter/postgres"]
 
 [dev-dependencies]
 tokio-test = "0.4"

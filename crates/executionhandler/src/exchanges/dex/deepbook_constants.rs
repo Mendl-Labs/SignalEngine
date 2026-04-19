@@ -106,3 +106,50 @@ pub mod lot_sizes {
     /// SUI-USDC tick size (minimum price increment)
     pub const SUI_USDC_TICK: u64 = 1000; // 0.000001 USDC
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_pool_address_mainnet() {
+        assert!(get_pool_address("SUI", "USDC", false).is_some());
+        assert!(get_pool_address("SUI", "USDT", false).is_some());
+        assert!(get_pool_address("USDC", "USDT", false).is_some());
+        assert!(get_pool_address("UNKNOWN", "USDC", false).is_none());
+    }
+
+    #[test]
+    fn test_get_pool_address_devnet() {
+        assert!(get_pool_address("SUI", "USDC", true).is_some());
+        assert!(get_pool_address("SUI", "USDT", true).is_none());
+    }
+
+    #[test]
+    fn test_package_addresses_non_empty() {
+        assert!(!packages::MAINNET_V2.is_empty());
+        assert!(!packages::TESTNET_V2.is_empty());
+        assert!(!packages::DEVNET_V2.is_empty());
+    }
+
+    #[test]
+    fn test_get_deepbook_package() {
+        assert_eq!(get_deepbook_package(true, false), packages::MAINNET_V2);
+        assert_eq!(get_deepbook_package(false, true), packages::DEVNET_V2);
+        assert_eq!(get_deepbook_package(false, false), packages::TESTNET_V2);
+    }
+
+    #[test]
+    fn test_function_names_non_empty() {
+        assert!(!functions::PLACE_LIMIT_ORDER.is_empty());
+        assert!(!functions::PLACE_MARKET_ORDER.is_empty());
+        assert!(!functions::CANCEL_ORDER.is_empty());
+        assert!(!functions::CANCEL_ALL_ORDERS.is_empty());
+    }
+
+    #[test]
+    fn test_lot_sizes_positive() {
+        assert!(lot_sizes::SUI_USDC_LOT > 0);
+        assert!(lot_sizes::SUI_USDC_TICK > 0);
+    }
+}

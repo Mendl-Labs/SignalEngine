@@ -311,3 +311,176 @@ impl BatchProcessor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── LockFreeRingBuffer ──────────────────────────────────────
+
+    #[test]
+    fn test_ring_buffer_new_is_empty() {
+        let buf = LockFreeRingBuffer::<u64>::new(8);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_push_pop_single() {
+        let buf = LockFreeRingBuffer::<u64>::new(8);
+        assert!(buf.try_push(Box::new(42)).is_ok());
+        assert_eq!(buf.len(), 1);
+        let val = buf.try_pop().unwrap();
+        assert_eq!(*val, 42);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_ring_buffer_fifo_order() {
+        let buf = LockFreeRingBuffer::<u64>::new(8);
+        for i in 0..5u64 {
+            buf.try_push(Box::new(i)).unwrap();
+        }
+        for i in 0..5u64 {
+            assert_eq!(*buf.try_pop().unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn test_ring_buffer_full_returns_err() {
+        // capacity 4 → usable slots = 3 (one slot sentinel)
+        let buf = LockFreeRingBuffer::<u64>::new(4);
+        assert!(buf.try_push(Box::new(1)).is_ok());
+        assert!(buf.try_push(Box::new(2)).is_ok());
+        assert!(buf.try_push(Box::new(3)).is_ok());
+        assert!(buf.try_push(Box::new(4)).is_err());
+    }
+
+    #[test]
+    fn test_ring_buffer_pop_empty_returns_none() {
+        let buf = LockFreeRingBuffer::<u64>::new(4);
+        assert!(buf.try_pop().is_none());
+    }
+
+    // ── AtomicMetrics ───────────────────────────────────────────
+
+    #[test]
+    fn test_atomic_metrics_new() {
+        let m = AtomicMetrics::new();
+        let snap = m.get_snapshot();
+        assert_eq!(snap.total_orders, 0);
+        assert_eq!(snap.successful_orders, 0);
+        assert_eq!(snap.failed_orders, 0);
+        assert_eq!(snap.min_latency_ns, 0); // clamped from u64::MAX
+        assert_eq!(snap.max_latency_ns, 0);
+        assert_eq!(snap.success_rate, 0.0);
+    }
+
+    #[test]
+    fn test_atomic_metrics_record_success() {
+        let m = AtomicMetrics::new();
+        m.record_order_success(1000);
+        m.record_order_success(3000);
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.total_orders, 2);
+        assert_eq!(snap.successful_orders, 2);
+        assert_eq!(snap.failed_orders, 0);
+        assert_eq!(snap.min_latency_ns, 1000);
+        assert_eq!(snap.max_latency_ns, 3000);
+        assert_eq!(snap.avg_latency_ns, 2000);
+        assert!((snap.success_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_atomic_metrics_record_failure() {
+        let m = AtomicMetrics::new();
+        m.record_order_success(500);
+        m.record_order_failure();
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.total_orders, 2);
+        assert_eq!(snap.successful_orders, 1);
+        assert_eq!(snap.failed_orders, 1);
+        assert!((snap.success_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_atomic_metrics_reset() {
+        let m = AtomicMetrics::new();
+        m.record_order_success(1000);
+        m.record_order_failure();
+        m.reset();
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.total_orders, 0);
+        assert_eq!(snap.successful_orders, 0);
+        assert_eq!(snap.failed_orders, 0);
+    }
+
+    #[test]
+    fn test_atomic_metrics_concurrent() {
+        let m = Arc::new(AtomicMetrics::new());
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let m_clone = Arc::clone(&m);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    m_clone.record_order_success(500);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let snap = m.get_snapshot();
+        assert_eq!(snap.total_orders, 400);
+        assert_eq!(snap.successful_orders, 400);
+    }
+
+    // ── SPSCQueue ───────────────────────────────────────────────
+
+    #[test]
+    fn test_spsc_queue_send_recv() {
+        let q = SPSCQueue::<u64>::new();
+        q.send(1).unwrap();
+        q.send(2).unwrap();
+        assert_eq!(q.try_recv(), Some(1));
+        assert_eq!(q.try_recv(), Some(2));
+        assert_eq!(q.try_recv(), None);
+    }
+
+    #[test]
+    fn test_spsc_queue_default() {
+        let q = SPSCQueue::<String>::default();
+        assert!(q.try_recv().is_none());
+    }
+
+    // ── TimestampCache ──────────────────────────────────────────
+
+    #[test]
+    fn test_timestamp_cache_store_load() {
+        let cache = TimestampCache::new(4); // 2^4 = 16 slots
+        cache.store(42, 12345);
+        assert_eq!(cache.load(42), Some(12345));
+    }
+
+    #[test]
+    fn test_timestamp_cache_missing_returns_none() {
+        let cache = TimestampCache::new(4);
+        assert_eq!(cache.load(99), None); // never stored → 0 → None
+    }
+
+    // ── fast_hash ───────────────────────────────────────────────
+
+    #[test]
+    fn test_fast_hash_deterministic() {
+        assert_eq!(fast_hash("order123"), fast_hash("order123"));
+    }
+
+    #[test]
+    fn test_fast_hash_different_strings_differ() {
+        assert_ne!(fast_hash("abc"), fast_hash("xyz"));
+    }
+}

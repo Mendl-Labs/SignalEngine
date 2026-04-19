@@ -162,3 +162,102 @@ impl AdaptiveRateLimiter {
         self.adaptation_factor
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RateLimiter ─────────────────────────────────────────────
+
+    #[test]
+    fn test_rate_limiter_new() {
+        let rl = RateLimiter::new(10, 5);
+        assert!((rl.utilization() - 0.0).abs() < f64::EPSILON);
+        assert!((rl.current_rps() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rate_limiter_acquire_within_burst() {
+        let mut rl = RateLimiter::new(10, 5);
+        // Should succeed up to burst capacity
+        for _ in 0..5 {
+            assert!(rl.try_acquire());
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_exhausts_tokens() {
+        let mut rl = RateLimiter::new(10, 3);
+        assert!(rl.try_acquire());
+        assert!(rl.try_acquire());
+        assert!(rl.try_acquire());
+        // 4th acquire should fail — tokens exhausted, refill hasn't kicked in
+        assert!(!rl.try_acquire());
+    }
+
+    #[test]
+    fn test_rate_limiter_utilization_increases() {
+        let mut rl = RateLimiter::new(10, 10);
+        assert!((rl.utilization() - 0.0).abs() < f64::EPSILON);
+        rl.try_acquire();
+        assert!(rl.utilization() > 0.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_current_rps() {
+        let mut rl = RateLimiter::new(100, 100);
+        rl.try_acquire();
+        rl.try_acquire();
+        assert!((rl.current_rps() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rate_limiter_reset() {
+        let mut rl = RateLimiter::new(10, 5);
+        rl.try_acquire();
+        rl.try_acquire();
+        rl.reset();
+        assert!((rl.utilization() - 0.0).abs() < f64::EPSILON);
+        assert!((rl.current_rps() - 0.0).abs() < f64::EPSILON);
+        // Should be able to acquire again
+        assert!(rl.try_acquire());
+    }
+
+    // ── AdaptiveRateLimiter ─────────────────────────────────────
+
+    #[test]
+    fn test_adaptive_rate_limiter_new() {
+        let arl = AdaptiveRateLimiter::new(100, 50);
+        assert!((arl.adaptation_factor() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_adaptive_rate_limiter_acquire() {
+        let mut arl = AdaptiveRateLimiter::new(100, 10);
+        assert!(arl.try_acquire());
+    }
+
+    #[test]
+    fn test_adaptive_report_errors_reduces_rate() {
+        let mut arl = AdaptiveRateLimiter::new(100, 50);
+        // 3 consecutive errors triggers 20% reduction
+        arl.report_rate_limit_error();
+        arl.report_rate_limit_error();
+        arl.report_rate_limit_error();
+        assert!(arl.adaptation_factor() < 1.0);
+        assert!((arl.adaptation_factor() - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_report_success_recovers() {
+        let mut arl = AdaptiveRateLimiter::new(100, 50);
+        // Trigger adaptation
+        for _ in 0..3 {
+            arl.report_rate_limit_error();
+        }
+        let factor_after_error = arl.adaptation_factor();
+        // Report success to start recovering
+        arl.report_success();
+        assert!(arl.adaptation_factor() > factor_after_error);
+    }
+}

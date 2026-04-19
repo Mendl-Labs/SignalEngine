@@ -331,3 +331,91 @@ impl SuiNetworkConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Known test key (32 bytes of 0x01)
+    const TEST_KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    #[test]
+    fn test_parse_private_key_valid() {
+        let key = SuiWallet::parse_private_key(TEST_KEY_HEX);
+        assert!(key.is_ok());
+    }
+
+    #[test]
+    fn test_parse_private_key_with_0x_prefix() {
+        let key = SuiWallet::parse_private_key(&format!("0x{}", TEST_KEY_HEX));
+        assert!(key.is_ok());
+    }
+
+    #[test]
+    fn test_parse_private_key_invalid_hex() {
+        let result = SuiWallet::parse_private_key("not_hex");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_private_key_wrong_length() {
+        let result = SuiWallet::parse_private_key("0101");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_derive_address_from_key() {
+        let key = SuiWallet::parse_private_key(TEST_KEY_HEX).unwrap();
+        let vk = key.verifying_key();
+        let addr = SuiWallet::derive_address(&vk).unwrap();
+        assert!(addr.starts_with("0x"));
+        assert_eq!(addr.len(), 66); // 0x + 64 hex chars
+    }
+
+    #[test]
+    fn test_derive_address_deterministic() {
+        let key = SuiWallet::parse_private_key(TEST_KEY_HEX).unwrap();
+        let vk = key.verifying_key();
+        let addr1 = SuiWallet::derive_address(&vk).unwrap();
+        let addr2 = SuiWallet::derive_address(&vk).unwrap();
+        assert_eq!(addr1, addr2);
+    }
+
+    #[tokio::test]
+    async fn test_wallet_new_valid_key() {
+        // Uses a real HTTP client but doesn't make RPC calls in constructor
+        let wallet = SuiWallet::new(TEST_KEY_HEX, "https://fullnode.devnet.sui.io:443").await;
+        assert!(wallet.is_ok());
+        let w = wallet.unwrap();
+        assert!(w.address().starts_with("0x"));
+        assert_eq!(w.rpc_url(), "https://fullnode.devnet.sui.io:443");
+    }
+
+    #[test]
+    fn test_sign_bytes_produces_64_byte_signature() {
+        let key = SuiWallet::parse_private_key(TEST_KEY_HEX).unwrap();
+        let sig: Ed25519Signature = key.sign(b"hello world");
+        assert_eq!(sig.to_bytes().len(), 64);
+    }
+
+    #[test]
+    fn test_sui_network_config_mainnet() {
+        let cfg = SuiNetworkConfig::mainnet();
+        assert!(cfg.is_mainnet);
+        assert!(cfg.rpc_url.contains("mainnet"));
+    }
+
+    #[test]
+    fn test_sui_network_config_testnet() {
+        let cfg = SuiNetworkConfig::testnet();
+        assert!(!cfg.is_mainnet);
+        assert!(cfg.rpc_url.contains("testnet"));
+    }
+
+    #[test]
+    fn test_sui_network_config_devnet() {
+        let cfg = SuiNetworkConfig::devnet();
+        assert!(!cfg.is_mainnet);
+        assert!(cfg.rpc_url.contains("devnet"));
+    }
+}

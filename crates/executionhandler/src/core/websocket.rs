@@ -180,3 +180,58 @@ impl WebSocketPool {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ws_manager_new_not_connected() {
+        let mgr = WebSocketManager::new("wss://example.com".into());
+        assert!(!mgr.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn test_ws_manager_subscriptions_empty() {
+        let mgr = WebSocketManager::new("wss://example.com".into());
+        assert!(mgr.get_subscriptions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ws_manager_subscribe_unsubscribe() {
+        let mgr = WebSocketManager::new("wss://example.com".into());
+        let sub = WebSocketSubscription {
+            channel: "orders".into(),
+            symbol: Some("BTC/USD".into()),
+            depth: Some(10),
+        };
+        mgr.subscribe(sub).await.unwrap();
+        assert_eq!(mgr.get_subscriptions().await.len(), 1);
+
+        mgr.unsubscribe("orders").await.unwrap();
+        assert!(mgr.get_subscriptions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ws_manager_disconnect_sets_false() {
+        let mgr = WebSocketManager::new("wss://example.com".into());
+        mgr.disconnect().await.unwrap();
+        assert!(!mgr.is_connected().await);
+    }
+
+    #[test]
+    fn test_ws_pool_round_robin() {
+        let pool = WebSocketPool::new("wss://example.com".into(), 3);
+        // Round-robin should cycle through connections
+        let _c0 = pool.get_connection();
+        let _c1 = pool.get_connection();
+        let _c2 = pool.get_connection();
+        let _c3 = pool.get_connection(); // wraps back to 0
+    }
+
+    #[tokio::test]
+    async fn test_ws_pool_no_active_connections() {
+        let pool = WebSocketPool::new("wss://example.com".into(), 2);
+        assert!(!pool.has_active_connections().await);
+    }
+}

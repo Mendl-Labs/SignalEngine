@@ -260,3 +260,182 @@ impl MetricsCollector {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_initial_state() {
+        let mc = MetricsCollector::new();
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 0);
+        assert_eq!(m.successful_orders, 0);
+        assert_eq!(m.failed_orders, 0);
+        assert_eq!(m.cancelled_orders, 0);
+        assert_eq!(m.avg_latency_ns, 0);
+        assert_eq!(m.min_latency_ns, 0); // wraps u64::MAX → 0 when no orders
+        assert_eq!(m.max_latency_ns, 0);
+        assert_eq!(m.total_volume, 0.0);
+        assert_eq!(m.total_fees, 0.0);
+        assert_eq!(m.fill_rate, 0.0);
+        assert_eq!(m.error_rate, 0.0);
+    }
+
+    #[test]
+    fn test_record_success_increments_counters() {
+        let mc = MetricsCollector::new();
+        mc.record_success(1000, 0.5, 0.01);
+        mc.record_success(2000, 1.0, 0.02);
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 2);
+        assert_eq!(m.successful_orders, 2);
+        assert_eq!(m.failed_orders, 0);
+        assert_eq!(m.avg_latency_ns, 1500); // (1000+2000)/2
+        assert_eq!(m.min_latency_ns, 1000);
+        assert_eq!(m.max_latency_ns, 2000);
+    }
+
+    #[test]
+    fn test_record_success_volume_and_fees() {
+        let mc = MetricsCollector::new();
+        mc.record_success(100, 1.5, 0.003);
+        mc.record_success(200, 2.5, 0.007);
+        let m = mc.get_metrics("test".into());
+        assert!((m.total_volume - 4.0).abs() < 0.01);
+        assert!((m.total_fees - 0.01).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_record_failure_increments() {
+        let mc = MetricsCollector::new();
+        mc.record_failure();
+        mc.record_failure();
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 2);
+        assert_eq!(m.failed_orders, 2);
+        assert_eq!(m.successful_orders, 0);
+    }
+
+    #[test]
+    fn test_record_cancellation_increments() {
+        let mc = MetricsCollector::new();
+        mc.record_cancellation();
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 1);
+        assert_eq!(m.cancelled_orders, 1);
+    }
+
+    #[test]
+    fn test_fill_rate_and_error_rate() {
+        let mc = MetricsCollector::new();
+        mc.record_success(100, 1.0, 0.01);
+        mc.record_success(100, 1.0, 0.01);
+        mc.record_success(100, 1.0, 0.01);
+        mc.record_failure();
+        let m = mc.get_metrics("test".into());
+        assert!((m.fill_rate - 0.75).abs() < 0.01);
+        assert!((m.error_rate - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_calculate_percentiles_empty() {
+        let mc = MetricsCollector::new();
+        let (p50, p95, p99, p999) = mc.calculate_percentiles();
+        assert_eq!((p50, p95, p99, p999), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_calculate_percentiles_single_element() {
+        let mc = MetricsCollector::new();
+        mc.record_success(5000, 0.0, 0.0);
+        let (p50, p95, p99, p999) = mc.calculate_percentiles();
+        assert_eq!(p50, 5000);
+        assert_eq!(p95, 5000);
+        assert_eq!(p99, 5000);
+        assert_eq!(p999, 5000);
+    }
+
+    #[test]
+    fn test_calculate_percentiles_known_distribution() {
+        let mc = MetricsCollector::new();
+        // Insert 100 values: 1, 2, 3, ..., 100
+        for i in 1..=100u64 {
+            mc.record_success(i, 0.0, 0.0);
+        }
+        let (p50, p95, p99, p999) = mc.calculate_percentiles();
+        // The impl uses sorted[(len * pct) as usize], so for 100 elements:
+        // p50 = sorted[50] = 51, p95 = sorted[95] = 96, p99 = sorted[99] = 100
+        assert_eq!(p50, 51);
+        assert!(p95 >= 95 && p95 <= 96);
+        assert!(p99 >= 99 && p99 <= 100);
+        assert_eq!(p999, 100);
+    }
+
+    #[test]
+    fn test_reset_clears_all_state() {
+        let mc = MetricsCollector::new();
+        mc.record_success(5000, 1.0, 0.1);
+        mc.record_failure();
+        mc.record_cancellation();
+        mc.reset();
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 0);
+        assert_eq!(m.successful_orders, 0);
+        assert_eq!(m.failed_orders, 0);
+        assert_eq!(m.cancelled_orders, 0);
+        assert_eq!(m.max_latency_ns, 0);
+        assert_eq!(m.total_volume, 0.0);
+        assert_eq!(m.total_fees, 0.0);
+    }
+
+    #[test]
+    fn test_concurrent_record_success() {
+        let mc = std::sync::Arc::new(MetricsCollector::new());
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let mc_clone = mc.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..250 {
+                    mc_clone.record_success(100, 0.001, 0.0001);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 1000);
+        assert_eq!(m.successful_orders, 1000);
+    }
+
+    #[test]
+    fn test_websocket_and_pool_status() {
+        let mc = MetricsCollector::new();
+        mc.set_websocket_connected(true);
+        mc.set_connection_pool(10, 3);
+        mc.set_rate_limit(80, 100);
+        let m = mc.get_metrics("test".into());
+        assert!(m.websocket_connected);
+        assert!((m.connection_pool_utilization - 0.3).abs() < 0.01);
+        assert!((m.rate_limit_utilization - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_default_trait_impl() {
+        let mc = MetricsCollector::default();
+        let m = mc.get_metrics("default".into());
+        assert_eq!(m.total_orders, 0);
+        assert_eq!(m.exchange, "default");
+    }
+
+    #[test]
+    fn test_record_success_simple() {
+        let mc = MetricsCollector::new();
+        mc.record_success_simple(500);
+        let m = mc.get_metrics("test".into());
+        assert_eq!(m.total_orders, 1);
+        assert_eq!(m.successful_orders, 1);
+        assert_eq!(m.total_volume, 0.0); // no volume tracked
+    }
+}
+

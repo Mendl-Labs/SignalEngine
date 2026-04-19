@@ -8,16 +8,22 @@ signalengine = { package = "signalengine-core", path = "../core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
-databaseschema = { path = "../../../databaseschema" }
-deadpool = "0.10"
-bigdecimal = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 dashmap = "5.5"
 crossbeam = "0.8"
-diesel-async = { version = "0.5", features = ["postgres", "deadpool"] }
-diesel = { version = "2.2", features = ["postgres", "uuid"] }
-base64 = "0.22"
 log = "0.4"
+
+# Database dependencies (optional — requires libpq at link time)
+databaseschema = { path = "../../../databaseschema", optional = true }
+deadpool = { version = "0.10", optional = true }
+bigdecimal = { version = "0.4", optional = true }
+diesel-async = { version = "0.5", features = ["postgres", "deadpool"], optional = true }
+diesel = { version = "2.2", features = ["postgres", "uuid"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+default = []
+postgres = ["diesel", "diesel-async", "databaseschema", "deadpool", "bigdecimal", "base64"]

@@ -712,3 +712,157 @@ fn deribit_definition() -> ExchangeDefinition {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== ExchangePreset::from_name ==========
+
+    #[test]
+    fn test_from_name_all_exchanges() {
+        assert_eq!(ExchangePreset::from_name("kraken"), Some(ExchangePreset::Kraken));
+        assert_eq!(ExchangePreset::from_name("coinbase"), Some(ExchangePreset::Coinbase));
+        assert_eq!(ExchangePreset::from_name("coinbase_pro"), Some(ExchangePreset::Coinbase));
+        assert_eq!(ExchangePreset::from_name("binance"), Some(ExchangePreset::Binance));
+        assert_eq!(ExchangePreset::from_name("binance_us"), Some(ExchangePreset::BinanceUS));
+        assert_eq!(ExchangePreset::from_name("bybit"), Some(ExchangePreset::Bybit));
+        assert_eq!(ExchangePreset::from_name("okx"), Some(ExchangePreset::OKX));
+        assert_eq!(ExchangePreset::from_name("okex"), Some(ExchangePreset::OKX));
+        assert_eq!(ExchangePreset::from_name("gemini"), Some(ExchangePreset::Gemini));
+        assert_eq!(ExchangePreset::from_name("deribit"), Some(ExchangePreset::Deribit));
+    }
+
+    #[test]
+    fn test_from_name_case_insensitive() {
+        assert_eq!(ExchangePreset::from_name("KRAKEN"), Some(ExchangePreset::Kraken));
+        assert_eq!(ExchangePreset::from_name("Binance"), Some(ExchangePreset::Binance));
+    }
+
+    #[test]
+    fn test_from_name_invalid() {
+        assert_eq!(ExchangePreset::from_name("invalid_exchange"), None);
+        assert_eq!(ExchangePreset::from_name(""), None);
+    }
+
+    // ========== Exchange definitions metadata ==========
+
+    #[test]
+    fn test_kraken_definition() {
+        let def = ExchangePreset::Kraken.definition();
+        assert_eq!(def.name, "Kraken");
+        assert!(!def.requires_passphrase);
+        assert!(matches!(def.auth_method, AuthMethod::HmacSha512 { use_nonce: true, .. }));
+        assert!(def.endpoints.rest_url.starts_with("https://"));
+        assert!(def.endpoints.websocket_url.starts_with("wss://"));
+    }
+
+    #[test]
+    fn test_coinbase_definition() {
+        let def = ExchangePreset::Coinbase.definition();
+        assert_eq!(def.name, "Coinbase");
+        assert!(def.requires_passphrase);
+        assert!(matches!(def.auth_method, AuthMethod::HmacSha256WithPassphrase { .. }));
+    }
+
+    #[test]
+    fn test_binance_definition() {
+        let def = ExchangePreset::Binance.definition();
+        assert_eq!(def.name, "Binance");
+        assert!(!def.requires_passphrase);
+        assert!(matches!(def.auth_method, AuthMethod::HmacSha256 { .. }));
+    }
+
+    #[test]
+    fn test_okx_definition() {
+        let def = ExchangePreset::OKX.definition();
+        assert_eq!(def.name, "OKX");
+        assert!(def.requires_passphrase);
+        assert!(matches!(def.auth_method, AuthMethod::HmacSha256WithPassphrase { .. }));
+    }
+
+    #[test]
+    fn test_deribit_definition() {
+        let def = ExchangePreset::Deribit.definition();
+        assert_eq!(def.name, "Deribit");
+        assert!(!def.requires_passphrase);
+        // Deribit uses separate buy/sell endpoints
+        assert!(def.endpoints.buy_order_path.is_some());
+        assert!(def.endpoints.sell_order_path.is_some());
+    }
+
+    // ========== Rate limits ==========
+
+    #[test]
+    fn test_all_exchanges_have_reasonable_rate_limits() {
+        let presets = [
+            ExchangePreset::Kraken, ExchangePreset::Coinbase,
+            ExchangePreset::BinanceUS, ExchangePreset::Binance,
+            ExchangePreset::Bybit, ExchangePreset::OKX,
+            ExchangePreset::Gemini, ExchangePreset::Deribit,
+        ];
+        for preset in &presets {
+            let def = preset.definition();
+            assert!(def.rate_limits.requests_per_second > 0, "{} rps must be > 0", def.name);
+            assert!(def.rate_limits.burst >= def.rate_limits.requests_per_second,
+                "{} burst ({}) must be >= rps ({})", def.name, def.rate_limits.burst, def.rate_limits.requests_per_second);
+            assert!(def.rate_limits.orders_per_second > 0, "{} orders_per_second must be > 0", def.name);
+        }
+    }
+
+    // ========== Endpoints ==========
+
+    #[test]
+    fn test_all_exchanges_have_valid_endpoints() {
+        let presets = [
+            ExchangePreset::Kraken, ExchangePreset::Coinbase,
+            ExchangePreset::BinanceUS, ExchangePreset::Binance,
+            ExchangePreset::Bybit, ExchangePreset::OKX,
+            ExchangePreset::Gemini, ExchangePreset::Deribit,
+        ];
+        for preset in &presets {
+            let def = preset.definition();
+            assert!(def.endpoints.rest_url.starts_with("https://"), "{} REST URL", def.name);
+            assert!(def.endpoints.websocket_url.starts_with("wss://"), "{} WS URL", def.name);
+            assert!(!def.endpoints.place_order_path.is_empty(), "{} place_order_path", def.name);
+            assert!(!def.endpoints.cancel_order_path.is_empty(), "{} cancel_order_path", def.name);
+        }
+    }
+
+    // ========== Display name ==========
+
+    #[test]
+    fn test_display_names() {
+        assert_eq!(ExchangePreset::Kraken.display_name(), "Kraken");
+        assert_eq!(ExchangePreset::BinanceUS.display_name(), "Binance US");
+        assert_eq!(ExchangePreset::OKX.display_name(), "OKX");
+    }
+
+    // ========== Serde roundtrip ==========
+
+    #[test]
+    fn test_exchange_preset_serde() {
+        for preset in [ExchangePreset::Kraken, ExchangePreset::Coinbase, ExchangePreset::Binance] {
+            let json = serde_json::to_string(&preset).unwrap();
+            let deser: ExchangePreset = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser, preset);
+        }
+    }
+
+    // ========== Defaults ==========
+
+    #[test]
+    fn test_trading_mode_default() {
+        let tm = TradingMode::default();
+        assert_eq!(tm.category, "spot");
+        assert_eq!(tm.mode, "cash");
+    }
+
+    #[test]
+    fn test_order_limits_default() {
+        let ol = OrderLimits::default();
+        assert!(ol.min_order_size > 0.0);
+        assert!(ol.max_order_size > ol.min_order_size);
+        assert!(ol.max_batch_size > 0);
+    }
+}

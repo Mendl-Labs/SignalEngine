@@ -238,3 +238,48 @@ pub fn enable_realtime_scheduling() -> Result<(), ExecutionError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_optimal_trading_core() {
+        let core = get_optimal_trading_core();
+        let num_cores = num_cpus::get();
+        if num_cores > 1 {
+            assert_eq!(core, 1);
+        } else {
+            assert_eq!(core, 0);
+        }
+    }
+
+    #[test]
+    fn test_core_assignment_optimal() {
+        let assignment = CoreAssignment::optimal_assignment();
+        let num_cores = num_cpus::get();
+
+        // primary_execution should not be 0 unless single-core
+        if num_cores > 1 {
+            assert_eq!(assignment.primary_execution, 1);
+        }
+        // All assignments should be within available cores
+        assert!(assignment.primary_execution < num_cores);
+        assert!(assignment.websocket_processing < num_cores);
+        assert!(assignment.metrics_collection < num_cores);
+        assert!(assignment.order_management < num_cores);
+    }
+
+    #[test]
+    fn test_set_cpu_affinity_invalid_core() {
+        let result = set_cpu_affinity(256);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_core_assignment_debug() {
+        let assignment = CoreAssignment::optimal_assignment();
+        let dbg = format!("{:?}", assignment);
+        assert!(dbg.contains("primary_execution"));
+    }
+}

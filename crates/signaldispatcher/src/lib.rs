@@ -490,3 +490,193 @@ impl ZeroCopyDispatcher {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam::channel;
+    use ultra_signal::{Signal, SignalAction, ExchangeId, signal_flags};
+
+    fn make_dispatcher() -> (UltraFastSignalDispatcher, channel::Receiver<Signal>, channel::Receiver<Signal>, channel::Receiver<Signal>) {
+        let (exec_tx, exec_rx) = channel::bounded(64);
+        let (port_tx, port_rx) = channel::bounded(64);
+        let (risk_tx, risk_rx) = channel::bounded(64);
+        let dispatcher = UltraFastSignalDispatcher::new(exec_tx, port_tx, risk_tx).unwrap();
+        (dispatcher, exec_rx, port_rx, risk_rx)
+    }
+
+    fn buy_signal() -> Signal {
+        Signal::new(1, 12345, ExchangeId::Kraken, SignalAction::Buy, 1.0, f64::NAN) // market order
+    }
+
+    fn sell_signal() -> Signal {
+        Signal::new(1, 12345, ExchangeId::Kraken, SignalAction::Sell, 1.0, f64::NAN)
+    }
+
+    fn buy_limit_signal() -> Signal {
+        Signal::new(1, 12345, ExchangeId::Kraken, SignalAction::BuyLimit, 1.0, 50000.0)
+    }
+
+    fn cancel_signal() -> Signal {
+        Signal::new(1, 12345, ExchangeId::Kraken, SignalAction::Cancel, 0.0, 0.0)
+    }
+
+    fn hold_signal() -> Signal {
+        Signal::new(1, 12345, ExchangeId::Kraken, SignalAction::Hold, 0.0, 0.0)
+    }
+
+    // All tests ignored on non-elevated Windows due to winapi thread priority APIs
+    // requiring elevation (os error 740). Run with: cargo test -p signal_dispatcher -- --ignored
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_new_creates_dispatcher() {
+        let (dispatcher, _, _, _) = make_dispatcher();
+        let (urgent, normal) = dispatcher.get_queue_stats();
+        assert_eq!(urgent, 0);
+        assert_eq!(normal, 0);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_submit_normal_signal_to_normal_queue() {
+        let (dispatcher, _, _, _) = make_dispatcher();
+        let sig = buy_signal();
+        assert!(dispatcher.submit_signal(sig).is_ok());
+        let (urgent, normal) = dispatcher.get_queue_stats();
+        assert_eq!(urgent, 0);
+        assert_eq!(normal, 1);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_submit_urgent_signal_to_urgent_queue() {
+        let (dispatcher, _, _, _) = make_dispatcher();
+        let mut sig = buy_signal();
+        sig.flags |= signal_flags::URGENT;
+        assert!(dispatcher.submit_signal(sig).is_ok());
+        let (urgent, normal) = dispatcher.get_queue_stats();
+        assert_eq!(urgent, 1);
+        assert_eq!(normal, 0);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_submit_batch() {
+        let (dispatcher, _, _, _) = make_dispatcher();
+        let signals = vec![buy_signal(), sell_signal(), hold_signal()];
+        let submitted = dispatcher.submit_signal_batch(&signals);
+        assert_eq!(submitted, 3);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_route_buy_market_to_execution_and_portfolio() {
+        let (mut dispatcher, exec_rx, port_rx, risk_rx) = make_dispatcher();
+        dispatcher.submit_signal(buy_signal()).unwrap();
+        dispatcher.process_batch_signals();
+        assert!(exec_rx.try_recv().is_ok());
+        assert!(port_rx.try_recv().is_ok());
+        assert!(risk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_route_sell_market_to_execution_and_portfolio() {
+        let (mut dispatcher, exec_rx, port_rx, risk_rx) = make_dispatcher();
+        dispatcher.submit_signal(sell_signal()).unwrap();
+        dispatcher.process_batch_signals();
+        assert!(exec_rx.try_recv().is_ok());
+        assert!(port_rx.try_recv().is_ok());
+        assert!(risk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_route_buy_limit_to_risk_and_portfolio() {
+        let (mut dispatcher, exec_rx, port_rx, risk_rx) = make_dispatcher();
+        dispatcher.submit_signal(buy_limit_signal()).unwrap();
+        dispatcher.process_batch_signals();
+        assert!(risk_rx.try_recv().is_ok());
+        assert!(port_rx.try_recv().is_ok());
+        assert!(exec_rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_route_cancel_to_execution_only() {
+        let (mut dispatcher, exec_rx, port_rx, risk_rx) = make_dispatcher();
+        dispatcher.submit_signal(cancel_signal()).unwrap();
+        dispatcher.process_batch_signals();
+        assert!(exec_rx.try_recv().is_ok());
+        assert!(port_rx.try_recv().is_err());
+        assert!(risk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_route_hold_to_portfolio_only() {
+        let (mut dispatcher, exec_rx, port_rx, risk_rx) = make_dispatcher();
+        dispatcher.submit_signal(hold_signal()).unwrap();
+        dispatcher.process_batch_signals();
+        assert!(port_rx.try_recv().is_ok());
+        assert!(exec_rx.try_recv().is_err());
+        assert!(risk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_get_performance_stats() {
+        let (dispatcher, _, _, _) = make_dispatcher();
+        let stats = dispatcher.get_performance_stats();
+        assert_eq!(stats.signals_processed, 0);
+        assert!(!stats.is_running);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_zero_copy_dispatcher_submit_and_recv() {
+        let zd = ZeroCopyDispatcher::new(64, 64);
+        let sig = Arc::new(buy_signal());
+        assert!(zd.submit_zero_copy(sig));
+        let received = zd.recv_zero_copy();
+        assert!(received.is_some());
+        assert_eq!(received.unwrap().action, SignalAction::Buy);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_zero_copy_urgent_priority() {
+        let zd = ZeroCopyDispatcher::new(64, 64);
+        let normal = Arc::new(hold_signal());
+        let mut urgent_sig = buy_signal();
+        urgent_sig.flags |= signal_flags::URGENT;
+        let urgent = Arc::new(urgent_sig);
+        zd.submit_zero_copy(normal);
+        zd.submit_zero_copy(urgent);
+        let first = zd.recv_zero_copy().unwrap();
+        assert!(first.is_urgent());
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_zero_copy_metrics() {
+        let zd = ZeroCopyDispatcher::new(64, 64);
+        let sig = Arc::new(buy_signal());
+        zd.submit_zero_copy(sig);
+        let (count, _avg, _max) = zd.get_metrics();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[ignore = "requires Windows elevation (os error 740)"]
+    fn test_legacy_dispatcher_new() {
+        let (exec_tx, _) = channel::bounded(64);
+        let (port_tx, _) = channel::bounded(64);
+        let (risk_tx, _) = channel::bounded(64);
+        let dispatcher = SignalDispatcher::new(exec_tx, port_tx, risk_tx).unwrap();
+        let (processed, _avg, _max, urgent, normal) = dispatcher.get_stats();
+        assert_eq!(processed, 0);
+        assert_eq!(urgent, 0);
+        assert_eq!(normal, 0);
+    }
+}

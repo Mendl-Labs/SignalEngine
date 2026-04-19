@@ -345,3 +345,274 @@ pub fn create_auth_strategy(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::config::{AuthMethod, SignatureLocation};
+
+    fn binance_auth_method() -> AuthMethod {
+        AuthMethod::HmacSha256 {
+            api_key_header: "X-MBX-APIKEY".to_string(),
+            signature_header: "signature".to_string(),
+            timestamp_header: "timestamp".to_string(),
+            timestamp_ms: true,
+            signature_location: SignatureLocation::Query,
+        }
+    }
+
+    fn kraken_auth_method() -> AuthMethod {
+        AuthMethod::HmacSha512 {
+            api_key_header: "API-Key".to_string(),
+            signature_header: "API-Sign".to_string(),
+            use_nonce: true,
+        }
+    }
+
+    fn coinbase_auth_method() -> AuthMethod {
+        AuthMethod::HmacSha256WithPassphrase {
+            api_key_header: "CB-ACCESS-KEY".to_string(),
+            signature_header: "CB-ACCESS-SIGN".to_string(),
+            passphrase_header: "CB-ACCESS-PASSPHRASE".to_string(),
+            timestamp_header: "CB-ACCESS-TIMESTAMP".to_string(),
+        }
+    }
+
+    // ========== AuthHeaders ==========
+
+    #[test]
+    fn test_auth_headers_new_is_empty() {
+        let ah = AuthHeaders::new();
+        assert!(ah.headers.is_empty());
+        assert!(ah.query_params.is_empty());
+        assert!(ah.body_params.is_empty());
+    }
+
+    #[test]
+    fn test_auth_headers_default() {
+        let ah = AuthHeaders::default();
+        assert!(ah.headers.is_empty());
+    }
+
+    // ========== HmacSha256Auth ==========
+
+    #[test]
+    fn test_hmac_sha256_signature_deterministic() {
+        let auth = HmacSha256Auth::new(
+            "api_key".to_string(),
+            "secret123".to_string(),
+            &binance_auth_method(),
+        ).unwrap();
+        let sig1 = auth.compute_signature("test_message");
+        let sig2 = auth.compute_signature("test_message");
+        assert_eq!(sig1, sig2);
+        assert!(!sig1.is_empty());
+    }
+
+    #[test]
+    fn test_hmac_sha256_different_messages_different_sigs() {
+        let auth = HmacSha256Auth::new(
+            "key".to_string(),
+            "secret".to_string(),
+            &binance_auth_method(),
+        ).unwrap();
+        let sig1 = auth.compute_signature("message_a");
+        let sig2 = auth.compute_signature("message_b");
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_hmac_sha256_wrong_auth_method() {
+        let result = HmacSha256Auth::new(
+            "key".to_string(),
+            "secret".to_string(),
+            &kraken_auth_method(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_hmac_sha256_sign_includes_api_key() {
+        let auth = HmacSha256Auth::new(
+            "my_api_key".to_string(),
+            "my_secret".to_string(),
+            &binance_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/api/v3/order", "", 1700000000000).await.unwrap();
+        assert_eq!(headers.headers.get("X-MBX-APIKEY").unwrap(), "my_api_key");
+        assert!(headers.query_params.contains_key("timestamp"));
+        assert!(headers.query_params.contains_key("signature"));
+    }
+
+    // ========== HmacSha512Auth (Kraken) ==========
+
+    #[test]
+    fn test_hmac_sha512_requires_base64_secret() {
+        // Valid base64 secret
+        let valid = HmacSha512Auth::new(
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"test_secret"),
+            &kraken_auth_method(),
+        );
+        assert!(valid.is_ok());
+    }
+
+    #[test]
+    fn test_hmac_sha512_invalid_base64_secret() {
+        let result = HmacSha512Auth::new(
+            "key".to_string(),
+            "not-valid-base64!!!".to_string(),
+            &kraken_auth_method(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hmac_sha512_wrong_auth_method() {
+        let result = HmacSha512Auth::new(
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"secret"),
+            &binance_auth_method(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kraken_signature_deterministic() {
+        let auth = HmacSha512Auth::new(
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"test_secret"),
+            &kraken_auth_method(),
+        ).unwrap();
+        let sig1 = auth.compute_kraken_signature("/0/private/AddOrder", 12345, "nonce=12345&ordertype=limit");
+        let sig2 = auth.compute_kraken_signature("/0/private/AddOrder", 12345, "nonce=12345&ordertype=limit");
+        assert_eq!(sig1, sig2);
+        // Result is base64-encoded
+        assert!(base64::engine::general_purpose::STANDARD.decode(&sig1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hmac_sha512_sign_includes_api_key() {
+        let auth = HmacSha512Auth::new(
+            "kraken_key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"kraken_secret"),
+            &kraken_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("POST", "/0/private/AddOrder", "nonce=12345", 12345).await.unwrap();
+        assert_eq!(headers.headers.get("API-Key").unwrap(), "kraken_key");
+        assert!(headers.headers.contains_key("API-Sign"));
+    }
+
+    // ========== HmacSha256PassphraseAuth (Coinbase) ==========
+
+    #[test]
+    fn test_passphrase_auth_requires_base64_secret() {
+        let valid = HmacSha256PassphraseAuth::new(
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"secret"),
+            "my_passphrase".to_string(),
+            &coinbase_auth_method(),
+        );
+        assert!(valid.is_ok());
+    }
+
+    #[test]
+    fn test_passphrase_auth_invalid_base64() {
+        let result = HmacSha256PassphraseAuth::new(
+            "key".to_string(),
+            "not-valid!!!".to_string(),
+            "pass".to_string(),
+            &coinbase_auth_method(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_passphrase_auth_sign_includes_all_headers() {
+        let auth = HmacSha256PassphraseAuth::new(
+            "cb_key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"cb_secret"),
+            "cb_pass".to_string(),
+            &coinbase_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("POST", "/api/v3/orders", "{}", 1700000000000).await.unwrap();
+        assert_eq!(headers.headers.get("CB-ACCESS-KEY").unwrap(), "cb_key");
+        assert_eq!(headers.headers.get("CB-ACCESS-PASSPHRASE").unwrap(), "cb_pass");
+        assert!(headers.headers.contains_key("CB-ACCESS-SIGN"));
+        assert!(headers.headers.contains_key("CB-ACCESS-TIMESTAMP"));
+    }
+
+    // ========== create_auth_strategy factory ==========
+
+    #[test]
+    fn test_create_auth_strategy_sha256() {
+        let result = create_auth_strategy(
+            &binance_auth_method(),
+            "key".to_string(),
+            "secret".to_string(),
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_sha512() {
+        let result = create_auth_strategy(
+            &kraken_auth_method(),
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"secret"),
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_passphrase_required() {
+        let result = create_auth_strategy(
+            &coinbase_auth_method(),
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"secret"),
+            None, // missing passphrase
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_passphrase_provided() {
+        let result = create_auth_strategy(
+            &coinbase_auth_method(),
+            "key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"secret"),
+            Some("passphrase".to_string()),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_rsa_unimplemented() {
+        let result = create_auth_strategy(
+            &AuthMethod::Rsa {
+                api_key_header: "X-Key".to_string(),
+                signature_header: "X-Sig".to_string(),
+            },
+            "key".to_string(),
+            "secret".to_string(),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_ed25519_unimplemented() {
+        let result = create_auth_strategy(
+            &AuthMethod::Ed25519 {
+                client_id_param: "client_id".to_string(),
+                signature_param: "signature".to_string(),
+            },
+            "key".to_string(),
+            "secret".to_string(),
+            None,
+        );
+        assert!(result.is_err());
+    }
+}

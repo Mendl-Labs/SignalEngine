@@ -151,3 +151,113 @@ impl Default for StrategyRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_registry_has_builtins() {
+        let registry = StrategyRegistry::new();
+        // Built-in: avellaneda-stoikov (enabled) + rsi-mean-reversion (disabled)
+        assert!(registry.strategies.len() >= 2);
+        assert!(registry.active_count() >= 1);
+    }
+
+    #[test]
+    fn test_register_and_lookup() {
+        let registry = StrategyRegistry::new();
+        let id = NEXT_STRATEGY_ID.fetch_add(1, Ordering::Relaxed);
+        registry.register_strategy(StrategyMetadata {
+            id,
+            strategy_type: StrategyType::Custom,
+            name: "test-strategy",
+            enabled: true,
+            symbols: vec![42],
+        });
+        let meta = registry.get_by_id(id).unwrap();
+        assert_eq!(meta.name, "test-strategy");
+        assert_eq!(meta.strategy_type, StrategyType::Custom);
+    }
+
+    #[test]
+    fn test_get_by_id_missing() {
+        let registry = StrategyRegistry::new();
+        assert!(registry.get_by_id(9999).is_none());
+    }
+
+    #[test]
+    fn test_is_enabled() {
+        let registry = StrategyRegistry::new();
+        let id = NEXT_STRATEGY_ID.fetch_add(1, Ordering::Relaxed);
+        registry.register_strategy(StrategyMetadata {
+            id,
+            strategy_type: StrategyType::Custom,
+            name: "disabled",
+            enabled: false,
+            symbols: vec![],
+        });
+        assert!(!registry.is_enabled(id));
+        assert!(!registry.is_enabled(9999));
+    }
+
+    #[test]
+    fn test_get_by_type() {
+        let registry = StrategyRegistry::new();
+        let ids = registry.get_by_type(StrategyType::AvellanedaStoikov);
+        assert!(!ids.is_empty());
+        // RsiMeanReversion is disabled by default, so shouldn't appear
+        let rsi = registry.get_by_type(StrategyType::RsiMeanReversion);
+        assert!(rsi.is_empty());
+    }
+
+    #[test]
+    fn test_strategies_for_symbol() {
+        let registry = StrategyRegistry::new();
+        let id = NEXT_STRATEGY_ID.fetch_add(1, Ordering::Relaxed);
+        let symbol_hash: SymbolHash = 12345;
+        registry.register_strategy(StrategyMetadata {
+            id,
+            strategy_type: StrategyType::Custom,
+            name: "symbol-specific",
+            enabled: true,
+            symbols: vec![symbol_hash],
+        });
+        let matched = registry.strategies_for_symbol(symbol_hash);
+        assert!(matched.contains(&id));
+        // Strategies with empty symbols match all
+        let all_match = registry.strategies_for_symbol(99999);
+        // The builtin avellaneda-stoikov has empty symbols, so it matches
+        assert!(!all_match.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_register() {
+        use std::sync::Arc;
+        let registry = Arc::new(StrategyRegistry::new());
+        let handles: Vec<_> = (0..4).map(|i| {
+            let reg = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let id = NEXT_STRATEGY_ID.fetch_add(1, Ordering::Relaxed);
+                reg.register_strategy(StrategyMetadata {
+                    id,
+                    strategy_type: StrategyType::Custom,
+                    name: "concurrent",
+                    enabled: true,
+                    symbols: vec![],
+                });
+                id
+            })
+        }).collect();
+        let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for id in ids {
+            assert!(registry.get_by_id(id).is_some());
+        }
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let registry = StrategyRegistry::default();
+        assert!(registry.strategies.len() >= 2);
+    }
+}

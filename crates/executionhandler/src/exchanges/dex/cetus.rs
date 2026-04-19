@@ -539,3 +539,42 @@ impl Default for CetusConnector {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cetus_connector_new() {
+        let conn = CetusConnector::new();
+        assert!(conn.config.is_none());
+        assert!(conn.wallet.is_none());
+    }
+
+    #[test]
+    fn test_cetus_connector_default() {
+        let conn = CetusConnector::default();
+        assert!(conn.config.is_none());
+    }
+
+    #[test]
+    fn test_get_pool_address_no_config() {
+        let conn = CetusConnector::new();
+        // Without config, is_devnet defaults to false (mainnet)
+        let result = conn.get_pool_address("SUI", "USDC");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_pool_address_unknown_pair() {
+        let conn = CetusConnector::new();
+        let result = conn.get_pool_address("UNKNOWN", "TOKEN");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_wallet_not_initialized() {
+        let conn = CetusConnector::new();
+        assert!(conn.get_wallet().is_err());
+    }
+}

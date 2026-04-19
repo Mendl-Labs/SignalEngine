@@ -23,8 +23,8 @@ signalgenerator = { path = "../signalgenerator" }
 smartorderrouter = { path = "../smartorderrouter" }
 strategyhandler = { path = "../strategyhandler" }
 strategyloader = { path = "../strategyloader" }
-databaseschema = { path = "../../../databaseschema" }
-bigdecimal = "0.4"
+databaseschema = { path = "../../../databaseschema", optional = true }
+bigdecimal = { version = "0.4", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = "1.44.1"
 ultra_signal = { path = "../signal" }
@@ -40,3 +40,7 @@ futures = { workspace = true }
 atomic = { workspace = true }
 fastrand = { workspace = true }
 serde = { workspace = true }
+
+[features]
+default = []
+postgres = ["databaseschema", "bigdecimal", "executionhandler/postgres", "smartorderrouter/postgres", "strategyloader/postgres"]

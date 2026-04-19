@@ -88,6 +88,7 @@ impl KillSwitch {
     }
 
     /// Trigger the kill switch AND fire-and-forget a DB persistence event.
+    #[cfg(feature = "postgres")]
     pub fn trigger_and_persist(
         &self,
         reason: KillReason,
@@ -126,6 +127,7 @@ impl KillSwitch {
     }
 
     /// Reset the kill switch AND persist the reset event to the DB.
+    #[cfg(feature = "postgres")]
     pub fn reset_and_persist(
         &self,
         pool: Arc<smartorderrouter::DbPool>,
@@ -156,6 +158,7 @@ impl KillSwitch {
 
     /// On startup, check if there is an outstanding (un-reset) kill-switch event
     /// in the DB and re-arm the in-memory kill switch accordingly.
+    #[cfg(feature = "postgres")]
     pub async fn check_startup_state(
         &self,
         pool: &smartorderrouter::DbPool,

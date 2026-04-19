@@ -34,6 +34,7 @@ pub mod graceful_shutdown;
 pub mod order_wal;
 pub mod hot_config;
 pub mod multi_tenant;
+#[cfg(feature = "postgres")]
 pub mod portfolio_snapshotter;
 pub mod paper_connector;
 
@@ -191,6 +192,7 @@ pub use multi_tenant::{
 };
 
 // Periodic portfolio PnL snapshotter (off-hot-path persistence)
+#[cfg(feature = "postgres")]
 pub use portfolio_snapshotter::{PortfolioSnapshotter, PortfolioSnapshotterConfig};
 
 use std::collections::HashMap;

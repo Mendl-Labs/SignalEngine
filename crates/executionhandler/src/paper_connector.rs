@@ -364,3 +364,171 @@ impl ExchangeConnector for PaperTradingConnector {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::traits::ExchangeConnector;
+
+    fn test_signal(action: SignalAction, qty: f64, price: Option<f64>) -> Signal {
+        Signal {
+            id: "sig-001".into(),
+            strategy_id: "strat-1".into(),
+            symbol: "BTC/USD".into(),
+            exchange: "paper".into(),
+            action,
+            quantity: qty,
+            price,
+            confidence: 0.9,
+            timestamp: 0,
+            metadata: HashMap::new(),
+        }
+    }
+
+    // ── PaperTradingConfig ──────────────────────────────────────
+
+    #[test]
+    fn test_config_default() {
+        let cfg = PaperTradingConfig::default();
+        assert!((cfg.slippage_bps - 5.0).abs() < f64::EPSILON);
+        assert!((cfg.partial_fill_probability - 0.1).abs() < f64::EPSILON);
+        assert!((cfg.base_latency_ms - 10.0).abs() < f64::EPSILON);
+    }
+
+    // ── PaperTradingConnector ───────────────────────────────────
+
+    #[test]
+    fn test_connector_exchange_name() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        assert_eq!(conn.exchange_name(), "paper");
+    }
+
+    #[test]
+    fn test_connector_get_limits() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let limits = conn.get_limits();
+        assert_eq!(limits.max_orders_per_second, 1000);
+        assert_eq!(limits.max_batch_size, 100);
+        assert_eq!(limits.supported_order_types.len(), 3);
+    }
+
+    #[test]
+    fn test_validate_order_positive_quantity() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::Buy, 1.0, None);
+        assert!(conn.validate_order(&signal).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_zero_quantity() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::Buy, 0.0, None);
+        assert!(conn.validate_order(&signal).is_err());
+    }
+
+    #[test]
+    fn test_validate_order_negative_quantity() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::Sell, -1.0, None);
+        assert!(conn.validate_order(&signal).is_err());
+    }
+
+    #[test]
+    fn test_convert_signal_buy_market() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::Buy, 0.5, None);
+        let order = conn.convert_signal(&signal).unwrap();
+        assert_eq!(order.symbol, "BTC/USD");
+        assert!(matches!(order.side, OrderSide::Buy));
+        assert!(matches!(order.order_type, OrderType::Market));
+        assert!((order.quantity - 0.5).abs() < f64::EPSILON);
+        assert!(order.price.is_none());
+    }
+
+    #[test]
+    fn test_convert_signal_sell_limit() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::SellLimit, 2.0, Some(50000.0));
+        let order = conn.convert_signal(&signal).unwrap();
+        assert!(matches!(order.side, OrderSide::Sell));
+        assert!(matches!(order.order_type, OrderType::Limit));
+        assert_eq!(order.price, Some(50000.0));
+    }
+
+    #[test]
+    fn test_convert_signal_buy_stop() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let signal = test_signal(SignalAction::BuyStop, 1.0, Some(48000.0));
+        let order = conn.convert_signal(&signal).unwrap();
+        assert!(matches!(order.side, OrderSide::Buy));
+        assert!(matches!(order.order_type, OrderType::Stop));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_always_succeeds() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let result = conn.cancel_order("order-123").await.unwrap();
+        assert_eq!(result.order_id, "order-123");
+        assert!(matches!(result.status, CancelStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_health_check_healthy() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let status = conn.health_check().await.unwrap();
+        assert_eq!(status.exchange, "paper");
+        assert!(matches!(status.status, HealthState::Healthy));
+        assert!(status.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_order_status() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let status = conn.get_order_status("xyz").await.unwrap();
+        assert!(status.is_some());
+        let s = status.unwrap();
+        assert_eq!(s.order_id, "xyz");
+    }
+
+    #[test]
+    fn test_get_metrics_initial() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let metrics = conn.get_metrics();
+        assert_eq!(metrics.exchange, "paper");
+        assert_eq!(metrics.total_orders, 0);
+        assert_eq!(metrics.successful_orders, 0);
+        assert_eq!(metrics.failed_orders, 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_market_buy() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        conn.initialize_book("BTC/USD", 50000.0).await;
+
+        let signal = test_signal(SignalAction::Buy, 0.1, None);
+        let result = conn.execute_order(&signal).await.unwrap();
+
+        assert_eq!(result.exchange, "paper");
+        assert!(result.filled_quantity > 0.0);
+        let metrics = conn.get_metrics();
+        assert_eq!(metrics.total_orders, 1);
+    }
+
+    #[tokio::test]
+    async fn test_edit_order() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        let params = EditOrderParams {
+            order_id: "ord-1".into(),
+            pair: "BTC/USD".into(),
+            volume: Some(2.0),
+            price: Some(51000.0),
+            price2: None,
+            oflags: None,
+            validate: false,
+        };
+        let result = conn.edit_order(params).await.unwrap();
+        assert_eq!(result.original_order_id, "ord-1");
+        assert!(result.new_order_id.is_some());
+        assert!(matches!(result.status, EditStatus::Success));
+    }
+}

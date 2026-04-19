@@ -152,3 +152,102 @@ impl PerformanceTimer {
         sorted.get(index).copied()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nano_timestamp_monotonic() {
+        let t1 = nano_timestamp();
+        let t2 = nano_timestamp();
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn test_nano_timer_elapsed() {
+        let timer = NanoTimer::start();
+        // Burn a tiny amount of CPU time
+        let mut v = 0u64;
+        for i in 0..10_000 {
+            v = v.wrapping_add(i);
+        }
+        let _ = v;
+        let ns = timer.elapsed_ns();
+        assert!(ns > 0, "elapsed_ns should be > 0");
+    }
+
+    #[test]
+    fn test_nano_timer_units_consistent() {
+        let timer = NanoTimer::start();
+        let mut v = 0u64;
+        for i in 0..100_000 {
+            v = v.wrapping_add(i);
+        }
+        let _ = v;
+        let ns = timer.elapsed_ns() as f64;
+        let us = timer.elapsed_us();
+        let ms = timer.elapsed_ms();
+
+        // us should be roughly ns / 1000 (allow large tolerance for timing jitter)
+        if ns > 1000.0 {
+            assert!(us > 0.0);
+        }
+        if ns > 1_000_000.0 {
+            assert!(ms > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_performance_timer_empty_statistics() {
+        let pt = PerformanceTimer::new(10);
+        assert!(pt.get_statistics().is_none());
+        assert!(pt.percentile(50.0).is_none());
+    }
+
+    #[test]
+    fn test_performance_timer_measure() {
+        let mut pt = PerformanceTimer::new(10);
+        let result = pt.measure(|| 42);
+        assert_eq!(result, 42);
+        let (min, max, avg) = pt.get_statistics().unwrap();
+        assert!(min <= max);
+        assert!(avg >= min as f64);
+        assert!(avg <= max as f64);
+    }
+
+    #[test]
+    fn test_performance_timer_multiple_measurements() {
+        let mut pt = PerformanceTimer::new(100);
+        for _ in 0..10 {
+            pt.measure(|| {
+                let mut v = 0u64;
+                for i in 0..1_000 {
+                    v = v.wrapping_add(i);
+                }
+                v
+            });
+        }
+        let (min, max, _avg) = pt.get_statistics().unwrap();
+        assert!(min <= max);
+    }
+
+    #[test]
+    fn test_performance_timer_percentile() {
+        let mut pt = PerformanceTimer::new(100);
+        for _ in 0..20 {
+            pt.measure(|| {
+                let mut v = 0u64;
+                for i in 0..500 {
+                    v = v.wrapping_add(i);
+                }
+                v
+            });
+        }
+        let p50 = pt.percentile(50.0);
+        let p99 = pt.percentile(99.0);
+        assert!(p50.is_some());
+        assert!(p99.is_some());
+        assert!(p50.unwrap() <= p99.unwrap());
+    }
+}

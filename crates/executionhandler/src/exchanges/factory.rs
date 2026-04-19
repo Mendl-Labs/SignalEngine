@@ -232,3 +232,123 @@ impl ExchangeFactory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config(name: &str) -> ExchangeConfig {
+        ExchangeConfig {
+            name: name.to_string(),
+            api_key: "test_api_key".to_string(),
+            secret_key: "test_secret_key".to_string(),
+            passphrase: None,
+            sandbox: true,
+            connection_pool_size: 10,
+            timeout_ms: 5000,
+            rate_limit_per_second: 10,
+            rate_limit_burst: 20,
+            websocket_url: None,
+            rest_api_url: None,
+            custom_headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_supported_exchanges_includes_all() {
+        let exchanges = ExchangeFactory::supported_exchanges();
+        assert!(exchanges.contains(&"kraken"));
+        assert!(exchanges.contains(&"coinbase"));
+        assert!(exchanges.contains(&"binance"));
+        assert!(exchanges.contains(&"binance_us"));
+        assert!(exchanges.contains(&"bybit"));
+        assert!(exchanges.contains(&"okx"));
+        assert!(exchanges.contains(&"gemini"));
+        assert!(exchanges.contains(&"deribit"));
+        assert!(exchanges.contains(&"paper"));
+        assert_eq!(exchanges.len(), 9);
+    }
+
+    #[test]
+    fn test_validate_config_valid() {
+        let config = valid_config("kraken");
+        assert!(ExchangeFactory::validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_empty_api_key() {
+        let mut config = valid_config("kraken");
+        config.api_key = String::new();
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_empty_secret() {
+        let mut config = valid_config("kraken");
+        config.secret_key = String::new();
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_zero_pool_size() {
+        let mut config = valid_config("kraken");
+        config.connection_pool_size = 0;
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_zero_timeout() {
+        let mut config = valid_config("kraken");
+        config.timeout_ms = 0;
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_coinbase_requires_passphrase() {
+        let mut config = valid_config("coinbase");
+        config.passphrase = None;
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_coinbase_with_passphrase() {
+        let mut config = valid_config("coinbase");
+        config.passphrase = Some("my_pass".to_string());
+        assert!(ExchangeFactory::validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_okx_requires_passphrase() {
+        let mut config = valid_config("okx");
+        config.passphrase = None;
+        assert!(ExchangeFactory::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_kraken_no_passphrase_needed() {
+        let config = valid_config("kraken");
+        // Kraken doesn't require passphrase — should pass
+        assert!(ExchangeFactory::validate_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_connector_paper() {
+        let config = valid_config("paper");
+        let result = ExchangeFactory::create_connector("paper", config).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_connector_paper_with_instance_id() {
+        let config = valid_config("paper_123");
+        let result = ExchangeFactory::create_connector("paper_123", config).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_connector_unsupported() {
+        let config = valid_config("nonexistent");
+        let result = ExchangeFactory::create_connector("nonexistent", config).await;
+        assert!(result.is_err());
+    }
+}

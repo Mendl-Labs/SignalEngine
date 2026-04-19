@@ -9,8 +9,11 @@ use dashmap::DashMap;
 use crossbeam::utils::CachePadded;
 
 pub mod database_integration_example;
+
+#[cfg(feature = "postgres")]
 pub mod database;
 
+#[cfg(feature = "postgres")]
 pub use database::{
     OrderDatabasePersistence, 
     DbPool,
@@ -21,6 +24,46 @@ pub use database::{
     BackgroundSorWriter,
     SorDbEvent,
 };
+
+// Stub types when postgres feature is not enabled, so downstream crates compile.
+#[cfg(not(feature = "postgres"))]
+pub type DbPool = ();
+
+#[cfg(not(feature = "postgres"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeCredential {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub exchange: String,
+    pub label: String,
+    pub api_key: String,
+    pub api_secret: String,
+    pub passphrase: Option<String>,
+    pub is_testnet: bool,
+    pub is_enabled: bool,
+}
+
+#[cfg(not(feature = "postgres"))]
+pub async fn load_exchange_credentials(
+    _pool: &DbPool,
+    _tenant_id: uuid::Uuid,
+) -> anyhow::Result<Vec<ExchangeCredential>> {
+    Ok(vec![])
+}
+
+#[cfg(not(feature = "postgres"))]
+pub async fn load_credentials_for_exchange(
+    _pool: &DbPool,
+    _tenant_id: uuid::Uuid,
+    _exchange: &str,
+) -> anyhow::Result<Option<ExchangeCredential>> {
+    Ok(None)
+}
+
+#[cfg(not(feature = "postgres"))]
+pub async fn create_pool(_database_url: &str) -> anyhow::Result<DbPool> {
+    Ok(())
+}
 
 /// Order side enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

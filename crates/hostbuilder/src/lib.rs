@@ -1,3 +1,4 @@
+#[cfg(feature = "postgres")]
 pub mod paper_trade_writer;
 
 use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
@@ -273,7 +274,7 @@ use ultra_logger::{ultra_info, ultra_warn, ultra_error};
 pub use datahandler::ORDERBOOKS;
 pub use portfoliohandler::PORTFOLIOS;
 
-/// Metadata for a paper-deployed strategy, shared between the deployment handler
+/// Metadata for a deployed strategy, shared between the deployment handler
 /// and the signal processing loop.
 #[derive(Debug, Clone)]
 pub struct PaperDeploymentMeta {
@@ -282,6 +283,8 @@ pub struct PaperDeploymentMeta {
     pub strategy_id_hash: u16,
     pub paper_exchange: String,
     pub symbols: Vec<String>,
+    /// Deployment mode: "paper" or "live"
+    pub mode: String,
 }
 
 /// Shared registry of active paper deployments, keyed by instance_id (Uuid).
@@ -372,6 +375,7 @@ impl HostedObject {
         // ======================================================================
         // Load exchange credentials from database (stored via Settings UI)
         // ======================================================================
+        #[cfg(feature = "postgres")]
         if let Ok(database_url) = env::var("DATABASE_URL") {
             if let Ok(tenant_id_str) = env::var("TENANT_ID") {
                 if let Ok(tenant_id) = uuid::Uuid::parse_str(&tenant_id_str) {
@@ -590,6 +594,7 @@ impl HostedObject {
         let paper_registry: PaperDeploymentRegistry = Arc::new(DashMap::new());
         
         // Create paper trade writer for DB persistence (if DATABASE_URL is set)
+        #[cfg(feature = "postgres")]
         let paper_fill_tx: Option<tokio::sync::mpsc::Sender<paper_trade_writer::PaperFillEvent>> = {
             match env::var("DATABASE_URL") {
                 Ok(db_url) => {
@@ -611,6 +616,8 @@ impl HostedObject {
                 }
             }
         };
+        #[cfg(not(feature = "postgres"))]
+        let paper_fill_tx: Option<()> = None;
         
         // Set up ultra-fast signal routing using Phase 2 order manager
         if let Some(signal_rx) = self.signal_rx.take() {
@@ -619,7 +626,7 @@ impl HostedObject {
                 return Ok(());
             };
             let signal_paper_registry = paper_registry.clone();
-            let signal_fill_tx = paper_fill_tx.clone();
+            let _signal_fill_tx = paper_fill_tx.clone();
             tokio::spawn(async move {
                 ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
                 let mut signal_count = 0u64;
@@ -669,6 +676,7 @@ impl HostedObject {
                         Ok(result) => {
                             // Record fill to trade_history for paper deployments
                             if result.success {
+                                #[cfg(feature = "postgres")]
                                 if let (Some(ref meta), Some(ref tx)) = (&paper_meta, &signal_fill_tx) {
                                     let fill_event = paper_trade_writer::PaperFillEvent {
                                         tenant_id: meta.tenant_id,
@@ -752,63 +760,91 @@ impl HostedObject {
             while let Some(event) = deployment_rx.recv().await {
                 match event {
                     DeploymentEvent::Deploy(strategy) => {
+                        let mode = strategy.mode.clone();
+                        let is_live = mode == "live";
+                        
                         ultra_logger::ultra_info!(format!(
-                            "🚀 Deploying strategy: {} ({}) for {} on {:?}",
+                            "🚀 Deploying strategy: {} ({}) [{}] for {} on {:?}",
                             strategy.strategy_name,
                             strategy.strategy_type,
+                            mode,
                             strategy.symbols.join(", "),
                             strategy.target_exchanges,
                         ));
                         
-                        // Track tenant mapping for trade persistence
-                        let paper_exchange_name = format!("paper_{}", strategy.instance_id);
                         let strategy_id_hash = (strategy.strategy_id.as_u128() & 0xFFFF) as u16;
-                        deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
-                            tenant_id: strategy.tenant_id,
-                            deployment_id: strategy.instance_id,
-                            strategy_id_hash,
-                            paper_exchange: paper_exchange_name.clone(),
-                            symbols: strategy.symbols.clone(),
-                        });
                         
-                        // Register a paper trading connector for this deployment instance
-                        if let Some(ref ultra_mgr) = deployment_ultra_mgr {
-                            let paper_config = executionhandler::core::types::ExchangeConfig {
-                                name: paper_exchange_name.clone(),
-                                api_key: String::new(),
-                                secret_key: String::new(),
-                                passphrase: None,
-                                sandbox: true,
-                                connection_pool_size: 1,
-                                timeout_ms: 5000,
-                                rate_limit_per_second: 1000,
-                                rate_limit_burst: 100,
-                                websocket_url: None,
-                                rest_api_url: None,
-                                custom_headers: std::collections::HashMap::new(),
-                            };
+                        if is_live {
+                            // Live mode — use real exchange connectors (already configured via YAML)
+                            // The exchange name matches target_exchanges from the deployment
+                            let exchange_name = strategy.target_exchanges.first()
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
                             
-                            let mut handler = ultra_mgr.execution_handler().write().await;
-                            match handler.add_exchange(paper_exchange_name.clone(), paper_config).await {
-                                Ok(_) => {
-                                    ultra_logger::ultra_info!(format!(
-                                        "✅ Paper trading connector '{}' registered for strategy {}",
-                                        paper_exchange_name, strategy.strategy_name
-                                    ));
-                                }
-                                Err(e) => {
-                                    ultra_logger::ultra_warn!(format!(
-                                        "⚠️ Failed to register paper connector for {}: {:?}",
-                                        strategy.strategy_name, e
-                                    ));
+                            deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
+                                tenant_id: strategy.tenant_id,
+                                deployment_id: strategy.instance_id,
+                                strategy_id_hash,
+                                paper_exchange: exchange_name.clone(),
+                                symbols: strategy.symbols.clone(),
+                                mode: "live".to_string(),
+                            });
+                            
+                            ultra_logger::ultra_info!(format!(
+                                "✅ Strategy {} ({}) deployed for LIVE trading on {}",
+                                strategy.strategy_name, strategy.instance_id, exchange_name
+                            ));
+                        } else {
+                            // Paper mode — create a paper trading connector
+                            let paper_exchange_name = format!("paper_{}", strategy.instance_id);
+                            deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
+                                tenant_id: strategy.tenant_id,
+                                deployment_id: strategy.instance_id,
+                                strategy_id_hash,
+                                paper_exchange: paper_exchange_name.clone(),
+                                symbols: strategy.symbols.clone(),
+                                mode: "paper".to_string(),
+                            });
+                            
+                            // Register a paper trading connector for this deployment instance
+                            if let Some(ref ultra_mgr) = deployment_ultra_mgr {
+                                let paper_config = executionhandler::core::types::ExchangeConfig {
+                                    name: paper_exchange_name.clone(),
+                                    api_key: String::new(),
+                                    secret_key: String::new(),
+                                    passphrase: None,
+                                    sandbox: true,
+                                    connection_pool_size: 1,
+                                    timeout_ms: 5000,
+                                    rate_limit_per_second: 1000,
+                                    rate_limit_burst: 100,
+                                    websocket_url: None,
+                                    rest_api_url: None,
+                                    custom_headers: std::collections::HashMap::new(),
+                                };
+                                
+                                let mut handler = ultra_mgr.execution_handler().write().await;
+                                match handler.add_exchange(paper_exchange_name.clone(), paper_config).await {
+                                    Ok(_) => {
+                                        ultra_logger::ultra_info!(format!(
+                                            "✅ Paper trading connector '{}' registered for strategy {}",
+                                            paper_exchange_name, strategy.strategy_name
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        ultra_logger::ultra_warn!(format!(
+                                            "⚠️ Failed to register paper connector for {}: {:?}",
+                                            strategy.strategy_name, e
+                                        ));
+                                    }
                                 }
                             }
+                            
+                            ultra_logger::ultra_info!(format!(
+                                "✅ Strategy {} ({}) deployed for PAPER trading",
+                                strategy.strategy_name, strategy.instance_id
+                            ));
                         }
-                        
-                        ultra_logger::ultra_info!(format!(
-                            "✅ Strategy {} ({}) deployed and ready for paper trading",
-                            strategy.strategy_name, strategy.instance_id
-                        ));
                     }
                     DeploymentEvent::Deactivate { instance_id, reason, close_positions, cancel_orders } => {
                         ultra_logger::ultra_info!(format!(

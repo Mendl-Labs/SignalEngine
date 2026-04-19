@@ -334,3 +334,35 @@ impl Default for DeepBookConnector {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deepbook_connector_new() {
+        let conn = DeepBookConnector::new();
+        assert!(conn.config.is_none());
+        assert!(conn.wallet.is_none());
+    }
+
+    #[test]
+    fn test_deepbook_connector_default() {
+        let conn = DeepBookConnector::default();
+        assert!(conn.config.is_none());
+    }
+
+    #[test]
+    fn test_get_pool_id_mainnet() {
+        let conn = DeepBookConnector::new();
+        let result = conn.get_pool_id("SUI", "USDC");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_pool_id_unknown_pair() {
+        let conn = DeepBookConnector::new();
+        let result = conn.get_pool_id("UNKNOWN", "TOKEN");
+        assert!(result.is_err());
+    }
+}

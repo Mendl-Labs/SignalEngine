@@ -83,6 +83,8 @@ pub struct DeployedStrategy {
     pub realized_pnl: std::sync::atomic::AtomicI64,
     pub open_positions: std::sync::atomic::AtomicI32,
     pub pending_orders: std::sync::atomic::AtomicI32,
+    /// Deployment mode: "paper" or "live"
+    pub mode: String,
 }
 
 impl DeployedStrategy {
@@ -102,6 +104,18 @@ impl DeployedStrategy {
                 .map_err(|e| DeploymentSubscriberError::ParseError(format!("Invalid parameters: {}", e)))?
         };
 
+        // Read mode from the dedicated proto field, falling back to risk_metrics JSON
+        let mode = if !msg.mode.is_empty() {
+            msg.mode.clone()
+        } else if !msg.risk_metrics.is_empty() {
+            serde_json::from_slice::<serde_json::Value>(&msg.risk_metrics)
+                .ok()
+                .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| "paper".to_string())
+        } else {
+            "paper".to_string()
+        };
+
         Ok(Self {
             strategy_id,
             instance_id,
@@ -118,6 +132,7 @@ impl DeployedStrategy {
             realized_pnl: std::sync::atomic::AtomicI64::new(0),
             open_positions: std::sync::atomic::AtomicI32::new(0),
             pending_orders: std::sync::atomic::AtomicI32::new(0),
+            mode,
         })
     }
 
@@ -563,6 +578,7 @@ mod tests {
             risk_metrics: vec![],
             admin_approved: true,
             timestamp: 0,
+            mode: "paper".to_string(),
         };
 
         let strategy = DeployedStrategy::from_deployment(&deployment).unwrap();

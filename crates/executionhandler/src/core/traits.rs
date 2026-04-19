@@ -197,3 +197,116 @@ pub trait NanoOptimized {
     /// Use SIMD operations for bulk calculations
     fn simd_calculate_metrics(&self, latencies: &[f64]) -> MetricsSnapshot;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signal::Signal;
+
+    /// Mock connector that succeeds on even-indexed signals, fails on odd
+    struct MockConnector;
+
+    #[async_trait]
+    impl ExchangeConnector for MockConnector {
+        fn exchange_name(&self) -> &str { "mock" }
+        async fn initialize(&mut self, _config: ExchangeConfig) -> Result<(), ExecutionError> { Ok(()) }
+        async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
+            let id_num: u64 = signal.id.parse().unwrap_or(0);
+            if id_num % 2 == 0 {
+                Ok(ExecutionResult {
+                    order_id: signal.id.clone(),
+                    exchange_order_id: Some(format!("exch_{}", signal.id)),
+                    exchange: "mock".into(),
+                    status: ExecutionStatus::Filled,
+                    filled_quantity: signal.quantity,
+                    remaining_quantity: 0.0,
+                    avg_fill_price: 100.0,
+                    total_fees: 0.1,
+                    fills: vec![],
+                    reject_reason: None,
+                    submitted_at: 0,
+                    updated_at: 0,
+                    latency_ns: 500,
+                    exchange_timestamp_ns: None,
+                    exchange_sequence: None,
+                })
+            } else {
+                Err(ExecutionError::Rejected("odd id".into()))
+            }
+        }
+        async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+            self.execute_batch_orders_sequential(signals).await
+        }
+        async fn cancel_order(&self, _id: &str) -> Result<CancelResult, ExecutionError> { unimplemented!() }
+        async fn cancel_all_orders(&self) -> Result<Vec<CancelResult>, ExecutionError> { unimplemented!() }
+        async fn edit_order(&self, _p: EditOrderParams) -> Result<EditResult, ExecutionError> { unimplemented!() }
+        async fn get_order_status(&self, _id: &str) -> Result<Option<OrderStatus>, ExecutionError> { unimplemented!() }
+        fn get_metrics(&self) -> ExecutionMetrics {
+            ExecutionMetrics {
+                exchange: "mock".into(),
+                total_orders: 0, successful_orders: 0, failed_orders: 0, cancelled_orders: 0,
+                avg_latency_ns: 0, min_latency_ns: 0, max_latency_ns: 0,
+                p50_latency_ns: 0, p95_latency_ns: 0, p99_latency_ns: 0, p999_latency_ns: 0,
+                total_volume: 0.0, total_fees: 0.0, fill_rate: 0.0, error_rate: 0.0,
+                orders_per_second: 0.0, last_updated: 0,
+                websocket_connected: false, connection_pool_utilization: 0.0, rate_limit_utilization: 0.0,
+            }
+        }
+        async fn subscribe_to_updates(&self, _cb: Box<dyn Fn(OrderUpdate) + Send + Sync>) {}
+        async fn health_check(&self) -> Result<HealthStatus, ExecutionError> { unimplemented!() }
+        fn get_limits(&self) -> ExchangeLimits { unimplemented!() }
+        fn validate_order(&self, _s: &Signal) -> Result<(), ExecutionError> { Ok(()) }
+        fn convert_signal(&self, _s: &Signal) -> Result<ExchangeOrder, ExecutionError> { unimplemented!() }
+    }
+
+    fn make_signal(id: &str) -> Signal {
+        Signal {
+            id: id.to_string(),
+            strategy_id: String::new(),
+            symbol: "BTC/USD".into(),
+            exchange: "mock".into(),
+            action: crate::signal::SignalAction::Buy,
+            quantity: 1.0,
+            price: Some(100.0),
+            confidence: 1.0,
+            timestamp: 0,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequential_batch_continues_on_failure() {
+        let conn = MockConnector;
+        let signals = vec![make_signal("0"), make_signal("1"), make_signal("2")];
+        let results = conn.execute_batch_orders_sequential(&signals).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].status, ExecutionStatus::Filled);
+        assert_eq!(results[1].status, ExecutionStatus::Rejected);
+        assert!(results[1].reject_reason.is_some());
+        assert_eq!(results[2].status, ExecutionStatus::Filled);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_batch_returns_all() {
+        let conn = MockConnector;
+        let signals = vec![make_signal("0"), make_signal("2"), make_signal("4")];
+        let results = conn.execute_batch_orders_parallel(&signals).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.status == ExecutionStatus::Filled));
+    }
+
+    #[tokio::test]
+    async fn test_optimized_batch_respects_batch_size() {
+        let conn = MockConnector;
+        let signals: Vec<Signal> = (0..5).map(|i| make_signal(&(i * 2).to_string())).collect();
+        let results = conn.execute_batch_orders_optimized(&signals, 2).await.unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_sequential_batch_empty_input() {
+        let conn = MockConnector;
+        let results = conn.execute_batch_orders_sequential(&[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+}

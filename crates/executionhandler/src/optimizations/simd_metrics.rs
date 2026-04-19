@@ -209,3 +209,114 @@ impl LatencyHistogram {
         self.buckets.iter_mut().for_each(|bucket| *bucket = 0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── simd_calculate_percentiles ──────────────────────────────
+
+    #[test]
+    fn test_percentiles_empty() {
+        let snap = simd_calculate_percentiles(&[]);
+        assert_eq!(snap.count, 0);
+        assert_eq!(snap.min_ns, 0);
+        assert_eq!(snap.max_ns, 0);
+    }
+
+    #[test]
+    fn test_percentiles_single_element() {
+        let snap = simd_calculate_percentiles(&[5000.0]);
+        assert_eq!(snap.count, 1);
+        assert_eq!(snap.min_ns, 5000);
+        assert_eq!(snap.max_ns, 5000);
+    }
+
+    #[test]
+    fn test_percentiles_known_distribution() {
+        let latencies: Vec<f64> = (1..=100).map(|i| i as f64 * 1000.0).collect();
+        let snap = simd_calculate_percentiles(&latencies);
+        assert_eq!(snap.count, 100);
+        assert_eq!(snap.min_ns, 1000);
+        assert_eq!(snap.max_ns, 100_000);
+        // p50 of 1..=100 (sorted) at index 50 → 51_000
+        assert_eq!(snap.p50_ns, 51_000);
+        assert_eq!(snap.p95_ns, 96_000);
+        assert_eq!(snap.p99_ns, 100_000);
+    }
+
+    #[test]
+    fn test_percentiles_mean_accuracy() {
+        let latencies = vec![100.0, 200.0, 300.0, 400.0];
+        let snap = simd_calculate_percentiles(&latencies);
+        assert!((snap.mean_ns - 250.0).abs() < 1.0);
+    }
+
+    // ── VectorizedMetrics ───────────────────────────────────────
+
+    #[test]
+    fn test_vectorized_metrics_new_empty() {
+        let vm = VectorizedMetrics::new(100);
+        let snap = vm.calculate_snapshot();
+        assert_eq!(snap.count, 0);
+    }
+
+    #[test]
+    fn test_vectorized_metrics_add_and_snapshot() {
+        let mut vm = VectorizedMetrics::new(100);
+        vm.add_latency(1000);
+        vm.add_latency(2000);
+        vm.add_latency(3000);
+        let snap = vm.calculate_snapshot();
+        assert_eq!(snap.count, 3);
+        assert_eq!(snap.min_ns, 1000);
+        assert_eq!(snap.max_ns, 3000);
+    }
+
+    #[test]
+    fn test_vectorized_metrics_reset() {
+        let mut vm = VectorizedMetrics::new(100);
+        vm.add_latency(1000);
+        vm.reset();
+        let snap = vm.calculate_snapshot();
+        assert_eq!(snap.count, 0);
+    }
+
+    // ── LatencyHistogram ────────────────────────────────────────
+
+    #[test]
+    fn test_histogram_new_empty() {
+        let h = LatencyHistogram::new();
+        let dist = h.get_distribution();
+        assert_eq!(dist.len(), 12); // 12 buckets
+        assert!(dist.iter().all(|&(_, count)| count == 0));
+    }
+
+    #[test]
+    fn test_histogram_record_buckets() {
+        let mut h = LatencyHistogram::new();
+        h.record(500);    // ≤ 1_000 → bucket 0
+        h.record(8_000);  // ≤ 10_000 → bucket 2
+        h.record(200_000_000); // > 100ms → bucket 11 (u64::MAX)
+
+        let dist = h.get_distribution();
+        assert_eq!(dist[0].1, 1); // ≤ 1μs
+        assert_eq!(dist[2].1, 1); // ≤ 10μs
+        assert_eq!(dist[11].1, 1); // overflow
+    }
+
+    #[test]
+    fn test_histogram_reset() {
+        let mut h = LatencyHistogram::new();
+        h.record(500);
+        h.reset();
+        let dist = h.get_distribution();
+        assert!(dist.iter().all(|&(_, count)| count == 0));
+    }
+
+    #[test]
+    fn test_histogram_default() {
+        let h = LatencyHistogram::default();
+        assert_eq!(h.get_distribution().len(), 12);
+    }
+}

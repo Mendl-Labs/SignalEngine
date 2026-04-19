@@ -365,4 +365,131 @@ mod tests {
         let parsed: StrategyParameters = serde_json::from_str(&json).unwrap();
         assert!(parsed.as_momentum().is_some());
     }
+
+    #[test]
+    fn test_strategy_type_display() {
+        assert_eq!(StrategyType::Custom.to_string(), "custom");
+        assert_eq!(StrategyType::CustomMarketMaking.to_string(), "custom_market_making");
+        assert_eq!(StrategyType::PortfolioMixed.to_string(), "portfolio_mixed");
+    }
+
+    #[test]
+    fn test_strategy_type_serde_roundtrip() {
+        for st in [StrategyType::Custom, StrategyType::CustomMarketMaking, StrategyType::PortfolioMixed] {
+            let json = serde_json::to_string(&st).unwrap();
+            let parsed: StrategyType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, st);
+        }
+    }
+
+    #[test]
+    fn test_portfolio_risk_limits_default() {
+        let limits = PortfolioRiskLimits::default();
+        assert_eq!(limits.max_total_exposure, 10_000.0);
+        assert_eq!(limits.max_daily_loss, 500.0);
+        assert!((limits.max_drawdown_pct - 0.15).abs() < f64::EPSILON);
+        assert_eq!(limits.cooldown_minutes, 30);
+    }
+
+    #[test]
+    fn test_asset_risk_limits_default() {
+        let limits = AssetRiskLimits::default();
+        assert_eq!(limits.max_position_size, 1_000.0);
+        assert!((limits.max_position_pct - 0.10).abs() < f64::EPSILON);
+        assert_eq!(limits.max_orders_per_minute, 10);
+    }
+
+    #[test]
+    fn test_momentum_params_default() {
+        let p = MomentumParams::default();
+        assert!((p.momentum_threshold_pct - 0.5).abs() < f64::EPSILON);
+        assert_eq!(p.momentum_lookback_ms, 60_000);
+        assert_eq!(p.volume_multiplier, 1.5);
+    }
+
+    #[test]
+    fn test_mean_reversion_params_default() {
+        let p = MeanReversionParams::default();
+        assert_eq!(p.zscore_entry_threshold, 2.0);
+        assert_eq!(p.zscore_exit_threshold, 0.5);
+        assert!(p.use_bollinger_bands);
+    }
+
+    #[test]
+    fn test_mean_reversion_serde_roundtrip() {
+        let params = StrategyParameters::MeanReversion(MeanReversionParams::default());
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: StrategyParameters = serde_json::from_str(&json).unwrap();
+        assert!(parsed.as_mean_reversion().is_some());
+        assert!(parsed.as_momentum().is_none());
+    }
+
+    #[test]
+    fn test_generic_params_accessors() {
+        let mut map = HashMap::new();
+        map.insert("threshold".to_string(), serde_json::json!(0.5));
+        map.insert("count".to_string(), serde_json::json!(10));
+        map.insert("name".to_string(), serde_json::json!("test"));
+        map.insert("flag".to_string(), serde_json::json!(true));
+        let gp = GenericParams { params: map };
+
+        assert_eq!(gp.get_f64("threshold"), Some(0.5));
+        assert_eq!(gp.get_i64("count"), Some(10));
+        assert_eq!(gp.get_str("name"), Some("test"));
+        assert_eq!(gp.get_bool("flag"), Some(true));
+        assert_eq!(gp.get_f64("missing"), None);
+    }
+
+    #[test]
+    fn test_trading_asset_key() {
+        let asset = TradingAsset {
+            symbol: "BTC/USD".to_string(),
+            exchange: "kraken".to_string(),
+            weight: 0.5,
+            risk_limits: AssetRiskLimits::default(),
+        };
+        assert_eq!(asset.key(), ("BTC/USD".to_string(), "kraken".to_string()));
+    }
+
+    #[test]
+    fn test_strategy_instance_full_serde() {
+        let instance = StrategyInstance {
+            id: Uuid::new_v4(),
+            name: "test-strat".to_string(),
+            strategy_type: StrategyType::Custom,
+            version: "1.0".to_string(),
+            assets: vec![TradingAsset {
+                symbol: "ETH/USD".to_string(),
+                exchange: "binance".to_string(),
+                weight: 1.0,
+                risk_limits: AssetRiskLimits::default(),
+            }],
+            parameters: StrategyParameters::Generic(GenericParams::default()),
+            portfolio_risk: PortfolioRiskLimits::default(),
+            enabled: true,
+            description: Some("A test strategy".to_string()),
+            python_source: None,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&instance).unwrap();
+        let parsed: StrategyInstance = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "test-strat");
+        assert_eq!(parsed.assets.len(), 1);
+        assert!(parsed.enabled);
+    }
+
+    #[test]
+    fn test_strategy_type_unknown_defaults_to_custom() {
+        let st: StrategyType = "something_unknown".parse().unwrap();
+        assert_eq!(st, StrategyType::Custom);
+    }
+
+    #[test]
+    fn test_portfolio_risk_serde_with_defaults() {
+        // Missing fields should use defaults
+        let json = r#"{}"#;
+        let limits: PortfolioRiskLimits = serde_json::from_str(json).unwrap();
+        assert_eq!(limits.max_total_exposure, 10_000.0);
+        assert_eq!(limits.cooldown_minutes, 30);
+    }
 }

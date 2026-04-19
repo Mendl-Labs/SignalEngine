@@ -280,3 +280,156 @@ impl Default for ExchangeCircuitBreakerManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(deprecated)]
+    fn make_breaker(threshold: u32, timeout_ms: u64) -> CircuitBreaker {
+        CircuitBreaker::new(threshold, Duration::from_millis(timeout_ms))
+    }
+
+    // ========== CircuitBreaker state transitions ==========
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_initial_state_is_closed() {
+        let cb = make_breaker(3, 1000);
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+        assert_eq!(cb.get_failure_count(), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_closed_to_open_after_threshold_failures() {
+        let cb = make_breaker(3, 1000);
+        for _ in 0..3 {
+            let _ = cb.call(|| Err::<(), &str>("fail"));
+        }
+        assert_eq!(cb.get_state(), CircuitState::Open);
+        assert_eq!(cb.get_failure_count(), 3);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_open_rejects_calls() {
+        let cb = make_breaker(1, 60_000); // long timeout
+        let _ = cb.call(|| Err::<(), &str>("fail")); // trip open
+        assert_eq!(cb.get_state(), CircuitState::Open);
+
+        let result = cb.call(|| Ok::<&str, &str>("should not run"));
+        assert!(matches!(result, Err(CircuitBreakerError::CircuitOpen)));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_open_to_half_open_after_timeout() {
+        let cb = make_breaker(1, 10); // 10ms timeout
+        let _ = cb.call(|| Err::<(), &str>("fail")); // trip open
+        assert_eq!(cb.get_state(), CircuitState::Open);
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Next call should be allowed (transitions to HalfOpen internally)
+        let result = cb.call(|| Ok::<&str, &str>("recovered"));
+        assert!(result.is_ok());
+        // After success in half-open, state depends on success_threshold (3)
+        assert_eq!(cb.get_state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_half_open_to_closed_after_success_threshold() {
+        let cb = make_breaker(1, 10);
+        let _ = cb.call(|| Err::<(), &str>("fail")); // trip open
+        std::thread::sleep(Duration::from_millis(20));
+
+        // 3 successes needed (success_threshold = 3)
+        for _ in 0..3 {
+            let result = cb.call(|| Ok::<&str, &str>("ok"));
+            assert!(result.is_ok());
+        }
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+        assert_eq!(cb.get_failure_count(), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_half_open_to_open_on_failure() {
+        let cb = make_breaker(1, 10);
+        let _ = cb.call(|| Err::<(), &str>("fail")); // trip open
+        std::thread::sleep(Duration::from_millis(20));
+
+        // One success (enters half-open)
+        let _ = cb.call(|| Ok::<&str, &str>("ok"));
+        assert_eq!(cb.get_state(), CircuitState::HalfOpen);
+
+        // Failure in half-open → back to open
+        let _ = cb.call(|| Err::<(), &str>("fail again"));
+        assert_eq!(cb.get_state(), CircuitState::Open);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_success_resets_failure_count_in_closed() {
+        let cb = make_breaker(3, 1000);
+        let _ = cb.call(|| Err::<(), &str>("fail"));
+        let _ = cb.call(|| Err::<(), &str>("fail"));
+        assert_eq!(cb.get_failure_count(), 2);
+
+        let _ = cb.call(|| Ok::<&str, &str>("success"));
+        assert_eq!(cb.get_failure_count(), 0);
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+    }
+
+    // ========== CircuitBreakerError ==========
+
+    #[test]
+    fn test_circuit_breaker_error_display() {
+        let open_err: CircuitBreakerError<String> = CircuitBreakerError::CircuitOpen;
+        assert_eq!(format!("{}", open_err), "Circuit breaker is open");
+
+        let svc_err = CircuitBreakerError::ServiceError("connection refused".to_string());
+        assert!(format!("{}", svc_err).contains("connection refused"));
+    }
+
+    // ========== ExchangeCircuitBreakerManager ==========
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_manager_independent_exchanges() {
+        let mut mgr = ExchangeCircuitBreakerManager::new();
+        mgr.add_exchange("kraken".into(), 2, Duration::from_secs(60));
+        mgr.add_exchange("binance".into(), 2, Duration::from_secs(60));
+
+        // Trip kraken
+        let _ = mgr.call("kraken", || Err::<(), &str>("fail"));
+        let _ = mgr.call("kraken", || Err::<(), &str>("fail"));
+
+        // Kraken open, binance still closed
+        let health = mgr.get_health_status();
+        assert_eq!(health["kraken"], CircuitState::Open);
+        assert_eq!(health["binance"], CircuitState::Closed);
+
+        // Binance still works
+        let result = mgr.call("binance", || Ok::<&str, &str>("ok"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_manager_unknown_exchange() {
+        let mgr = ExchangeCircuitBreakerManager::new();
+        let result = mgr.call("unknown", || Ok::<&str, &str>("ok"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No circuit breaker configured"));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_manager_default() {
+        let mgr = ExchangeCircuitBreakerManager::default();
+        assert!(mgr.get_health_status().is_empty());
+    }
+}

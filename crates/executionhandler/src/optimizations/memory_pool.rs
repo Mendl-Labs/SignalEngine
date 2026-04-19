@@ -200,3 +200,104 @@ impl ArenaAllocator {
         self.offset as f64 / self.buffer.len() as f64
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── OrderPool ───────────────────────────────────────────────
+
+    #[test]
+    fn test_order_pool_get_returns_default_order() {
+        let pool = OrderPool::new(8);
+        let order = pool.get();
+        assert!(order.inner.symbol.is_empty());
+        assert_eq!(order.inner.quantity, 0.0);
+    }
+
+    #[test]
+    fn test_order_pool_get_from_empty_fallback() {
+        let pool = OrderPool::new(8);
+        // Pool has no pre-allocated objects → falls back to heap
+        let order = pool.get();
+        assert_eq!(order.pool_id, 0); // heap-allocated marker
+    }
+
+    #[test]
+    fn test_order_pool_preallocate_and_get() {
+        let mut pool = OrderPool::new(8);
+        pool.preallocate(4).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.allocated, 4);
+        assert_eq!(stats.available, 4);
+
+        let order = pool.get();
+        // After preallocation, pool_id should be non-zero (came from pool)
+        assert_ne!(order.pool_id, 0);
+    }
+
+    #[test]
+    fn test_order_pool_stats() {
+        let mut pool = OrderPool::new(16);
+        pool.preallocate(8).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.capacity, 16);
+        assert_eq!(stats.allocated, 8);
+        assert_eq!(stats.available, 8);
+        assert!((stats.utilization - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ── ArenaAllocator ──────────────────────────────────────────
+
+    #[test]
+    fn test_arena_allocator_new() {
+        let arena = ArenaAllocator::new(1024);
+        assert!((arena.utilization() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_arena_allocate_and_use() {
+        let mut arena = ArenaAllocator::new(1024);
+        let val: &mut u64 = arena.allocate().unwrap();
+        *val = 42;
+        assert_eq!(*val, 42);
+        assert!(arena.utilization() > 0.0);
+    }
+
+    #[test]
+    fn test_arena_allocate_overflow() {
+        let mut arena = ArenaAllocator::new(4); // tiny arena
+        // A u64 is 8 bytes, won't fit in 4 bytes
+        let result: Option<&mut u64> = arena.allocate();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_arena_reset() {
+        let mut arena = ArenaAllocator::new(1024);
+        let _: &mut u64 = arena.allocate().unwrap();
+        assert!(arena.utilization() > 0.0);
+        arena.reset();
+        assert!((arena.utilization() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ── Thread-local pool ───────────────────────────────────────
+
+    #[test]
+    fn test_thread_local_order() {
+        let order = get_thread_local_order();
+        assert!(order.inner.symbol.is_empty());
+        return_thread_local_order(order);
+    }
+
+    // ── ExchangeOrder Default ───────────────────────────────────
+
+    #[test]
+    fn test_exchange_order_default() {
+        let order = ExchangeOrder::default();
+        assert!(order.symbol.is_empty());
+        assert_eq!(order.quantity, 0.0);
+        assert!(order.price.is_none());
+        assert!(order.metadata.is_empty());
+    }
+}
