@@ -48,8 +48,8 @@ configMap:
     signal-engine-config.yaml: |
       environment: Production
       message_broker:
-        address: "message-broker-engine-messagebroker-helm.messagebroker.svc.cluster.local"
-        port: 6379
+        address: "message-broker-engine.messagebroker.svc.cluster.local"
+        port: 8081
         max_connections: 1000
         buffer_size: 10240
         compression_enabled: true
