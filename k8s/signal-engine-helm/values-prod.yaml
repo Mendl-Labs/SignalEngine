@@ -1,5 +1,6 @@
 # ==============================================================================
 # SignalEngine Production Values — Hetzner k3s single-node
+# Trigger rebuild: picks up fix for PublisherConfig double-port bug (cf75fbd)
 # ==============================================================================
 
 global:
