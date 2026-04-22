@@ -281,10 +281,15 @@ pub struct PaperDeploymentMeta {
     pub tenant_id: uuid::Uuid,
     pub deployment_id: uuid::Uuid,
     pub strategy_id_hash: u16,
+    /// Connector key inside `ExecutionHandler.connectors` (e.g. `"paper_{uuid}"`)
     pub paper_exchange: String,
+    /// The real exchange name used for `ORDERBOOKS` lookups (e.g. `"kraken"`)
+    pub real_exchange: String,
     pub symbols: Vec<String>,
     /// Deployment mode: "paper" or "live"
     pub mode: String,
+    /// True for market-making strategies that require live L3 book feeds.
+    pub is_market_making: bool,
 }
 
 /// Shared registry of active paper deployments, keyed by instance_id (Uuid).
@@ -786,8 +791,10 @@ impl HostedObject {
                                 deployment_id: strategy.instance_id,
                                 strategy_id_hash,
                                 paper_exchange: exchange_name.clone(),
+                                real_exchange: exchange_name.clone(),
                                 symbols: strategy.symbols.clone(),
                                 mode: "live".to_string(),
+                                is_market_making: false,
                             });
                             
                             ultra_logger::ultra_info!(format!(
@@ -797,34 +804,32 @@ impl HostedObject {
                         } else {
                             // Paper mode — create a paper trading connector
                             let paper_exchange_name = format!("paper_{}", strategy.instance_id);
+                            let real_exchange = strategy.target_exchanges.first()
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
                             deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
                                 tenant_id: strategy.tenant_id,
                                 deployment_id: strategy.instance_id,
                                 strategy_id_hash,
                                 paper_exchange: paper_exchange_name.clone(),
+                                real_exchange: real_exchange.clone(),
                                 symbols: strategy.symbols.clone(),
                                 mode: "paper".to_string(),
+                                is_market_making: strategy.strategy_type == "custom_market_making",
                             });
                             
+                            // Build PaperTradingConfig from deployment sim config fields,
+                            // falling back to sensible defaults when not specified.
+                            let sim_config = executionhandler::PaperTradingConfig {
+                                slippage_bps: strategy.slippage_bps.unwrap_or(5.0),
+                                partial_fill_probability: 0.1, // not yet user-configurable
+                                base_latency_ms: 10.0,         // not yet user-configurable
+                            };
+
                             // Register a paper trading connector for this deployment instance
                             if let Some(ref ultra_mgr) = deployment_ultra_mgr {
-                                let paper_config = executionhandler::core::types::ExchangeConfig {
-                                    name: paper_exchange_name.clone(),
-                                    api_key: String::new(),
-                                    secret_key: String::new(),
-                                    passphrase: None,
-                                    sandbox: true,
-                                    connection_pool_size: 1,
-                                    timeout_ms: 5000,
-                                    rate_limit_per_second: 1000,
-                                    rate_limit_burst: 100,
-                                    websocket_url: None,
-                                    rest_api_url: None,
-                                    custom_headers: std::collections::HashMap::new(),
-                                };
-                                
                                 let mut handler = ultra_mgr.execution_handler().write().await;
-                                match handler.add_exchange(paper_exchange_name.clone(), paper_config).await {
+                                match handler.add_paper_exchange(paper_exchange_name.clone(), sim_config).await {
                                     Ok(_) => {
                                         ultra_logger::ultra_info!(format!(
                                             "✅ Paper trading connector '{}' registered for strategy {}",
@@ -857,7 +862,58 @@ impl HostedObject {
             }
             ultra_logger::ultra_info!("📡 Deployment event handler stopped");
         });
-        
+
+        // Spawn book-sync task — every 10 ms, push the latest top-20 bid/ask levels
+        // from DataHandler's ORDERBOOKS global into each active MM paper connector.
+        // This ensures simulated fills use realistic book-walking rather than a flat
+        // slippage percentage.
+        let book_sync_registry = paper_registry.clone();
+        let book_sync_ultra_mgr = self.ultra_order_manager.clone();
+        tokio::spawn(async move {
+            let tick = tokio::time::Duration::from_millis(10);
+            loop {
+                tokio::time::sleep(tick).await;
+
+                // Collect MM paper deployments without holding the DashMap lock across awaits
+                let mm_deployments: Vec<(String, String, Vec<String>)> = book_sync_registry
+                    .iter()
+                    .filter(|e| e.value().is_market_making && e.value().mode == "paper")
+                    .map(|e| {
+                        let m = e.value();
+                        (m.paper_exchange.clone(), m.real_exchange.clone(), m.symbols.clone())
+                    })
+                    .collect();
+
+                for (paper_exchange, real_exchange, symbols) in mm_deployments {
+                    for symbol in &symbols {
+                        // Read top-20 levels; drop the orderbook lock before any await
+                        let maybe_levels: Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> = {
+                            let key = (symbol.clone(), real_exchange.clone());
+                            if let Some(ob_arc) = datahandler::ORDERBOOKS.get(&key) {
+                                ob_arc.read().ok().and_then(|ob| ob.get_orderbook_levels(20).ok())
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((bids, asks)) = maybe_levels {
+                            if !bids.is_empty() {
+                                if let Some(ref mgr) = book_sync_ultra_mgr {
+                                    let handler = mgr.execution_handler().read().await;
+                                    handler.update_connector_book(
+                                        &paper_exchange,
+                                        symbol,
+                                        bids,
+                                        asks,
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Exchanges are now loaded from YAML config in create_handlers()
         
         // Strategy manager is already created and configured

@@ -143,6 +143,16 @@ pub trait ExchangeConnector: Send + Sync {
 
     /// Convert internal signal to exchange-specific format
     fn convert_signal(&self, signal: &Signal) -> Result<ExchangeOrder, ExecutionError>;
+
+    /// Feed a live order book snapshot into the connector for a given symbol.
+    ///
+    /// Paper connectors use this to populate their internal `MockExchangeConnector`
+    /// with real market depth so that simulated fills use realistic book-walking
+    /// rather than a flat slippage percentage.
+    ///
+    /// Live connectors receive order book data directly from the exchange WebSocket
+    /// and can leave this as the default no-op.
+    fn update_book(&self, _symbol: &str, _bids: Vec<(f64, f64)>, _asks: Vec<(f64, f64)>) {}
 }
 
 /// Trait for exchange-specific authentication

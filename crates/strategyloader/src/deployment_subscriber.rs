@@ -85,6 +85,11 @@ pub struct DeployedStrategy {
     pub pending_orders: std::sync::atomic::AtomicI32,
     /// Deployment mode: "paper" or "live"
     pub mode: String,
+    /// Paper simulation config (only relevant in paper mode)
+    pub slippage_bps: Option<f64>,
+    pub fill_model: Option<String>,
+    pub maker_fee_bps: Option<f64>,
+    pub taker_fee_bps: Option<f64>,
 }
 
 impl DeployedStrategy {
@@ -105,16 +110,23 @@ impl DeployedStrategy {
         };
 
         // Read mode from the dedicated proto field, falling back to risk_metrics JSON
+        let risk_meta: serde_json::Value = if !msg.risk_metrics.is_empty() {
+            serde_json::from_slice(&msg.risk_metrics).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+
         let mode = if !msg.mode.is_empty() {
             msg.mode.clone()
-        } else if !msg.risk_metrics.is_empty() {
-            serde_json::from_slice::<serde_json::Value>(&msg.risk_metrics)
-                .ok()
-                .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or_else(|| "paper".to_string())
         } else {
-            "paper".to_string()
+            risk_meta.get("mode").and_then(|m| m.as_str()).unwrap_or("paper").to_string()
         };
+
+        // Extract optional sim config from risk_metrics JSON
+        let slippage_bps = risk_meta.get("slippage_bps").and_then(|v| v.as_f64());
+        let fill_model = risk_meta.get("fill_model").and_then(|v| v.as_str()).map(String::from);
+        let maker_fee_bps = risk_meta.get("maker_fee_bps").and_then(|v| v.as_f64());
+        let taker_fee_bps = risk_meta.get("taker_fee_bps").and_then(|v| v.as_f64());
 
         Ok(Self {
             strategy_id,
@@ -133,6 +145,10 @@ impl DeployedStrategy {
             open_positions: std::sync::atomic::AtomicI32::new(0),
             pending_orders: std::sync::atomic::AtomicI32::new(0),
             mode,
+            slippage_bps,
+            fill_model,
+            maker_fee_bps,
+            taker_fee_bps,
         })
     }
 
@@ -404,6 +420,16 @@ impl DeploymentSubscriber {
 
             // If deployment succeeded, publish market data subscriptions for each exchange
             if success && !active_exchanges.is_empty() && !symbols.is_empty() {
+                // Market-making strategies require L3 order book data for realistic simulation
+                // and quote placement. Directional strategies only need trade ticks.
+                let is_market_making = deployment.strategy_type == "custom_market_making";
+                let data_types = if is_market_making {
+                    vec!["level3".to_string(), "trade".to_string()]
+                } else {
+                    vec!["trade".to_string()]
+                };
+                let orderbook_depth: i32 = if is_market_making { 100 } else { 0 };
+
                 for exchange in &active_exchanges {
                     let subscription_id = format!("{}_{}", instance_id_str, exchange);
                     
@@ -413,8 +439,8 @@ impl DeploymentSubscriber {
                         strategy_instance_id: instance_id_str.clone(),
                         exchange: exchange.clone(),
                         symbols: symbols.clone(),
-                        data_types: vec!["level3".to_string(), "trade".to_string()],
-                        orderbook_depth: 100, // Default depth for HFT
+                        data_types: data_types.clone(),
+                        orderbook_depth,
                         timestamp: Utc::now().timestamp_millis(),
                     };
 

@@ -502,7 +502,39 @@ impl UltraLowLatencyExecutionHandler {
         
         Ok(())
     }
-    
+
+    /// Add a paper trading connector with explicit simulation configuration.
+    ///
+    /// Use this instead of `add_exchange` when deploying a strategy in paper mode
+    /// so user-specified slippage, fees, and fill model are honoured.
+    pub async fn add_paper_exchange(&mut self, exchange_name: String, paper_config: crate::PaperTradingConfig) -> Result<(), ExecutionError> {
+        let connector = Box::new(crate::PaperTradingConnector::new(paper_config));
+        let mut connectors = self.connectors.write().await;
+        connectors.insert(exchange_name.clone(), connector as Box<dyn crate::core::ExchangeConnector>);
+        if self.default_exchange.is_none() {
+            self.default_exchange = Some(exchange_name);
+        }
+        Ok(())
+    }
+
+    /// Feed a live order book snapshot into a named connector.
+    ///
+    /// Used by the hostbuilder's book-sync task to push L3 snapshots from the
+    /// DataHandler's `ORDERBOOKS` global into paper trading connectors so that
+    /// simulated fills use realistic book-walking rather than a flat slippage model.
+    pub async fn update_connector_book(
+        &self,
+        exchange_name: &str,
+        symbol: &str,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+    ) {
+        let connectors = self.connectors.read().await;
+        if let Some(connector) = connectors.get(exchange_name) {
+            connector.update_book(symbol, bids, asks);
+        }
+    }
+
     /// Add an exchange connector from database-stored credentials
     /// 
     /// This is the primary method for production use - loads credentials stored 

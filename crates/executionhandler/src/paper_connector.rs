@@ -88,17 +88,6 @@ impl PaperTradingConnector {
         self.mock.initialize_order_book(symbol, price).await;
     }
 
-    /// Feed live order book levels from an external data source
-    pub fn update_book(&self, symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
-        let to_levels = |pairs: Vec<(f64, f64)>| -> Vec<PriceLevel> {
-            pairs.into_iter().map(|(p, q)| PriceLevel {
-                price: SimBigDecimal::from_str(&p.to_string()).unwrap_or_default(),
-                quantity: SimBigDecimal::from_str(&q.to_string()).unwrap_or_default(),
-            }).collect()
-        };
-        self.mock.update_order_book(symbol, to_levels(bids), to_levels(asks));
-    }
-
     /// Convert a Signal to a SimulationOrder
     fn signal_to_sim_order(signal: &Signal) -> SimulationOrder {
         let (side, order_type) = match signal.action {
@@ -341,6 +330,16 @@ impl ExchangeConnector for PaperTradingConnector {
             return Err(ExecutionError::Validation("Quantity must be positive".into()));
         }
         Ok(())
+    }
+
+    fn update_book(&self, symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
+        let to_levels = |pairs: Vec<(f64, f64)>| -> Vec<PriceLevel> {
+            pairs.into_iter().map(|(p, q)| PriceLevel {
+                price: SimBigDecimal::from_str(&p.to_string()).unwrap_or_default(),
+                quantity: SimBigDecimal::from_str(&q.to_string()).unwrap_or_default(),
+            }).collect()
+        };
+        self.mock.update_order_book(symbol, to_levels(bids), to_levels(asks));
     }
 
     fn convert_signal(&self, signal: &Signal) -> Result<ExchangeOrder, ExecutionError> {
