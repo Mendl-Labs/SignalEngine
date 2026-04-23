@@ -36,6 +36,21 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
+use diesel::{ExpressionMethods, JoinOnDsl, OptionalExtension, QueryDsl, SelectableHelper};
+#[cfg(feature = "postgres")]
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+#[cfg(feature = "postgres")]
+use diesel_async::pooled_connection::deadpool::Pool;
+#[cfg(feature = "postgres")]
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "postgres")]
+use databaseschema::models::backtest_result::BacktestResult;
+#[cfg(feature = "postgres")]
+use databaseschema::models::deployed_strategy::DeployedStrategy as DbDeployedStrategy;
+#[cfg(feature = "postgres")]
+use databaseschema::schema::{backtest_jobs, backtest_results, deployed_strategies};
+
 /// Topics for deployment events
 pub mod topics {
     pub const STRATEGY_DEPLOYMENT: &str = "strategy.deployment";
@@ -162,12 +177,12 @@ impl DeployedStrategy {
             strategy_name: self.strategy_name.clone(),
             active_exchanges: self.target_exchanges.clone(),
             symbols: self.symbols.clone(),
-            unrealized_pnl: self.unrealized_pnl.load(Ordering::Relaxed) as f64 / 10000.0,
-            realized_pnl: self.realized_pnl.load(Ordering::Relaxed) as f64 / 10000.0,
-            open_positions: self.open_positions.load(Ordering::Relaxed),
-            pending_orders: self.pending_orders.load(Ordering::Relaxed),
+            unrealized_pnl: std::sync::atomic::AtomicI64::load(&self.unrealized_pnl, Ordering::Relaxed) as f64 / 10000.0,
+            realized_pnl: std::sync::atomic::AtomicI64::load(&self.realized_pnl, Ordering::Relaxed) as f64 / 10000.0,
+            open_positions: std::sync::atomic::AtomicI32::load(&self.open_positions, Ordering::Relaxed),
+            pending_orders: std::sync::atomic::AtomicI32::load(&self.pending_orders, Ordering::Relaxed),
             deployed_at: self.deployed_at,
-            total_trades: self.total_trades.load(Ordering::Relaxed) as i64,
+            total_trades: std::sync::atomic::AtomicU64::load(&self.total_trades, Ordering::Relaxed) as i64,
         }
     }
 }
@@ -281,6 +296,99 @@ impl DeploymentSubscriber {
         Ok(())
     }
 
+    /// Reconcile active deployments from DB after startup.
+    ///
+    /// This replays deployment events for strategies that were already active
+    /// before SignalEngine restarted, ensuring market data subscriptions are
+    /// re-established in demand-driven DataEngine mode.
+    #[cfg(feature = "postgres")]
+    pub async fn reconcile_active_deployments_from_db(
+        &self,
+    ) -> Result<usize, DeploymentSubscriberError> {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => return Ok(0),
+        };
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+        let pool: Pool<AsyncPgConnection> = Pool::builder(manager)
+            .max_size(5)
+            .build()
+            .map_err(|e| DeploymentSubscriberError::LoadError(format!("DB pool: {}", e)))?;
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| DeploymentSubscriberError::LoadError(format!("DB connection: {}", e)))?;
+
+        let rows: Vec<(DbDeployedStrategy, BacktestResult)> = deployed_strategies::table
+            .inner_join(
+                backtest_results::table.on(deployed_strategies::backtest_result_id.eq(backtest_results::id)),
+            )
+            .filter(deployed_strategies::is_active.eq(true))
+            .filter(deployed_strategies::status.eq("active"))
+            .select((DbDeployedStrategy::as_select(), BacktestResult::as_select()))
+            .load(&mut conn)
+            .await
+            .map_err(|e| DeploymentSubscriberError::LoadError(format!("Query active deployments: {}", e)))?;
+
+        let mut replayed = 0usize;
+
+        for (deployment, backtest) in rows {
+            let strategy_type = backtest_jobs::table
+                .filter(backtest_jobs::result_id.eq(Some(deployment.backtest_result_id)))
+                .select(backtest_jobs::strategy_type)
+                .first::<String>(&mut conn)
+                .await
+                .optional()
+                .map_err(|e| {
+                    DeploymentSubscriberError::LoadError(format!(
+                        "Query strategy type for deployment {}: {}",
+                        deployment.id, e
+                    ))
+                })?
+                .unwrap_or_else(|| "custom".to_string());
+
+            let exchanges: Vec<String> = deployment
+                .exchange_targets
+                .iter()
+                .filter_map(|e| e.clone())
+                .collect();
+
+            let deployment_msg = StrategyDeployment {
+                strategy_id: deployment.backtest_result_id.to_string(),
+                instance_id: deployment.id.to_string(),
+                tenant_id: deployment.tenant_id.to_string(),
+                strategy_type,
+                strategy_name: deployment.name.clone(),
+                version: "1.0".to_string(),
+                parameters: Vec::new(),
+                initial_capital: 0.0,
+                target_exchanges: exchanges,
+                symbols: vec![backtest.symbol.clone()],
+                approved_by: deployment.deployed_by.unwrap_or_else(|| "reconciler".to_string()),
+                approved_at: deployment.deployed_at.to_rfc3339(),
+                performance_summary: Vec::new(),
+                risk_metrics: Vec::new(),
+                admin_approved: false,
+                timestamp: Utc::now().timestamp(),
+                mode: deployment.mode,
+            };
+
+            Self::handle_deployment(
+                deployment_msg,
+                &self.deployed_strategies,
+                self.publisher.as_ref(),
+                &self.node_id,
+                self.deployment_tx.as_ref(),
+            )
+            .await;
+
+            replayed += 1;
+        }
+
+        Ok(replayed)
+    }
+
     /// Process incoming messages
     async fn process_messages(
         subscriber: Arc<UltraFastSubscriber>,
@@ -296,7 +404,7 @@ impl DeploymentSubscriber {
             topics::STRATEGY_STATUS_REQUEST,
         ];
 
-        while is_running.load(Ordering::Relaxed) {
+        while std::sync::atomic::AtomicBool::load(&is_running, Ordering::Relaxed) {
             let mut had_message = false;
 
             // Poll each topic for messages

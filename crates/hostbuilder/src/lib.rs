@@ -631,7 +631,7 @@ impl HostedObject {
                 return Ok(());
             };
             let signal_paper_registry = paper_registry.clone();
-            let _signal_fill_tx = paper_fill_tx.clone();
+            let signal_fill_tx = paper_fill_tx.clone();
             tokio::spawn(async move {
                 ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
                 let mut signal_count = 0u64;
@@ -913,6 +913,23 @@ impl HostedObject {
                 }
             }
         });
+
+        // Reconcile already-active deployments so restarts don't require a manual
+        // pause/resume cycle to restore strategy routing and market subscriptions.
+        #[cfg(feature = "postgres")]
+        {
+            match deployment_subscriber.reconcile_active_deployments_from_db().await {
+                Ok(0) => ultra_info!("ℹ️ Deployment reconciliation found no active deployments"),
+                Ok(count) => ultra_info!(format!(
+                    "✅ Reconciled {} active deployment(s) from DB",
+                    count
+                )),
+                Err(e) => ultra_warn!(format!(
+                    "⚠️ Deployment reconciliation failed: {:?}",
+                    e
+                )),
+            }
+        }
 
         // Exchanges are now loaded from YAML config in create_handlers()
         

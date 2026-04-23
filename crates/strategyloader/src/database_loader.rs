@@ -20,7 +20,7 @@ use ultra_logger::{ultra_warn, ultra_info};
 use databaseschema::models::strategy::{Strategy, StrategyInstance as DbStrategyInstance};
 use databaseschema::models::deployed_strategy::DeployedStrategy;
 use databaseschema::models::backtest_result::BacktestResult;
-use databaseschema::schema::{strategies, strategy_instances, deployed_strategies, backtest_results};
+use databaseschema::schema::{deployed_strategies, backtest_results};
 
 use crate::types::*;
 use crate::loader::StrategyLoader;
@@ -122,7 +122,7 @@ impl DatabaseStrategyLoader {
         let assets = Self::parse_assets(&params_json).unwrap_or_else(|_| {
             vec![TradingAsset {
                 symbol: backtest.symbol.clone(),
-                exchange: deployment.exchange_targets.first()
+                exchange: deployment.exchange_targets.get(0)
                     .and_then(|e| e.clone())
                     .unwrap_or_else(|| "kraken".to_string()),
                 weight: 1.0,
