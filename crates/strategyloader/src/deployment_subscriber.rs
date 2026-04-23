@@ -253,6 +253,9 @@ impl DeploymentSubscriber {
             DeploymentSubscriberError::SubscriptionError(format!("{:?}", e))
         })?;
 
+        // Start the subscriber receive loop after all SUBSCRIBE_ACKs are received.
+        subscriber.start();
+
         self.is_running.store(true, Ordering::SeqCst);
 
         // Spawn message processing task

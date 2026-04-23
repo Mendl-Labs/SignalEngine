@@ -3974,6 +3974,7 @@ dependencies = [
  "prost-build",
  "protocol",
  "spin_sleep",
+ "tokio",
  "ultra-logger",
 ]
 
