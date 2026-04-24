@@ -594,6 +594,7 @@ impl DeploymentSubscriber {
 
             let encoded = request.encode_to_vec();
             let _ = pub_arc.publish_raw(encoded, topics::STRATEGY_DEPLOYMENT_ACK).await;
+            let _ = pub_arc.flush().await;
 
             // If deployment succeeded, publish market data subscriptions for each exchange
             if success && !active_exchanges.is_empty() && !symbols.is_empty() {
@@ -632,6 +633,11 @@ impl DeploymentSubscriber {
                     if let Err(_e) = pub_arc.publish_raw(encoded, topics::MARKET_DATA_SUBSCRIBE).await {
                         ultra_warn!(format!(
                             "⚠️ Failed to publish MarketDataSubscribe for exchange {}: {:?}",
+                            exchange, _e
+                        ));
+                    } else if let Err(_e) = pub_arc.flush().await {
+                        ultra_warn!(format!(
+                            "⚠️ Failed to flush MarketDataSubscribe for exchange {}: {:?}",
                             exchange, _e
                         ));
                     } else {
@@ -689,6 +695,7 @@ impl DeploymentSubscriber {
 
                     let encoded = market_unsub.encode_to_vec();
                     let _ = pub_arc.publish_raw(encoded, topics::MARKET_DATA_UNSUBSCRIBE).await;
+                    let _ = pub_arc.flush().await;
                 }
             }
 
@@ -747,6 +754,7 @@ impl DeploymentSubscriber {
             let _ = pub_arc
                 .publish_raw(encoded, topics::STRATEGY_STATUS_RESPONSE)
                 .await;
+            let _ = pub_arc.flush().await;
         }
     }
 
