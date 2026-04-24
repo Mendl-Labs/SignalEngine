@@ -29,8 +29,9 @@ COPY . ./
 # Change to SignalEngine directory and build
 WORKDIR /app/SignalEngine
 
-# Build the SignalEngine program
-RUN cargo build --release --bin program && \
+# Build the SignalEngine program with postgres support enabled.
+# Reconciliation and DB-backed deployment recovery are cfg-gated on this feature.
+RUN cargo build --release --bin program --features postgres && \
     cp target/release/program /bin/signal-engine
 
 ################################################################################
