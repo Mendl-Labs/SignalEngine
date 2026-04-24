@@ -22,6 +22,7 @@
 use chrono::Utc;
 use dashmap::DashMap;
 use prost::Message;
+use ultra_logger::{ultra_info, ultra_warn};
 use protocol::broker::messages::{
     publish_request, DeploymentStatusRequest, DeploymentStatusResponse,
     MarketDataSubscribe, MarketDataUnsubscribe,
@@ -620,10 +621,24 @@ impl DeploymentSubscriber {
                         timestamp: Utc::now().timestamp_millis(),
                     };
 
-                    let encoded = market_sub.encode_to_vec();
+                    // Wrap in PublishRequest with RawData payload — DataEngine's SubscriptionManager
+                    // decodes PublishRequest and expects MarketDataSubscribe bytes inside RawData.
+                    let market_sub_bytes = market_sub.encode_to_vec();
+                    let request = PublishRequest {
+                        topic: topics::MARKET_DATA_SUBSCRIBE.to_string(),
+                        payload: Some(publish_request::Payload::RawData(market_sub_bytes)),
+                    };
+                    let encoded = request.encode_to_vec();
                     if let Err(_e) = pub_arc.publish_raw(encoded, topics::MARKET_DATA_SUBSCRIBE).await {
-                        // Log error but don't fail deployment
-                        // Strategy can still work if DataEngine is already streaming
+                        ultra_warn!(format!(
+                            "⚠️ Failed to publish MarketDataSubscribe for exchange {}: {:?}",
+                            exchange, _e
+                        ));
+                    } else {
+                        ultra_info!(format!(
+                            "📡 Published MarketDataSubscribe for exchange={} symbols={:?}",
+                            exchange, symbols
+                        ));
                     }
                 }
             }
