@@ -31,6 +31,36 @@ pub struct DatabaseStrategyLoader {
     pool: Pool<AsyncPgConnection>,
 }
 
+fn resolved_database_url() -> Result<String> {
+    let raw = std::env::var("DATABASE_URL")
+        .map_err(|_| StrategyLoaderError::Config("DATABASE_URL not set".into()))?;
+
+    // Kubernetes does not expand env references in value fields, so resolve
+    // placeholders such as $(POSTGRES_USER) manually when present.
+    let mut resolved = raw.clone();
+    for key in [
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let needle = format!("$({})", key);
+            resolved = resolved.replace(&needle, &value);
+        }
+    }
+
+    if resolved.contains("$(") {
+        return Err(StrategyLoaderError::Config(format!(
+            "DATABASE_URL contains unresolved placeholders: {}",
+            raw
+        )));
+    }
+
+    Ok(resolved)
+}
+
 impl DatabaseStrategyLoader {
     /// Create a new database strategy loader with connection pool
     pub fn new(pool: Pool<AsyncPgConnection>) -> Self {
@@ -40,9 +70,8 @@ impl DatabaseStrategyLoader {
     /// Create from DATABASE_URL environment variable
     pub async fn from_env() -> Result<Self> {
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-        
-        let database_url = std::env::var("DATABASE_URL")
-            .map_err(|_| StrategyLoaderError::Config("DATABASE_URL not set".into()))?;
+
+        let database_url = resolved_database_url()?;
         
         let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
         let pool = Pool::builder(config)

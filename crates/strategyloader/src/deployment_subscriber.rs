@@ -216,6 +216,38 @@ pub enum DeploymentEvent {
 }
 
 impl DeploymentSubscriber {
+    fn resolved_database_url() -> Result<String, DeploymentSubscriberError> {
+        let raw = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => return Ok(String::new()),
+        };
+
+        // Kubernetes env values are not shell-expanded; resolve placeholders
+        // such as $(POSTGRES_USER) from sibling POSTGRES_* env vars.
+        let mut resolved = raw.clone();
+        for key in [
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_HOST",
+            "POSTGRES_PORT",
+            "POSTGRES_DB",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                let needle = format!("$({})", key);
+                resolved = resolved.replace(&needle, &value);
+            }
+        }
+
+        if resolved.contains("$(") {
+            return Err(DeploymentSubscriberError::LoadError(format!(
+                "DATABASE_URL contains unresolved placeholders: {}",
+                raw
+            )));
+        }
+
+        Ok(resolved)
+    }
+
     /// Create a new deployment subscriber
     pub fn new(broker_address: &str, node_id: &str) -> Self {
         Self {
@@ -305,10 +337,10 @@ impl DeploymentSubscriber {
     pub async fn reconcile_active_deployments_from_db(
         &self,
     ) -> Result<usize, DeploymentSubscriberError> {
-        let database_url = match std::env::var("DATABASE_URL") {
-            Ok(url) => url,
-            Err(_) => return Ok(0),
-        };
+        let database_url = Self::resolved_database_url()?;
+        if database_url.is_empty() {
+            return Ok(0);
+        }
 
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
         let pool: Pool<AsyncPgConnection> = Pool::builder(manager)
