@@ -248,6 +248,43 @@ impl DeploymentSubscriber {
         Ok(resolved)
     }
 
+    #[cfg(feature = "postgres")]
+    fn resolve_reconcile_exchanges(deployment: &DbDeployedStrategy) -> Vec<String> {
+        let mut exchanges: Vec<String> = deployment
+            .exchange_targets
+            .iter()
+            .filter_map(|e| e.as_ref().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if exchanges.is_empty() {
+            if let Some(metadata) = &deployment.metadata {
+                if let Some(arr) = metadata.get("exchange_targets").and_then(|v| v.as_array()) {
+                    exchanges.extend(arr.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()));
+                }
+
+                if exchanges.is_empty() {
+                    if let Some(exchange) = metadata
+                        .get("exchange")
+                        .or_else(|| metadata.get("target_exchange"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let ex = exchange.trim().to_string();
+                        if !ex.is_empty() {
+                            exchanges.push(ex);
+                        }
+                    }
+                }
+            }
+        }
+
+        if exchanges.is_empty() {
+            exchanges.push("kraken".to_string());
+        }
+
+        exchanges
+    }
+
     /// Create a new deployment subscriber
     pub fn new(broker_address: &str, node_id: &str) -> Self {
         Self {
@@ -380,11 +417,7 @@ impl DeploymentSubscriber {
                 })?
                 .unwrap_or_else(|| "custom".to_string());
 
-            let exchanges: Vec<String> = deployment
-                .exchange_targets
-                .iter()
-                .filter_map(|e| e.clone())
-                .collect();
+            let exchanges = Self::resolve_reconcile_exchanges(&deployment);
 
             let deployment_msg = StrategyDeployment {
                 strategy_id: deployment.backtest_result_id.to_string(),
