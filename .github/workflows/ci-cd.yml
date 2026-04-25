@@ -266,11 +266,96 @@ jobs:
           echo "Pull: docker pull ${{ env.IMAGE_NAME }}:$SHORT_SHA"
           echo "=========================================="
 
-  deploy:
-    name: Deploy to Kubernetes
+  deploy-qa:
+    name: Deploy to QA & Smoke Test
     runs-on: [self-hosted, linux, x64]
     needs: build
     if: github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
+    timeout-minutes: 20
+    env:
+      TARGET_NAMESPACE: signalengine-qa
+      VALUES_FILE: values-qa.yaml
+      RELEASE_NAME: signal-engine
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.3'
+
+      - name: Configure Kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Deploy to QA
+        run: |
+          set -euo pipefail
+          cd SignalEngine
+          IMAGE_TAG="${{ github.sha }}"
+          IMAGE_TAG="${IMAGE_TAG:0:7}"
+          echo "[QA] Deploying $IMAGE_TAG to namespace $TARGET_NAMESPACE"
+
+          kubectl create namespace "$TARGET_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --namespace="$TARGET_NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          STATUS=$(helm list -n "$TARGET_NAMESPACE" --all -o json 2>/dev/null | jq -r '.[] | select(.name=="'"$RELEASE_NAME"'") | .status' || echo "")
+          if [[ "$STATUS" == *"pending"* ]] || [ "$STATUS" = "failed" ]; then
+            helm uninstall "$RELEASE_NAME" -n "$TARGET_NAMESPACE" --wait --timeout 2m 2>/dev/null || true
+            sleep 5
+          fi
+
+          helm upgrade --install "$RELEASE_NAME" ./${{ env.HELM_CHART_PATH }} \
+            --namespace "$TARGET_NAMESPACE" \
+            --create-namespace \
+            -f ./${{ env.HELM_CHART_PATH }}/$VALUES_FILE \
+            --set "image.repository=${{ env.IMAGE_NAME }}" \
+            --set "image.tag=$IMAGE_TAG" \
+            --set "image.pullPolicy=IfNotPresent" \
+            --set "imagePullSecrets[0].name=ghcr-secret" \
+            --timeout 5m
+          echo "[OK] QA deploy complete"
+
+      - name: Smoke Test (QA)
+        run: |
+          set -euo pipefail
+          echo "[SMOKE] Waiting for QA pods to become ready..."
+          kubectl rollout status deployment -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --timeout=4m || \
+            kubectl rollout status deployment -n "$TARGET_NAMESPACE" --timeout=4m
+          kubectl get pods -n "$TARGET_NAMESPACE" -o wide
+          NOT_READY=$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' | grep -c false || true)
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "[FAIL] One or more containers are not ready"
+            kubectl describe pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm | tail -80
+            kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=80 --all-containers || true
+            exit 1
+          fi
+          LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers 2>&1 || true)
+          if echo "$LOGS" | grep -qiE 'panic|FATAL'; then
+            echo "[FAIL] Critical error pattern detected in QA logs"
+            echo "$LOGS" | tail -50
+            exit 1
+          fi
+          echo "[OK] QA smoke test passed"
+
+  deploy:
+    name: Deploy to Kubernetes (Prod)
+    runs-on: [self-hosted, linux, x64]
+    needs: deploy-qa
+    if: github.ref == 'refs/heads/main' && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout SignalEngine
