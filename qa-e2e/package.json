@@ -1,0 +1,15 @@
+{
+  "name": "signal-engine-qa-e2e",
+  "version": "1.0.0",
+  "description": "QA End-to-End Testing Agent for SignalEngine",
+  "main": "index.js",
+  "scripts": {
+    "test": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["qa", "e2e", "testing", "kubernetes", "signalengine"],
+  "author": "mendllabs",
+  "license": "MIT"
+}

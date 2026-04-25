@@ -351,6 +351,37 @@ jobs:
           fi
           echo "[OK] QA smoke test passed"
 
+      - name: Setup Node.js (for qa-e2e agent)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run QA E2E Agent
+        env:
+          TARGET_NAMESPACE: ${{ env.TARGET_NAMESPACE }}
+          IMAGE_TAG: ${{ github.sha }}
+          FAIL_FAST: 'true'
+          READY_TIMEOUT_SECONDS: '300'
+        run: |
+          set -euo pipefail
+          # Truncate IMAGE_TAG to 7 chars to match Helm deploy tag
+          export IMAGE_TAG="${IMAGE_TAG:0:7}"
+
+          cd SignalEngine/qa-e2e
+          # Pure-node agent, zero npm dependencies - just run it.
+          node index.js
+
+      - name: Debug — Dump QA Cluster State on Failure
+        if: failure()
+        run: |
+          set +e
+          echo "=== Pods ==="
+          kubectl get pods -n "$TARGET_NAMESPACE" -o wide
+          echo "=== Recent Events ==="
+          kubectl get events -n "$TARGET_NAMESPACE" --sort-by='.lastTimestamp' | tail -50
+          echo "=== App Pod Logs ==="
+          kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers || true
+
   deploy:
     name: Deploy to Kubernetes (Prod)
     runs-on: [self-hosted, linux, x64]
