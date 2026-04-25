@@ -1,0 +1,23 @@
+# =============================================================================
+# SignalEngine QA Environment Configuration
+# Production-like topology with reduced resources for testing
+# =============================================================================
+
+global:
+  environment: qa
+
+replicaCount: 1
+
+image:
+  pullPolicy: Always
+
+resources:
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+
+autoscaling:
+  enabled: false
