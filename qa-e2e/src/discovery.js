@@ -50,7 +50,8 @@ class Discovery {
         restarts: pod.status.containerStatuses?.[0]?.restartCount || 0,
         image: pod.spec.containers?.[0]?.image || 'unknown',
         ip: pod.status.podIP,
-        node: pod.spec.nodeName
+        node: pod.spec.nodeName,
+        terminating: !!pod.metadata.deletionTimestamp
       }));
     } catch (err) {
       throw new Error(`Failed to get pods: ${err.message}`);
