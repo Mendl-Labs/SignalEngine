@@ -737,6 +737,12 @@ impl HostedObject {
                         });
                         match signals {
                             Ok(sigs) => {
+                                if !sigs.is_empty() && signals_emitted < 10 {
+                                    ultra_logger::ultra_info!(format!(
+                                        "🔗 Bridge: strategy emitted {} signals (sid_hash={}, sym={}, bid={}, ask={})",
+                                        sigs.len(), sid_hash, md.symbol, md.bid, md.ask
+                                    ));
+                                }
                                 for mut sig in sigs {
                                     // Stamp the deployment's strategy_id_hash so the
                                     // downstream signal loop matches it to paper_registry.
@@ -788,6 +794,14 @@ impl HostedObject {
                         .find(|e| e.value().strategy_id_hash == signal.strategy_id)
                         .map(|e| e.value().clone());
 
+                    if signal_count <= 10 {
+                        ultra_logger::ultra_info!(format!(
+                            "🎯 Signal #{} received: sid={}, action={:?}, qty={}, price={}, paper_meta={}",
+                            signal_count, signal.strategy_id, signal.action, signal.quantity, signal.price,
+                            paper_meta.is_some()
+                        ));
+                    }
+
                     // Resolve symbol: prefer the deployment's first symbol (readable),
                     // fall back to the global hash->name map populated at deploy time,
                     // and only as a last resort use the raw hash placeholder.
@@ -830,6 +844,12 @@ impl HostedObject {
                         priority
                     ).await {
                         Ok(result) => {
+                            if signal_count <= 10 {
+                                ultra_logger::ultra_info!(format!(
+                                    "🎯 Order #{} result: success={}, filled_qty={}, avg_price={}, order_id={}, err={:?}",
+                                    signal_count, result.success, result.filled_quantity, result.avg_price, result.order_id, result.error
+                                ));
+                            }
                             // Record fill to trade_history for paper deployments
                             if result.success {
                                 #[cfg(feature = "postgres")]
