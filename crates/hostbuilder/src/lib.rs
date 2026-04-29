@@ -637,8 +637,20 @@ impl HostedObject {
         // Create paper trade writer for DB persistence (if DATABASE_URL is set)
         #[cfg(feature = "postgres")]
         let paper_fill_tx: Option<tokio::sync::mpsc::Sender<paper_trade_writer::PaperFillEvent>> = {
-            match env::var("DATABASE_URL") {
-                Ok(db_url) => {
+            // Kubernetes env values are not shell-expanded; resolve $(VAR) placeholders
+            // from sibling POSTGRES_* env vars (same logic as strategyloader uses).
+            fn resolve_db_url() -> Option<String> {
+                let raw = std::env::var("DATABASE_URL").ok()?;
+                let mut resolved = raw.clone();
+                for key in ["POSTGRES_USER","POSTGRES_PASSWORD","POSTGRES_HOST","POSTGRES_PORT","POSTGRES_DB"] {
+                    if let Ok(v) = std::env::var(key) {
+                        resolved = resolved.replace(&format!("$({})", key), &v);
+                    }
+                }
+                if resolved.contains("$(") { None } else { Some(resolved) }
+            }
+            match resolve_db_url() {
+                Some(db_url) => {
                     match smartorderrouter::database::create_pool(&db_url).await {
                         Ok(pool) => {
                             let writer = paper_trade_writer::PaperTradeWriter::new(Arc::new(pool));
@@ -651,8 +663,8 @@ impl HostedObject {
                         }
                     }
                 }
-                Err(_) => {
-                    ultra_info!("ℹ️ DATABASE_URL not set — paper trades will not persist to DB");
+                None => {
+                    ultra_info!("ℹ️ DATABASE_URL not set or unresolved — paper trades will not persist to DB");
                     None
                 }
             }
