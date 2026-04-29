@@ -681,9 +681,18 @@ impl HostedObject {
                 );
                 let mut tick_count: u64 = 0;
                 let mut signals_emitted: u64 = 0;
+                // Normalize symbols for matching: uppercase + strip '/' '-' '_'
+                // so that "BTC/USD" (Kraken trade) matches "BTC-USD" (deployment).
+                fn norm_sym(s: &str) -> String {
+                    s.chars()
+                        .filter(|c| !matches!(c, '/' | '-' | '_' | ' '))
+                        .flat_map(|c| c.to_uppercase())
+                        .collect()
+                }
                 while let Ok(md) = market_data_rx.recv() {
                     tick_count += 1;
 
+                    let md_norm = norm_sym(&md.symbol);
                     // Snapshot matching deployments (drop iterator before await to
                     // avoid holding the DashMap shard lock across awaits).
                     let matches: Vec<(u16, String, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
@@ -692,7 +701,7 @@ impl HostedObject {
                             e.value()
                                 .symbols
                                 .iter()
-                                .any(|s| s.eq_ignore_ascii_case(&md.symbol))
+                                .any(|s| norm_sym(s) == md_norm)
                         })
                         .map(|e| {
                             let v = e.value();
