@@ -262,13 +262,18 @@ use datahandler::{DataHandler, DataHandlerTrait};
 use dotenv::dotenv;
 use mockall::automock;
 use portfoliohandler::{PortfolioHandler, PortfolioHandlerTrait};
-use strategyhandler::{StrategyManager, StrategyConfig}; // Remove non-existent types
+use strategyhandler::{
+    StrategyManager, StrategyConfig, Strategy, SimpleMarketMakingStrategy,
+    MarketData as StratMarketData,
+};
 use strategyloader::{DeploymentSubscriber, DeploymentEvent};
 use std::{env, error::Error, sync::{Arc, RwLock}, collections::HashMap};
 use tokio::sync::broadcast;
 use orderbook::Orderbook;
 use portfolio::CryptoWallet;
 use ultra_logger::{ultra_info, ultra_warn, ultra_error};
+use ultra_signal::hash_symbol;
+use lazy_static::lazy_static;
 
 // Re-export the global storage from datahandler and portfoliohandler
 pub use datahandler::ORDERBOOKS;
@@ -295,6 +300,26 @@ pub struct PaperDeploymentMeta {
 /// Shared registry of active paper deployments, keyed by instance_id (Uuid).
 /// The signal loop scans this (typically <10 entries) to match strategy_id_hash.
 pub type PaperDeploymentRegistry = Arc<DashMap<uuid::Uuid, PaperDeploymentMeta>>;
+
+/// A strategy that has been deployed and is actively consuming market data.
+/// The market_data->strategy bridge clones the inner Arc and invokes
+/// `generate_signals()` on each tick whose symbol matches.
+pub struct DeployedStrategyEntry {
+    pub strategy_id_hash: u16,
+    pub symbols: Vec<String>,
+    pub real_exchange: String,
+    pub strategy: Arc<tokio::sync::Mutex<Box<dyn Strategy>>>,
+}
+
+/// Registry of deployed strategies keyed by deployment instance_id (Uuid).
+pub type DeployedStrategyRegistry = Arc<DashMap<uuid::Uuid, DeployedStrategyEntry>>;
+
+lazy_static! {
+    /// Global symbol_hash -> canonical symbol name map. Populated when a
+    /// deployment is registered; read by the signal loop so trade_history
+    /// rows show readable symbols (e.g. "BTC/USD") rather than `SYMBOL_<hash>`.
+    pub static ref SYMBOL_NAMES: DashMap<u64, String> = DashMap::new();
+}
 
 #[automock]
 #[async_trait]
@@ -543,6 +568,12 @@ impl HostedObject {
         
         // Create handlers (exchanges are loaded from YAML config inside create_handlers)
         let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers().await?;
+
+        // Capture the market-data receiver BEFORE the datahandler is moved into
+        // its blocking task — this is the channel `process_trade()` writes to
+        // after Bug #13 (synthetic top-of-book). The bridge task spawned below
+        // pulls from this and feeds each deployed strategy's `generate_signals()`.
+        let market_data_rx = datahandler.get_market_data_receiver();
         
         // Initialize strategy manager with the loaded config
         self.strategy_manager = Some(Self::create_strategy_manager(&config)?);
@@ -597,6 +628,11 @@ impl HostedObject {
         
         // Shared registry of paper deployments — deployment handler writes, signal loop reads
         let paper_registry: PaperDeploymentRegistry = Arc::new(DashMap::new());
+
+        // Shared registry of deployed strategies (paper + live). Populated by
+        // DeploymentEvent::Deploy below; consumed by the market_data->strategy
+        // bridge task to drive `Strategy::generate_signals()` on each tick.
+        let deployed_strategies: DeployedStrategyRegistry = Arc::new(DashMap::new());
         
         // Create paper trade writer for DB persistence (if DATABASE_URL is set)
         #[cfg(feature = "postgres")]
@@ -623,7 +659,106 @@ impl HostedObject {
         };
         #[cfg(not(feature = "postgres"))]
         let paper_fill_tx: Option<()> = None;
-        
+
+        // ======================================================================
+        // Bridge: market_data_receiver -> deployed strategies -> signal_tx
+        //
+        // After Bug #13, DataHandler::process_trade() pushes a `MarketData`
+        // onto `market_data_rx` for every Kraken trade (with a synthetic
+        // ±1bp top-of-book book derived from the trade price). This task
+        // pulls each tick, finds every deployed strategy whose symbol set
+        // includes the tick's symbol, calls `generate_signals()`, stamps the
+        // strategy_id onto each emitted Signal, and forwards into signal_tx.
+        // The existing Phase-2 ultra signal loop (below) then routes those
+        // signals to the paper exchange and persists fills to trade_history.
+        // ======================================================================
+        if let Some(signal_tx) = self.signal_tx.clone() {
+            let bridge_registry = deployed_strategies.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                ultra_logger::ultra_info!(
+                    "🔗 Market-data -> strategy bridge started (consuming DataHandler::market_data_rx)"
+                );
+                let mut tick_count: u64 = 0;
+                let mut signals_emitted: u64 = 0;
+                while let Ok(md) = market_data_rx.recv() {
+                    tick_count += 1;
+
+                    // Snapshot matching deployments (drop iterator before await to
+                    // avoid holding the DashMap shard lock across awaits).
+                    let matches: Vec<(u16, String, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
+                        .iter()
+                        .filter(|e| {
+                            e.value()
+                                .symbols
+                                .iter()
+                                .any(|s| s.eq_ignore_ascii_case(&md.symbol))
+                        })
+                        .map(|e| {
+                            let v = e.value();
+                            (v.strategy_id_hash, v.real_exchange.clone(), v.strategy.clone())
+                        })
+                        .collect();
+
+                    if matches.is_empty() {
+                        continue;
+                    }
+
+                    // Build the strategyhandler::MarketData expected by Strategy::generate_signals.
+                    // signalgenerator::MarketData lacks an exchange field, so we use the
+                    // deployment's real_exchange.
+                    for (sid_hash, exch, strat) in matches {
+                        let strat_md = StratMarketData {
+                            symbol: md.symbol.clone(),
+                            exchange: exch,
+                            timestamp: md.timestamp,
+                            price: md.price,
+                            mid_price: (md.bid + md.ask) / 2.0,
+                            volume: md.volume,
+                            bid: md.bid,
+                            best_bid: md.bid,
+                            ask: md.ask,
+                            best_ask: md.ask,
+                            spread: md.spread,
+                        };
+                        let signal_tx = signal_tx.clone();
+                        let signals = runtime.block_on(async move {
+                            let mut s = strat.lock().await;
+                            s.generate_signals(&strat_md).await
+                        });
+                        match signals {
+                            Ok(sigs) => {
+                                for mut sig in sigs {
+                                    // Stamp the deployment's strategy_id_hash so the
+                                    // downstream signal loop matches it to paper_registry.
+                                    sig.strategy_id = sid_hash;
+                                    if signal_tx.try_send(sig).is_ok() {
+                                        signals_emitted += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ultra_logger::ultra_warn!(format!(
+                                    "Strategy generate_signals failed: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+
+                    if tick_count % 50 == 0 {
+                        ultra_logger::ultra_info!(format!(
+                            "🔗 Bridge stats: ticks={} signals_emitted={}",
+                            tick_count, signals_emitted
+                        ));
+                    }
+                }
+                ultra_logger::ultra_info!("🔗 Market-data -> strategy bridge stopped");
+            });
+        } else {
+            ultra_warn!("signal_tx not available — market_data->strategy bridge NOT started");
+        }
+
         // Set up ultra-fast signal routing using Phase 2 order manager
         if let Some(signal_rx) = self.signal_rx.take() {
             let Some(ultra_order_manager) = self.ultra_order_manager.clone() else {
@@ -639,13 +774,20 @@ impl HostedObject {
                 while let Ok(signal) = signal_rx.recv() {
                     signal_count += 1;
                     
-                    // Convert ultra_signal to order parameters
-                    let symbol = format!("SYMBOL_{}", signal.symbol_hash); // In production, use reverse hash lookup
-                    
                     // Check if this strategy has a paper deployment — if so, route to paper exchange
                     let paper_meta = signal_paper_registry.iter()
                         .find(|e| e.value().strategy_id_hash == signal.strategy_id)
                         .map(|e| e.value().clone());
+
+                    // Resolve symbol: prefer the deployment's first symbol (readable),
+                    // fall back to the global hash->name map populated at deploy time,
+                    // and only as a last resort use the raw hash placeholder.
+                    let symbol = paper_meta
+                        .as_ref()
+                        .and_then(|m| m.symbols.first().cloned())
+                        .or_else(|| SYMBOL_NAMES.get(&signal.symbol_hash).map(|e| e.value().clone()))
+                        .unwrap_or_else(|| format!("SYMBOL_{}", signal.symbol_hash));
+
                     let exchange = paper_meta.as_ref()
                         .map(|m| m.paper_exchange.clone())
                         .unwrap_or_else(|| format!("EXCHANGE_{}", signal.exchange_id));
@@ -759,6 +901,7 @@ impl HostedObject {
         // and wires deployed strategies into the signal generation + execution pipeline
         let deployment_ultra_mgr = self.ultra_order_manager.clone();
         let deploy_registry = paper_registry.clone();
+        let deploy_strategies = deployed_strategies.clone();
         tokio::spawn(async move {
             ultra_logger::ultra_info!("📡 Deployment event handler started");
             
@@ -797,7 +940,43 @@ impl HostedObject {
                         }
                         
                         let strategy_id_hash = (strategy.strategy_id.as_u128() & 0xFFFF) as u16;
-                        
+
+                        // Populate global symbol_hash -> name map so the signal loop
+                        // (and any downstream consumers that read SYMBOL_NAMES) can
+                        // render readable symbols on trade_history rows.
+                        for sym in &strategy.symbols {
+                            SYMBOL_NAMES.insert(hash_symbol(sym), sym.clone());
+                        }
+
+                        // Build a strategy instance for this deployment. We currently
+                        // only support SimpleMarketMakingStrategy; other strategy_type
+                        // values fall back to it. The config.id is set to the
+                        // strategy_id_hash so SimpleMarketMakingStrategy stamps the
+                        // right id on the Signal it produces (the bridge also
+                        // overrides defensively).
+                        let strat_params: HashMap<String, serde_json::Value> =
+                            match &strategy.parameters {
+                                serde_json::Value::Object(map) => map
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                                _ => HashMap::new(),
+                            };
+                        let strat_config = StrategyConfig {
+                            id: strategy_id_hash.to_string(),
+                            name: strategy.strategy_name.clone(),
+                            enabled: true,
+                            symbols: strategy.symbols.clone(),
+                            exchanges: strategy.target_exchanges.clone(),
+                            parameters: strat_params,
+                            max_position_size: 10_000.0,
+                            risk_limit: 0.02,
+                        };
+                        let strat_instance: Arc<tokio::sync::Mutex<Box<dyn Strategy>>> =
+                            Arc::new(tokio::sync::Mutex::new(Box::new(
+                                SimpleMarketMakingStrategy::new(strat_config),
+                            )));
+
                         if is_live {
                             // Live mode — use real exchange connectors (already configured via YAML)
                             // The exchange name matches target_exchanges from the deployment
@@ -813,7 +992,14 @@ impl HostedObject {
                                 mode: "live".to_string(),
                                 is_market_making: false,
                             });
-                            
+
+                            deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
+                                strategy_id_hash,
+                                symbols: strategy.symbols.clone(),
+                                real_exchange: exchange_name.clone(),
+                                strategy: strat_instance.clone(),
+                            });
+
                             ultra_logger::ultra_info!(format!(
                                 "✅ Strategy {} ({}) deployed for LIVE trading on {}",
                                 strategy.strategy_name, strategy.instance_id, exchange_name
@@ -831,6 +1017,13 @@ impl HostedObject {
                                 symbols: strategy.symbols.clone(),
                                 mode: "paper".to_string(),
                                 is_market_making: strategy.strategy_type == "custom_market_making",
+                            });
+
+                            deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
+                                strategy_id_hash,
+                                symbols: strategy.symbols.clone(),
+                                real_exchange: real_exchange.clone(),
+                                strategy: strat_instance.clone(),
                             });
                             
                             // Build PaperTradingConfig from deployment sim config fields,
@@ -872,6 +1065,7 @@ impl HostedObject {
                             instance_id, reason, close_positions, cancel_orders
                         ));
                         deploy_registry.remove(&instance_id);
+                        deploy_strategies.remove(&instance_id);
                     }
                 }
             }
