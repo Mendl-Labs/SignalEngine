@@ -410,7 +410,24 @@ impl DataHandler {
         
         // Ensure orderbook exists for this symbol/exchange
         let _orderbook = self.get_or_create_orderbook(&trade.symbol, &trade.exchange);
-        
+
+        // Bootstrap a synthetic ±1bp top-of-book from the trade so that
+        // generate_market_data() returns a non-None MarketData even when no
+        // L2/L3 book feed is available (e.g., Kraken Level 3 requires auth and
+        // paper trading runs on public trade-only feeds). This keeps the
+        // signal pipeline alive end-to-end for paper trading.
+        let price = trade.price as f64;
+        if price > 0.0 {
+            let bid_price = price * 0.9999;
+            let ask_price = price * 1.0001;
+            let qty = (trade.quantity as f64).max(0.001);
+            let updates = [
+                OrderbookUpdate { side: "bid".to_string(), price: bid_price, quantity: qty, timestamp: start_time },
+                OrderbookUpdate { side: "ask".to_string(), price: ask_price, quantity: qty, timestamp: start_time },
+            ];
+            let _ = self.update_orderbook_fast(&trade.symbol, &trade.exchange, &updates);
+        }
+
         // Generate market data from the trade
         if let Some(market_data) = self.generate_market_data(&trade.symbol, &trade.exchange) {
             let _ = self.market_data_sender.try_send(market_data);
