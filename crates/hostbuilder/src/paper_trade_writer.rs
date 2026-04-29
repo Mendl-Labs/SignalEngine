@@ -15,6 +15,7 @@ use databaseschema::models::trade_history::NewTradeRecord;
 use databaseschema::models::pnl_snapshot::NewPnLSnapshot;
 use databaseschema::ops::trade_history_ops;
 use databaseschema::ops::pnl_snapshot_ops;
+use databaseschema::ops::deployed_strategy_ops;
 
 use ultra_logger::{ultra_info, ultra_error};
 
@@ -140,6 +141,19 @@ impl PaperTradeWriter {
 
         match trade_history_ops::insert_trade(&mut conn, trade).await {
             Ok(_) => {
+                // Update deployed_strategies counters so the dashboard sees the trade
+                let pnl_delta = realized_pnl.clone().unwrap_or_else(bigdecimal::BigDecimal::default);
+                if let Err(e) = deployed_strategy_ops::increment_trade_and_pnl(
+                    &mut conn,
+                    fill.deployment_id,
+                    &pnl_delta,
+                ).await {
+                    ultra_error!(format!(
+                        "Paper trade writer: failed to increment deployment counters for {}: {}",
+                        fill.deployment_id, e
+                    ));
+                }
+
                 let mut state = deployment_state
                     .entry(fill.deployment_id)
                     .or_default();
