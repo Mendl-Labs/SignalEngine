@@ -32,7 +32,7 @@ use ultra_logger::{ultra_info, ultra_error, ultra_debug};
 
 // Message broker integration
 use subscriber::{UltraFastSubscriber, UltraFastMessage};
-use protocol::broker::messages::{Trade, Orders};
+use protocol::broker::messages::{Trade, Orders, MarketMessage, market_message};
 use prost::Message;
 
 // **ULTRA-LOW LATENCY OPTIMIZATION**: Lock-free orderbook storage
@@ -337,25 +337,64 @@ impl DataHandler {
         
         // Determine message type based on topic
         if topic.ends_with(".trades") {
-            // Decode as Trade message
-            match Trade::decode(data) {
-                Ok(trade) => {
-                    self.process_trade(&trade)?;
+            // DataEngine publishes a MarketMessage wrapper containing a TradesPayload
+            // (or a single Trade for legacy callers). Try MarketMessage first; fall
+            // back to a bare Trade decode for backward compatibility.
+            match MarketMessage::decode(data) {
+                Ok(market_msg) => {
+                    match market_msg.payload {
+                        Some(market_message::Payload::TradesPayload(trades)) => {
+                            for trade in &trades.trades {
+                                if let Err(e) = self.process_trade(trade) {
+                                    ultra_error!(format!("process_trade failed: {}", e));
+                                }
+                            }
+                        }
+                        Some(market_message::Payload::Trade(trade)) => {
+                            self.process_trade(&trade)?;
+                        }
+                        other => {
+                            ultra_debug!(format!("Ignoring non-trade MarketMessage payload on {}: {:?}", topic, other.is_some()));
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
-                    ultra_error!(format!("Failed to decode Trade: {} (data_len={})", e, data_len));
+                Err(market_err) => {
+                    // Backward-compat: try decoding as a bare Trade
+                    match Trade::decode(data) {
+                        Ok(trade) => {
+                            self.process_trade(&trade)?;
+                        }
+                        Err(e) => {
+                            self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                            ultra_error!(format!("Failed to decode trade message (MarketMessage err: {}, Trade err: {}, data_len={})", market_err, e, data_len));
+                        }
+                    }
                 }
             }
         } else if topic.ends_with(".level3") {
-            // Decode as Orders message (level 3 orderbook updates)
-            match Orders::decode(data) {
-                Ok(orders) => {
-                    self.process_orderbook_orders(&orders)?;
+            // DataEngine publishes a MarketMessage with OrdersPayload; fall back
+            // to bare Orders decode for backward compatibility.
+            match MarketMessage::decode(data) {
+                Ok(market_msg) => {
+                    match market_msg.payload {
+                        Some(market_message::Payload::OrdersPayload(orders)) => {
+                            self.process_orderbook_orders(&orders)?;
+                        }
+                        other => {
+                            ultra_debug!(format!("Ignoring non-orders MarketMessage payload on {}: {:?}", topic, other.is_some()));
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
-                    ultra_error!(format!("Failed to decode Orders: {}", e));
+                Err(market_err) => {
+                    match Orders::decode(data) {
+                        Ok(orders) => {
+                            self.process_orderbook_orders(&orders)?;
+                        }
+                        Err(e) => {
+                            self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                            ultra_error!(format!("Failed to decode orders message (MarketMessage err: {}, Orders err: {})", market_err, e));
+                        }
+                    }
                 }
             }
         } else if topic == topics::PORTFOLIO_BALANCES {
