@@ -601,10 +601,13 @@ impl DeploymentSubscriber {
                 // Market-making strategies require L3 order book data for realistic simulation
                 // and quote placement. Directional strategies only need trade ticks.
                 let is_market_making = deployment.strategy_type == "custom_market_making";
+                // Data-type vocabulary must match DataEngine's tenant tier allowlist
+                // (see DataEngine/hostbuilder/src/core/tenant_subscription_limits.rs).
+                // Canonical names are plural: "trades", "orderbook".
                 let data_types = if is_market_making {
-                    vec!["level3".to_string(), "trade".to_string()]
+                    vec!["orderbook".to_string(), "trades".to_string()]
                 } else {
-                    vec!["trade".to_string()]
+                    vec!["trades".to_string()]
                 };
                 let orderbook_depth: i32 = if is_market_making { 100 } else { 0 };
 
