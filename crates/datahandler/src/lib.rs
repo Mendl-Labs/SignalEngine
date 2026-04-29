@@ -703,7 +703,21 @@ impl DataHandlerTrait for DataHandler {
         ultra_info!(format!("Topics: {:?}", self.subscribed_topics));
         ultra_info!(format!("Symbols: {:?}", self.symbols));
         ultra_info!(format!("Exchanges: {:?}", self.exchanges));
-        
+
+        // Send SUBSCRIBE frames to the message broker so the broker actually
+        // routes published market data to this subscriber. Without this the
+        // subscriber connection exists but no topics are bound, so trade
+        // messages published by DataEngine are dropped at the broker.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if let Err(e) = handle.block_on(self.subscribe_to_broker()) {
+                ultra_error!(format!("Failed to subscribe to broker topics: {e}"));
+                return Err(e);
+            }
+        } else {
+            ultra_error!("No tokio runtime available to subscribe to broker topics");
+            return Err("No tokio runtime".into());
+        }
+
         // Start the subscriber
         self.start();
         
