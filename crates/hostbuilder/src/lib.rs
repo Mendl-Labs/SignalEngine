@@ -777,14 +777,31 @@ impl HostedObject {
                             strategy.target_exchanges,
                         ));
                         
+                        // Guard: empty target_exchanges silently breaks the pipeline
+                        // (DataEngine has no "unknown" connector → no ticks → no signals).
+                        // Reject the deployment instead of registering with a bogus exchange.
+                        if strategy.target_exchanges.is_empty() {
+                            ultra_logger::ultra_error!(format!(
+                                "❌ Rejected deployment {} ({}): target_exchanges is empty. \
+                                 Fix the deployment row's exchange_targets and re-publish.",
+                                strategy.strategy_name, strategy.instance_id
+                            ));
+                            continue;
+                        }
+                        if strategy.symbols.is_empty() {
+                            ultra_logger::ultra_error!(format!(
+                                "❌ Rejected deployment {} ({}): symbols is empty.",
+                                strategy.strategy_name, strategy.instance_id
+                            ));
+                            continue;
+                        }
+                        
                         let strategy_id_hash = (strategy.strategy_id.as_u128() & 0xFFFF) as u16;
                         
                         if is_live {
                             // Live mode — use real exchange connectors (already configured via YAML)
                             // The exchange name matches target_exchanges from the deployment
-                            let exchange_name = strategy.target_exchanges.first()
-                                .cloned()
-                                .unwrap_or_else(|| "unknown".to_string());
+                            let exchange_name = strategy.target_exchanges[0].clone();
                             
                             deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
                                 tenant_id: strategy.tenant_id,
@@ -804,9 +821,7 @@ impl HostedObject {
                         } else {
                             // Paper mode — create a paper trading connector
                             let paper_exchange_name = format!("paper_{}", strategy.instance_id);
-                            let real_exchange = strategy.target_exchanges.first()
-                                .cloned()
-                                .unwrap_or_else(|| "unknown".to_string());
+                            let real_exchange = strategy.target_exchanges[0].clone();
                             deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
                                 tenant_id: strategy.tenant_id,
                                 deployment_id: strategy.instance_id,
