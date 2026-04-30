@@ -787,6 +787,7 @@ dependencies = [
  "once_cell",
  "postgres-native-tls",
  "rand 0.8.5",
+ "scoped-futures",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

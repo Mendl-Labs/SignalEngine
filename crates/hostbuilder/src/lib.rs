@@ -878,7 +878,6 @@ impl HostedObject {
                                         quantity: result.filled_quantity,
                                         price: result.avg_price,
                                         fees: result.fees,
-                                        realized_pnl: None, // Computed by P&L snapshot writer
                                         fill_id: format!("fill_{}", signal_count),
                                         order_id: result.order_id.clone(),
                                     };
