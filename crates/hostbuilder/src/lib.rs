@@ -1120,6 +1120,8 @@ impl HostedObject {
         let book_sync_ultra_mgr = self.ultra_order_manager.clone();
         tokio::spawn(async move {
             let tick = tokio::time::Duration::from_millis(10);
+            let mut last_heartbeat = std::time::Instant::now();
+            let mut sync_count: u64 = 0;
             loop {
                 tokio::time::sleep(tick).await;
 
@@ -1136,16 +1138,33 @@ impl HostedObject {
                     })
                     .collect();
 
+                // Helper: canonicalize symbols/exchanges so "BTC/USD" matches
+                // "BTC-USD" and "kraken" matches "Kraken". DataEngine and the
+                // strategy/deployment subscribe layer don't always agree on form.
+                fn canon(s: &str) -> String {
+                    s.replace('/', "-").to_uppercase()
+                }
+
                 for (paper_exchange, real_exchange, symbols) in mm_deployments {
+                    let canon_real_exchange = canon(&real_exchange);
                     for symbol in &symbols {
-                        // Read top-20 levels; drop the orderbook lock before any await
+                        let canon_symbol = canon(symbol);
+                        // Find the orderbook by canonical match — DataHandler may
+                        // have stored it under a slightly different symbol/exchange
+                        // string than the deployment metadata uses.
                         let maybe_levels: Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> = {
-                            let key = (symbol.clone(), real_exchange.clone());
-                            if let Some(ob_arc) = datahandler::ORDERBOOKS.get(&key) {
-                                ob_arc.read().ok().and_then(|ob| ob.get_orderbook_levels(20).ok())
-                            } else {
-                                None
+                            let mut found = None;
+                            for entry in datahandler::ORDERBOOKS.iter() {
+                                let (sym, exch) = entry.key();
+                                if canon(sym) == canon_symbol
+                                    && canon(exch) == canon_real_exchange
+                                {
+                                    found = entry.value().clone().read().ok()
+                                        .and_then(|ob| ob.get_orderbook_levels(20).ok());
+                                    break;
+                                }
                             }
+                            found
                         };
 
                         if let Some((bids, asks)) = maybe_levels {
@@ -1158,10 +1177,33 @@ impl HostedObject {
                                         bids,
                                         asks,
                                     ).await;
+                                    sync_count += 1;
                                 }
                             }
                         }
                     }
+                }
+
+                // Heartbeat every 30s: report sync activity and snapshot of which
+                // (symbol, exchange) keys DataHandler has loaded. Without this it's
+                // impossible to tell whether book-sync is actually pushing prices
+                // into mock connectors or silently looking up the wrong key.
+                if last_heartbeat.elapsed() >= std::time::Duration::from_secs(30) {
+                    let mut keys: Vec<String> = datahandler::ORDERBOOKS
+                        .iter()
+                        .map(|e| {
+                            let (s, x) = e.key();
+                            format!("({},{})", s, x)
+                        })
+                        .collect();
+                    keys.sort();
+                    keys.truncate(10);
+                    ultra_logger::ultra_info!(format!(
+                        "📚 book-sync heartbeat: {} pushes since start, ORDERBOOKS keys=[{}]",
+                        sync_count,
+                        keys.join(", ")
+                    ));
+                    last_heartbeat = std::time::Instant::now();
                 }
             }
         });
