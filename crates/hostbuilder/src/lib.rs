@@ -1123,10 +1123,13 @@ impl HostedObject {
             loop {
                 tokio::time::sleep(tick).await;
 
-                // Collect MM paper deployments without holding the DashMap lock across awaits
+                // Collect ALL paper deployments (MM and non-MM) without holding the
+                // DashMap lock across awaits. Without this, non-MM paper strategies
+                // fill against the MockExchange default book (~$50000 mid) and never
+                // realize P&L because every fill is at the same flat price.
                 let mm_deployments: Vec<(String, String, Vec<String>)> = book_sync_registry
                     .iter()
-                    .filter(|e| e.value().is_market_making && e.value().mode == "paper")
+                    .filter(|e| e.value().mode == "paper")
                     .map(|e| {
                         let m = e.value();
                         (m.paper_exchange.clone(), m.real_exchange.clone(), m.symbols.clone())
