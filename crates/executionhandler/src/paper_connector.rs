@@ -88,6 +88,12 @@ impl PaperTradingConnector {
         self.mock.initialize_order_book(symbol, price).await;
     }
 
+    /// Canonical symbol form used by both `update_book` and order lookup, so a
+    /// signal that arrives as `BTC/USD` matches a book pushed in as `BTC-USD`.
+    fn canonical_symbol(symbol: &str) -> String {
+        symbol.replace('/', "-").to_uppercase()
+    }
+
     /// Convert a Signal to a SimulationOrder
     fn signal_to_sim_order(signal: &Signal) -> SimulationOrder {
         let (side, order_type) = match signal.action {
@@ -107,7 +113,7 @@ impl PaperTradingConnector {
 
         SimulationOrder {
             id: Uuid::new_v4(),
-            symbol: signal.symbol.clone(),
+            symbol: Self::canonical_symbol(&signal.symbol),
             side,
             order_type,
             quantity,
@@ -339,7 +345,8 @@ impl ExchangeConnector for PaperTradingConnector {
                 quantity: SimBigDecimal::from_str(&q.to_string()).unwrap_or_default(),
             }).collect()
         };
-        self.mock.update_order_book(symbol, to_levels(bids), to_levels(asks));
+        let canonical = Self::canonical_symbol(symbol);
+        self.mock.update_order_book(&canonical, to_levels(bids), to_levels(asks));
     }
 
     fn convert_signal(&self, signal: &Signal) -> Result<ExchangeOrder, ExecutionError> {
