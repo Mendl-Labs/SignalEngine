@@ -17,6 +17,7 @@ use lazy_static::lazy_static;
 use orderbook::Orderbook;
 use ultra_signal::Signal;
 use signalgenerator::MarketData;
+use chrono::{DateTime, Utc};
 use std::{
     error::Error, 
     sync::{Arc, RwLock}, 
@@ -40,11 +41,64 @@ use prost::Message;
 lazy_static! {
     pub static ref ORDERBOOKS: DashMap<(String, String), Arc<RwLock<Orderbook>>> = DashMap::new();
     pub static ref LAST_UPDATE: DashMap<(String, String), Instant> = DashMap::new();
+
+    // Wallclock freshness tracking — keyed by (symbol, exchange) — populated
+    // by process_trade and update_orderbook_fast. Read by hostbuilder's
+    // market-data health writer to populate the `market_data_health` table.
+    pub static ref LAST_TICK_AT_UTC: DashMap<(String, String), DateTime<Utc>> = DashMap::new();
+    pub static ref LAST_ORDERBOOK_AT_UTC: DashMap<(String, String), DateTime<Utc>> = DashMap::new();
+    // (window_start_utc, count_in_window) — used to compute ticks_per_sec.
+    pub static ref TICK_WINDOW: DashMap<(String, String), (DateTime<Utc>, u64)> = DashMap::new();
     
     // Performance metrics for monitoring
     static ref TOTAL_UPDATES: AtomicU64 = AtomicU64::new(0);
     static ref AVG_UPDATE_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
     static ref ORDERBOOK_ACCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Snapshot of market-data freshness for a single (symbol, exchange) pair.
+#[derive(Debug, Clone)]
+pub struct MarketDataHealthSnapshot {
+    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_orderbook_at: Option<DateTime<Utc>>,
+    /// Ticks per second over the most recent window (resets each call).
+    pub ticks_per_sec: f64,
+}
+
+/// Read and reset the per-(symbol, exchange) freshness counters. Returns
+/// `None` when nothing has ever been recorded for the pair.
+pub fn snapshot_market_data_health(symbol: &str, exchange: &str) -> Option<MarketDataHealthSnapshot> {
+    let key = (symbol.to_string(), exchange.to_string());
+    let last_tick_at = LAST_TICK_AT_UTC.get(&key).map(|v| *v);
+    let last_orderbook_at = LAST_ORDERBOOK_AT_UTC.get(&key).map(|v| *v);
+    if last_tick_at.is_none() && last_orderbook_at.is_none() {
+        return None;
+    }
+    let now = Utc::now();
+    let ticks_per_sec = if let Some(mut entry) = TICK_WINDOW.get_mut(&key) {
+        let (start, count) = *entry;
+        let elapsed = (now - start).num_milliseconds() as f64 / 1000.0;
+        let rate = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
+        *entry = (now, 0);
+        rate
+    } else {
+        0.0
+    };
+    Some(MarketDataHealthSnapshot { last_tick_at, last_orderbook_at, ticks_per_sec })
+}
+
+#[inline]
+fn record_tick(symbol: &str, exchange: &str) {
+    let key = (symbol.to_string(), exchange.to_string());
+    let now = Utc::now();
+    LAST_TICK_AT_UTC.insert(key.clone(), now);
+    let mut entry = TICK_WINDOW.entry(key).or_insert((now, 0));
+    entry.1 += 1;
+}
+
+#[inline]
+fn record_orderbook(symbol: &str, exchange: &str) {
+    LAST_ORDERBOOK_AT_UTC.insert((symbol.to_string(), exchange.to_string()), Utc::now());
 }
 
 /// Market data topics from MessageBroker (published by DataEngine)
@@ -408,6 +462,9 @@ impl DataHandler {
     fn process_trade(&self, trade: &Trade) -> Result<(), Box<dyn Error>> {
         let start_time = ultra_signal::high_precision_timestamp_ns();
         
+        // Record wallclock tick freshness for market_data_health.
+        record_tick(&trade.symbol, &trade.exchange);
+        
         // Ensure orderbook exists for this symbol/exchange
         let _orderbook = self.get_or_create_orderbook(&trade.symbol, &trade.exchange);
 
@@ -623,6 +680,7 @@ impl DataHandler {
         // Update last update time using lock-free DashMap
         let key = (symbol.to_string(), exchange.to_string());
         LAST_UPDATE.insert(key, Instant::now());
+        record_orderbook(symbol, exchange);
         
         // Update performance metrics
         let end_time = ultra_signal::high_precision_timestamp_ns();

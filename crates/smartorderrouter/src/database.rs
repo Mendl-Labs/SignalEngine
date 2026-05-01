@@ -277,6 +277,8 @@ impl OrderDatabasePersistence {
             exchange_trade_id: fill_id.to_string(),
             exchange_order_id: order_unique_id.to_string(),
             executed_at: now,
+            signal_price: None,
+            signal_at: None,
         };
 
         trade_history_ops::insert_trade(&mut conn, trade_record)

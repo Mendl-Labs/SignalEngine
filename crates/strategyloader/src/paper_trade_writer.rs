@@ -155,6 +155,8 @@ impl PaperTradeWriter {
             exchange_trade_id: fill.fill_id.clone(),
             exchange_order_id: fill.order_id.clone(),
             executed_at: Utc::now(),
+            signal_price: None,
+            signal_at: None,
         };
 
         match trade_history_ops::insert_trade(&mut conn, trade).await {

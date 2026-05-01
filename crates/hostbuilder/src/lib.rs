@@ -1,5 +1,7 @@
 #[cfg(feature = "postgres")]
 pub mod paper_trade_writer;
+#[cfg(feature = "postgres")]
+pub mod market_health_writer;
 
 use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
 use executionhandler::signal::{Signal as ExecSignal, SignalAction as ExecSignalAction};
@@ -653,8 +655,11 @@ impl HostedObject {
                 Some(db_url) => {
                     match smartorderrouter::database::create_pool(&db_url).await {
                         Ok(pool) => {
-                            let writer = paper_trade_writer::PaperTradeWriter::new(Arc::new(pool));
+                            let pool_arc = Arc::new(pool);
+                            let writer = paper_trade_writer::PaperTradeWriter::new(pool_arc.clone());
+                            market_health_writer::spawn(pool_arc);
                             ultra_info!("✅ Paper trade writer initialized — fills will persist to trade_history");
+                            ultra_info!("✅ Market-data health writer spawned (30s cadence)");
                             Some(writer.sender())
                         }
                         Err(e) => {
