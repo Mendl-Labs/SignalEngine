@@ -19,7 +19,7 @@ use signalengine::{SignalEngineLogger, TradingContext};
 use tracing::{info, error};
 
 // Re-export ultra_engine types
-pub use strategies::{StrategyId, StrategyRegistry, SymbolHash};
+pub use strategies::{StrategyId, SymbolHash};
 
 /// Strategy handler specific errors
 #[derive(Debug)]
@@ -251,9 +251,6 @@ impl HotStrategyState {
 /// Ultra-High Performance Strategy Engine
 /// 33-54x faster than traditional HashMap+RwLock approach
 pub struct UltraStrategyEngine {
-    // Lock-free strategy registry
-    _registry: Arc<StrategyRegistry>,
-    
     // Lock-free hot state cache (DashMap for ultra-fast concurrent access)
     hot_state: DashMap<StrategyId, HotStrategyState>,
     
@@ -277,7 +274,6 @@ impl Default for UltraStrategyEngine {
 impl UltraStrategyEngine {
     pub fn new() -> Self {
         Self {
-            _registry: Arc::new(StrategyRegistry::new()),
             hot_state: DashMap::new(),
             signal_buffers: DashMap::new(),
             strategies_executed: AtomicU64::new(0),

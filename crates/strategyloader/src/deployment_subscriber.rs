@@ -600,16 +600,20 @@ impl DeploymentSubscriber {
             if success && !active_exchanges.is_empty() && !symbols.is_empty() {
                 // Market-making strategies require L3 order book data for realistic simulation
                 // and quote placement. Directional strategies only need trade ticks.
-                let is_market_making = deployment.strategy_type == "custom_market_making";
+                // Capability lookup tolerates legacy aliases ("market_making",
+                // "MarketMaking", etc.) that the previous literal compare missed.
+                let caps = crate::types::data_requirements_for_strategy_type(&deployment.strategy_type);
                 // Data-type vocabulary must match DataEngine's tenant tier allowlist
                 // (see DataEngine/hostbuilder/src/core/tenant_subscription_limits.rs).
                 // Canonical names are plural: "trades", "orderbook".
-                let data_types = if is_market_making {
-                    vec!["orderbook".to_string(), "trades".to_string()]
-                } else {
-                    vec!["trades".to_string()]
-                };
-                let orderbook_depth: i32 = if is_market_making { 100 } else { 0 };
+                let mut data_types: Vec<String> = Vec::with_capacity(2);
+                if caps.needs_orderbook {
+                    data_types.push("orderbook".to_string());
+                }
+                if caps.needs_trades {
+                    data_types.push("trades".to_string());
+                }
+                let orderbook_depth: i32 = caps.orderbook_depth as i32;
 
                 for exchange in &active_exchanges {
                     let subscription_id = format!("{}_{}", instance_id_str, exchange);
@@ -793,7 +797,7 @@ mod tests {
             strategy_id: Uuid::new_v4().to_string(),
             instance_id: Uuid::new_v4().to_string(),
             tenant_id: Uuid::new_v4().to_string(),
-            strategy_type: "AvellanedaStoikov".to_string(),
+            strategy_type: "custom_market_making".to_string(),
             strategy_name: "BTC Market Maker".to_string(),
             version: "1.0.0".to_string(),
             parameters: serde_json::to_vec(&serde_json::json!({"gamma": 0.1})).unwrap(),
@@ -810,7 +814,7 @@ mod tests {
         };
 
         let strategy = DeployedStrategy::from_deployment(&deployment).unwrap();
-        assert_eq!(strategy.strategy_type, "AvellanedaStoikov");
+        assert_eq!(strategy.strategy_type, "custom_market_making");
         assert_eq!(strategy.strategy_name, "BTC Market Maker");
         assert!(strategy.is_active.load(Ordering::Relaxed));
     }

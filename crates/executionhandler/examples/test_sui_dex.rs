@@ -93,7 +93,7 @@ async fn main() {
     
     let test_signal = Signal {
         id: "test_1".to_string(),
-        strategy_id: "avellaneda_stoikov".to_string(),
+        strategy_id: "example_market_maker".to_string(),
         symbol: "SUI/USDC".to_string(),
         exchange: "Cetus".to_string(),
         action: SignalAction::Buy,

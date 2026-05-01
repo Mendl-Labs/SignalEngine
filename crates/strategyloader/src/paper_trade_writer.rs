@@ -233,6 +233,9 @@ impl PaperTradeWriter {
                 trades_count: state.trades_count,
                 winning_trades: state.winning_trades,
                 losing_trades: state.losing_trades,
+                // This writer is the paper-trading hot path. Live
+                // deployments do not flow through here yet.
+                mode: "paper".to_string(),
             };
 
             match pnl_snapshot_ops::upsert_snapshot(&mut conn, snapshot).await {

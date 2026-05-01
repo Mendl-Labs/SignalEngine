@@ -22,6 +22,10 @@ pub struct PortfolioSnapshotterConfig {
     pub interval: Duration,
     /// Tenant owning this strategy session.
     pub tenant_id: Uuid,
+    /// Deployment mode this snapshotter represents ("paper" or "live").
+    /// Drives the `mode` column on `pnl_snapshots` so paper and live
+    /// portfolios are tracked on independent rows.
+    pub mode: String,
 }
 
 impl Default for PortfolioSnapshotterConfig {
@@ -29,6 +33,7 @@ impl Default for PortfolioSnapshotterConfig {
         Self {
             interval: Duration::from_secs(5),
             tenant_id: Uuid::nil(),
+            mode: "paper".to_string(),
         }
     }
 }
@@ -73,7 +78,8 @@ impl PortfolioSnapshotter {
                     BigDecimal::try_from(pnl.realized_pnl).unwrap_or_default(),
                     BigDecimal::try_from(pnl.unrealized_pnl).unwrap_or_default(),
                 )
-                .with_exchange_breakdown(by_exchange_json);
+                .with_exchange_breakdown(by_exchange_json)
+                .with_mode(config.mode.clone());
 
                 match pool.get().await {
                     Ok(mut conn) => {

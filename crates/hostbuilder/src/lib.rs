@@ -1061,7 +1061,7 @@ impl HostedObject {
                                 real_exchange: real_exchange.clone(),
                                 symbols: strategy.symbols.clone(),
                                 mode: "paper".to_string(),
-                                is_market_making: strategy.strategy_type == "custom_market_making",
+                                is_market_making: strategyloader::is_market_making_strategy_type(&strategy.strategy_type),
                             });
 
                             deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {

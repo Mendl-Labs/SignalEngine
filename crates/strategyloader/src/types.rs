@@ -34,8 +34,88 @@ impl std::str::FromStr for StrategyType {
             "custom" | "momentum" | "mean_reversion" | "meanreversion" | "arbitrage" | "liquidity_sweep" => Ok(StrategyType::Custom),
             "custom_market_making" | "custommarketmaking" | "market_making" | "marketmaking" => Ok(StrategyType::CustomMarketMaking),
             "portfolio_mixed" | "portfoliomixed" => Ok(StrategyType::PortfolioMixed),
-            _ => Ok(StrategyType::Custom),
+            other => Err(format!(
+                "unknown strategy_type '{}': expected one of custom, custom_market_making (aliases: market_making, marketmaking), portfolio_mixed",
+                other
+            )),
         }
+    }
+}
+
+/// How a strategy interacts with the order book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStyle {
+    /// Crosses the spread with market / IOC orders (takes liquidity).
+    Aggressive,
+    /// Posts resting limit quotes; needs L2/L3 book to size and place them.
+    PassiveQuoting,
+    /// Mixes both styles (e.g. directional with limit orders).
+    Mixed,
+}
+
+/// Market data a strategy needs to function correctly.
+///
+/// Capability types are kept in `strategyloader::types` so the runtime
+/// can switch on them without depending on the strategy implementation
+/// crate. They are the dispatch key replacing string compares against
+/// `strategy_type == "custom_market_making"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataRequirements {
+    /// True when the strategy posts resting quotes or otherwise reads
+    /// L2/L3 book state. False for trade-only directional strategies.
+    pub needs_orderbook: bool,
+    /// Levels per side requested when `needs_orderbook` is true. 0 if not.
+    pub orderbook_depth: u32,
+    /// Trades-only directional inputs. Practically always true.
+    pub needs_trades: bool,
+}
+
+impl Default for DataRequirements {
+    /// Conservative default: trades-only, aggressive-style execution.
+    fn default() -> Self {
+        Self { needs_orderbook: false, orderbook_depth: 0, needs_trades: true }
+    }
+}
+
+impl DataRequirements {
+    /// Standard L3 / passive market-making requirements (100 levels each side).
+    pub const fn passive_market_making() -> Self {
+        Self { needs_orderbook: true, orderbook_depth: 100, needs_trades: true }
+    }
+}
+
+/// Single source of truth for "is this deployment a market-making strategy?".
+///
+/// Tolerant of legacy aliases (`market_making`, `marketmaking`,
+/// `MarketMaking`) so misconfigured rows still classify correctly. Used by
+/// `deployment_subscriber` and `hostbuilder` to choose between an
+/// orderbook-subscribed paper deployment and a trades-only one.
+pub fn is_market_making_strategy_type(strategy_type: &str) -> bool {
+    matches!(
+        strategy_type.to_lowercase().as_str(),
+        "custom_market_making" | "custommarketmaking" | "market_making" | "marketmaking"
+    )
+}
+
+/// Capability bundle derived from a `strategy_type` string. Falls back to
+/// the conservative trades-only / aggressive default when the type is
+/// unknown — callers that want strict validation should call
+/// `StrategyType::from_str` first.
+pub fn data_requirements_for_strategy_type(strategy_type: &str) -> DataRequirements {
+    if is_market_making_strategy_type(strategy_type) {
+        DataRequirements::passive_market_making()
+    } else {
+        DataRequirements::default()
+    }
+}
+
+/// Mirror of `data_requirements_for_strategy_type` for the execution style.
+pub fn execution_style_for_strategy_type(strategy_type: &str) -> ExecutionStyle {
+    if is_market_making_strategy_type(strategy_type) {
+        ExecutionStyle::PassiveQuoting
+    } else {
+        ExecutionStyle::Aggressive
     }
 }
 
@@ -354,6 +434,40 @@ mod tests {
         assert_eq!("custom".parse::<StrategyType>().unwrap(), StrategyType::Custom);
         assert_eq!("custom_market_making".parse::<StrategyType>().unwrap(), StrategyType::CustomMarketMaking);
         assert_eq!("portfolio_mixed".parse::<StrategyType>().unwrap(), StrategyType::PortfolioMixed);
+        // Aliases for the MM type — these previously silently fell through
+        // to Custom and caused paper deployments to subscribe to the wrong
+        // data types.
+        assert_eq!("market_making".parse::<StrategyType>().unwrap(), StrategyType::CustomMarketMaking);
+        assert_eq!("MarketMaking".parse::<StrategyType>().unwrap(), StrategyType::CustomMarketMaking);
+    }
+
+    #[test]
+    fn test_strategy_type_unknown_rejected() {
+        // Unknown strings used to silently default to Custom, which masked
+        // misconfigured deployments. They must now error instead.
+        let err = "totally_made_up".parse::<StrategyType>().unwrap_err();
+        assert!(err.contains("totally_made_up"));
+    }
+
+    #[test]
+    fn test_capability_helpers_for_market_making() {
+        assert!(is_market_making_strategy_type("custom_market_making"));
+        assert!(is_market_making_strategy_type("MarketMaking"));
+        assert!(is_market_making_strategy_type("market_making"));
+        assert!(!is_market_making_strategy_type("custom"));
+        assert!(!is_market_making_strategy_type("momentum"));
+
+        let mm = data_requirements_for_strategy_type("market_making");
+        assert!(mm.needs_orderbook);
+        assert_eq!(mm.orderbook_depth, 100);
+        assert!(mm.needs_trades);
+        assert_eq!(execution_style_for_strategy_type("market_making"), ExecutionStyle::PassiveQuoting);
+
+        let dir = data_requirements_for_strategy_type("custom");
+        assert!(!dir.needs_orderbook);
+        assert_eq!(dir.orderbook_depth, 0);
+        assert!(dir.needs_trades);
+        assert_eq!(execution_style_for_strategy_type("custom"), ExecutionStyle::Aggressive);
     }
     
     #[test]
@@ -480,8 +594,15 @@ mod tests {
 
     #[test]
     fn test_strategy_type_unknown_defaults_to_custom() {
-        let st: StrategyType = "something_unknown".parse().unwrap();
-        assert_eq!(st, StrategyType::Custom);
+        // Behavior change: unknown strategy_type strings used to silently
+        // default to Custom, which masked misconfigured deployments
+        // (e.g. a `MarketMaking` row that should map to CustomMarketMaking
+        // but instead became Custom and skipped orderbook subscription).
+        // The parser now errors so the misconfiguration surfaces. The
+        // previously-silent aliases like `MarketMaking` are now explicit
+        // matches in the parser — see test_strategy_type_parsing.
+        let err = "something_unknown".parse::<StrategyType>().unwrap_err();
+        assert!(err.contains("something_unknown"));
     }
 
     #[test]
