@@ -867,8 +867,21 @@ impl HostedObject {
                                     signal_count, result.success, result.filled_quantity, result.avg_price, result.order_id, result.error
                                 ));
                             }
-                            // Record fill to trade_history for paper deployments
-                            if result.success {
+                            // Record fill to trade_history for paper deployments.
+                            // Defense-in-depth: only emit when the fill is real
+                            // (success + nonzero qty + nonzero price). Previously
+                            // a hardcoded $50K fallback in the mock exchange
+                            // produced phantom fills that corrupted live P&L.
+                            let real_fill = result.success
+                                && result.filled_quantity > 0.0
+                                && result.avg_price > 0.0;
+                            if !real_fill {
+                                ultra_logger::ultra_warn!(format!(
+                                    "Skipping PaperFillEvent: symbol={} success={} filled_qty={} avg_price={} reason={:?}",
+                                    symbol, result.success, result.filled_quantity, result.avg_price, result.error
+                                ));
+                            }
+                            if real_fill {
                                 #[cfg(feature = "postgres")]
                                 if let (Some(ref meta), Some(ref tx)) = (&paper_meta, &signal_fill_tx) {
                                     let fill_event = paper_trade_writer::PaperFillEvent {
