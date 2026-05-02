@@ -509,7 +509,8 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_market_buy() {
         let conn = PaperTradingConnector::new(PaperTradingConfig::default());
-        conn.initialize_book("BTC/USD", 50000.0).await;
+        // Initialize the book under the canonical symbol that execute_order will look up.
+        conn.initialize_book("BTC-USD", 50000.0).await;
 
         let signal = test_signal(SignalAction::Buy, 0.1, None);
         let result = conn.execute_order(&signal).await.unwrap();
