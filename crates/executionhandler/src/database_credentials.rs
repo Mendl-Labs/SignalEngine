@@ -154,11 +154,43 @@ impl DatabaseCredentialProvider {
     }
 }
 
-/// Decrypt a value encrypted by the BacktestingEngine API
-/// Format: "enc:base64_encoded_value"
+/// Decrypt a value encrypted by the BacktestingEngine API.
+///
+/// Supports two formats:
+/// - `aes:<base64(nonce+ciphertext)>` — AES-256-GCM with 12-byte nonce, key
+///   sourced from `CREDENTIALS_ENCRYPTION_KEY` env (64 hex chars / 32 bytes).
+/// - `enc:<base64>` — legacy plain base64 (kept for rows created before AES
+///   was introduced).
+///
+/// Returns `None` (and logs) for any decode/decrypt failure rather than
+/// panicking — one bad row should not take the engine down.
 pub fn decrypt_credential_value(encrypted: &str) -> Option<String> {
-    // Match the encryption format from BacktestingEngine/program/src/api/exchange_credentials.rs
-    if let Some(encoded) = encrypted.strip_prefix("enc:") {
+    if let Some(encoded) = encrypted.strip_prefix("aes:") {
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::{Aead, KeyInit};
+        let hex_key = match std::env::var("CREDENTIALS_ENCRYPTION_KEY") {
+            Ok(v) => v,
+            Err(_) => {
+                log::error!("CREDENTIALS_ENCRYPTION_KEY env var not set; cannot decrypt aes: credential");
+                return None;
+            }
+        };
+        let key_bytes = hex::decode(hex_key.trim()).ok()?;
+        if key_bytes.len() != 32 {
+            log::error!("CREDENTIALS_ENCRYPTION_KEY must be 32 bytes (64 hex chars), got {}", key_bytes.len());
+            return None;
+        }
+        let combined = STANDARD.decode(encoded).ok()?;
+        if combined.len() < 12 {
+            return None;
+        }
+        let (nonce_bytes, ciphertext) = combined.split_at(12);
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+        String::from_utf8(plaintext).ok()
+    } else if let Some(encoded) = encrypted.strip_prefix("enc:") {
         STANDARD.decode(encoded).ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
     } else {

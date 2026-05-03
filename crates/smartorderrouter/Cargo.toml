@@ -23,7 +23,9 @@ bigdecimal = { version = "0.4", optional = true }
 diesel-async = { version = "0.5", features = ["postgres", "deadpool"], optional = true }
 diesel = { version = "2.2", features = ["postgres", "uuid"], optional = true }
 base64 = { version = "0.22", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 
 [features]
 default = []
-postgres = ["diesel", "diesel-async", "databaseschema", "deadpool", "bigdecimal", "base64"]
+postgres = ["diesel", "diesel-async", "databaseschema", "deadpool", "bigdecimal", "base64", "aes-gcm", "hex"]

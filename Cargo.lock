@@ -1053,6 +1053,7 @@ dependencies = [
 name = "executionhandler"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -3804,6 +3805,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 name = "smartorderrouter"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64 0.22.1",
  "bigdecimal 0.4.10",
@@ -3815,6 +3817,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "exchangemetricaggregator",
+ "hex",
  "log",
  "serde",
  "serde_json",

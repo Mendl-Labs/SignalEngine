@@ -118,6 +118,16 @@ spec:
                   name: {{ include "signal-engine-helm.fullname" . }}-config
                   key: tenant-id
                   optional: true
+            # AES-256-GCM key (64 hex chars) used to decrypt per-tenant exchange
+            # API credentials stored in `exchange_credentials.api_key_encrypted`.
+            # MUST match the key BacktestingEngine uses to encrypt them. Created
+            # out-of-band as `signalengine-credentials-encryption` Secret.
+            - name: CREDENTIALS_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-credentials-encryption
+                  key: key
+                  optional: true
             # System environment variables
             - name: POD_NAME
               valueFrom:

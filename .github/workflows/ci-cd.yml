@@ -462,7 +462,7 @@ jobs:
           # Optional secrets
           OPTIONAL_SECRETS=(
             "ELASTIC-CLOUD-ENDPOINT" "ELASTIC-CLOUD-USERNAME" "ELASTIC-CLOUD-PASSWORD"
-            "kraken-api-key" "kraken-secret-key"
+            "CREDENTIALS-ENCRYPTION-KEY"
           )
 
           echo "[INFO] Fetching required secrets..."
@@ -532,6 +532,18 @@ jobs:
           # NOTE: Per-tenant exchange API keys are NOT created here. Users add
           # their own keys via the Settings UI; SignalEngine loads them from the
           # encrypted `exchange_credentials` table on demand.
+
+          # Master AES-256-GCM key used to decrypt those per-tenant keys.
+          # MUST match the value used by BacktestingEngine.
+          if [ -n "${CREDENTIALS_ENCRYPTION_KEY:-}" ]; then
+            kubectl create secret generic signalengine-credentials-encryption \
+              --from-literal=key="${CREDENTIALS_ENCRYPTION_KEY}" \
+              --namespace=${{ env.NAMESPACE }} \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "[OK] signalengine-credentials-encryption secret synced"
+          else
+            echo "[WARN] CREDENTIALS_ENCRYPTION_KEY not set in vault — live trading will be unable to decrypt user API keys"
+          fi
 
           kubectl create secret generic signalengine-elastic-secret \
             --from-literal=endpoint="${ELASTIC_CLOUD_ENDPOINT:-}" \
