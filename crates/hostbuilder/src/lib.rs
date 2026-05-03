@@ -638,7 +638,10 @@ impl HostedObject {
         
         // Create paper trade writer for DB persistence (if DATABASE_URL is set)
         #[cfg(feature = "postgres")]
-        let paper_fill_tx: Option<tokio::sync::mpsc::Sender<paper_trade_writer::PaperFillEvent>> = {
+        let (paper_fill_tx, deploy_db_pool): (
+            Option<tokio::sync::mpsc::Sender<paper_trade_writer::PaperFillEvent>>,
+            Option<Arc<smartorderrouter::DbPool>>,
+        ) = {
             // Kubernetes env values are not shell-expanded; resolve $(VAR) placeholders
             // from sibling POSTGRES_* env vars (same logic as strategyloader uses).
             fn resolve_db_url() -> Option<String> {
@@ -657,25 +660,27 @@ impl HostedObject {
                         Ok(pool) => {
                             let pool_arc = Arc::new(pool);
                             let writer = paper_trade_writer::PaperTradeWriter::new(pool_arc.clone());
-                            market_health_writer::spawn(pool_arc);
+                            market_health_writer::spawn(pool_arc.clone());
                             ultra_info!("✅ Paper trade writer initialized — fills will persist to trade_history");
                             ultra_info!("✅ Market-data health writer spawned (30s cadence)");
-                            Some(writer.sender())
+                            (Some(writer.sender()), Some(pool_arc))
                         }
                         Err(e) => {
                             ultra_warn!(format!("⚠️ Could not create DB pool for paper trade writer: {}", e));
-                            None
+                            (None, None)
                         }
                     }
                 }
                 None => {
                     ultra_info!("ℹ️ DATABASE_URL not set or unresolved — paper trades will not persist to DB");
-                    None
+                    (None, None)
                 }
             }
         };
         #[cfg(not(feature = "postgres"))]
         let paper_fill_tx: Option<()> = None;
+        #[cfg(not(feature = "postgres"))]
+        let deploy_db_pool: Option<()> = None;
 
         // ======================================================================
         // Bridge: market_data_receiver -> deployed strategies -> signal_tx
@@ -960,6 +965,11 @@ impl HostedObject {
         let deployment_ultra_mgr = self.ultra_order_manager.clone();
         let deploy_registry = paper_registry.clone();
         let deploy_strategies = deployed_strategies.clone();
+        // Lazily-loaded per-tenant exchange credentials live in the DB; the pool
+        // is captured here so the Deploy handler can refresh connectors without
+        // a pod restart when users edit their API keys in the Settings UI.
+        #[cfg(feature = "postgres")]
+        let deploy_db_pool_for_handler = deploy_db_pool.clone();
         tokio::spawn(async move {
             ultra_logger::ultra_info!("📡 Deployment event handler started");
             
@@ -1039,7 +1049,64 @@ impl HostedObject {
                             // Live mode — use real exchange connectors (already configured via YAML)
                             // The exchange name matches target_exchanges from the deployment
                             let exchange_name = strategy.target_exchanges[0].clone();
-                            
+
+                            // Lazily (re)load the per-tenant credential for this
+                            // exchange from the DB and register/refresh the
+                            // connector. This is idempotent — every Deploy event
+                            // rebuilds the connector with the latest stored keys
+                            // so users who rotate their API keys in the Settings
+                            // UI take effect on the next deploy without a pod
+                            // restart. If no enabled credential exists, reject.
+                            #[cfg(feature = "postgres")]
+                            {
+                                if let (Some(ref ultra_mgr), Some(ref pool)) =
+                                    (deployment_ultra_mgr.as_ref(), deploy_db_pool_for_handler.as_ref())
+                                {
+                                    let mut handler = ultra_mgr.execution_handler().write().await;
+                                    match handler
+                                        .ensure_exchange_for_tenant(pool, strategy.tenant_id, &exchange_name)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            ultra_logger::ultra_info!(format!(
+                                                "🔑 Loaded {} credential for tenant {} (deployment {})",
+                                                exchange_name, strategy.tenant_id, strategy.instance_id
+                                            ));
+                                        }
+                                        Ok(false) => {
+                                            ultra_logger::ultra_error!(format!(
+                                                "❌ Rejected live deployment {} ({}): no enabled \
+                                                 credential for exchange '{}' on tenant {}. \
+                                                 Add API keys via the Settings UI and re-publish.",
+                                                strategy.strategy_name,
+                                                strategy.instance_id,
+                                                exchange_name,
+                                                strategy.tenant_id,
+                                            ));
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            ultra_logger::ultra_error!(format!(
+                                                "❌ Rejected live deployment {} ({}): credential load \
+                                                 failed for exchange '{}': {:?}",
+                                                strategy.strategy_name,
+                                                strategy.instance_id,
+                                                exchange_name,
+                                                e,
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    ultra_logger::ultra_error!(format!(
+                                        "❌ Rejected live deployment {} ({}): no DB pool or order \
+                                         manager available — cannot verify exchange credential.",
+                                        strategy.strategy_name, strategy.instance_id
+                                    ));
+                                    continue;
+                                }
+                            }
+
                             deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
                                 tenant_id: strategy.tenant_id,
                                 deployment_id: strategy.instance_id,

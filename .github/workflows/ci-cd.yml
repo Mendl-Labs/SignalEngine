@@ -529,11 +529,9 @@ jobs:
             --namespace=${{ env.NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
 
-          kubectl create secret generic signalengine-kraken-secret \
-            --from-literal=api-key="${kraken_api_key:-}" \
-            --from-literal=secret-key="${kraken_secret_key:-}" \
-            --namespace=${{ env.NAMESPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
+          # NOTE: Per-tenant exchange API keys are NOT created here. Users add
+          # their own keys via the Settings UI; SignalEngine loads them from the
+          # encrypted `exchange_credentials` table on demand.
 
           kubectl create secret generic signalengine-elastic-secret \
             --from-literal=endpoint="${ELASTIC_CLOUD_ENDPOINT:-}" \

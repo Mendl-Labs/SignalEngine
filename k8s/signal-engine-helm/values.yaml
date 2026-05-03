@@ -420,7 +420,16 @@ trading:
   max_orders_per_second: 10000
   latency_threshold_us: 100
 
-# Exchange-specific configuration
+# Strategy configuration
+strategies:
+  market_maker:
+    enabled: true
+
+# Exchange feature flags (NOT credentials — credentials are BYOK and stored
+# encrypted per-tenant in the `exchange_credentials` table). These flags only
+# control whether the runtime-config.yaml lists the exchange as a known
+# connector target. Adding/removing an entry here does not grant access; users
+# must still upload their own API keys via the Settings UI.
 exchanges:
   kraken:
     enabled: true
@@ -428,31 +437,24 @@ exchanges:
   binance:
     enabled: true
     sandbox: false
-  coinbase:
-    enabled: false
-    sandbox: true
-
-# Strategy configuration
-strategies:
-  market_maker:
-    enabled: true
 
 # Secrets (stored separately for security)
 # DO NOT PUT REAL CREDENTIALS IN THIS FILE - IT GOES TO GIT
+#
+# NOTE: Per-tenant exchange API keys are NOT configured here. Users add their
+# own keys for any supported exchange via the Settings UI; they are stored
+# encrypted in the `exchange_credentials` table and loaded by SignalEngine on
+# demand (see crates/hostbuilder/src/lib.rs::initialize_from_database and
+# UltraLowLatencyExecutionHandler::ensure_exchange_for_tenant).
 secrets:
-  # Kraken API credentials (TEMPLATE - replace with real values)
-  kraken:
-    apiKey: "YOUR_KRAKEN_API_KEY_HERE"
-    secretKey: "YOUR_KRAKEN_SECRET_KEY_HERE"
-  
-  # Database credentials  
+  # Database credentials
   database:
     password: "YOUR_DATABASE_PASSWORD_HERE"
-  
+
   # Redis credentials
   redis:
     password: "YOUR_REDIS_PASSWORD_HERE"
-    
+
   # Message broker credentials
   messageBroker:
     password: "YOUR_MESSAGE_BROKER_PASSWORD_HERE"

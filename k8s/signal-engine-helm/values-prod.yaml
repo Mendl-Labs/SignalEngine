@@ -89,21 +89,11 @@ configMap:
             max_order_size: 5000.0
             max_daily_loss: 1000.0
             max_position_value: 50000.0
-      exchanges:
-        - name: "kraken"
-          enabled: true
-          api_key: "placeholder"
-          secret_key: "placeholder"
-          sandbox: true
-          rate_limits:
-            orders_per_second: 10
-            requests_per_second: 60
-            window_size:
-              secs: 1
-              nanos: 0
-          timeout:
-            secs: 5
-            nanos: 0
+      # Per-tenant exchange API keys are NOT configured here. Users add their own
+      # keys via the Settings UI; they are stored encrypted in `exchange_credentials`
+      # and loaded by SignalEngine on startup (warm load via TENANT_ID) and on
+      # demand at deploy time (UltraLowLatencyExecutionHandler::ensure_exchange_for_tenant).
+      exchanges: []
       performance:
         worker_threads: 4
         cpu_affinity_enabled: false

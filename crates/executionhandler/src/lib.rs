@@ -597,6 +597,57 @@ impl UltraLowLatencyExecutionHandler {
         Ok(initialized_count)
     }
 
+    /// Returns true if a connector for `exchange_name` is currently registered.
+    ///
+    /// Cheap read-locked lookup. Used by callers that want to check before
+    /// triggering a (more expensive) `ensure_exchange_for_tenant` reload.
+    pub async fn has_connector(&self, exchange_name: &str) -> bool {
+        let connectors = self.connectors.read().await;
+        connectors.contains_key(exchange_name)
+    }
+
+    /// Lazily load (or refresh) a single tenant+exchange credential from the
+    /// database and register the resulting connector. Idempotent — calling this
+    /// repeatedly always rebuilds the connector with the latest stored creds, so
+    /// users who edit their API keys in the UI see the change without a pod
+    /// restart.
+    ///
+    /// Returns `Ok(true)` if a credential was found and a connector was
+    /// registered, `Ok(false)` if no enabled credential exists for that
+    /// (tenant, exchange) pair, and an error if the DB lookup or connector
+    /// initialization failed.
+    pub async fn ensure_exchange_for_tenant(
+        &mut self,
+        pool: &smartorderrouter::DbPool,
+        tenant_id: uuid::Uuid,
+        exchange: &str,
+    ) -> Result<bool, ExecutionError> {
+        let credential = smartorderrouter::load_credentials_for_exchange(pool, tenant_id, exchange)
+            .await
+            .map_err(|e| ExecutionError::Unknown(format!(
+                "Failed to load credential for tenant={} exchange={}: {}",
+                tenant_id, exchange, e
+            )))?;
+
+        match credential {
+            Some(cred) => {
+                self.add_exchange_from_credential(&cred).await?;
+                log::info!(
+                    "[EXECUTION] Lazily loaded {} credential for tenant {}",
+                    exchange, tenant_id
+                );
+                Ok(true)
+            }
+            None => {
+                log::warn!(
+                    "[EXECUTION] No enabled credential for tenant={} exchange={}",
+                    tenant_id, exchange
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Remove an exchange connector
     pub async fn remove_exchange(&mut self, exchange_name: &str) -> Result<(), ExecutionError> {
         let mut connectors = self.connectors.write().await;
