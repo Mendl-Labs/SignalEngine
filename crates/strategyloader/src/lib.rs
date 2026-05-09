@@ -37,7 +37,7 @@ pub use error::StrategyLoaderError;
 pub use router::MarketDataRouter;
 pub use state::{StrategyState, AssetState, PortfolioState, StrategyStateRegistry};
 pub use strategy::{
-    PortfolioStrategy, Signal, MarketDataEvent,
+    PortfolioStrategy, Signal, MarketDataEvent, BarEvent,
     MomentumStrategy, MeanReversionStrategy, StrategyFactory
 };
 pub use manager::{StrategyManager, SignalStore, SignalInfo, SignalStatus, ManagerMetrics};

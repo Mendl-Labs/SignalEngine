@@ -25,6 +25,7 @@ use crate::{
     PortfolioStrategy, StrategyState, StrategyStateRegistry,
     MarketDataRouter, MarketDataEvent, Signal,
 };
+use crate::strategy::BarEvent;
 
 /// Signal status for tracking lifecycle
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +352,47 @@ impl StrategyManager {
         }
     }
     
+    /// Process a completed OHLCV bar event, routing to all subscribed strategies.
+    ///
+    /// Signals generated via `on_bar()` are stored and fanned out through the
+    /// same signal handlers as tick-level signals.
+    pub async fn on_bar(&self, event: &BarEvent) -> Vec<Signal> {
+        let mut all_signals = Vec::new();
+
+        // Route by symbol/exchange — same router as tick data.
+        let strategy_ids = {
+            let router = self.router.read().await;
+            router.route(&event.symbol, &event.exchange)
+        };
+
+        let strategies = self.strategies.read().await;
+        let mut state_registry = self.state_registry.write().await;
+
+        for strategy_id in strategy_ids {
+            let Some(executor) = strategies.get(&strategy_id) else {
+                continue;
+            };
+            let Some(state) = state_registry.get_mut(strategy_id) else {
+                continue;
+            };
+            let signals = executor.on_bar(event, state);
+            all_signals.extend(signals);
+        }
+
+        for signal in &all_signals {
+            self.signals_generated.fetch_add(1, Ordering::Relaxed);
+            self.signal_store.store(signal.clone());
+            let handlers = self.signal_handlers.read();
+            for handler in handlers.iter() {
+                if handler.try_send(signal.clone()).is_ok() {
+                    self.signals_routed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        all_signals
+    }
+
     /// Process a market data event, routing to subscribed strategies
     /// Also stores and routes generated signals
     pub async fn on_market_data(&self, event: &MarketDataEvent) -> Vec<Signal> {

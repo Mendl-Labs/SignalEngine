@@ -149,6 +149,26 @@ pub struct MarketDataEvent {
     pub ask: Option<f64>,
 }
 
+/// Completed OHLCV bar event delivered to strategies.
+///
+/// Strategies that need time-series data (EMA, RSI, VWAP, etc.) should
+/// implement `on_bar()` rather than accumulating raw ticks themselves.
+#[derive(Debug, Clone)]
+pub struct BarEvent {
+    pub symbol: String,
+    pub exchange: String,
+    pub bar_start_ms: i64,
+    pub bar_end_ms: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub trade_count: i32,
+    /// Bar resolution in seconds (e.g. 1 for 1-second bars).
+    pub interval_secs: i32,
+}
+
 /// Trait for strategy execution
 /// 
 /// Strategies implement this trait to process market data and generate signals.
@@ -166,6 +186,12 @@ pub trait PortfolioStrategy: Send + Sync {
         event: &MarketDataEvent,
         state: &mut StrategyState,
     ) -> Vec<Signal>;
+
+    /// Process a completed OHLCV bar.  Default implementation is a no-op so
+    /// existing strategies that only use tick data compile without changes.
+    fn on_bar(&self, _event: &BarEvent, _state: &mut StrategyState) -> Vec<Signal> {
+        vec![]
+    }
     
     /// Called when an order is filled
     fn on_fill(

@@ -576,6 +576,10 @@ impl HostedObject {
         // after Bug #13 (synthetic top-of-book). The bridge task spawned below
         // pulls from this and feeds each deployed strategy's `generate_signals()`.
         let market_data_rx = datahandler.get_market_data_receiver();
+
+        // Capture the bar receiver so the bar bridge task (spawned below) can
+        // consume completed OHLCV bars from the BarAggregator-backed channel.
+        let bar_rx = datahandler.get_bar_receiver();
         
         // Initialize strategy manager with the loaded config
         self.strategy_manager = Some(Self::create_strategy_manager(&config)?);
@@ -794,6 +798,40 @@ impl HostedObject {
             });
         } else {
             ultra_warn!("signal_tx not available — market_data->strategy bridge NOT started");
+        }
+
+        // ======================================================================
+        // Bridge: bar_receiver -> deployed strategies
+        //
+        // Consumes completed OHLCV bars produced by DataEngine's BarAggregator
+        // (one bar per symbol per second) and forwards them to any deployed
+        // strategy that exposes `on_bar()`.  Until `strategyhandler::Strategy`
+        // grows a `on_bar()` method, this task acts as a reliable drain so the
+        // bar channel never fills and back-pressures the data pipeline.
+        // ======================================================================
+        {
+            let bar_bridge_registry = deployed_strategies.clone();
+            tokio::task::spawn_blocking(move || {
+                ultra_logger::ultra_info!("📊 Bar bridge started — consuming BarAggregator output");
+                let mut bar_count: u64 = 0;
+                while let Ok(bar) = bar_rx.recv() {
+                    bar_count += 1;
+                    // Log periodically; strategies will consume via on_bar once
+                    // strategyhandler::Strategy is extended.
+                    if bar_count % 60 == 1 {
+                        ultra_logger::ultra_info!(format!(
+                            "📊 Bar ({}/{}): o={:.4} h={:.4} l={:.4} c={:.4} v={:.4} trades={} deployed={}",
+                            bar.symbol, bar.exchange,
+                            bar.open, bar.high, bar.low, bar.close, bar.volume,
+                            bar.trade_count,
+                            bar_bridge_registry.len(),
+                        ));
+                    }
+                    // Future: iterate bar_bridge_registry and call strategy.on_bar(&bar)
+                    let _ = bar_bridge_registry.len(); // keep registry arc alive
+                }
+                ultra_logger::ultra_info!("📊 Bar bridge stopped");
+            });
         }
 
         // Set up ultra-fast signal routing using Phase 2 order manager

@@ -33,7 +33,7 @@ use ultra_logger::{ultra_info, ultra_error, ultra_debug};
 
 // Message broker integration
 use subscriber::{UltraFastSubscriber, UltraFastMessage};
-use protocol::broker::messages::{Trade, Orders, MarketMessage, market_message};
+use protocol::broker::messages::{Bar, Trade, Orders, MarketMessage, market_message};
 use prost::Message;
 
 // **ULTRA-LOW LATENCY OPTIMIZATION**: Lock-free orderbook storage
@@ -116,6 +116,11 @@ pub mod topics {
     /// Portfolio balance updates
     pub const PORTFOLIO_BALANCES: &str = "portfolio.updates.balances";
     
+    /// Build topic name for exchange bars
+    pub fn bars_topic(exchange: &str) -> String {
+        format!("{}{}{}", TRADE_TOPIC_PREFIX, exchange, ".bars")
+    }
+    
     /// Build topic name for exchange trades
     pub fn trades_topic(exchange: &str) -> String {
         format!("{}{}{}", TRADE_TOPIC_PREFIX, exchange, TRADE_TOPIC_SUFFIX)
@@ -172,6 +177,22 @@ pub struct OrderbookUpdate {
     pub timestamp: u64,
 }
 
+/// Completed bar event forwarded to strategies.
+#[derive(Debug, Clone)]
+pub struct BarEvent {
+    pub symbol: String,
+    pub exchange: String,
+    pub bar_start_ms: i64,
+    pub bar_end_ms: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub trade_count: i32,
+    pub interval_secs: i32,
+}
+
 pub trait DataHandlerTrait {
     fn listen(&mut self) -> Result<(), Box<dyn Error>>;
     fn get_market_data(&self, symbol: &str, exchange: &str) -> Option<MarketData>;
@@ -223,6 +244,10 @@ pub struct DataHandler {
     // Market data channels for ultra-fast distribution
     market_data_sender: Sender<MarketData>,
     market_data_receiver: Receiver<MarketData>,
+
+    // Bar event channel for time-series (OHLCV) delivery to strategies
+    bar_sender: Sender<BarEvent>,
+    bar_receiver: Receiver<BarEvent>,
     
     // Signal routing for strategy updates
     strategy_signal_sender: Option<Sender<Signal>>,
@@ -258,6 +283,8 @@ impl Clone for DataHandler {
         Self {
             market_data_sender: self.market_data_sender.clone(),
             market_data_receiver: self.market_data_receiver.clone(),
+            bar_sender: self.bar_sender.clone(),
+            bar_receiver: self.bar_receiver.clone(),
             strategy_signal_sender: self.strategy_signal_sender.clone(),
             subscriber: Arc::clone(&self.subscriber),
             broker_config: self.broker_config.clone(),
@@ -290,6 +317,9 @@ impl DataHandler {
         // 10,000 capacity provides buffer while preventing unbounded memory growth
         const MARKET_DATA_CHANNEL_CAPACITY: usize = 10_000;
         let (market_data_sender, market_data_receiver) = bounded(MARKET_DATA_CHANNEL_CAPACITY);
+
+        // Bounded channel for completed OHLCV bars (1-sec cadence, modest capacity)
+        let (bar_sender, bar_receiver) = bounded::<BarEvent>(4_096);
         
         ultra_info!(format!("Created bounded market data channel with capacity={}", MARKET_DATA_CHANNEL_CAPACITY));
         
@@ -307,6 +337,7 @@ impl DataHandler {
         for exchange in &config.exchanges {
             subscribed_topics.push(topics::trades_topic(exchange));
             subscribed_topics.push(topics::level3_topic(exchange));
+            subscribed_topics.push(topics::bars_topic(exchange));
         }
         subscribed_topics.push(topics::PORTFOLIO_BALANCES.to_string());
         
@@ -315,6 +346,8 @@ impl DataHandler {
         Ok(Self {
             market_data_sender,
             market_data_receiver,
+            bar_sender,
+            bar_receiver,
             strategy_signal_sender: None,
             subscriber,
             broker_config: config.clone(),
@@ -451,6 +484,19 @@ impl DataHandler {
                     }
                 }
             }
+        } else if topic.ends_with(".bars") {
+            // DataEngine publishes a MarketMessage with a Bar payload from the bar aggregator.
+            match MarketMessage::decode(data) {
+                Ok(market_msg) => {
+                    if let Some(market_message::Payload::Bar(bar)) = market_msg.payload {
+                        self.process_bar(&bar);
+                    }
+                }
+                Err(e) => {
+                    self.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                    ultra_error!(format!("Failed to decode bar message on {}: {} (data_len={})", topic, e, data_len));
+                }
+            }
         } else if topic == topics::PORTFOLIO_BALANCES {
             // Portfolio balance update received
         }
@@ -458,6 +504,26 @@ impl DataHandler {
         Ok(())
     }
     
+    /// Process a completed bar received from the aggregator.
+    fn process_bar(&self, bar: &Bar) {
+        let event = BarEvent {
+            symbol: bar.symbol.clone(),
+            exchange: bar.exchange.clone(),
+            bar_start_ms: bar.bar_start_ms,
+            bar_end_ms: bar.bar_end_ms,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+            trade_count: bar.trade_count,
+            interval_secs: bar.interval_secs,
+        };
+        if let Err(e) = self.bar_sender.try_send(event) {
+            ultra_debug!(format!("Bar channel full, dropping bar for {}/{}: {}", bar.symbol, bar.exchange, e));
+        }
+    }
+
     /// Process a trade message and update orderbooks
     fn process_trade(&self, trade: &Trade) -> Result<(), Box<dyn Error>> {
         let start_time = ultra_signal::high_precision_timestamp_ns();
@@ -755,6 +821,11 @@ impl DataHandler {
     /// Get market data receiver for strategies
     pub fn get_market_data_receiver(&self) -> Receiver<MarketData> {
         self.market_data_receiver.clone()
+    }
+
+    /// Get bar event receiver for strategies that consume OHLCV bars.
+    pub fn get_bar_receiver(&self) -> Receiver<BarEvent> {
+        self.bar_receiver.clone()
     }
 
     /// Get all orderbooks for monitoring
