@@ -239,9 +239,9 @@ jobs:
 
           echo "[PUSH] Pushing image..."
           docker push ${{ env.IMAGE_NAME }}:$SHORT_SHA
-          docker tag ${{ env.IMAGE_NAME }}:$SHORT_SHA ${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.IMAGE_NAME }}:latest
-          echo "[OK] Pushed image with tags: $SHORT_SHA, latest"
+          # :latest intentionally NOT pushed. Mutable tags + IfNotPresent pullPolicy
+          # caused stale-image incidents (see 2026-05-30 audit). Deploy by SHA only.
+          echo "[OK] Pushed image with tag: $SHORT_SHA (immutable SHA only)"
 
       - name: Security Scan
         continue-on-error: true
@@ -371,7 +371,7 @@ jobs:
           # Pure-node agent, zero npm dependencies - just run it.
           node index.js
 
-      - name: Debug — Dump QA Cluster State on Failure
+      - name: Debug Ã¢â‚¬â€ Dump QA Cluster State on Failure
         if: failure()
         run: |
           set +e
@@ -542,7 +542,7 @@ jobs:
               --dry-run=client -o yaml | kubectl apply -f -
             echo "[OK] signalengine-credentials-encryption secret synced"
           else
-            echo "[WARN] CREDENTIALS_ENCRYPTION_KEY not set in vault — live trading will be unable to decrypt user API keys"
+            echo "[WARN] CREDENTIALS_ENCRYPTION_KEY not set in vault Ã¢â‚¬â€ live trading will be unable to decrypt user API keys"
           fi
 
           kubectl create secret generic signalengine-elastic-secret \
