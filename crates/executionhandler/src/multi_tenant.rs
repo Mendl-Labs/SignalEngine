@@ -55,7 +55,7 @@ pub enum SubscriptionTier {
     Explorer,
     Trader,
     Professional,
-    Institution,
+    Team,
     Enterprise,
 }
 
@@ -72,7 +72,7 @@ impl SubscriptionTier {
             Self::Explorer => 10,           // 10 orders/min - paper trading only
             Self::Trader => 100,            // 100 orders/min - basic live
             Self::Professional => 1_000,    // 1000 orders/min - active trading
-            Self::Institution => 10_000,    // 10K orders/min - institutional
+            Self::Team => 10_000,           // 10K orders/min - team tier
             Self::Enterprise => 100_000,    // 100K orders/min - HFT
         }
     }
@@ -83,7 +83,7 @@ impl SubscriptionTier {
             Self::Explorer => 3,
             Self::Trader => 25,
             Self::Professional => 100,
-            Self::Institution => 500,
+            Self::Team => 500,
             Self::Enterprise => usize::MAX, // Unlimited
         }
     }
@@ -94,7 +94,7 @@ impl SubscriptionTier {
             Self::Explorer => 1,
             Self::Trader => 1,
             Self::Professional => 3,
-            Self::Institution => 10,
+            Self::Team => 10,
             Self::Enterprise => usize::MAX,
         }
     }
@@ -105,7 +105,7 @@ impl SubscriptionTier {
             Self::Explorer => 1,
             Self::Trader => 5,
             Self::Professional => 10,
-            Self::Institution => 25,
+            Self::Team => 25,
             Self::Enterprise => 50,
         }
     }
@@ -116,7 +116,7 @@ impl SubscriptionTier {
             Self::Explorer => 0,          // Best effort, no SLA
             Self::Trader => 50_000,       // 50ms
             Self::Professional => 10_000, // 10ms
-            Self::Institution => 1_000,   // 1ms
+            Self::Team => 1_000,          // 1ms
             Self::Enterprise => 100,      // 100μs
         }
     }
@@ -126,12 +126,12 @@ impl SubscriptionTier {
         match s.to_lowercase().as_str() {
             "trader" => Self::Trader,
             "professional" => Self::Professional,
-            "institution" => Self::Institution,
+            "team" | "institution" => Self::Team,
             "enterprise" => Self::Enterprise,
             // Backward compat
             "free" => Self::Explorer,
             "pro" => Self::Professional,
-            "live" => Self::Institution,
+            "live" => Self::Team,
             _ => Self::Explorer,
         }
     }
@@ -143,7 +143,7 @@ impl std::fmt::Display for SubscriptionTier {
             Self::Explorer => write!(f, "explorer"),
             Self::Trader => write!(f, "trader"),
             Self::Professional => write!(f, "professional"),
-            Self::Institution => write!(f, "institution"),
+            Self::Team => write!(f, "team"),
             Self::Enterprise => write!(f, "enterprise"),
         }
     }
