@@ -307,6 +307,12 @@ impl GenericConnector {
                     return Err(ExecutionError::Exchange(msg.to_string()));
                 }
             }
+            ExchangePreset::AlpacaPaper => {
+                // Alpaca returns {"code":..., "message":"..."} on error
+                if let Some(msg) = response.get("message").and_then(|m| m.as_str()) {
+                    return Err(ExecutionError::Exchange(msg.to_string()));
+                }
+            }
         }
         
         Ok(())
@@ -356,6 +362,11 @@ impl GenericConnector {
                 response.get("result")
                     .and_then(|r| r.get("order"))
                     .and_then(|o| o.get("order_id"))
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string())
+            }
+            ExchangePreset::AlpacaPaper => {
+                response.get("id")
                     .and_then(|id| id.as_str())
                     .map(|s| s.to_string())
             }

@@ -318,6 +318,30 @@ impl AuthStrategy for HmacSha256PassphraseAuth {
     }
 }
 
+/// Plain API-key header auth (Alpaca) — injects key+secret as headers, no signing.
+pub struct ApiKeyHeaderAuth {
+    api_key: String,
+    api_secret: String,
+    api_key_header: String,
+    api_secret_header: String,
+}
+
+#[async_trait]
+impl AuthStrategy for ApiKeyHeaderAuth {
+    async fn sign(
+        &self,
+        _method: &str,
+        _path: &str,
+        _body: &str,
+        _timestamp: u64,
+    ) -> Result<AuthHeaders, ExecutionError> {
+        let mut auth = AuthHeaders::new();
+        auth.headers.insert(self.api_key_header.clone(), self.api_key.clone());
+        auth.headers.insert(self.api_secret_header.clone(), self.api_secret.clone());
+        Ok(auth)
+    }
+}
+
 /// Factory function to create the appropriate auth strategy
 pub fn create_auth_strategy(
     auth_method: &AuthMethod,
@@ -337,6 +361,14 @@ pub fn create_auth_strategy(
                 ExecutionError::Authentication("Passphrase required for this exchange".to_string())
             })?;
             Ok(Box::new(HmacSha256PassphraseAuth::new(api_key, secret_key, pass, auth_method)?))
+        }
+        AuthMethod::ApiKeyHeader { api_key_header, api_secret_header } => {
+            Ok(Box::new(ApiKeyHeaderAuth {
+                api_key,
+                api_secret: secret_key,
+                api_key_header: api_key_header.clone(),
+                api_secret_header: api_secret_header.clone(),
+            }))
         }
         AuthMethod::Rsa { .. } | AuthMethod::Ed25519 { .. } => {
             Err(ExecutionError::Authentication(

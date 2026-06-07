@@ -21,6 +21,7 @@ pub enum ExchangePreset {
     OKX,
     Gemini,
     Deribit,
+    AlpacaPaper,
 }
 
 impl ExchangePreset {
@@ -35,6 +36,7 @@ impl ExchangePreset {
             ExchangePreset::OKX => okx_definition(),
             ExchangePreset::Gemini => gemini_definition(),
             ExchangePreset::Deribit => deribit_definition(),
+            ExchangePreset::AlpacaPaper => alpaca_paper_definition(),
         }
     }
     
@@ -49,6 +51,7 @@ impl ExchangePreset {
             "okx" | "okex" => Some(Self::OKX),
             "gemini" => Some(Self::Gemini),
             "deribit" => Some(Self::Deribit),
+            "alpaca_paper" | "alpaca-paper" | "alpaca" => Some(Self::AlpacaPaper),
             _ => None,
         }
     }
@@ -64,6 +67,7 @@ impl ExchangePreset {
             ExchangePreset::OKX => "OKX",
             ExchangePreset::Gemini => "Gemini",
             ExchangePreset::Deribit => "Deribit",
+            ExchangePreset::AlpacaPaper => "Alpaca Paper",
         }
     }
 }
@@ -107,6 +111,13 @@ pub enum AuthMethod {
     Ed25519 {
         client_id_param: String,
         signature_param: String,
+    },
+    /// Plain API-key header auth (Alpaca) — no signing, just pass the key and secret as headers
+    ApiKeyHeader {
+        /// Header name for the API key
+        api_key_header: String,
+        /// Header name for the API secret
+        api_secret_header: String,
     },
 }
 
@@ -709,6 +720,62 @@ fn deribit_definition() -> ExchangeDefinition {
             max_order_size: 10_000_000.0,
             default_tick_size: 0.5,
             max_batch_size: 20,
+        },
+    }
+}
+
+fn alpaca_paper_definition() -> ExchangeDefinition {
+    ExchangeDefinition {
+        name: "Alpaca Paper".to_string(),
+        auth_method: AuthMethod::ApiKeyHeader {
+            api_key_header: "APCA-API-KEY-ID".to_string(),
+            api_secret_header: "APCA-API-SECRET-KEY".to_string(),
+        },
+        endpoints: EndpointConfig {
+            rest_url: "https://paper-api.alpaca.markets".to_string(),
+            websocket_url: "wss://stream.data.alpaca.markets/v2/iex".to_string(),
+            place_order_path: "/v2/orders".to_string(),
+            buy_order_path: None,
+            sell_order_path: None,
+            cancel_order_path: "/v2/orders".to_string(),
+            order_status_path: "/v2/orders".to_string(),
+            balance_path: "/v2/account".to_string(),
+            health_check_path: "/v2/clock".to_string(),
+            place_order_method: "POST".to_string(),
+            content_type: ContentType::Json,
+        },
+        symbol_format: SymbolFormat {
+            separator: "".to_string(),
+            uppercase: true,
+            custom_mappings: HashMap::new(),
+            base_prefix: "".to_string(),
+            quote_prefix: "".to_string(),
+        },
+        rate_limits: RateLimits {
+            requests_per_second: 200,
+            burst: 200,
+            orders_per_second: 200,
+            max_concurrent_orders: 500,
+        },
+        order_params: OrderParamsMapping {
+            symbol_field: "symbol".to_string(),
+            side_field: "side".to_string(),
+            type_field: "type".to_string(),
+            quantity_field: "qty".to_string(),
+            price_field: "limit_price".to_string(),
+            client_id_field: Some("client_order_id".to_string()),
+            side_buy: "buy".to_string(),
+            side_sell: "sell".to_string(),
+            type_market: "market".to_string(),
+            type_limit: "limit".to_string(),
+        },
+        requires_passphrase: false,
+        trading_mode: TradingMode::default(),
+        order_limits: OrderLimits {
+            min_order_size: 0.000001, // fractional shares supported
+            max_order_size: 10_000_000.0,
+            default_tick_size: 0.01,
+            max_batch_size: 500,
         },
     }
 }

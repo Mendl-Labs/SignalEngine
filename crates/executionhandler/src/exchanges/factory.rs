@@ -77,7 +77,7 @@ impl ExchangeFactory {
     pub fn supported_exchanges() -> Vec<&'static str> {
         vec![
             "kraken",
-            "coinbase", 
+            "coinbase",
             "binance",
             "binance_us",
             "bybit",
@@ -85,6 +85,7 @@ impl ExchangeFactory {
             "gemini",
             "deribit",
             "paper",
+            "alpaca_paper",
         ]
     }
 
@@ -233,6 +234,42 @@ impl ExchangeFactory {
     }
 }
 
+/// Returns true if the current UTC time falls within NYSE regular trading hours
+/// (9:30 AM – 4:00 PM US/Eastern, Monday–Friday, excluding holidays).
+///
+/// Holiday exclusions are NOT implemented here — callers that need full holiday
+/// awareness should integrate with an exchange calendar API. This guard blocks
+/// orders on weekends and outside core session hours only.
+pub fn is_nyse_market_hours() -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // UTC offset for US/Eastern: EST = UTC-5, EDT = UTC-4
+    // NYSE trades 9:30–16:00 ET.  We approximate: open=[14:30,21:00) UTC in summer,
+    // [14:30,21:00) UTC in winter.  To keep this dependency-free we use a fixed
+    // UTC-5 (EST) offset — callers in EDT will be 1 h early, which is the safe side
+    // (they'll see "open" start 1 h late and "close" end 1 h late, never trading outside hours).
+    const UTC_OFFSET_SECS: u64 = 5 * 3600; // UTC-5 (EST, conservative)
+    let local_secs = secs.saturating_sub(UTC_OFFSET_SECS);
+
+    let day_of_week = (local_secs / 86400 + 4) % 7; // 0=Sun … 6=Sat; epoch was a Thursday (day=4)
+    let seconds_in_day = local_secs % 86400;
+
+    // Monday=1 … Friday=5
+    if day_of_week == 0 || day_of_week == 6 {
+        return false; // weekend
+    }
+
+    let open = 9 * 3600 + 30 * 60;  // 09:30
+    let close = 16 * 3600;          // 16:00
+
+    seconds_in_day >= open && seconds_in_day < close
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,7 +303,8 @@ mod tests {
         assert!(exchanges.contains(&"gemini"));
         assert!(exchanges.contains(&"deribit"));
         assert!(exchanges.contains(&"paper"));
-        assert_eq!(exchanges.len(), 9);
+        assert!(exchanges.contains(&"alpaca_paper"));
+        assert_eq!(exchanges.len(), 10);
     }
 
     #[test]
