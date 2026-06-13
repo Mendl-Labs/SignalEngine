@@ -14,7 +14,7 @@ use crossbeam::channel::Sender;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use orderbook::{Orderbook, OrderbookMetrics};
-use ultra_signal::{Signal, SignalAction, ExchangeId, SYMBOLS};
+use ultra_signal::{Signal, SignalAction, ExchangeId, SYMBOLS, hash_symbol};
 use signalengine::{SignalEngineLogger, TradingContext};
 use tracing::{info, error};
 
@@ -695,15 +695,17 @@ impl Strategy for SimpleMarketMakingStrategy {
         let last_quotes = self.last_quotes.get(&market_data.symbol).copied().unwrap_or((0.0, 0.0));
         
         // Check if quotes have changed significantly (0.01% threshold)
-        let _bid_changed = (new_bid - last_quotes.0).abs() / new_bid.max(1e-12) > 0.0001;
-        let _ask_changed = (new_ask - last_quotes.1).abs() / new_ask.max(1e-12) > 0.0001;
-        
-        // For paper-trading verification: fire on every tick so the pipeline
-        // produces a steady stream of fills (the synthetic OB updates only
-        // change when underlying trade price moves, which can be infrequent).
-        if true {
-            let symbol_hash = SYMBOLS.btc_usd;
-            let exchange_id = ExchangeId::Binance; // Default to Binance
+        let bid_changed = (new_bid - last_quotes.0).abs() / new_bid.max(1e-12) > 0.0001;
+        let ask_changed = (new_ask - last_quotes.1).abs() / new_ask.max(1e-12) > 0.0001;
+
+        if bid_changed || ask_changed {
+            let symbol_hash = hash_symbol(&market_data.symbol);
+            let exchange_id = match market_data.exchange.to_lowercase().as_str() {
+                "binance" => ExchangeId::Binance,
+                "coinbase" | "coinbase_pro" => ExchangeId::Coinbase,
+                "kraken" => ExchangeId::Kraken,
+                _ => ExchangeId::Binance,
+            };
             let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
             let base_quantity = 0.01; // Base quantity for orders
             

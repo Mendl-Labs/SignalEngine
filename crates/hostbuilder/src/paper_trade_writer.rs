@@ -194,6 +194,12 @@ impl PaperTradeWriter {
         let price = bigdecimal::BigDecimal::try_from(fill.price).unwrap_or_default();
         let fees = bigdecimal::BigDecimal::try_from(fill.fees).unwrap_or_default();
 
+        let quote_currency = fill.symbol
+            .split(|c| c == '/' || c == '-')
+            .nth(1)
+            .unwrap_or("USD")
+            .to_string();
+
         let side = match fill.side.to_ascii_lowercase().as_str() {
             "buy" => TradeSide::Buy,
             "sell" => TradeSide::Sell,
@@ -216,7 +222,7 @@ impl PaperTradeWriter {
             qty,
             price,
             fees,
-            "USD".to_string(),
+            quote_currency,
             fill.fill_id.clone(),
             fill.order_id.clone(),
             Utc::now(),

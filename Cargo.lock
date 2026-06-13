@@ -3687,6 +3687,7 @@ dependencies = [
  "crossbeam",
  "signalengine-core",
  "tokio",
+ "ultra-logger",
  "ultra_signal",
  "winapi",
 ]

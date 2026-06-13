@@ -222,9 +222,9 @@ impl UltraFastSignalDispatcher {
         portfolio_sender: &Sender<Signal>,
         risk_sender: &Sender<Signal>,
     ) {
-        // **ULTRA-FAST SIGNAL ROUTING** 
+        // **ULTRA-FAST SIGNAL ROUTING**
         // Route based on signal action without complex logic
-        
+
         match signal.action {
             SignalAction::Buy | SignalAction::Sell => {
                 // Market orders go directly to execution (fastest path)
@@ -233,6 +233,7 @@ impl UltraFastSignalDispatcher {
                 } else {
                     // Limit orders need risk check first
                     if signal.should_bypass_risk_checks() {
+                        Self::log_risk_bypass(signal);
                         let _ = execution_sender.try_send(*signal);
                     } else {
                         let _ = risk_sender.try_send(*signal);
@@ -241,26 +242,43 @@ impl UltraFastSignalDispatcher {
                 // Always update portfolio
                 let _ = portfolio_sender.try_send(*signal);
             }
-            
+
             SignalAction::BuyLimit | SignalAction::SellLimit => {
                 // Limit orders through risk management unless urgent
                 if signal.is_urgent() {
+                    Self::log_risk_bypass(signal);
                     let _ = execution_sender.try_send(*signal);
                 } else {
                     let _ = risk_sender.try_send(*signal);
                 }
                 let _ = portfolio_sender.try_send(*signal);
             }
-            
+
             SignalAction::Cancel => {
                 // Cancel orders go directly to execution
                 let _ = execution_sender.try_send(*signal);
             }
-            
+
             SignalAction::Hold => {
                 // Hold signals only update portfolio
                 let _ = portfolio_sender.try_send(*signal);
             }
+        }
+    }
+
+    /// Loudly log signals that skip risk checks, rate-limited so the hot
+    /// path is not flooded (first occurrence, then every 100th).
+    #[cold]
+    fn log_risk_bypass(signal: &Signal) {
+        use std::sync::atomic::AtomicU64;
+        static BYPASS_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 100 == 0 {
+            ultra_logger::ultra_warn!(format!(
+                "⚠️ RISK BYPASS: signal routed directly to execution without risk checks \
+                 (strategy_id={}, symbol_hash={:#x}, action={:?}, qty={}, total_bypasses={})",
+                signal.strategy_id, signal.symbol_hash, signal.action, signal.quantity, n + 1
+            ));
         }
     }
 

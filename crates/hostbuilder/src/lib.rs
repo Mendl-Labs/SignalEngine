@@ -1193,8 +1193,7 @@ impl HostedObject {
                             // falling back to sensible defaults when not specified.
                             let sim_config = executionhandler::PaperTradingConfig {
                                 slippage_bps: strategy.slippage_bps.unwrap_or(5.0),
-                                partial_fill_probability: 0.1, // not yet user-configurable
-                                base_latency_ms: 10.0,         // not yet user-configurable
+                                ..Default::default()
                             };
 
                             // Register a paper trading connector for this deployment instance

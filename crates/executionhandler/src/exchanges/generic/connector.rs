@@ -86,15 +86,67 @@ impl GenericConnector {
                     .join("&")
             }
             ContentType::Json => {
+                // Exchanges with nested JSON bodies (OANDA) pre-serialize into __raw_body
+                if let Some(raw) = params.get("__raw_body") {
+                    return raw.clone();
+                }
                 serde_json::to_string(params).unwrap_or_default()
             }
         }
     }
-    
+
+    /// Substitute path template placeholders (OANDA's `{account_id}` rides in the passphrase credential)
+    fn resolve_path(&self, path: &str) -> String {
+        if path.contains("{account_id}") {
+            let account_id = self.config.as_ref()
+                .and_then(|c| c.passphrase.as_deref())
+                .unwrap_or("");
+            path.replace("{account_id}", account_id)
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// Build OANDA v20 order body: nested {"order":{...}}, side encoded as signed integer units
+    fn build_oanda_order_params(&self, signal: &Signal) -> Result<HashMap<String, String>, ExecutionError> {
+        use crate::signal::SignalAction;
+
+        let instrument = self.symbol_converter.to_exchange_format(&signal.symbol);
+        // OANDA units are signed integers: positive = buy, negative = sell
+        let mut units = signal.quantity.round() as i64;
+        if matches!(signal.action,
+            SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop)
+        {
+            units = -units;
+        }
+
+        let mut order = serde_json::json!({
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": units.to_string(),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+        });
+        if let Some(price) = signal.price {
+            order["type"] = "LIMIT".into();
+            order["price"] = price.to_string().into();
+            order["timeInForce"] = "GTC".into();
+        }
+
+        let body = serde_json::json!({ "order": order }).to_string();
+        let mut params = HashMap::new();
+        params.insert("__raw_body".to_string(), body);
+        Ok(params)
+    }
+
     /// Build order parameters from signal
     fn build_order_params(&self, signal: &Signal) -> Result<HashMap<String, String>, ExecutionError> {
         use crate::signal::SignalAction;
-        
+
+        if matches!(self.preset, ExchangePreset::OandaPractice) {
+            return self.build_oanda_order_params(signal);
+        }
+
         let params_map = &self.definition.order_params;
         let mut params = HashMap::new();
         
@@ -173,7 +225,9 @@ impl GenericConnector {
         
         let auth = self.auth.as_ref()
             .ok_or_else(|| ExecutionError::Authentication("Authentication not initialized".to_string()))?;
-        
+
+        let path = &self.resolve_path(path);
+
         // Build request body
         let body = self.build_request_body(&params);
         
@@ -313,6 +367,12 @@ impl GenericConnector {
                     return Err(ExecutionError::Exchange(msg.to_string()));
                 }
             }
+            ExchangePreset::OandaPractice => {
+                // OANDA v20 returns {"errorCode":..., "errorMessage":"..."} on error
+                if let Some(msg) = response.get("errorMessage").and_then(|m| m.as_str()) {
+                    return Err(ExecutionError::Exchange(msg.to_string()));
+                }
+            }
         }
         
         Ok(())
@@ -367,6 +427,15 @@ impl GenericConnector {
             }
             ExchangePreset::AlpacaPaper => {
                 response.get("id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string())
+            }
+            ExchangePreset::OandaPractice => {
+                // Market FOK fills synchronously (orderFillTransaction); otherwise fall back
+                // to the created order's transaction id
+                response.get("orderFillTransaction")
+                    .and_then(|t| t.get("id"))
+                    .or_else(|| response.get("orderCreateTransaction").and_then(|t| t.get("id")))
                     .and_then(|id| id.as_str())
                     .map(|s| s.to_string())
             }

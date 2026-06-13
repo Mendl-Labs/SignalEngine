@@ -342,6 +342,26 @@ impl AuthStrategy for ApiKeyHeaderAuth {
     }
 }
 
+/// Bearer-token auth (OANDA) — injects `Authorization: Bearer <api_key>`, no signing.
+pub struct BearerTokenAuth {
+    api_key: String,
+}
+
+#[async_trait]
+impl AuthStrategy for BearerTokenAuth {
+    async fn sign(
+        &self,
+        _method: &str,
+        _path: &str,
+        _body: &str,
+        _timestamp: u64,
+    ) -> Result<AuthHeaders, ExecutionError> {
+        let mut auth = AuthHeaders::new();
+        auth.headers.insert("Authorization".to_string(), format!("Bearer {}", self.api_key));
+        Ok(auth)
+    }
+}
+
 /// Factory function to create the appropriate auth strategy
 pub fn create_auth_strategy(
     auth_method: &AuthMethod,
@@ -370,6 +390,7 @@ pub fn create_auth_strategy(
                 api_secret_header: api_secret_header.clone(),
             }))
         }
+        AuthMethod::BearerToken => Ok(Box::new(BearerTokenAuth { api_key })),
         AuthMethod::Rsa { .. } | AuthMethod::Ed25519 { .. } => {
             Err(ExecutionError::Authentication(
                 "RSA and Ed25519 auth not yet implemented".to_string(),

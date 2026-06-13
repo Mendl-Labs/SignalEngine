@@ -22,6 +22,7 @@ pub enum ExchangePreset {
     Gemini,
     Deribit,
     AlpacaPaper,
+    OandaPractice,
 }
 
 impl ExchangePreset {
@@ -37,9 +38,10 @@ impl ExchangePreset {
             ExchangePreset::Gemini => gemini_definition(),
             ExchangePreset::Deribit => deribit_definition(),
             ExchangePreset::AlpacaPaper => alpaca_paper_definition(),
+            ExchangePreset::OandaPractice => oanda_practice_definition(),
         }
     }
-    
+
     /// Parse from exchange name string
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_lowercase().as_str() {
@@ -52,10 +54,11 @@ impl ExchangePreset {
             "gemini" => Some(Self::Gemini),
             "deribit" => Some(Self::Deribit),
             "alpaca_paper" | "alpaca-paper" | "alpaca" => Some(Self::AlpacaPaper),
+            "oanda_practice" | "oanda-practice" | "oanda" => Some(Self::OandaPractice),
             _ => None,
         }
     }
-    
+
     /// Get the display name
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -68,6 +71,7 @@ impl ExchangePreset {
             ExchangePreset::Gemini => "Gemini",
             ExchangePreset::Deribit => "Deribit",
             ExchangePreset::AlpacaPaper => "Alpaca Paper",
+            ExchangePreset::OandaPractice => "OANDA Practice",
         }
     }
 }
@@ -119,6 +123,8 @@ pub enum AuthMethod {
         /// Header name for the API secret
         api_secret_header: String,
     },
+    /// OAuth-style bearer token (OANDA) — `Authorization: Bearer <api_key>`
+    BearerToken,
 }
 
 /// Where to place the signature in the request
@@ -776,6 +782,64 @@ fn alpaca_paper_definition() -> ExchangeDefinition {
             max_order_size: 10_000_000.0,
             default_tick_size: 0.01,
             max_batch_size: 500,
+        },
+    }
+}
+
+fn oanda_practice_definition() -> ExchangeDefinition {
+    ExchangeDefinition {
+        name: "OANDA Practice".to_string(),
+        auth_method: AuthMethod::BearerToken,
+        endpoints: EndpointConfig {
+            // {account_id} is substituted from the passphrase credential at request time
+            rest_url: "https://api-fxpractice.oanda.com".to_string(),
+            websocket_url: "wss://stream-fxpractice.oanda.com".to_string(),
+            place_order_path: "/v3/accounts/{account_id}/orders".to_string(),
+            buy_order_path: None,
+            sell_order_path: None,
+            cancel_order_path: "/v3/accounts/{account_id}/orders".to_string(),
+            order_status_path: "/v3/accounts/{account_id}/orders".to_string(),
+            balance_path: "/v3/accounts/{account_id}/summary".to_string(),
+            health_check_path: "/v3/accounts".to_string(),
+            place_order_method: "POST".to_string(),
+            content_type: ContentType::Json,
+        },
+        symbol_format: SymbolFormat {
+            separator: "_".to_string(),
+            uppercase: true,
+            custom_mappings: HashMap::new(),
+            base_prefix: "".to_string(),
+            quote_prefix: "".to_string(),
+        },
+        rate_limits: RateLimits {
+            requests_per_second: 100,
+            burst: 100,
+            orders_per_second: 100,
+            max_concurrent_orders: 200,
+        },
+        // OANDA uses a nested {"order": {...}} body with side encoded in the units
+        // sign — built in connector.rs::build_order_params, so most field names
+        // here are informational.
+        order_params: OrderParamsMapping {
+            symbol_field: "instrument".to_string(),
+            side_field: "".to_string(),
+            type_field: "type".to_string(),
+            quantity_field: "units".to_string(),
+            price_field: "price".to_string(),
+            client_id_field: None,
+            side_buy: "buy".to_string(),
+            side_sell: "sell".to_string(),
+            type_market: "MARKET".to_string(),
+            type_limit: "LIMIT".to_string(),
+        },
+        // Account ID rides in the passphrase credential field
+        requires_passphrase: true,
+        trading_mode: TradingMode::default(),
+        order_limits: OrderLimits {
+            min_order_size: 1.0, // OANDA units are integers
+            max_order_size: 10_000_000.0,
+            default_tick_size: 0.00001,
+            max_batch_size: 1,
         },
     }
 }

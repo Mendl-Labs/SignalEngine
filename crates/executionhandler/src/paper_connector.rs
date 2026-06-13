@@ -38,6 +38,8 @@ pub struct PaperTradingConfig {
     pub partial_fill_probability: f64,
     /// Base latency for simulated execution in milliseconds
     pub base_latency_ms: f64,
+    /// Taker fee rate in basis points (default 10 bps = 0.10%)
+    pub taker_fee_bps: f64,
 }
 
 impl Default for PaperTradingConfig {
@@ -46,6 +48,7 @@ impl Default for PaperTradingConfig {
             slippage_bps: 5.0,
             partial_fill_probability: 0.1,
             base_latency_ms: 10.0,
+            taker_fee_bps: 10.0,
         }
     }
 }
@@ -132,6 +135,7 @@ impl PaperTradingConnector {
     fn convert_result(
         signal: &Signal,
         sim_result: &simulation_engine::MockExecutionResult,
+        taker_fee_bps: f64,
     ) -> ExecutionResult {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -147,6 +151,7 @@ impl PaperTradingConnector {
 
         let filled_qty: f64 = sim_result.filled_quantity.to_string().parse().unwrap_or(0.0);
         let avg_price: f64 = sim_result.average_price.to_string().parse().unwrap_or(0.0);
+        let fee = avg_price * filled_qty * (taker_fee_bps / 10_000.0);
 
         let fill = ExecutionFill {
             fill_id: Uuid::new_v4().to_string(),
@@ -159,7 +164,7 @@ impl PaperTradingConnector {
             },
             quantity: filled_qty,
             price: avg_price,
-            fee: 0.0, // paper trading has no fees
+            fee,
             fee_asset: "USD".to_string(),
             timestamp: now_ns,
             trade_id: Uuid::new_v4().to_string(),
@@ -184,7 +189,7 @@ impl PaperTradingConnector {
             filled_quantity: filled_qty,
             remaining_quantity: signal.quantity - filled_qty,
             avg_fill_price: avg_price,
-            total_fees: 0.0,
+            total_fees: fee,
             fills,
             reject_reason,
             submitted_at: now_ns,
@@ -213,7 +218,7 @@ impl ExchangeConnector for PaperTradingConnector {
         let sim_result = self.mock.execute_order(&sim_order).await
             .map_err(|e| ExecutionError::Exchange(format!("Paper trading error: {}", e)))?;
 
-        let result = Self::convert_result(signal, &sim_result);
+        let result = Self::convert_result(signal, &sim_result, self.config.taker_fee_bps);
 
         if result.status == ExecutionStatus::Filled || result.status == ExecutionStatus::PartiallyFilled {
             self.successful_orders.fetch_add(1, Ordering::Relaxed);

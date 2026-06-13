@@ -86,6 +86,7 @@ impl ExchangeFactory {
             "deribit",
             "paper",
             "alpaca_paper",
+            "oanda_practice",
         ]
     }
 
@@ -270,6 +271,35 @@ pub fn is_nyse_market_hours() -> bool {
     seconds_in_day >= open && seconds_in_day < close
 }
 
+/// Returns true if the current UTC time falls within forex market hours
+/// (Sunday 5:00 PM – Friday 5:00 PM US/Eastern, i.e. the 24x5 interbank session).
+///
+/// Uses the same fixed UTC-5 (EST) approximation as `is_nyse_market_hours` to stay
+/// dependency-free; during EDT the open/close boundaries shift by 1 h.
+pub fn is_forex_market_hours() -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    const UTC_OFFSET_SECS: u64 = 5 * 3600; // UTC-5 (EST, conservative)
+    let local_secs = secs.saturating_sub(UTC_OFFSET_SECS);
+
+    let day_of_week = (local_secs / 86400 + 4) % 7; // 0=Sun … 6=Sat
+    let seconds_in_day = local_secs % 86400;
+
+    let five_pm = 17 * 3600;
+
+    match day_of_week {
+        6 => false,                          // Saturday: closed
+        0 => seconds_in_day >= five_pm,      // Sunday: opens 17:00 ET
+        5 => seconds_in_day < five_pm,       // Friday: closes 17:00 ET
+        _ => true,                           // Mon–Thu: open 24 h
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +334,8 @@ mod tests {
         assert!(exchanges.contains(&"deribit"));
         assert!(exchanges.contains(&"paper"));
         assert!(exchanges.contains(&"alpaca_paper"));
-        assert_eq!(exchanges.len(), 10);
+        assert!(exchanges.contains(&"oanda_practice"));
+        assert_eq!(exchanges.len(), 11);
     }
 
     #[test]
