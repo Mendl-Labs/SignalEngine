@@ -223,9 +223,74 @@ pub trait DexConnector: Send + Sync {
     
     /// Get wallet balance for token
     async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError>;
-    
+
     /// Approve token spending (EVM only)
     async fn approve_token(&self, token_address: &str, spender: &str, amount: f64) -> Result<String, ExecutionError>;
+
+    // ── Liquidity Provision (optional) ──────────────────────────────────
+
+    /// Add liquidity to a pool. Returns a receipt with position details.
+    async fn add_liquidity(&self, _params: AddLiquidityParams) -> Result<LpReceipt, ExecutionError> {
+        Err(ExecutionError::Validation("LP not supported on this connector".into()))
+    }
+
+    /// Remove liquidity from a position. `fraction` in [0.0, 1.0].
+    async fn remove_liquidity(&self, _position_id: &str, _fraction: f64) -> Result<LpRemovalResult, ExecutionError> {
+        Err(ExecutionError::Validation("LP not supported on this connector".into()))
+    }
+
+    /// Collect accrued fees from an LP position.
+    async fn collect_fees(&self, _position_id: &str) -> Result<LpFeeCollection, ExecutionError> {
+        Err(ExecutionError::Validation("LP not supported on this connector".into()))
+    }
+}
+
+/// Parameters for adding liquidity to a pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddLiquidityParams {
+    pub pool_id: String,
+    pub token_a: String,
+    pub token_b: String,
+    pub amount_a: f64,
+    pub amount_b: f64,
+    pub tick_lower: Option<i32>,
+    pub tick_upper: Option<i32>,
+    pub slippage_bps: u32,
+}
+
+/// Receipt returned after adding liquidity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LpReceipt {
+    pub position_id: String,
+    pub tx_hash: String,
+    pub liquidity_units: f64,
+    pub amount_a_deposited: f64,
+    pub amount_b_deposited: f64,
+    pub tick_lower: Option<i32>,
+    pub tick_upper: Option<i32>,
+    pub gas_used: u64,
+}
+
+/// Result of removing liquidity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LpRemovalResult {
+    pub position_id: String,
+    pub tx_hash: String,
+    pub amount_a_received: f64,
+    pub amount_b_received: f64,
+    pub fees_collected_a: f64,
+    pub fees_collected_b: f64,
+    pub gas_used: u64,
+}
+
+/// Result of collecting fees from an LP position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LpFeeCollection {
+    pub position_id: String,
+    pub tx_hash: String,
+    pub fees_a: f64,
+    pub fees_b: f64,
+    pub gas_used: u64,
 }
 
 /// Quote information from DEX

@@ -3,6 +3,7 @@ use log::{info, warn, error, debug};
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
 use crate::exchanges::kraken::KrakenConnector;
 use crate::exchanges::generic::{GenericConnector, ExchangePreset};
+use crate::exchanges::dex::{DexToExchangeAdapter, BlockchainNetwork};
 use crate::paper_connector::{PaperTradingConnector, PaperTradingConfig};
 use smartorderrouter::ExchangeCredential;
 
@@ -29,7 +30,12 @@ impl ExchangeFactory {
             let connector = PaperTradingConnector::new(PaperTradingConfig::default());
             return Ok(Box::new(connector));
         }
-        
+
+        // DEX connectors (Sui chain: Cetus, DeepBook)
+        if let Some(dex_connector) = Self::try_create_dex_connector(&exchange_lower, config.clone()).await? {
+            return Ok(dex_connector);
+        }
+
         // Check if this is a supported exchange using the generic connector
         if let Some(preset) = ExchangePreset::from_name(&exchange_lower) {
             debug!("[FACTORY] Using GenericConnector for {} (preset: {:?})", exchange_name, preset);
@@ -87,6 +93,8 @@ impl ExchangeFactory {
             "paper",
             "alpaca_paper",
             "oanda_practice",
+            "cetus",
+            "deepbook",
         ]
     }
 
@@ -231,6 +239,36 @@ impl ExchangeFactory {
                 );
                 Err(e)
             }
+        }
+    }
+
+    async fn try_create_dex_connector(
+        exchange_lower: &str,
+        config: ExchangeConfig,
+    ) -> Result<Option<Box<dyn ExchangeConnector>>, ExecutionError> {
+        let network = if config.sandbox {
+            BlockchainNetwork::SuiTestnet
+        } else {
+            BlockchainNetwork::Sui
+        };
+
+        let adapter = match exchange_lower {
+            "cetus" | "cetus_amm" | "cetusprotocol" => {
+                Some(DexToExchangeAdapter::cetus(network))
+            }
+            "deepbook" | "deepbookv2" | "deep_book" => {
+                Some(DexToExchangeAdapter::deepbook(network))
+            }
+            _ => None,
+        };
+
+        if let Some(mut adapter) = adapter {
+            info!("[FACTORY] Creating DEX connector: {} (network: {:?})", exchange_lower, network);
+            adapter.initialize(config).await?;
+            info!("[FACTORY] DEX connector {} initialized successfully", exchange_lower);
+            Ok(Some(Box::new(adapter)))
+        } else {
+            Ok(None)
         }
     }
 }
