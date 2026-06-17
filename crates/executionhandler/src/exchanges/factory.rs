@@ -373,7 +373,9 @@ mod tests {
         assert!(exchanges.contains(&"paper"));
         assert!(exchanges.contains(&"alpaca_paper"));
         assert!(exchanges.contains(&"oanda_practice"));
-        assert_eq!(exchanges.len(), 11);
+        assert!(exchanges.contains(&"cetus"));
+        assert!(exchanges.contains(&"deepbook"));
+        assert_eq!(exchanges.len(), 13);
     }
 
     #[test]
