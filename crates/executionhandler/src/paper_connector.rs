@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use simulation_engine::{
@@ -24,7 +25,7 @@ use crate::core::types::{
     ExecutionMetrics, ExchangeConfig, ExchangeOrder, ExchangeLimits,
     OrderType, TimeInForce, OrderSide, CancelResult, CancelStatus,
     EditOrderParams, EditResult, EditStatus, OrderStatus, OrderUpdate,
-    HealthStatus, HealthState,
+    UpdateType, HealthStatus, HealthState,
 };
 use crate::signal::{Signal, SignalAction};
 use crate::core::traits::ExchangeConnector;
@@ -40,6 +41,8 @@ pub struct PaperTradingConfig {
     pub base_latency_ms: f64,
     /// Taker fee rate in basis points (default 10 bps = 0.10%)
     pub taker_fee_bps: f64,
+    /// Optional realism config for advanced cost modeling
+    pub realism: Option<PaperRealismConfig>,
 }
 
 impl Default for PaperTradingConfig {
@@ -49,6 +52,34 @@ impl Default for PaperTradingConfig {
             partial_fill_probability: 0.1,
             base_latency_ms: 10.0,
             taker_fee_bps: 10.0,
+            realism: None,
+        }
+    }
+}
+
+/// Advanced realism config for paper trading (mirrors backtest RealismConfig subset)
+#[derive(Debug, Clone)]
+pub struct PaperRealismConfig {
+    /// Market impact coefficient (sqrt model). 0.3 is calibrated default.
+    pub market_impact_k: f64,
+    /// Estimate spread from order book depth
+    pub spread_from_book: bool,
+    /// Cap on spread-based cost in bps
+    pub spread_cap_bps: f64,
+    /// Enable adverse selection penalty
+    pub adverse_selection: bool,
+    /// Max adverse selection penalty in bps
+    pub adverse_selection_max_bps: f64,
+}
+
+impl Default for PaperRealismConfig {
+    fn default() -> Self {
+        Self {
+            market_impact_k: 0.3,
+            spread_from_book: true,
+            spread_cap_bps: 50.0,
+            adverse_selection: true,
+            adverse_selection_max_bps: 20.0,
         }
     }
 }
@@ -60,6 +91,11 @@ pub struct PaperTradingConnector {
     total_orders: AtomicU64,
     successful_orders: AtomicU64,
     failed_orders: AtomicU64,
+    update_callback: Mutex<Option<Arc<dyn Fn(OrderUpdate) + Send + Sync>>>,
+    book_initialized: AtomicBool,
+    last_mid_price: Mutex<HashMap<String, f64>>,
+    last_spread_bps: Mutex<HashMap<String, f64>>,
+    last_book_depth: Mutex<HashMap<String, f64>>,
 }
 
 impl PaperTradingConnector {
@@ -81,6 +117,11 @@ impl PaperTradingConnector {
             total_orders: AtomicU64::new(0),
             successful_orders: AtomicU64::new(0),
             failed_orders: AtomicU64::new(0),
+            update_callback: Mutex::new(None),
+            book_initialized: AtomicBool::new(false),
+            last_mid_price: Mutex::new(HashMap::new()),
+            last_spread_bps: Mutex::new(HashMap::new()),
+            last_book_depth: Mutex::new(HashMap::new()),
         }
     }
 
@@ -89,6 +130,53 @@ impl PaperTradingConnector {
         let price = SimBigDecimal::from_str(&mid_price.to_string())
             .unwrap_or_else(|_| SimBigDecimal::from(0));
         self.mock.initialize_order_book(symbol, price).await;
+    }
+
+    /// Apply realistic fill costs using the realism config.
+    /// Returns adjusted fill price accounting for market impact, spread, and adverse selection.
+    fn apply_paper_fill_costs(&self, base_price: f64, is_buy: bool, order_value: f64, symbol: &str) -> f64 {
+        let realism = match &self.config.realism {
+            Some(r) => r,
+            None => return base_price,
+        };
+
+        let canonical = Self::canonical_symbol(symbol);
+        let mut total_bps = 0.0f64;
+
+        // Market impact: sqrt model based on order size relative to book depth
+        if realism.market_impact_k > 0.0 {
+            let book_depth = self.last_book_depth.lock().unwrap()
+                .get(&canonical).copied().unwrap_or(1_000_000.0);
+            let mid = self.last_mid_price.lock().unwrap()
+                .get(&canonical).copied().unwrap_or(base_price);
+            if book_depth > 0.0 && mid > 0.0 {
+                let participation = order_value / (book_depth * mid);
+                total_bps += realism.market_impact_k * participation.min(1.0).sqrt() * 10_000.0;
+            }
+        }
+
+        // Spread cost from live book
+        if realism.spread_from_book {
+            let spread_bps = self.last_spread_bps.lock().unwrap()
+                .get(&canonical).copied().unwrap_or(0.0);
+            total_bps += spread_bps.min(realism.spread_cap_bps) * 0.5;
+        }
+
+        // Adverse selection: penalize if price recently moved against the trade direction
+        if realism.adverse_selection {
+            let mid = self.last_mid_price.lock().unwrap()
+                .get(&canonical).copied().unwrap_or(base_price);
+            if mid > 0.0 {
+                let price_move_bps = (base_price - mid) / mid * 10_000.0;
+                let adversely_selected = (is_buy && price_move_bps > 0.0) || (!is_buy && price_move_bps < 0.0);
+                if adversely_selected {
+                    total_bps += price_move_bps.abs().min(realism.adverse_selection_max_bps);
+                }
+            }
+        }
+
+        let adjustment = base_price * total_bps / 10_000.0;
+        if is_buy { base_price + adjustment } else { base_price - adjustment }
     }
 
     /// Canonical symbol form used by both `update_book` and order lookup, so a
@@ -218,12 +306,56 @@ impl ExchangeConnector for PaperTradingConnector {
         let sim_result = self.mock.execute_order(&sim_order).await
             .map_err(|e| ExecutionError::Exchange(format!("Paper trading error: {}", e)))?;
 
-        let result = Self::convert_result(signal, &sim_result, self.config.taker_fee_bps);
+        let mut result = Self::convert_result(signal, &sim_result, self.config.taker_fee_bps);
+
+        // Apply realism cost model if enabled and we got a fill
+        if self.config.realism.is_some() && result.filled_quantity > 0.0 {
+            let is_buy = matches!(signal.action, SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop);
+            let order_value = result.avg_fill_price * result.filled_quantity;
+            let adjusted_price = self.apply_paper_fill_costs(
+                result.avg_fill_price, is_buy, order_value, &signal.symbol
+            );
+            let price_diff = (adjusted_price - result.avg_fill_price).abs();
+            let additional_cost = price_diff * result.filled_quantity;
+            result.avg_fill_price = adjusted_price;
+            result.total_fees += additional_cost;
+            let fill_count = result.fills.len().max(1) as f64;
+            for fill in &mut result.fills {
+                fill.price = adjusted_price;
+                fill.fee += additional_cost / fill_count;
+            }
+        }
 
         if result.status == ExecutionStatus::Filled || result.status == ExecutionStatus::PartiallyFilled {
             self.successful_orders.fetch_add(1, Ordering::Relaxed);
         } else {
             self.failed_orders.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Fire async update callback
+        if result.filled_quantity > 0.0 {
+            if let Some(cb) = self.update_callback.lock().unwrap().as_ref() {
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let update_type = if result.status == ExecutionStatus::Filled {
+                    UpdateType::CompleteFill
+                } else {
+                    UpdateType::PartialFill
+                };
+                cb(OrderUpdate {
+                    order_id: result.order_id.clone(),
+                    exchange_order_id: result.exchange_order_id.clone().unwrap_or_default(),
+                    update_type,
+                    status: result.status.clone(),
+                    filled_quantity: Some(result.filled_quantity),
+                    fill_price: Some(result.avg_fill_price),
+                    timestamp: now_ns,
+                    exchange_timestamp_ns: Some(now_ns),
+                    exchange_sequence: None,
+                });
+            }
         }
 
         Ok(result)
@@ -300,8 +432,8 @@ impl ExchangeConnector for PaperTradingConnector {
         }
     }
 
-    async fn subscribe_to_updates(&self, _callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
-        // Paper trading doesn't produce async updates
+    async fn subscribe_to_updates(&self, callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
+        *self.update_callback.lock().unwrap() = Some(Arc::from(callback));
     }
 
     async fn health_check(&self) -> Result<HealthStatus, ExecutionError> {
@@ -344,13 +476,30 @@ impl ExchangeConnector for PaperTradingConnector {
     }
 
     fn update_book(&self, symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
+        let canonical = Self::canonical_symbol(symbol);
+
+        // Track market microstructure for realism cost model
+        if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+            let mid = (best_bid + best_ask) / 2.0;
+            if mid > 0.0 {
+                let spread_bps = (best_ask - best_bid) / mid * 10_000.0;
+                *self.last_mid_price.lock().unwrap().entry(canonical.clone()).or_insert(0.0) = mid;
+                *self.last_spread_bps.lock().unwrap().entry(canonical.clone()).or_insert(0.0) = spread_bps;
+            }
+            let total_depth: f64 = bids.iter().chain(asks.iter()).map(|(_, q)| q).sum();
+            *self.last_book_depth.lock().unwrap().entry(canonical.clone()).or_insert(0.0) = total_depth;
+        }
+
+        if !self.book_initialized.load(Ordering::Relaxed) {
+            self.book_initialized.store(true, Ordering::Relaxed);
+        }
+
         let to_levels = |pairs: Vec<(f64, f64)>| -> Vec<PriceLevel> {
             pairs.into_iter().map(|(p, q)| PriceLevel {
                 price: SimBigDecimal::from_str(&p.to_string()).unwrap_or_default(),
                 quantity: SimBigDecimal::from_str(&q.to_string()).unwrap_or_default(),
             }).collect()
         };
-        let canonical = Self::canonical_symbol(symbol);
         self.mock.update_order_book(&canonical, to_levels(bids), to_levels(asks));
     }
 
@@ -542,5 +691,85 @@ mod tests {
         assert_eq!(result.original_order_id, "ord-1");
         assert!(result.new_order_id.is_some());
         assert!(matches!(result.status, EditStatus::Success));
+    }
+
+    #[tokio::test]
+    async fn test_paper_fill_costs_market_impact() {
+        let config = PaperTradingConfig {
+            realism: Some(PaperRealismConfig {
+                market_impact_k: 0.3,
+                spread_from_book: false,
+                spread_cap_bps: 50.0,
+                adverse_selection: false,
+                adverse_selection_max_bps: 20.0,
+            }),
+            ..Default::default()
+        };
+        let conn = PaperTradingConnector::new(config);
+
+        // Set up book depth and mid price
+        conn.update_book("BTC/USD", vec![(50000.0, 10.0)], vec![(50001.0, 10.0)]);
+
+        // Small order: low impact
+        let small_price = conn.apply_paper_fill_costs(50000.0, true, 1000.0, "BTC/USD");
+        // Large order: higher impact
+        let large_price = conn.apply_paper_fill_costs(50000.0, true, 100_000.0, "BTC/USD");
+
+        assert!(large_price > small_price, "Larger order should have worse fill");
+        assert!(small_price > 50000.0, "Buy should get filled above base price");
+    }
+
+    #[tokio::test]
+    async fn test_paper_fill_costs_spread() {
+        let config = PaperTradingConfig {
+            realism: Some(PaperRealismConfig {
+                market_impact_k: 0.0,
+                spread_from_book: true,
+                spread_cap_bps: 50.0,
+                adverse_selection: false,
+                adverse_selection_max_bps: 20.0,
+            }),
+            ..Default::default()
+        };
+        let conn = PaperTradingConnector::new(config);
+
+        // Wide spread book
+        conn.update_book("BTC/USD", vec![(49900.0, 5.0)], vec![(50100.0, 5.0)]);
+
+        let buy_price = conn.apply_paper_fill_costs(50000.0, true, 5000.0, "BTC/USD");
+        let sell_price = conn.apply_paper_fill_costs(50000.0, false, 5000.0, "BTC/USD");
+
+        assert!(buy_price > 50000.0, "Buy pays spread cost");
+        assert!(sell_price < 50000.0, "Sell pays spread cost");
+    }
+
+    #[tokio::test]
+    async fn test_fill_event_callback() {
+        use std::sync::atomic::AtomicU32;
+
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        conn.initialize_book("BTC-USD", 50000.0).await;
+
+        let fill_count = Arc::new(AtomicU32::new(0));
+        let count_clone = fill_count.clone();
+
+        conn.subscribe_to_updates(Box::new(move |update| {
+            assert!(update.filled_quantity.unwrap_or(0.0) > 0.0);
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        })).await;
+
+        let signal = test_signal(SignalAction::Buy, 0.1, None);
+        let result = conn.execute_order(&signal).await.unwrap();
+
+        assert!(result.filled_quantity > 0.0);
+        assert_eq!(fill_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_realism_matches_base_behavior() {
+        let conn = PaperTradingConnector::new(PaperTradingConfig::default());
+        // Without realism, apply_paper_fill_costs is a no-op
+        let price = conn.apply_paper_fill_costs(50000.0, true, 10000.0, "BTC/USD");
+        assert!((price - 50000.0).abs() < f64::EPSILON);
     }
 }

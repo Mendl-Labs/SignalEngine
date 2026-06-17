@@ -40,7 +40,7 @@ pub use strategy::{
     PortfolioStrategy, Signal, MarketDataEvent, BarEvent,
     MomentumStrategy, MeanReversionStrategy, StrategyFactory
 };
-pub use manager::{StrategyManager, SignalStore, SignalInfo, SignalStatus, ManagerMetrics};
+pub use manager::{StrategyManager, SignalStore, SignalInfo, SignalStatus, ManagerMetrics, BookUpdateFn};
 pub use deployment_subscriber::{
     DeploymentSubscriber, DeployedStrategy, DeploymentEvent, DeploymentSubscriberError,
     topics as deployment_topics,

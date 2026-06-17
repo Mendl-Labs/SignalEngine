@@ -27,6 +27,9 @@ use crate::{
 };
 use crate::strategy::BarEvent;
 
+/// Callback type for forwarding book updates to paper connectors
+pub type BookUpdateFn = Arc<dyn Fn(&str, Vec<(f64, f64)>, Vec<(f64, f64)>) + Send + Sync>;
+
 /// Signal status for tracking lifecycle
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalStatus {
@@ -138,26 +141,29 @@ impl SignalStore {
 pub struct StrategyManager {
     /// Loaded strategy executors
     strategies: RwLock<HashMap<Uuid, Arc<dyn PortfolioStrategy>>>,
-    
+
     /// Strategy state tracking
     state_registry: RwLock<StrategyStateRegistry>,
-    
+
     /// Market data router
     router: RwLock<MarketDataRouter>,
-    
+
     /// Strategy loader (for reloading)
     loader: Arc<dyn StrategyLoader>,
-    
+
     /// Signal store for tracking all generated signals
     signal_store: Arc<SignalStore>,
-    
+
     /// Signal handlers for routing signals to execution
     signal_handlers: parking_lot::RwLock<Vec<Sender<Signal>>>,
-    
+
+    /// Paper connectors receiving book updates keyed by (symbol, exchange)
+    paper_book_sinks: parking_lot::RwLock<HashMap<(String, String), Vec<BookUpdateFn>>>,
+
     /// Performance metrics
     signals_generated: AtomicU64,
     signals_routed: AtomicU64,
-    
+
     /// Ultra-logger instance
     logger: Arc<SignalEngineLogger>,
 }
@@ -176,6 +182,7 @@ impl StrategyManager {
             loader,
             signal_store: Arc::new(SignalStore::new()),
             signal_handlers: parking_lot::RwLock::new(Vec::new()),
+            paper_book_sinks: parking_lot::RwLock::new(HashMap::new()),
             signals_generated: AtomicU64::new(0),
             signals_routed: AtomicU64::new(0),
             logger,
@@ -187,6 +194,20 @@ impl StrategyManager {
         let mut handlers = self.signal_handlers.write();
         handlers.push(handler);
         self.logger.info(&format!("Added signal handler (total: {})", handlers.len())).await;
+    }
+
+    /// Register a paper connector to receive book updates for a specific symbol/exchange pair
+    pub fn register_paper_book_sink(&self, symbol: &str, exchange: &str, sink: BookUpdateFn) {
+        let key = (symbol.to_uppercase(), exchange.to_lowercase());
+        let mut sinks = self.paper_book_sinks.write();
+        sinks.entry(key).or_default().push(sink);
+    }
+
+    /// Unregister all paper book sinks (e.g., on deployment removal)
+    pub fn clear_paper_book_sinks(&self, symbol: &str, exchange: &str) {
+        let key = (symbol.to_uppercase(), exchange.to_lowercase());
+        let mut sinks = self.paper_book_sinks.write();
+        sinks.remove(&key);
     }
     
     /// Get the signal store for external access
@@ -398,6 +419,19 @@ impl StrategyManager {
     pub async fn on_market_data(&self, event: &MarketDataEvent) -> Vec<Signal> {
         let start = std::time::Instant::now();
         let mut all_signals = Vec::new();
+
+        // Forward bid/ask to paper connectors for order book simulation
+        if let (Some(bid), Some(ask)) = (event.bid, event.ask) {
+            let key = (event.symbol.to_uppercase(), event.exchange.to_lowercase());
+            let sinks = self.paper_book_sinks.read();
+            if let Some(sink_list) = sinks.get(&key) {
+                let bids = vec![(bid, 1.0)];
+                let asks = vec![(ask, 1.0)];
+                for sink in sink_list {
+                    sink(&event.symbol, bids.clone(), asks.clone());
+                }
+            }
+        }
         
         // Get strategy IDs interested in this event
         let strategy_ids = {
