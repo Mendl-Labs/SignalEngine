@@ -1101,8 +1101,10 @@ impl HostedObject {
                                     (deployment_ultra_mgr.as_ref(), deploy_db_pool_for_handler.as_ref())
                                 {
                                     let mut handler = ultra_mgr.execution_handler().write().await;
+                                    // live_only=true: a live deployment must
+                                    // never bind to a testnet/sandbox key.
                                     match handler
-                                        .ensure_exchange_for_tenant(pool, strategy.tenant_id, &exchange_name)
+                                        .ensure_exchange_for_tenant(pool, strategy.tenant_id, &exchange_name, true)
                                         .await
                                     {
                                         Ok(true) => {
@@ -1114,8 +1116,8 @@ impl HostedObject {
                                         Ok(false) => {
                                             ultra_logger::ultra_error!(format!(
                                                 "❌ Rejected live deployment {} ({}): no enabled \
-                                                 credential for exchange '{}' on tenant {}. \
-                                                 Add API keys via the Settings UI and re-publish.",
+                                                 non-testnet credential for exchange '{}' on tenant {}. \
+                                                 Add production API keys via the Settings UI and re-publish.",
                                                 strategy.strategy_name,
                                                 strategy.instance_id,
                                                 exchange_name,

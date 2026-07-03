@@ -542,11 +542,19 @@ pub async fn load_exchange_credentials(
     Ok(credentials)
 }
 
-/// Load credentials for a specific exchange
+/// Load credentials for a specific exchange.
+///
+/// `live_only: true` restricts the lookup to non-testnet credentials — REQUIRED
+/// for live deployments. Without it the first enabled row wins, and a tenant
+/// holding both sandbox and production keys for the same exchange could have
+/// live orders signed with the sandbox key (orders silently go nowhere real)
+/// or, inverted, a "sandbox" flow hit production. Paper/simulation flows may
+/// pass `false` to accept either.
 pub async fn load_credentials_for_exchange(
     pool: &DbPool,
     tenant_id: Uuid,
     exchange: &str,
+    live_only: bool,
 ) -> Result<Option<ExchangeCredential>> {
     use databaseschema::schema::exchange_credentials;
     use diesel_async::RunQueryDsl;
@@ -554,10 +562,15 @@ pub async fn load_credentials_for_exchange(
     let mut conn = pool.get().await
         .context("Failed to get database connection")?;
 
-    let query = exchange_credentials::table
+    let mut query = exchange_credentials::table
         .filter(exchange_credentials::tenant_id.eq(tenant_id))
         .filter(exchange_credentials::exchange.eq(exchange.to_lowercase()))
         .filter(exchange_credentials::is_enabled.eq(true))
+        .into_boxed();
+    if live_only {
+        query = query.filter(exchange_credentials::is_testnet.eq(false));
+    }
+    let query = query
         .select((
             exchange_credentials::id,
             exchange_credentials::tenant_id,

@@ -616,13 +616,19 @@ impl UltraLowLatencyExecutionHandler {
     /// registered, `Ok(false)` if no enabled credential exists for that
     /// (tenant, exchange) pair, and an error if the DB lookup or connector
     /// initialization failed.
+    ///
+    /// `live_only: true` restricts the lookup to non-testnet credentials and
+    /// MUST be set when registering a connector for a live deployment — a
+    /// tenant holding both sandbox and production keys must never have live
+    /// orders signed with the sandbox key.
     pub async fn ensure_exchange_for_tenant(
         &mut self,
         pool: &smartorderrouter::DbPool,
         tenant_id: uuid::Uuid,
         exchange: &str,
+        live_only: bool,
     ) -> Result<bool, ExecutionError> {
-        let credential = smartorderrouter::load_credentials_for_exchange(pool, tenant_id, exchange)
+        let credential = smartorderrouter::load_credentials_for_exchange(pool, tenant_id, exchange, live_only)
             .await
             .map_err(|e| ExecutionError::Unknown(format!(
                 "Failed to load credential for tenant={} exchange={}: {}",
@@ -633,14 +639,15 @@ impl UltraLowLatencyExecutionHandler {
             Some(cred) => {
                 self.add_exchange_from_credential(&cred).await?;
                 log::info!(
-                    "[EXECUTION] Lazily loaded {} credential for tenant {}",
-                    exchange, tenant_id
+                    "[EXECUTION] Lazily loaded {} credential for tenant {} (live_only={})",
+                    exchange, tenant_id, live_only
                 );
                 Ok(true)
             }
             None => {
                 log::warn!(
-                    "[EXECUTION] No enabled credential for tenant={} exchange={}",
+                    "[EXECUTION] No enabled{} credential for tenant={} exchange={}",
+                    if live_only { " non-testnet" } else { "" },
                     tenant_id, exchange
                 );
                 Ok(false)

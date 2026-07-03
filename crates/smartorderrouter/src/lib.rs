@@ -56,6 +56,7 @@ pub async fn load_credentials_for_exchange(
     _pool: &DbPool,
     _tenant_id: uuid::Uuid,
     _exchange: &str,
+    _live_only: bool,
 ) -> anyhow::Result<Option<ExchangeCredential>> {
     Ok(None)
 }
