@@ -664,9 +664,9 @@ impl HostedObject {
                         Ok(pool) => {
                             let pool_arc = Arc::new(pool);
                             let writer = paper_trade_writer::PaperTradeWriter::new(pool_arc.clone());
-                            market_health_writer::spawn(pool_arc.clone());
+                            market_health_writer::spawn(pool_arc.clone(), paper_registry.clone());
                             ultra_info!("✅ Paper trade writer initialized — fills will persist to trade_history");
-                            ultra_info!("✅ Market-data health writer spawned (30s cadence)");
+                            ultra_info!("✅ Market-data health writer spawned (30s cadence, incl. deployment heartbeat)");
                             (Some(writer.sender()), Some(pool_arc))
                         }
                         Err(e) => {

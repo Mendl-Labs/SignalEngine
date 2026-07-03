@@ -588,6 +588,14 @@ impl Orderbook {
         }
     }
     
+    /// Total number of updates applied to this book since creation.
+    /// Monotonic — consumers can diff across intervals to detect whether
+    /// fresh market data arrived (the data-heartbeat uses exactly this).
+    #[inline]
+    pub fn update_count(&self) -> u64 {
+        self.update_count.load(Ordering::Relaxed)
+    }
+
     // Get average update time
     #[inline]
     pub fn average_update_time(&self) -> Duration {
