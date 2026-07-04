@@ -133,6 +133,25 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
             }
         }
 
+        // Flush signal-emission times recorded by the bridge (in-memory hot
+        // path) to last_signal_at. Drain each entry only on successful write
+        // so a failed flush retries next tick.
+        let pending_signals: Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
+            crate::LAST_SIGNAL_EMITTED.iter().map(|e| (*e.key(), *e.value())).collect();
+        for (dep_id, at) in pending_signals {
+            match deployed_strategy_ops::stamp_last_signal_at(&mut conn, dep_id, at).await {
+                Ok(_) => {
+                    // Remove only if unchanged — a newer emission during the
+                    // write must survive for the next flush.
+                    crate::LAST_SIGNAL_EMITTED.remove_if(&dep_id, |_, v| *v == at);
+                }
+                Err(e) => ultra_error!(format!(
+                    "market-health: last_signal_at flush failed for {}: {}",
+                    dep_id, e
+                )),
+            }
+        }
+
         let mut upserted = 0usize;
         let mut missing = 0usize;
 

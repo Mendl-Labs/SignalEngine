@@ -321,6 +321,13 @@ lazy_static! {
     /// deployment is registered; read by the signal loop so trade_history
     /// rows show readable symbols (e.g. "BTC/USD") rather than `SYMBOL_<hash>`.
     pub static ref SYMBOL_NAMES: DashMap<u64, String> = DashMap::new();
+
+    /// Deployment id -> most recent signal-emission time. Written by the
+    /// market-data bridge (hot loop: in-memory only), flushed to
+    /// `deployed_strategies.last_signal_at` by the market-health writer's 30s
+    /// tick. This is the write path behind the dashboard's "Last signal"
+    /// recency indicator, which was previously never populated.
+    pub static ref LAST_SIGNAL_EMITTED: DashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = DashMap::new();
 }
 
 #[automock]
@@ -721,7 +728,7 @@ impl HostedObject {
                     let md_norm = norm_sym(&md.symbol);
                     // Snapshot matching deployments (drop iterator before await to
                     // avoid holding the DashMap shard lock across awaits).
-                    let matches: Vec<(u16, String, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
+                    let matches: Vec<(uuid::Uuid, u16, String, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
                         .iter()
                         .filter(|e| {
                             e.value()
@@ -731,7 +738,7 @@ impl HostedObject {
                         })
                         .map(|e| {
                             let v = e.value();
-                            (v.strategy_id_hash, v.real_exchange.clone(), v.strategy.clone())
+                            (*e.key(), v.strategy_id_hash, v.real_exchange.clone(), v.strategy.clone())
                         })
                         .collect();
 
@@ -742,7 +749,7 @@ impl HostedObject {
                     // Build the strategyhandler::MarketData expected by Strategy::generate_signals.
                     // signalgenerator::MarketData lacks an exchange field, so we use the
                     // deployment's real_exchange.
-                    for (sid_hash, exch, strat) in matches {
+                    for (deployment_id, sid_hash, exch, strat) in matches {
                         let strat_md = StratMarketData {
                             symbol: md.symbol.clone(),
                             exchange: exch,
@@ -769,13 +776,20 @@ impl HostedObject {
                                         sigs.len(), sid_hash, md.symbol, md.bid, md.ask
                                     ));
                                 }
+                                let mut any_sent = false;
                                 for mut sig in sigs {
                                     // Stamp the deployment's strategy_id_hash so the
                                     // downstream signal loop matches it to paper_registry.
                                     sig.strategy_id = sid_hash;
                                     if signal_tx.try_send(sig).is_ok() {
                                         signals_emitted += 1;
+                                        any_sent = true;
                                     }
+                                }
+                                if any_sent {
+                                    // In-memory only (hot loop); the market-health
+                                    // writer flushes this to last_signal_at every 30s.
+                                    LAST_SIGNAL_EMITTED.insert(deployment_id, chrono::Utc::now());
                                 }
                             }
                             Err(e) => {
