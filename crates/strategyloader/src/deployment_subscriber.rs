@@ -118,11 +118,24 @@ pub struct DeployedStrategy {
     /// callers should fall back to a conservative default (matching
     /// BacktestingEngine's own `python_simulation.rs` default of 2%).
     pub position_size_pct: Option<f64>,
+    /// The deployment's actual Python strategy source (`backtest_results.python_source_code`),
+    /// fetched by strategy_id since it isn't carried on the `StrategyDeployment`
+    /// wire message. `None` for genuine (non-AI-authored) strategy types, or
+    /// when the lookup fails/postgres isn't enabled.
+    pub python_source_code: Option<String>,
 }
 
 impl DeployedStrategy {
-    /// Create a new deployed strategy from a deployment message
-    pub fn from_deployment(msg: &StrategyDeployment) -> Result<Self, DeploymentSubscriberError> {
+    /// Create a new deployed strategy from a deployment message.
+    ///
+    /// `python_source_code` is resolved by the caller (not looked up here) --
+    /// see `DeploymentSubscriber::fetch_python_source_code` for the live/hot
+    /// path, and `reconcile_active_deployments_from_db` for the reconcile
+    /// path, which already has it in scope from its own DB join.
+    pub fn from_deployment(
+        msg: &StrategyDeployment,
+        python_source_code: Option<String>,
+    ) -> Result<Self, DeploymentSubscriberError> {
         let strategy_id = Uuid::parse_str(&msg.strategy_id)
             .map_err(|e| DeploymentSubscriberError::ParseError(format!("Invalid strategy_id: {}", e)))?;
         let instance_id = Uuid::parse_str(&msg.instance_id)
@@ -179,6 +192,7 @@ impl DeployedStrategy {
             taker_fee_bps,
             capital_allocation: msg.initial_capital,
             position_size_pct: risk_meta.get("position_size_pct").and_then(|v| v.as_f64()),
+            python_source_code,
         })
     }
 
@@ -261,6 +275,41 @@ impl DeploymentSubscriber {
         }
 
         Ok(resolved)
+    }
+
+    /// Look up the deployment's actual Python strategy source, keyed by the
+    /// backtest result id (published as `StrategyDeployment.strategy_id` --
+    /// see `deployment_publisher.rs`'s `strategy_id: backtest_result_id.to_string()`).
+    ///
+    /// Not carried on the wire message itself: adding a field there would
+    /// touch the shared cross-service proto contract
+    /// (`MessageBrokerEngine/protos/messages.proto`) for zero benefit until a
+    /// consumer exists. A one-off connection per deployment event is
+    /// acceptable here since deployments are rare, not a hot path.
+    #[cfg(feature = "postgres")]
+    async fn fetch_python_source_code(strategy_id: &str) -> Option<String> {
+        let backtest_result_id = Uuid::parse_str(strategy_id).ok()?;
+        let database_url = Self::resolved_database_url().ok()?;
+        if database_url.is_empty() {
+            return None;
+        }
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+        let pool: Pool<AsyncPgConnection> = Pool::builder(manager).max_size(1).build().ok()?;
+        let mut conn = pool.get().await.ok()?;
+
+        backtest_results::table
+            .filter(backtest_results::id.eq(backtest_result_id))
+            .select(backtest_results::python_source_code)
+            .first::<Option<String>>(&mut conn)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn fetch_python_source_code(_strategy_id: &str) -> Option<String> {
+        None
     }
 
     #[cfg(feature = "postgres")]
@@ -504,6 +553,7 @@ impl DeploymentSubscriber {
 
             Self::handle_deployment(
                 deployment_msg,
+                backtest.python_source_code.clone(),
                 &self.deployed_strategies,
                 self.publisher.as_ref(),
                 &self.node_id,
@@ -569,8 +619,10 @@ impl DeploymentSubscriber {
         if let Ok(request) = PublishRequest::decode(msg.data.as_slice()) {
             match request.payload {
                 Some(publish_request::Payload::StrategyDeployment(deployment)) => {
+                    let python_source_code = Self::fetch_python_source_code(&deployment.strategy_id).await;
                     Self::handle_deployment(
                         deployment,
+                        python_source_code,
                         deployed_strategies,
                         publisher,
                         node_id,
@@ -606,16 +658,21 @@ impl DeploymentSubscriber {
         }
     }
 
-    /// Handle a deployment message
+    /// Handle a deployment message.
+    ///
+    /// `python_source_code` is resolved by the caller -- the reconcile path
+    /// already has it from its own DB join; the live/hot path fetches it via
+    /// `fetch_python_source_code` before calling this.
     async fn handle_deployment(
         deployment: StrategyDeployment,
+        python_source_code: Option<String>,
         deployed_strategies: &Arc<DashMap<Uuid, Arc<DeployedStrategy>>>,
         publisher: Option<&Arc<UltraFastPublisher>>,
         node_id: &str,
         deployment_tx: Option<&mpsc::Sender<DeploymentEvent>>,
     ) {
-        let (success, error_message, active_exchanges, symbols, instance_id_str, tenant_id_str) = 
-            match DeployedStrategy::from_deployment(&deployment) {
+        let (success, error_message, active_exchanges, symbols, instance_id_str, tenant_id_str) =
+            match DeployedStrategy::from_deployment(&deployment, python_source_code) {
             Ok(strategy) => {
                 let instance_id = strategy.instance_id;
                 let exchanges = strategy.target_exchanges.clone();
@@ -875,12 +932,13 @@ mod tests {
             mode: "paper".to_string(),
         };
 
-        let strategy = DeployedStrategy::from_deployment(&deployment).unwrap();
+        let strategy = DeployedStrategy::from_deployment(&deployment, None).unwrap();
         assert_eq!(strategy.strategy_type, "custom_market_making");
         assert_eq!(strategy.strategy_name, "BTC Market Maker");
         assert!(strategy.is_active.load(Ordering::Relaxed));
         assert_eq!(strategy.capital_allocation, 10000.0);
         assert_eq!(strategy.position_size_pct, None);
+        assert_eq!(strategy.python_source_code, None);
     }
 
     #[test]
@@ -906,8 +964,16 @@ mod tests {
             mode: "paper".to_string(),
         };
 
-        let strategy = DeployedStrategy::from_deployment(&deployment).unwrap();
+        let strategy = DeployedStrategy::from_deployment(
+            &deployment,
+            Some("class Strategy:\n    pass".to_string()),
+        )
+        .unwrap();
         assert_eq!(strategy.capital_allocation, 10000.0);
         assert_eq!(strategy.position_size_pct, Some(0.25));
+        assert_eq!(
+            strategy.python_source_code,
+            Some("class Strategy:\n    pass".to_string())
+        );
     }
 }
