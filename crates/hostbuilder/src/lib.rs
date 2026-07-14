@@ -1078,7 +1078,7 @@ impl HostedObject {
                         // strategy_id_hash so SimpleMarketMakingStrategy stamps the
                         // right id on the Signal it produces (the bridge also
                         // overrides defensively).
-                        let strat_params: HashMap<String, serde_json::Value> =
+                        let mut strat_params: HashMap<String, serde_json::Value> =
                             match &strategy.parameters {
                                 serde_json::Value::Object(map) => map
                                     .iter()
@@ -1086,6 +1086,22 @@ impl HostedObject {
                                     .collect(),
                                 _ => HashMap::new(),
                             };
+                        // Surface capital context to the strategy instance so order
+                        // sizing scales with the deployment's actual allocated capital
+                        // instead of a fixed unit quantity regardless of account size.
+                        let has_capital_context = strategy.capital_allocation > 0.0;
+                        if has_capital_context {
+                            strat_params.insert(
+                                "capital_allocation".to_string(),
+                                serde_json::json!(strategy.capital_allocation),
+                            );
+                        }
+                        if let Some(pct) = strategy.position_size_pct {
+                            strat_params.insert(
+                                "position_size_pct".to_string(),
+                                serde_json::json!(pct),
+                            );
+                        }
                         let strat_config = StrategyConfig {
                             id: strategy_id_hash.to_string(),
                             name: strategy.strategy_name.clone(),
@@ -1093,8 +1109,12 @@ impl HostedObject {
                             symbols: strategy.symbols.clone(),
                             exchanges: strategy.target_exchanges.clone(),
                             parameters: strat_params,
-                            max_position_size: 10_000.0,
-                            risk_limit: 0.02,
+                            max_position_size: if has_capital_context {
+                                strategy.capital_allocation
+                            } else {
+                                10_000.0
+                            },
+                            risk_limit: strategy.position_size_pct.unwrap_or(0.02),
                         };
                         let strat_instance: Arc<tokio::sync::Mutex<Box<dyn Strategy>>> =
                             Arc::new(tokio::sync::Mutex::new(Box::new(

@@ -643,6 +643,35 @@ impl StrategyManager {
     }
 }
 
+/// Default fraction of allocated capital to risk per entry when a deployment
+/// doesn't declare its own `position_size_pct` -- matches
+/// `BacktestingEngine/backtest/src/python_simulation.rs::resolve_position_size_pct`'s
+/// own fallback so backtest and live sizing agree in the absence of an
+/// explicit value.
+const DEFAULT_POSITION_SIZE_PCT: f64 = 0.02;
+
+/// Size an order as a fraction of allocated capital, ported from
+/// `BacktestingEngine/portfoliomanager/src/margin.rs::size_leveraged_order`
+/// (leverage fixed at 1.0 here -- no leverage data is plumbed through to
+/// live deployments yet). Falls back to `fallback_quantity` when capital
+/// context isn't available, preserving today's behavior for deployments
+/// that don't carry a `capital_allocation`.
+fn size_order_from_capital(
+    capital_allocation: Option<f64>,
+    position_size_pct: Option<f64>,
+    price: f64,
+    fallback_quantity: f64,
+) -> f64 {
+    match capital_allocation {
+        Some(equity) if equity > 0.0 && price > 0.0 => {
+            let pct = position_size_pct.unwrap_or(DEFAULT_POSITION_SIZE_PCT);
+            let notional = equity * pct;
+            notional / price
+        }
+        _ => fallback_quantity,
+    }
+}
+
 /// Simple Market Making Strategy (comprehensive implementation)
 pub struct SimpleMarketMakingStrategy {
     config: StrategyConfig,
@@ -707,7 +736,14 @@ impl Strategy for SimpleMarketMakingStrategy {
                 _ => ExchangeId::Binance,
             };
             let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
-            let base_quantity = 0.01; // Base quantity for orders
+            let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
+            let position_size_pct = self.config.parameters.get("position_size_pct").and_then(|v| v.as_f64());
+            let base_quantity = size_order_from_capital(
+                capital_allocation,
+                position_size_pct,
+                market_data.mid_price,
+                0.01, // fallback for deployments with no capital context
+            );
             
             // Generate buy limit order
             if new_bid > 0.0 {
@@ -769,6 +805,26 @@ pub fn create_strategy(config: StrategyConfig) -> Result<Box<dyn Strategy>, Box<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_order_from_capital_uses_position_size_pct_of_equity() {
+        // $10,000 equity, 25% position size, price 16.35 -> notional $2,500
+        let qty = size_order_from_capital(Some(10_000.0), Some(0.25), 16.35, 0.01);
+        assert!((qty - (2_500.0 / 16.35)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn size_order_from_capital_falls_back_to_default_pct_when_unset() {
+        let qty = size_order_from_capital(Some(10_000.0), None, 100.0, 0.01);
+        assert!((qty - (10_000.0 * DEFAULT_POSITION_SIZE_PCT / 100.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn size_order_from_capital_falls_back_to_fixed_quantity_without_capital_context() {
+        assert_eq!(size_order_from_capital(None, Some(0.25), 16.35, 0.01), 0.01);
+        assert_eq!(size_order_from_capital(Some(0.0), Some(0.25), 16.35, 0.01), 0.01);
+        assert_eq!(size_order_from_capital(Some(10_000.0), Some(0.25), 0.0, 0.01), 0.01);
+    }
 
     #[test]
     fn test_ultra_strategy_engine_creation() {

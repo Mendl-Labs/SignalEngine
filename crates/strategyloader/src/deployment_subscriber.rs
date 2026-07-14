@@ -51,6 +51,8 @@ use databaseschema::models::backtest_result::BacktestResult;
 use databaseschema::models::deployed_strategy::DeployedStrategy as DbDeployedStrategy;
 #[cfg(feature = "postgres")]
 use databaseschema::schema::{backtest_jobs, backtest_results, deployed_strategies};
+#[cfg(feature = "postgres")]
+use bigdecimal::ToPrimitive;
 
 /// Topics for deployment events
 pub mod topics {
@@ -106,6 +108,16 @@ pub struct DeployedStrategy {
     pub fill_model: Option<String>,
     pub maker_fee_bps: Option<f64>,
     pub taker_fee_bps: Option<f64>,
+    /// Capital allocated to this deployment (from `deployed_strategies.capital_allocation`,
+    /// forwarded over the wire as `StrategyDeployment.initial_capital`). Used to size
+    /// orders proportionally to account size instead of a fixed unit quantity.
+    pub capital_allocation: f64,
+    /// Fraction of `capital_allocation` to risk per entry (the strategy's own
+    /// declared `position_size_pct`/`risk_per_trade`, when known). `None` until
+    /// the deployment's backtest params are fetched (see Phase 2 DB lookup) --
+    /// callers should fall back to a conservative default (matching
+    /// BacktestingEngine's own `python_simulation.rs` default of 2%).
+    pub position_size_pct: Option<f64>,
 }
 
 impl DeployedStrategy {
@@ -165,6 +177,8 @@ impl DeployedStrategy {
             fill_model,
             maker_fee_bps,
             taker_fee_bps,
+            capital_allocation: msg.initial_capital,
+            position_size_pct: risk_meta.get("position_size_pct").and_then(|v| v.as_f64()),
         })
     }
 
@@ -456,6 +470,18 @@ impl DeploymentSubscriber {
             let exchanges = Self::resolve_reconcile_exchanges(&deployment);
             let symbols = Self::resolve_reconcile_symbols(&backtest.symbol, &params_json);
 
+            // Carry the strategy's own declared position_size_pct (if present in
+            // the backtest's params) through risk_metrics -- from_deployment()
+            // reads it back out on the other side. capital_allocation goes
+            // through the dedicated initial_capital field.
+            let position_size_pct = params_json
+                .get("position_size_pct")
+                .or_else(|| params_json.get("risk_per_trade"));
+            let risk_metrics = position_size_pct
+                .map(|v| serde_json::json!({ "position_size_pct": v }))
+                .and_then(|v| serde_json::to_vec(&v).ok())
+                .unwrap_or_default();
+
             let deployment_msg = StrategyDeployment {
                 strategy_id: deployment.backtest_result_id.to_string(),
                 instance_id: deployment.id.to_string(),
@@ -464,13 +490,13 @@ impl DeploymentSubscriber {
                 strategy_name: deployment.name.clone(),
                 version: "1.0".to_string(),
                 parameters: Vec::new(),
-                initial_capital: 0.0,
+                initial_capital: deployment.capital_allocation.to_f64().unwrap_or(0.0),
                 target_exchanges: exchanges,
                 symbols,
                 approved_by: deployment.deployed_by.unwrap_or_else(|| "reconciler".to_string()),
                 approved_at: deployment.deployed_at.to_rfc3339(),
                 performance_summary: Vec::new(),
-                risk_metrics: Vec::new(),
+                risk_metrics,
                 admin_approved: false,
                 timestamp: Utc::now().timestamp(),
                 mode: deployment.mode,
@@ -853,5 +879,35 @@ mod tests {
         assert_eq!(strategy.strategy_type, "custom_market_making");
         assert_eq!(strategy.strategy_name, "BTC Market Maker");
         assert!(strategy.is_active.load(Ordering::Relaxed));
+        assert_eq!(strategy.capital_allocation, 10000.0);
+        assert_eq!(strategy.position_size_pct, None);
+    }
+
+    #[test]
+    fn test_deployed_strategy_reads_position_size_pct_from_risk_metrics() {
+        let deployment = StrategyDeployment {
+            strategy_id: Uuid::new_v4().to_string(),
+            instance_id: Uuid::new_v4().to_string(),
+            tenant_id: Uuid::new_v4().to_string(),
+            strategy_type: "custom".to_string(),
+            strategy_name: "AggressiveMeanReversion".to_string(),
+            version: "1.0.0".to_string(),
+            parameters: Vec::new(),
+            initial_capital: 10000.0,
+            target_exchanges: vec!["oanda".to_string()],
+            symbols: vec!["USD-ZAR".to_string()],
+            approved_by: "admin".to_string(),
+            approved_at: "2026-01-25T12:00:00Z".to_string(),
+            performance_summary: vec![],
+            risk_metrics: serde_json::to_vec(&serde_json::json!({"position_size_pct": 0.25}))
+                .unwrap(),
+            admin_approved: true,
+            timestamp: 0,
+            mode: "paper".to_string(),
+        };
+
+        let strategy = DeployedStrategy::from_deployment(&deployment).unwrap();
+        assert_eq!(strategy.capital_allocation, 10000.0);
+        assert_eq!(strategy.position_size_pct, Some(0.25));
     }
 }
