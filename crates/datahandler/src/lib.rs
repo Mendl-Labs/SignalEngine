@@ -224,7 +224,22 @@ impl Default for BrokerConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
-            exchanges: vec!["kraken".to_string()],
+            // Which exchanges' market.data.{exchange}.{trades,level3,bars}
+            // topics this DataHandler subscribes to -- NOT driven by active
+            // deployments or the exchange each one actually uses, just this
+            // fixed list. A deployment on an exchange absent here silently
+            // never receives data: DataEngine publishes correctly, but
+            // nothing ever subscribed to that topic. Overridable via
+            // MARKET_DATA_EXCHANGES (comma-separated) without a redeploy.
+            exchanges: std::env::var("MARKET_DATA_EXCHANGES")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["kraken".to_string(), "oanda".to_string()]),
             symbols: vec![
                 "BTC/USD".to_string(),
                 "ETH/USD".to_string(),
@@ -1035,6 +1050,33 @@ pub fn get_global_performance_metrics() -> (u64, u64, u64, usize) {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // Regression: BrokerConfig::default()'s exchanges list drives which
+    // market.data.{exchange}.{trades,level3,bars} topics DataHandler
+    // subscribes to. It used to be a single hardcoded "kraken" -- any
+    // deployment on another exchange (e.g. oanda) never received market
+    // data no matter what DataEngine published, since nothing ever
+    // subscribed to that topic. Confirms both the fixed default and that
+    // MARKET_DATA_EXCHANGES still overrides it for ops flexibility.
+    #[test]
+    #[serial]
+    fn default_broker_config_subscribes_to_kraken_and_oanda() {
+        // SAFETY: test-only env manipulation, guarded by #[serial].
+        unsafe { std::env::remove_var("MARKET_DATA_EXCHANGES"); }
+        let config = BrokerConfig::default();
+        assert!(config.exchanges.contains(&"kraken".to_string()));
+        assert!(config.exchanges.contains(&"oanda".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn market_data_exchanges_env_var_overrides_default() {
+        // SAFETY: test-only env manipulation, guarded by #[serial].
+        unsafe { std::env::set_var("MARKET_DATA_EXCHANGES", "binance, Coinbase ,oanda"); }
+        let config = BrokerConfig::default();
+        assert_eq!(config.exchanges, vec!["binance", "coinbase", "oanda"]);
+        unsafe { std::env::remove_var("MARKET_DATA_EXCHANGES"); }
+    }
 
     #[test]
     #[serial]
