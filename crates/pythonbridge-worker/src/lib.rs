@@ -30,6 +30,9 @@
 //! is this crate running in its own dedicated OS process (see Phase 4's
 //! supervisor), with no filesystem/network access enforced at the k8s layer.
 
+pub mod client;
+pub mod protocol;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use std::collections::VecDeque;

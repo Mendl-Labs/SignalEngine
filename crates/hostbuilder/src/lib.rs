@@ -265,7 +265,7 @@ use dotenv::dotenv;
 use mockall::automock;
 use portfoliohandler::{PortfolioHandler, PortfolioHandlerTrait};
 use strategyhandler::{
-    StrategyManager, StrategyConfig, Strategy, SimpleMarketMakingStrategy,
+    StrategyManager, StrategyConfig, Strategy,
     MarketData as StratMarketData,
 };
 use strategyloader::{DeploymentSubscriber, DeploymentEvent};
@@ -1072,11 +1072,14 @@ impl HostedObject {
                             SYMBOL_NAMES.insert(hash_symbol(sym), sym.clone());
                         }
 
-                        // Build a strategy instance for this deployment. We currently
-                        // only support SimpleMarketMakingStrategy; other strategy_type
-                        // values fall back to it. The config.id is set to the
-                        // strategy_id_hash so SimpleMarketMakingStrategy stamps the
-                        // right id on the Signal it produces (the bridge also
+                        // Build a strategy instance for this deployment.
+                        // create_strategy() dispatches to PythonBridgeStrategy
+                        // (runs the deployment's actual Python compute_signals())
+                        // when python_source_code is available, falling back to
+                        // SimpleMarketMakingStrategy only for genuine
+                        // market-making deployments that have none. The config.id
+                        // is set to the strategy_id_hash so the strategy stamps
+                        // the right id on the Signal it produces (the bridge also
                         // overrides defensively).
                         let mut strat_params: HashMap<String, serde_json::Value> =
                             match &strategy.parameters {
@@ -1102,6 +1105,12 @@ impl HostedObject {
                                 serde_json::json!(pct),
                             );
                         }
+                        if let Some(source) = &strategy.python_source_code {
+                            strat_params.insert(
+                                "python_source_code".to_string(),
+                                serde_json::json!(source),
+                            );
+                        }
                         let strat_config = StrategyConfig {
                             id: strategy_id_hash.to_string(),
                             name: strategy.strategy_name.clone(),
@@ -1117,9 +1126,30 @@ impl HostedObject {
                             risk_limit: strategy.position_size_pct.unwrap_or(0.02),
                         };
                         let strat_instance: Arc<tokio::sync::Mutex<Box<dyn Strategy>>> =
-                            Arc::new(tokio::sync::Mutex::new(Box::new(
-                                SimpleMarketMakingStrategy::new(strat_config),
-                            )));
+                            match strategyhandler::create_strategy(strat_config) {
+                                Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+                                Err(e) => {
+                                    ultra_logger::ultra_error!(format!(
+                                        "❌ Rejected deployment {} ({}): failed to construct strategy: {}",
+                                        strategy.strategy_name, strategy.instance_id, e
+                                    ));
+                                    continue;
+                                }
+                            };
+
+                        // SimpleMarketMakingStrategy's initialize() is a no-op
+                        // (just logs), but PythonBridgeStrategy's is where the
+                        // pythonbridge-worker child process actually gets
+                        // spawned -- every deployment must be initialized
+                        // before its first generate_signals() call or a
+                        // Python-backed deployment will error on every tick.
+                        if let Err(e) = strat_instance.lock().await.initialize().await {
+                            ultra_logger::ultra_error!(format!(
+                                "❌ Rejected deployment {} ({}): strategy initialize() failed: {}",
+                                strategy.strategy_name, strategy.instance_id, e
+                            ));
+                            continue;
+                        }
 
                         if is_live {
                             // Live mode — use real exchange connectors (already configured via YAML)

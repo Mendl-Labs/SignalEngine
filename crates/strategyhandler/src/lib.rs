@@ -796,15 +796,196 @@ impl Strategy for SimpleMarketMakingStrategy {
     }
 }
 
-/// Factory function to create strategies from configuration
+/// A live/paper strategy backed by a `pythonbridge-worker` child process,
+/// running the deployment's actual Python `compute_signals()` logic instead
+/// of the generic market-making quotes `SimpleMarketMakingStrategy` produces.
+///
+/// Requires `config.parameters["python_source_code"]` (a string) --
+/// `hostbuilder`'s deploy handler only constructs this strategy when that's
+/// present (see `DeployedStrategy::python_source_code`, fetched via
+/// `DeploymentSubscriber::fetch_python_source_code`); `capital_allocation`
+/// and `position_size_pct`, when present, feed `size_order_from_capital`
+/// (the same sizing formula `SimpleMarketMakingStrategy` uses -- see that
+/// function's doc).
+pub struct PythonBridgeStrategy {
+    config: StrategyConfig,
+    worker: Option<pythonbridge_worker::client::WorkerProcess>,
+    /// This strategy's own last non-flat signal direction (+1 long, -1
+    /// short), used only to size a CLOSE signal's flattening order. NOT
+    /// authoritative against the real broker/deployment_positions state --
+    /// after a worker restart this resets to `None`, so a CLOSE signal
+    /// arriving with no locally-tracked entry is dropped (logged, not
+    /// acted on) rather than guessed. Real position truth lives downstream
+    /// in `deployment_positions`, which nets correctly regardless via the
+    /// avg-cost engine even if this local proxy's size is imprecise.
+    last_side: Option<i8>,
+    last_quantity: f64,
+}
+
+impl PythonBridgeStrategy {
+    pub fn new(config: StrategyConfig) -> Self {
+        Self { config, worker: None, last_side: None, last_quantity: 0.0 }
+    }
+}
+
+#[async_trait]
+impl Strategy for PythonBridgeStrategy {
+    fn config(&self) -> &StrategyConfig {
+        &self.config
+    }
+
+    async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
+        let source_code = self
+            .config
+            .parameters
+            .get("python_source_code")
+            .and_then(|v| v.as_str())
+            .ok_or("PythonBridgeStrategy requires python_source_code in config.parameters")?
+            .to_string();
+
+        let mut parameters: HashMap<String, f64> = HashMap::new();
+        for (k, v) in &self.config.parameters {
+            if let Some(f) = v.as_f64() {
+                parameters.insert(k.clone(), f);
+            }
+        }
+
+        // Generous default lookback window -- see PythonStrategyRunner::new's
+        // doc on why "generous default" beats "guess low" here. Timeout
+        // matches the source bridge's own default (python_strategy.rs).
+        const WINDOW_SIZE: usize = 200;
+        const TIMEOUT_SECS: u64 = 30;
+
+        let binary_path = pythonbridge_worker::client::default_binary_path();
+        let mut worker = pythonbridge_worker::client::WorkerProcess::spawn(&binary_path)?;
+        worker.initialize(source_code, parameters, TIMEOUT_SECS, WINDOW_SIZE)?;
+        self.worker = Some(worker);
+
+        let logger = SignalEngineLogger::new("StrategyHandler").await;
+        logger.info(&format!("Initialized PythonBridgeStrategy: {}", self.config.name)).await;
+        Ok(())
+    }
+
+    async fn generate_signals(&mut self, market_data: &MarketData) -> Result<Vec<Signal>, Box<dyn Error>> {
+        let worker = self.worker.as_mut().ok_or("PythonBridgeStrategy not initialized")?;
+
+        worker.push_bar(market_data.mid_price, market_data.volume, market_data.timestamp as i64)?;
+        let raw_signal = worker.compute_signal()?;
+
+        if raw_signal == 0 {
+            return Ok(Vec::new());
+        }
+
+        let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
+        let position_size_pct = self.config.parameters.get("position_size_pct").and_then(|v| v.as_f64());
+        let symbol_hash = hash_symbol(&market_data.symbol);
+        let exchange_id = match market_data.exchange.to_lowercase().as_str() {
+            "binance" => ExchangeId::Binance,
+            "coinbase" | "coinbase_pro" => ExchangeId::Coinbase,
+            "kraken" => ExchangeId::Kraken,
+            // No native oanda (or most other live venues) variant exists on
+            // ExchangeId yet -- SimpleMarketMakingStrategy has this exact
+            // same gap. This field only affects internal Signal routing,
+            // not the exchange string actually persisted to trade_history.
+            _ => ExchangeId::Binance,
+        };
+        let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
+
+        let (action, quantity) = match raw_signal {
+            1 => {
+                let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
+                self.last_side = Some(1);
+                self.last_quantity = qty;
+                (SignalAction::Buy, qty)
+            }
+            -1 => {
+                let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
+                self.last_side = Some(-1);
+                self.last_quantity = qty;
+                (SignalAction::Sell, qty)
+            }
+            2 => match self.last_side.take() {
+                Some(1) => (SignalAction::Sell, self.last_quantity),
+                Some(-1) => (SignalAction::Buy, self.last_quantity),
+                _ => return Ok(Vec::new()), // nothing locally tracked to close
+            },
+            _ => return Ok(Vec::new()),
+        };
+
+        if quantity <= 0.0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![Signal::new(strategy_id, symbol_hash, exchange_id, action, quantity, market_data.mid_price)])
+    }
+
+    fn update_state(&mut self, _market_data: &MarketData) {
+        // Window/state updates happen in generate_signals (push_bar advances
+        // the worker's rolling window there); nothing additional to do here.
+    }
+
+    async fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
+        self.worker = None; // WorkerProcess::drop() shuts the child process down
+        Ok(())
+    }
+
+    fn get_config(&self) -> &StrategyConfig {
+        &self.config
+    }
+
+    fn update_config(&mut self, config: StrategyConfig) {
+        self.config = config;
+    }
+}
+
+/// Factory function to create strategies from configuration.
+///
+/// Dispatches to `PythonBridgeStrategy` when the deployment's actual Python
+/// source is available (real strategies, e.g. AI-generated ones), falling
+/// back to `SimpleMarketMakingStrategy` only for deployments that
+/// genuinely are generic market-making (no `python_source_code`).
 pub fn create_strategy(config: StrategyConfig) -> Result<Box<dyn Strategy>, Box<dyn Error>> {
-    // For now, only support simple market making
-    Ok(Box::new(SimpleMarketMakingStrategy::new(config)))
+    if config.parameters.get("python_source_code").and_then(|v| v.as_str()).is_some() {
+        Ok(Box::new(PythonBridgeStrategy::new(config)))
+    } else {
+        Ok(Box::new(SimpleMarketMakingStrategy::new(config)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(python_source_code: Option<&str>) -> StrategyConfig {
+        let mut parameters = HashMap::new();
+        if let Some(src) = python_source_code {
+            parameters.insert("python_source_code".to_string(), serde_json::json!(src));
+        }
+        StrategyConfig {
+            id: "1".to_string(),
+            name: "test".to_string(),
+            enabled: true,
+            symbols: vec!["BTC/USD".to_string()],
+            exchanges: vec!["kraken".to_string()],
+            parameters,
+            max_position_size: 10_000.0,
+            risk_limit: 0.02,
+        }
+    }
+
+    #[test]
+    fn create_strategy_constructs_without_erroring_for_python_deployment() {
+        // Construction alone must not try to spawn the worker process --
+        // that only happens in initialize(), spawned lazily on first use.
+        let strategy = create_strategy(test_config(Some("class Strategy: pass"))).unwrap();
+        assert_eq!(strategy.config().id, "1");
+    }
+
+    #[test]
+    fn create_strategy_falls_back_to_market_making_without_python_source() {
+        let strategy = create_strategy(test_config(None)).unwrap();
+        assert_eq!(strategy.config().id, "1");
+    }
 
     #[test]
     fn size_order_from_capital_uses_position_size_pct_of_equity() {

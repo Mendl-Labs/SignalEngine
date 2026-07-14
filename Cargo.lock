@@ -3146,6 +3146,8 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "pyo3",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -3996,6 +3998,7 @@ dependencies = [
  "lazy_static",
  "orderbook",
  "portfolio",
+ "pythonbridge-worker",
  "serde",
  "serde_json",
  "signal_dispatcher",
