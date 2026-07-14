@@ -286,6 +286,41 @@ impl DeploymentSubscriber {
         exchanges
     }
 
+    /// Resolve the per-asset symbol list to subscribe to, from the backtest
+    /// job's `params_json.portfolio_assets`.
+    ///
+    /// `backtest_results.symbol` is a single display-string column: for a
+    /// portfolio backtest it holds every asset's symbol joined with ", "
+    /// (e.g. "USD-ZAR, AUD-NZD, CHF-ZAR") for human-readable display. Passing
+    /// that joined string straight through as a `MarketDataSubscribe` symbol
+    /// looks up a ticker that doesn't exist on any exchange, so the
+    /// subscription silently matches nothing and the deployment never
+    /// receives data -- with no error anywhere, since publishing the
+    /// subscribe request itself succeeds. `portfolio_assets` carries the
+    /// real, structured per-asset breakdown and is always present for
+    /// portfolio backtests; single-asset backtests have no
+    /// `portfolio_assets`, so `single_symbol` is the correct value there.
+    #[cfg(feature = "postgres")]
+    fn resolve_reconcile_symbols(single_symbol: &str, params_json: &serde_json::Value) -> Vec<String> {
+        let portfolio_symbols: Vec<String> = params_json
+            .get("portfolio_assets")
+            .and_then(|v| v.as_array())
+            .map(|assets| {
+                assets
+                    .iter()
+                    .filter_map(|asset| asset.get("symbol").and_then(|s| s.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if portfolio_symbols.is_empty() {
+            vec![single_symbol.to_string()]
+        } else {
+            portfolio_symbols
+        }
+    }
+
     /// Create a new deployment subscriber
     pub fn new(broker_address: &str, node_id: &str) -> Self {
         Self {
@@ -404,10 +439,10 @@ impl DeploymentSubscriber {
         let mut replayed = 0usize;
 
         for (deployment, backtest) in rows {
-            let strategy_type = backtest_jobs::table
+            let (strategy_type, params_json) = backtest_jobs::table
                 .filter(backtest_jobs::result_id.eq(Some(deployment.backtest_result_id)))
-                .select(backtest_jobs::strategy_type)
-                .first::<String>(&mut conn)
+                .select((backtest_jobs::strategy_type, backtest_jobs::params_json))
+                .first::<(String, serde_json::Value)>(&mut conn)
                 .await
                 .optional()
                 .map_err(|e| {
@@ -416,9 +451,10 @@ impl DeploymentSubscriber {
                         deployment.id, e
                     ))
                 })?
-                .unwrap_or_else(|| "custom".to_string());
+                .unwrap_or_else(|| ("custom".to_string(), serde_json::Value::Null));
 
             let exchanges = Self::resolve_reconcile_exchanges(&deployment);
+            let symbols = Self::resolve_reconcile_symbols(&backtest.symbol, &params_json);
 
             let deployment_msg = StrategyDeployment {
                 strategy_id: deployment.backtest_result_id.to_string(),
@@ -430,7 +466,7 @@ impl DeploymentSubscriber {
                 parameters: Vec::new(),
                 initial_capital: 0.0,
                 target_exchanges: exchanges,
-                symbols: vec![backtest.symbol.clone()],
+                symbols,
                 approved_by: deployment.deployed_by.unwrap_or_else(|| "reconciler".to_string()),
                 approved_at: deployment.deployed_at.to_rfc3339(),
                 performance_summary: Vec::new(),
