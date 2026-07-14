@@ -876,13 +876,17 @@ impl HostedObject {
                         ));
                     }
 
-                    // Resolve symbol: prefer the deployment's first symbol (readable),
-                    // fall back to the global hash->name map populated at deploy time,
-                    // and only as a last resort use the raw hash placeholder.
-                    let symbol = paper_meta
-                        .as_ref()
-                        .and_then(|m| m.symbols.first().cloned())
-                        .or_else(|| SYMBOL_NAMES.get(&signal.symbol_hash).map(|e| e.value().clone()))
+                    // Resolve symbol: prefer the per-signal hash->name lookup (populated
+                    // at deploy time for every one of the deployment's symbols) so each
+                    // trade is labeled with the asset it was ACTUALLY for; fall back to
+                    // the deployment's first symbol only when that lookup fails (e.g. an
+                    // unrecognized/legacy hash). Trying paper_meta's first symbol FIRST
+                    // used to mean every trade on every asset in a multi-asset portfolio
+                    // got mislabeled with just the first configured symbol -- price/qty
+                    // were correct (tied to the real signal), only the recorded symbol
+                    // was wrong for every asset but the first.
+                    let symbol = SYMBOL_NAMES.get(&signal.symbol_hash).map(|e| e.value().clone())
+                        .or_else(|| paper_meta.as_ref().and_then(|m| m.symbols.first().cloned()))
                         .unwrap_or_else(|| format!("SYMBOL_{}", signal.symbol_hash));
 
                     let exchange = paper_meta.as_ref()
