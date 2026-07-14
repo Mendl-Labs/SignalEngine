@@ -16,6 +16,7 @@ members = [
     "crates/strategyloader",
     "crates/signal",
     "crates/signaldispatcher",
+    "crates/pythonbridge-worker",
 ]
 resolver = "2"
 

@@ -1,0 +1,17 @@
+[package]
+name = "pythonbridge-worker"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone Python strategy execution, hand-ported from
+# BacktestingEngine/strategy/src/strategies/python_strategy.rs (not a shared
+# crate -- see SignalEngine/crates/pythonbridge-worker/src/lib.rs module doc
+# for why). Runs in its own dedicated process (Phase 4's supervisor spawns
+# one per deployment), never inside SignalEngine's shared tokio runtime.
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
