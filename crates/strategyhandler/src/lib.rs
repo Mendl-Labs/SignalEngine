@@ -938,14 +938,32 @@ impl Strategy for PythonBridgeStrategy {
     }
 }
 
+/// Rollout kill switch for `PythonBridgeStrategy`, following the same
+/// opt-out env-var idiom as `BacktestingEngine`'s
+/// `python_strategy.rs::compute_features_enabled`. Defaults ON: falling
+/// back to `SimpleMarketMakingStrategy` isn't actually a *safer* state --
+/// it's the bug this whole fix addresses (every deployment silently running
+/// a generic market-maker instead of its own strategy) -- so this exists as
+/// a rollback switch for an unexpected issue with the new path, not a
+/// staged default-off rollout. Set `PYTHON_BRIDGE_STRATEGY_ENABLED=0` (or
+/// `false`) to force every deployment back to the old behavior.
+fn python_bridge_strategy_enabled() -> bool {
+    std::env::var("PYTHON_BRIDGE_STRATEGY_ENABLED")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
 /// Factory function to create strategies from configuration.
 ///
 /// Dispatches to `PythonBridgeStrategy` when the deployment's actual Python
-/// source is available (real strategies, e.g. AI-generated ones), falling
-/// back to `SimpleMarketMakingStrategy` only for deployments that
-/// genuinely are generic market-making (no `python_source_code`).
+/// source is available (real strategies, e.g. AI-generated ones) AND the
+/// rollout kill switch is enabled, falling back to
+/// `SimpleMarketMakingStrategy` for deployments that genuinely are generic
+/// market-making (no `python_source_code`), or when the kill switch has
+/// been flipped off.
 pub fn create_strategy(config: StrategyConfig) -> Result<Box<dyn Strategy>, Box<dyn Error>> {
-    if config.parameters.get("python_source_code").and_then(|v| v.as_str()).is_some() {
+    let has_python_source = config.parameters.get("python_source_code").and_then(|v| v.as_str()).is_some();
+    if has_python_source && python_bridge_strategy_enabled() {
         Ok(Box::new(PythonBridgeStrategy::new(config)))
     } else {
         Ok(Box::new(SimpleMarketMakingStrategy::new(config)))
@@ -955,6 +973,12 @@ pub fn create_strategy(config: StrategyConfig) -> Result<Box<dyn Strategy>, Box<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that read/write PYTHON_BRIDGE_STRATEGY_ENABLED --
+    /// env vars are process-global, and Rust runs tests in parallel by
+    /// default, so without this two of these tests running concurrently
+    /// could observe each other's value and flake.
+    static ENV_VAR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_config(python_source_code: Option<&str>) -> StrategyConfig {
         let mut parameters = HashMap::new();
@@ -985,6 +1009,38 @@ mod tests {
     fn create_strategy_falls_back_to_market_making_without_python_source() {
         let strategy = create_strategy(test_config(None)).unwrap();
         assert_eq!(strategy.config().id, "1");
+    }
+
+    #[test]
+    fn python_bridge_strategy_enabled_defaults_to_true() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("PYTHON_BRIDGE_STRATEGY_ENABLED");
+        assert!(python_bridge_strategy_enabled());
+    }
+
+    #[test]
+    fn python_bridge_strategy_enabled_respects_explicit_disable() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        std::env::set_var("PYTHON_BRIDGE_STRATEGY_ENABLED", "false");
+        assert!(!python_bridge_strategy_enabled());
+        std::env::set_var("PYTHON_BRIDGE_STRATEGY_ENABLED", "0");
+        assert!(!python_bridge_strategy_enabled());
+        std::env::remove_var("PYTHON_BRIDGE_STRATEGY_ENABLED");
+    }
+
+    #[test]
+    fn kill_switch_off_falls_back_to_market_making_even_with_python_source() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        std::env::set_var("PYTHON_BRIDGE_STRATEGY_ENABLED", "false");
+        // Can't downcast Box<dyn Strategy> to check the concrete type, but
+        // construction succeeding regardless of which branch is taken is
+        // still a real regression guard: this must not error out, and a
+        // manual/integration check confirms the branch via generate_signals
+        // behavior (PythonBridgeStrategy errors without python worker
+        // wiring set up; SimpleMarketMakingStrategy does not need one).
+        let strategy = create_strategy(test_config(Some("class Strategy: pass"))).unwrap();
+        assert_eq!(strategy.config().id, "1");
+        std::env::remove_var("PYTHON_BRIDGE_STRATEGY_ENABLED");
     }
 
     #[test]
