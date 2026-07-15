@@ -672,6 +672,22 @@ fn size_order_from_capital(
     }
 }
 
+/// Resolve `position_size_pct`, preferring the strategy's own resolved
+/// `self.params` (worker-reported, post-`initialize()`) over
+/// `config.parameters` (DB-sourced, and known-broken for AI-generated
+/// strategies -- their real value is baked into `python_source_code`, not a
+/// separate structured field; see `DeployedStrategy::position_size_pct`'s
+/// doc in `strategyloader`).
+fn resolve_position_size_pct(
+    resolved_params: &HashMap<String, f64>,
+    config_parameters: &HashMap<String, serde_json::Value>,
+) -> Option<f64> {
+    resolved_params
+        .get("position_size_pct")
+        .copied()
+        .or_else(|| config_parameters.get("position_size_pct").and_then(|v| v.as_f64()))
+}
+
 /// Simple Market Making Strategy (comprehensive implementation)
 pub struct SimpleMarketMakingStrategy {
     config: StrategyConfig,
@@ -839,6 +855,14 @@ pub struct PythonBridgeStrategy {
     pending_close: f64,
     pending_volume: f64,
     pending_timestamp: i64,
+    /// The strategy's own resolved `self.params`, reported back by the
+    /// worker after `initialize()` -- the only reliable source for values
+    /// like `position_size_pct` that AI-generated strategies bake directly
+    /// into source rather than expose as a separate structured DB field
+    /// (`config.parameters["position_size_pct"]`, sourced from
+    /// `backtest_jobs.params_json`, is `None` in practice for these
+    /// strategies -- see `DeployedStrategy::position_size_pct`'s doc).
+    resolved_params: HashMap<String, f64>,
 }
 
 /// Default bar interval when a deployment doesn't declare
@@ -871,6 +895,7 @@ impl PythonBridgeStrategy {
             pending_close: 0.0,
             pending_volume: 0.0,
             pending_timestamp: 0,
+            resolved_params: HashMap::new(),
         }
     }
 }
@@ -905,7 +930,7 @@ impl Strategy for PythonBridgeStrategy {
 
         let binary_path = pythonbridge_worker::client::default_binary_path();
         let mut worker = pythonbridge_worker::client::WorkerProcess::spawn(&binary_path)?;
-        worker.initialize(source_code, parameters, TIMEOUT_SECS, WINDOW_SIZE)?;
+        self.resolved_params = worker.initialize(source_code, parameters, TIMEOUT_SECS, WINDOW_SIZE)?;
         self.worker = Some(worker);
 
         self.candle_interval_minutes = self
@@ -917,8 +942,8 @@ impl Strategy for PythonBridgeStrategy {
 
         let logger = SignalEngineLogger::new("StrategyHandler").await;
         logger.info(&format!(
-            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={})",
-            self.config.name, self.candle_interval_minutes
+            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?})",
+            self.config.name, self.candle_interval_minutes, self.resolved_params.get("position_size_pct")
         )).await;
         Ok(())
     }
@@ -976,7 +1001,7 @@ impl Strategy for PythonBridgeStrategy {
         }
 
         let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
-        let position_size_pct = self.config.parameters.get("position_size_pct").and_then(|v| v.as_f64());
+        let position_size_pct = resolve_position_size_pct(&self.resolved_params, &self.config.parameters);
         let symbol_hash = hash_symbol(&market_data.symbol);
         let exchange_id = match market_data.exchange.to_lowercase().as_str() {
             "binance" => ExchangeId::Binance,
@@ -1208,6 +1233,30 @@ mod tests {
         assert_eq!(size_order_from_capital(None, Some(0.25), 16.35, 0.01), 0.01);
         assert_eq!(size_order_from_capital(Some(0.0), Some(0.25), 16.35, 0.01), 0.01);
         assert_eq!(size_order_from_capital(Some(10_000.0), Some(0.25), 0.0, 0.01), 0.01);
+    }
+
+    #[test]
+    fn resolve_position_size_pct_prefers_resolved_params_over_config() {
+        let mut resolved = HashMap::new();
+        resolved.insert("position_size_pct".to_string(), 0.25);
+        let mut config = HashMap::new();
+        config.insert("position_size_pct".to_string(), serde_json::json!(0.02));
+
+        assert_eq!(resolve_position_size_pct(&resolved, &config), Some(0.25));
+    }
+
+    #[test]
+    fn resolve_position_size_pct_falls_back_to_config_when_not_resolved() {
+        let resolved = HashMap::new();
+        let mut config = HashMap::new();
+        config.insert("position_size_pct".to_string(), serde_json::json!(0.02));
+
+        assert_eq!(resolve_position_size_pct(&resolved, &config), Some(0.02));
+    }
+
+    #[test]
+    fn resolve_position_size_pct_none_when_neither_source_has_it() {
+        assert_eq!(resolve_position_size_pct(&HashMap::new(), &HashMap::new()), None);
     }
 
     #[test]

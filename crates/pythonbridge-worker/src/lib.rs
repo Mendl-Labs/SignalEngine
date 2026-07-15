@@ -350,8 +350,21 @@ impl PythonStrategyRunner {
     /// (out of scope: `compute_signals`-only strategies recompute their
     /// entry/exit state as local variables inside each call over the given
     /// window, not via persisted instance attributes).
-    pub fn initialize(&mut self, parameters: &std::collections::HashMap<String, f64>) -> Result<(), PythonBridgeError> {
-        let py_obj = Python::with_gil(|py| -> Result<PyObject, PythonBridgeError> {
+    ///
+    /// Returns the strategy's resolved `self.params` after `initialize()`
+    /// (its own `__init__` defaults merged with any overrides passed here) --
+    /// the Python object is the only reliable source of truth for its own
+    /// parameter values (e.g. `position_size_pct`), since AI-generated
+    /// strategies bake them directly into source rather than exposing them
+    /// as a separate structured field anywhere queryable by SQL. Only
+    /// numeric (float/bool) entries are included; strings and other
+    /// non-numeric values are silently omitted -- callers only need numbers
+    /// for sizing/risk math.
+    pub fn initialize(
+        &mut self,
+        parameters: &std::collections::HashMap<String, f64>,
+    ) -> Result<std::collections::HashMap<String, f64>, PythonBridgeError> {
+        let (py_obj, resolved_params) = Python::with_gil(|py| -> Result<(PyObject, std::collections::HashMap<String, f64>), PythonBridgeError> {
             ast_security_scan(py, &self.source_code).map_err(PythonBridgeError::Setup)?;
 
             inject_sdk(py)?;
@@ -392,7 +405,25 @@ impl PythonStrategyRunner {
                 .call_method1("initialize", (params_dict,))
                 .map_err(|e| PythonBridgeError::Setup(format!("Python initialize() error: {}", e)))?;
 
-            Ok(instance.into())
+            // Read back the resolved self.params -- the post-merge state,
+            // not the pre-merge __init__ default -- so callers get the
+            // strategy's actual, final parameter values.
+            let mut resolved_params = std::collections::HashMap::new();
+            if let Ok(params_attr) = instance.getattr("params") {
+                if let Ok(dict) = params_attr.downcast::<PyDict>() {
+                    for (k, v) in dict.iter() {
+                        let Ok(key) = k.extract::<String>() else { continue };
+                        if let Ok(val) = v.extract::<f64>() {
+                            resolved_params.insert(key, val);
+                        } else if let Ok(val_bool) = v.extract::<bool>() {
+                            resolved_params.insert(key, if val_bool { 1.0 } else { 0.0 });
+                        }
+                        // non-numeric (strings etc.) silently omitted
+                    }
+                }
+            }
+
+            Ok((instance.into(), resolved_params))
         })?;
 
         // Single persistent watchdog thread (started once, not per-call) --
@@ -416,7 +447,7 @@ _thread.start_new_thread(_persistent_watchdog, ())
 
         *self.py_strategy.lock().expect("py_strategy mutex poisoned") = Some(py_obj);
         self.initialized = true;
-        Ok(())
+        Ok(resolved_params)
     }
 
     /// Push a new bar into the rolling window, evicting the oldest bar once
@@ -649,6 +680,51 @@ class Strategy(BaseStrategy):
         let err = on_python_thread(|| Python::with_gil(|py| ast_security_scan(py, MALICIOUS_EVAL)));
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("Forbidden call"));
+    }
+
+    const STRATEGY_WITH_POSITION_SIZE_PCT: &str = r#"
+from trading_platform import BaseStrategy
+import numpy as np
+
+class Strategy(BaseStrategy):
+    def __init__(self):
+        self.params = {"position_size_pct": 0.25, "label": "not-a-number"}
+
+    def name(self) -> str:
+        return "HasPositionSizePct"
+
+    def compute_signals(self, prices, volumes, timestamps):
+        return np.zeros(len(prices), dtype=np.int8)
+"#;
+
+    #[test]
+    fn initialize_reports_back_the_strategys_own_declared_position_size_pct() {
+        let resolved = on_python_thread(|| {
+            let mut runner = PythonStrategyRunner::new(STRATEGY_WITH_POSITION_SIZE_PCT.to_string(), 10);
+            runner.initialize(&std::collections::HashMap::new()).unwrap()
+        });
+        assert_eq!(resolved.get("position_size_pct"), Some(&0.25));
+    }
+
+    #[test]
+    fn initialize_reports_back_the_post_merge_value_when_overridden() {
+        let resolved = on_python_thread(|| {
+            let mut runner = PythonStrategyRunner::new(STRATEGY_WITH_POSITION_SIZE_PCT.to_string(), 10);
+            let mut overrides = std::collections::HashMap::new();
+            overrides.insert("position_size_pct".to_string(), 0.5);
+            runner.initialize(&overrides).unwrap()
+        });
+        // Must reflect the override (post-merge), not the __init__ default.
+        assert_eq!(resolved.get("position_size_pct"), Some(&0.5));
+    }
+
+    #[test]
+    fn initialize_silently_omits_non_numeric_params() {
+        let resolved = on_python_thread(|| {
+            let mut runner = PythonStrategyRunner::new(STRATEGY_WITH_POSITION_SIZE_PCT.to_string(), 10);
+            runner.initialize(&std::collections::HashMap::new()).unwrap()
+        });
+        assert!(!resolved.contains_key("label"));
     }
 
     #[test]

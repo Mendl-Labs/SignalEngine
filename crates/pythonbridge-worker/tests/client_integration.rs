@@ -88,9 +88,16 @@ fn compute_signal_before_initialize_errors() {
 #[test]
 fn mean_reversion_strategy_buys_on_a_real_dip_via_ipc() {
     let mut worker = WorkerProcess::spawn(&worker_binary_path()).unwrap();
-    worker
+    let resolved_params = worker
         .initialize(AGGRESSIVE_MEAN_REVERSION_STRATEGY.to_string(), HashMap::new(), 30, 20)
         .unwrap();
+
+    // Confirms the resolved_params round-trip works over the real IPC
+    // boundary, not just in the unit-level PyO3 calls -- this is the exact
+    // mechanism that fixes position_size_pct silently defaulting to 2%
+    // instead of a strategy's real declared value.
+    assert_eq!(resolved_params.get("lookback"), Some(&5.0));
+    assert_eq!(resolved_params.get("entry_z"), Some(&1.0));
 
     // Flat prices around 100, then a sharp dip -- should trigger BUY once
     // the dip is the most recent bar.

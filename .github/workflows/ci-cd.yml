@@ -118,8 +118,17 @@ jobs:
           cd SignalEngine
           # Run datahandler tests with single thread (uses global ORDERBOOKS state)
           cargo test -p datahandler -- --test-threads=1
+          # pythonbridge-worker embeds a single, process-wide CPython
+          # interpreter (pyo3 auto-initialize) with a persistent watchdog
+          # thread whose _thread.interrupt_main() targets whichever OS
+          # thread first touched Python -- running its tests in parallel
+          # (cargo's default) makes different tests land on different
+          # threads and race, confirmed via repeated local runs (serial:
+          # 14/14 pass every time; parallel: 3/14 intermittently fail with
+          # "python worker thread dropped result sender").
+          cargo test -p pythonbridge-worker -- --test-threads=1
           # Run all other tests in parallel
-          if cargo test --workspace --exclude datahandler; then
+          if cargo test --workspace --exclude datahandler --exclude pythonbridge-worker; then
             echo "[OK] Tests passed!"
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else

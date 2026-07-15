@@ -84,15 +84,18 @@ impl WorkerProcess {
         Ok(response)
     }
 
+    /// Returns the strategy's resolved `self.params` after initialization --
+    /// see `Response::Initialized`'s doc for why this matters (e.g.
+    /// `position_size_pct` for AI-generated strategies).
     pub fn initialize(
         &mut self,
         source_code: String,
         parameters: HashMap<String, f64>,
         timeout_secs: u64,
         window_size: usize,
-    ) -> Result<(), WorkerProcessError> {
+    ) -> Result<HashMap<String, f64>, WorkerProcessError> {
         match self.call(&Request::Initialize { source_code, parameters, timeout_secs, window_size })? {
-            Response::Initialized => Ok(()),
+            Response::Initialized { resolved_params } => Ok(resolved_params),
             _ => Err(WorkerProcessError::UnexpectedResponse),
         }
     }

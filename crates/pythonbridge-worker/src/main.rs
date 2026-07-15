@@ -54,9 +54,9 @@ fn handle_request(request: Request, runner: &mut Option<PythonStrategyRunner>) -
         Request::Initialize { source_code, parameters, timeout_secs, window_size } => {
             let mut new_runner = PythonStrategyRunner::new(source_code, window_size).with_timeout(timeout_secs);
             Some(match new_runner.initialize(&parameters) {
-                Ok(()) => {
+                Ok(resolved_params) => {
                     *runner = Some(new_runner);
-                    Response::Initialized
+                    Response::Initialized { resolved_params }
                 }
                 Err(e) => Response::Error { message: e.to_string() },
             })

@@ -48,7 +48,13 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Response {
-    Initialized,
+    /// `resolved_params` is the strategy's own `self.params` after its
+    /// `initialize()` ran (its `__init__` defaults merged with the
+    /// `Request::Initialize.parameters` overrides) -- the Python object is
+    /// the only reliable source of truth for values like
+    /// `position_size_pct` that AI-generated strategies bake directly into
+    /// source rather than expose as a separate structured DB field.
+    Initialized { resolved_params: HashMap<String, f64> },
     BarPushed,
     /// Signal values match the SDK convention: `1 = BUY`, `-1 = SELL`,
     /// `2 = CLOSE`, `0 = HOLD`.
