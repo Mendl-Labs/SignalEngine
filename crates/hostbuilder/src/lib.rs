@@ -1111,6 +1111,12 @@ impl HostedObject {
                                 serde_json::json!(source),
                             );
                         }
+                        if let Some(interval) = strategy.candle_interval_minutes {
+                            strat_params.insert(
+                                "candle_interval_minutes".to_string(),
+                                serde_json::json!(interval),
+                            );
+                        }
                         let strat_config = StrategyConfig {
                             id: strategy_id_hash.to_string(),
                             name: strategy.strategy_name.clone(),

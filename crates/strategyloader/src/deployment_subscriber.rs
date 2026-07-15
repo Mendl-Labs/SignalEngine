@@ -83,6 +83,21 @@ pub enum DeploymentSubscriberError {
     NoStrategyManager,
 }
 
+/// Extra per-deployment config fetched from the DB, not carried on the
+/// `StrategyDeployment` wire message -- see
+/// `DeploymentSubscriber::fetch_deployment_python_config`.
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentPythonConfig {
+    pub python_source_code: Option<String>,
+    /// The strategy's declared bar interval (`backtest_jobs.params_json.candle_interval_minutes`).
+    /// `PythonBridgeStrategy` needs this to aggregate ticks into real bars
+    /// before calling `compute_signals()` -- without it, a strategy tuned
+    /// for e.g. 4-hour bars would have its 25-bar lookback span 25 raw
+    /// ticks (seconds) instead of ~100 hours, and its holding-period exit
+    /// fire in seconds instead of hours.
+    pub candle_interval_minutes: Option<i64>,
+}
+
 /// Information about a deployed strategy for tracking
 #[derive(Debug)]
 pub struct DeployedStrategy {
@@ -117,24 +132,45 @@ pub struct DeployedStrategy {
     /// the deployment's backtest params are fetched (see Phase 2 DB lookup) --
     /// callers should fall back to a conservative default (matching
     /// BacktestingEngine's own `python_simulation.rs` default of 2%).
+    ///
+    /// KNOWN GAP: this is only ever populated via `risk_metrics` JSON, which
+    /// `reconcile_active_deployments_from_db` builds from
+    /// `backtest_jobs.params_json.position_size_pct` -- but that top-level
+    /// key doesn't actually exist for AI-generated strategies (confirmed):
+    /// the real value lives baked into `python_source_code`'s own
+    /// `self.params` dict, not as a separate structured DB field, and
+    /// BacktestingEngine's publisher never sends it on the wire either. In
+    /// practice this is `None` today even for a strategy whose Python
+    /// source declares e.g. `position_size_pct: 0.25`, silently falling
+    /// back to the 2% default. Correct fix: have the worker report back the
+    /// actual `self.params["position_size_pct"]` it initialized with (it's
+    /// the single source of truth), not try to duplicate/parse the value
+    /// from SQL. Not fixed here -- flagged as a follow-up.
     pub position_size_pct: Option<f64>,
     /// The deployment's actual Python strategy source (`backtest_results.python_source_code`),
     /// fetched by strategy_id since it isn't carried on the `StrategyDeployment`
     /// wire message. `None` for genuine (non-AI-authored) strategy types, or
     /// when the lookup fails/postgres isn't enabled.
     pub python_source_code: Option<String>,
+    /// The strategy's declared bar interval in minutes
+    /// (`backtest_jobs.params_json.candle_interval_minutes`), fetched
+    /// alongside `python_source_code`. `PythonBridgeStrategy` aggregates raw
+    /// ticks into bars of this size before calling `compute_signals()` --
+    /// see `DeploymentPythonConfig`'s doc for why this matters.
+    pub candle_interval_minutes: Option<i64>,
 }
 
 impl DeployedStrategy {
     /// Create a new deployed strategy from a deployment message.
     ///
-    /// `python_source_code` is resolved by the caller (not looked up here) --
-    /// see `DeploymentSubscriber::fetch_python_source_code` for the live/hot
-    /// path, and `reconcile_active_deployments_from_db` for the reconcile
-    /// path, which already has it in scope from its own DB join.
+    /// `python_config` is resolved by the caller (not looked up here) -- see
+    /// `DeploymentSubscriber::fetch_deployment_python_config` for the
+    /// live/hot path, and `reconcile_active_deployments_from_db` for the
+    /// reconcile path, which already has `python_source_code`/
+    /// `candle_interval_minutes` in scope from its own DB join.
     pub fn from_deployment(
         msg: &StrategyDeployment,
-        python_source_code: Option<String>,
+        python_config: DeploymentPythonConfig,
     ) -> Result<Self, DeploymentSubscriberError> {
         let strategy_id = Uuid::parse_str(&msg.strategy_id)
             .map_err(|e| DeploymentSubscriberError::ParseError(format!("Invalid strategy_id: {}", e)))?;
@@ -192,7 +228,8 @@ impl DeployedStrategy {
             taker_fee_bps,
             capital_allocation: msg.initial_capital,
             position_size_pct: risk_meta.get("position_size_pct").and_then(|v| v.as_f64()),
-            python_source_code,
+            python_source_code: python_config.python_source_code,
+            candle_interval_minutes: python_config.candle_interval_minutes,
         })
     }
 
@@ -277,39 +314,58 @@ impl DeploymentSubscriber {
         Ok(resolved)
     }
 
-    /// Look up the deployment's actual Python strategy source, keyed by the
-    /// backtest result id (published as `StrategyDeployment.strategy_id` --
-    /// see `deployment_publisher.rs`'s `strategy_id: backtest_result_id.to_string()`).
+    /// Look up the deployment's actual Python strategy source and its
+    /// declared bar interval, keyed by the backtest result id (published as
+    /// `StrategyDeployment.strategy_id` -- see `deployment_publisher.rs`'s
+    /// `strategy_id: backtest_result_id.to_string()`).
     ///
-    /// Not carried on the wire message itself: adding a field there would
+    /// Not carried on the wire message itself: adding fields there would
     /// touch the shared cross-service proto contract
     /// (`MessageBrokerEngine/protos/messages.proto`) for zero benefit until a
     /// consumer exists. A one-off connection per deployment event is
     /// acceptable here since deployments are rare, not a hot path.
     #[cfg(feature = "postgres")]
-    async fn fetch_python_source_code(strategy_id: &str) -> Option<String> {
-        let backtest_result_id = Uuid::parse_str(strategy_id).ok()?;
-        let database_url = Self::resolved_database_url().ok()?;
-        if database_url.is_empty() {
-            return None;
+    async fn fetch_deployment_python_config(strategy_id: &str) -> DeploymentPythonConfig {
+        async fn inner(strategy_id: &str) -> Option<DeploymentPythonConfig> {
+            let backtest_result_id = Uuid::parse_str(strategy_id).ok()?;
+            let database_url = DeploymentSubscriber::resolved_database_url().ok()?;
+            if database_url.is_empty() {
+                return None;
+            }
+
+            let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+            let pool: Pool<AsyncPgConnection> = Pool::builder(manager).max_size(1).build().ok()?;
+            let mut conn = pool.get().await.ok()?;
+
+            let python_source_code: Option<String> = backtest_results::table
+                .filter(backtest_results::id.eq(backtest_result_id))
+                .select(backtest_results::python_source_code)
+                .first(&mut conn)
+                .await
+                .ok()?;
+
+            // candle_interval_minutes lives on the originating backtest_jobs
+            // row's params_json, not on backtest_results itself -- same join
+            // reconcile_active_deployments_from_db already does.
+            let candle_interval_minutes: Option<i64> = backtest_jobs::table
+                .filter(backtest_jobs::result_id.eq(Some(backtest_result_id)))
+                .select(backtest_jobs::params_json)
+                .first::<serde_json::Value>(&mut conn)
+                .await
+                .optional()
+                .ok()
+                .flatten()
+                .and_then(|params| params.get("candle_interval_minutes").and_then(|v| v.as_i64()));
+
+            Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes })
         }
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
-        let pool: Pool<AsyncPgConnection> = Pool::builder(manager).max_size(1).build().ok()?;
-        let mut conn = pool.get().await.ok()?;
-
-        backtest_results::table
-            .filter(backtest_results::id.eq(backtest_result_id))
-            .select(backtest_results::python_source_code)
-            .first::<Option<String>>(&mut conn)
-            .await
-            .ok()
-            .flatten()
+        inner(strategy_id).await.unwrap_or_default()
     }
 
     #[cfg(not(feature = "postgres"))]
-    async fn fetch_python_source_code(_strategy_id: &str) -> Option<String> {
-        None
+    async fn fetch_deployment_python_config(_strategy_id: &str) -> DeploymentPythonConfig {
+        DeploymentPythonConfig::default()
     }
 
     #[cfg(feature = "postgres")]
@@ -551,9 +607,16 @@ impl DeploymentSubscriber {
                 mode: deployment.mode,
             };
 
+            let candle_interval_minutes = params_json
+                .get("candle_interval_minutes")
+                .and_then(|v| v.as_i64());
+
             Self::handle_deployment(
                 deployment_msg,
-                backtest.python_source_code.clone(),
+                DeploymentPythonConfig {
+                    python_source_code: backtest.python_source_code.clone(),
+                    candle_interval_minutes,
+                },
                 &self.deployed_strategies,
                 self.publisher.as_ref(),
                 &self.node_id,
@@ -619,10 +682,10 @@ impl DeploymentSubscriber {
         if let Ok(request) = PublishRequest::decode(msg.data.as_slice()) {
             match request.payload {
                 Some(publish_request::Payload::StrategyDeployment(deployment)) => {
-                    let python_source_code = Self::fetch_python_source_code(&deployment.strategy_id).await;
+                    let python_config = Self::fetch_deployment_python_config(&deployment.strategy_id).await;
                     Self::handle_deployment(
                         deployment,
-                        python_source_code,
+                        python_config,
                         deployed_strategies,
                         publisher,
                         node_id,
@@ -660,19 +723,19 @@ impl DeploymentSubscriber {
 
     /// Handle a deployment message.
     ///
-    /// `python_source_code` is resolved by the caller -- the reconcile path
+    /// `python_config` is resolved by the caller -- the reconcile path
     /// already has it from its own DB join; the live/hot path fetches it via
-    /// `fetch_python_source_code` before calling this.
+    /// `fetch_deployment_python_config` before calling this.
     async fn handle_deployment(
         deployment: StrategyDeployment,
-        python_source_code: Option<String>,
+        python_config: DeploymentPythonConfig,
         deployed_strategies: &Arc<DashMap<Uuid, Arc<DeployedStrategy>>>,
         publisher: Option<&Arc<UltraFastPublisher>>,
         node_id: &str,
         deployment_tx: Option<&mpsc::Sender<DeploymentEvent>>,
     ) {
         let (success, error_message, active_exchanges, symbols, instance_id_str, tenant_id_str) =
-            match DeployedStrategy::from_deployment(&deployment, python_source_code) {
+            match DeployedStrategy::from_deployment(&deployment, python_config) {
             Ok(strategy) => {
                 let instance_id = strategy.instance_id;
                 let exchanges = strategy.target_exchanges.clone();
@@ -932,13 +995,14 @@ mod tests {
             mode: "paper".to_string(),
         };
 
-        let strategy = DeployedStrategy::from_deployment(&deployment, None).unwrap();
+        let strategy = DeployedStrategy::from_deployment(&deployment, DeploymentPythonConfig::default()).unwrap();
         assert_eq!(strategy.strategy_type, "custom_market_making");
         assert_eq!(strategy.strategy_name, "BTC Market Maker");
         assert!(strategy.is_active.load(Ordering::Relaxed));
         assert_eq!(strategy.capital_allocation, 10000.0);
         assert_eq!(strategy.position_size_pct, None);
         assert_eq!(strategy.python_source_code, None);
+        assert_eq!(strategy.candle_interval_minutes, None);
     }
 
     #[test]
@@ -966,7 +1030,10 @@ mod tests {
 
         let strategy = DeployedStrategy::from_deployment(
             &deployment,
-            Some("class Strategy:\n    pass".to_string()),
+            DeploymentPythonConfig {
+                python_source_code: Some("class Strategy:\n    pass".to_string()),
+                candle_interval_minutes: Some(240),
+            },
         )
         .unwrap();
         assert_eq!(strategy.capital_allocation, 10000.0);
@@ -975,5 +1042,6 @@ mod tests {
             strategy.python_source_code,
             Some("class Strategy:\n    pass".to_string())
         );
+        assert_eq!(strategy.candle_interval_minutes, Some(240));
     }
 }

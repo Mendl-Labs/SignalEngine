@@ -820,11 +820,58 @@ pub struct PythonBridgeStrategy {
     /// avg-cost engine even if this local proxy's size is imprecise.
     last_side: Option<i8>,
     last_quantity: f64,
+    /// Bar interval (minutes) ticks are aggregated into before being pushed
+    /// to the worker. Resolved once in `initialize()` from
+    /// `config.parameters["candle_interval_minutes"]` (defaults to
+    /// `DEFAULT_CANDLE_INTERVAL_MINUTES` when absent). Without this, every
+    /// tick would be pushed as its own "bar" -- a strategy tuned for e.g.
+    /// 4-hour bars would have its lookback span seconds of raw ticks
+    /// instead of ~100 hours, and its holding-period exit fire in seconds
+    /// instead of hours (this is exactly the bug being fixed here).
+    candle_interval_minutes: i64,
+    /// The last tick's bar-bucket index (see `bar_bucket`). `None` until
+    /// the first tick ever seen -- there's nothing to close yet at that
+    /// point, so it's just recorded, not pushed.
+    last_bucket: Option<i64>,
+    /// Accumulated close price/volume/timestamp for the CURRENT,
+    /// not-yet-closed bar (updated on every tick within the same bucket;
+    /// pushed to the worker only once a tick lands in a new bucket).
+    pending_close: f64,
+    pending_volume: f64,
+    pending_timestamp: i64,
+}
+
+/// Default bar interval when a deployment doesn't declare
+/// `candle_interval_minutes` (rare -- only reconciled/live deployments
+/// predating this fix, or manually-created ones). Longer-than-actual is the
+/// safer failure mode: it makes the strategy under-trade rather than
+/// reproducing the tick-as-bar over-trading bug for a strategy missing the
+/// field.
+const DEFAULT_CANDLE_INTERVAL_MINUTES: i64 = 60;
+
+/// Compute the bar-bucket index for a tick's timestamp (nanoseconds since
+/// Unix epoch -- confirmed this is what `MarketData::timestamp` actually
+/// carries, via `SignalEngine/crates/datahandler/src/lib.rs`'s
+/// `SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`). Two ticks
+/// with the same bucket index belong to the same, not-yet-closed bar.
+fn bar_bucket(timestamp_ns: u64, candle_interval_minutes: i64) -> i64 {
+    let bucket_width_ns = (candle_interval_minutes.max(1) as u64) * 60 * 1_000_000_000;
+    (timestamp_ns / bucket_width_ns) as i64
 }
 
 impl PythonBridgeStrategy {
     pub fn new(config: StrategyConfig) -> Self {
-        Self { config, worker: None, last_side: None, last_quantity: 0.0 }
+        Self {
+            config,
+            worker: None,
+            last_side: None,
+            last_quantity: 0.0,
+            candle_interval_minutes: DEFAULT_CANDLE_INTERVAL_MINUTES,
+            last_bucket: None,
+            pending_close: 0.0,
+            pending_volume: 0.0,
+            pending_timestamp: 0,
+        }
     }
 }
 
@@ -861,15 +908,67 @@ impl Strategy for PythonBridgeStrategy {
         worker.initialize(source_code, parameters, TIMEOUT_SECS, WINDOW_SIZE)?;
         self.worker = Some(worker);
 
+        self.candle_interval_minutes = self
+            .config
+            .parameters
+            .get("candle_interval_minutes")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_CANDLE_INTERVAL_MINUTES);
+
         let logger = SignalEngineLogger::new("StrategyHandler").await;
-        logger.info(&format!("Initialized PythonBridgeStrategy: {}", self.config.name)).await;
+        logger.info(&format!(
+            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={})",
+            self.config.name, self.candle_interval_minutes
+        )).await;
         Ok(())
     }
 
     async fn generate_signals(&mut self, market_data: &MarketData) -> Result<Vec<Signal>, Box<dyn Error>> {
-        let worker = self.worker.as_mut().ok_or("PythonBridgeStrategy not initialized")?;
+        if self.worker.is_none() {
+            return Err("PythonBridgeStrategy not initialized".into());
+        }
 
-        worker.push_bar(market_data.mid_price, market_data.volume, market_data.timestamp as i64)?;
+        // Aggregate raw ticks into bars of candle_interval_minutes before
+        // ever calling into the worker -- see the struct's field docs for
+        // why. Only a bucket-boundary crossing pushes a completed bar and
+        // asks for a signal; every other tick just updates the running
+        // accumulator and returns no signal.
+        let bucket = bar_bucket(market_data.timestamp, self.candle_interval_minutes);
+        let bar_closed = match self.last_bucket {
+            None => {
+                // First tick ever -- nothing to close yet.
+                self.last_bucket = Some(bucket);
+                self.pending_close = market_data.mid_price;
+                self.pending_volume = market_data.volume;
+                self.pending_timestamp = market_data.timestamp as i64;
+                false
+            }
+            Some(prev) if prev == bucket => {
+                // Still inside the same bar -- keep accumulating.
+                self.pending_close = market_data.mid_price;
+                self.pending_volume += market_data.volume;
+                self.pending_timestamp = market_data.timestamp as i64;
+                false
+            }
+            Some(_) => true, // bucket changed -- the previous bar just closed
+        };
+
+        if !bar_closed {
+            return Ok(Vec::new());
+        }
+
+        // Push the just-closed bar, then start the new bucket's accumulator
+        // from this tick.
+        let closed_close = self.pending_close;
+        let closed_volume = self.pending_volume;
+        let closed_timestamp = self.pending_timestamp;
+        self.last_bucket = Some(bucket);
+        self.pending_close = market_data.mid_price;
+        self.pending_volume = market_data.volume;
+        self.pending_timestamp = market_data.timestamp as i64;
+
+        let worker = self.worker.as_mut().ok_or("PythonBridgeStrategy not initialized")?;
+        worker.push_bar(closed_close, closed_volume, closed_timestamp)?;
         let raw_signal = worker.compute_signal()?;
 
         if raw_signal == 0 {
@@ -1041,6 +1140,54 @@ mod tests {
         let strategy = create_strategy(test_config(Some("class Strategy: pass"))).unwrap();
         assert_eq!(strategy.config().id, "1");
         std::env::remove_var("PYTHON_BRIDGE_STRATEGY_ENABLED");
+    }
+
+    #[test]
+    fn bar_bucket_same_bucket_for_ticks_within_the_same_interval() {
+        // 240-minute (4h) bars, in nanoseconds
+        let bucket_width_ns: u64 = 240 * 60 * 1_000_000_000;
+        let t0 = 10 * bucket_width_ns; // exactly on a boundary
+        let t1 = t0 + bucket_width_ns / 2; // mid-bar
+        let t2 = t0 + bucket_width_ns - 1; // last ns before the next boundary
+        assert_eq!(bar_bucket(t0, 240), bar_bucket(t1, 240));
+        assert_eq!(bar_bucket(t0, 240), bar_bucket(t2, 240));
+    }
+
+    #[test]
+    fn bar_bucket_changes_exactly_at_the_interval_boundary() {
+        let bucket_width_ns: u64 = 240 * 60 * 1_000_000_000;
+        let t0 = 10 * bucket_width_ns;
+        let last_tick_of_bar = t0 + bucket_width_ns - 1;
+        let first_tick_of_next_bar = t0 + bucket_width_ns;
+        assert_eq!(bar_bucket(last_tick_of_bar, 240), bar_bucket(t0, 240));
+        assert_ne!(bar_bucket(first_tick_of_next_bar, 240), bar_bucket(t0, 240));
+        assert_eq!(bar_bucket(first_tick_of_next_bar, 240), bar_bucket(t0, 240) + 1);
+    }
+
+    #[test]
+    fn bar_bucket_smaller_interval_produces_more_buckets_for_the_same_span() {
+        // Over the same real time span, a 60-minute bar interval must
+        // produce strictly more distinct buckets than a 240-minute one --
+        // this is the property whose absence caused the original bug
+        // (every tick landing in its own "bucket" is the limiting case).
+        let one_day_ns: u64 = 24 * 60 * 60 * 1_000_000_000;
+        let ticks: Vec<u64> = (0..24).map(|h| h * 60 * 60 * 1_000_000_000).collect();
+        assert!(one_day_ns > 0); // sanity: ticks span exactly one day
+
+        let buckets_240: std::collections::HashSet<i64> =
+            ticks.iter().map(|&t| bar_bucket(t, 240)).collect();
+        let buckets_60: std::collections::HashSet<i64> =
+            ticks.iter().map(|&t| bar_bucket(t, 60)).collect();
+        assert!(buckets_60.len() > buckets_240.len());
+    }
+
+    #[test]
+    fn bar_bucket_clamps_zero_or_negative_interval_to_one_minute() {
+        // Defensive: a misconfigured/zero interval must not divide by zero
+        // or produce a nonsensical (e.g. always-same) bucket for every tick.
+        let one_minute_ns: u64 = 60 * 1_000_000_000;
+        assert_eq!(bar_bucket(0, 0), bar_bucket(0, 1));
+        assert_ne!(bar_bucket(one_minute_ns, 0), bar_bucket(2 * one_minute_ns, 0));
     }
 
     #[test]
