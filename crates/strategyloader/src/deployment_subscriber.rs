@@ -116,7 +116,12 @@ pub struct DeploymentPythonConfig {
 /// of treating `symbols[0]`/`target_exchanges[0]` as the representative
 /// symbol/exchange for a multi-symbol deployment (e.g. hostbuilder's
 /// warm-start fetch and its live-mode credential loading).
-#[cfg(feature = "postgres")]
+///
+/// Deliberately NOT gated behind `#[cfg(feature = "postgres")]` -- despite
+/// living alongside DB-querying code in this file, this function is pure
+/// (`serde_json::Value` in, `Option<String>` out) and both its call sites
+/// are themselves already postgres-gated, so it must stay buildable in a
+/// non-postgres build for its own unit tests below.
 fn resolve_asset_class(params_json: &serde_json::Value) -> Option<String> {
     if let Some(s) = params_json.get("asset_class").and_then(|v| v.as_str()) {
         return Some(s.to_string());
