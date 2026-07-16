@@ -152,6 +152,23 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
             }
         }
 
+        // Flush bar counts recorded by the bridge (in-memory hot path) to
+        // bars_accumulated -- the write path behind the dashboard's "still
+        // warming up" indicator. Same drain-on-success discipline as above.
+        let pending_bars: Vec<(uuid::Uuid, u32)> =
+            crate::LAST_BARS_ACCUMULATED.iter().map(|e| (*e.key(), *e.value())).collect();
+        for (dep_id, bars) in pending_bars {
+            match deployed_strategy_ops::stamp_bars_accumulated(&mut conn, dep_id, bars as i32).await {
+                Ok(_) => {
+                    crate::LAST_BARS_ACCUMULATED.remove_if(&dep_id, |_, v| *v == bars);
+                }
+                Err(e) => ultra_error!(format!(
+                    "market-health: bars_accumulated flush failed for {}: {}",
+                    dep_id, e
+                )),
+            }
+        }
+
         let mut upserted = 0usize;
         let mut missing = 0usize;
 

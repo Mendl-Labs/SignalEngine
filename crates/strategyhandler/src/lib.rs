@@ -472,6 +472,13 @@ pub trait Strategy: Send + Sync {
         self.config()
     }
     fn update_config(&mut self, config: StrategyConfig);
+    /// Bars accumulated since this instance was (re)initialized, when the
+    /// implementer tracks it (currently only `PythonBridgeStrategy`, whose
+    /// bar-based lookback strategies need this for the dashboard's warm-up
+    /// indicator). `None` for implementers that don't track it.
+    fn bars_since_init(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Enhanced Strategy Manager combining ultra-performance with comprehensive features
@@ -863,6 +870,13 @@ pub struct PythonBridgeStrategy {
     /// `backtest_jobs.params_json`, is `None` in practice for these
     /// strategies -- see `DeployedStrategy::position_size_pct`'s doc).
     resolved_params: HashMap<String, f64>,
+    /// How many bars have been pushed to the worker since this instance was
+    /// (re)initialized -- surfaced to the dashboard so "still building
+    /// required history" (e.g. a 25-bar lookback strategy needs 25 closed
+    /// bars before it can compute anything) is never mistaken for a broken
+    /// deployment. Starts at 0, or at the warm-start count when historical
+    /// bars are seeded in `initialize()`.
+    bars_since_init: u32,
 }
 
 /// Default bar interval when a deployment doesn't declare
@@ -896,6 +910,7 @@ impl PythonBridgeStrategy {
             pending_volume: 0.0,
             pending_timestamp: 0,
             resolved_params: HashMap::new(),
+            bars_since_init: 0,
         }
     }
 }
@@ -994,6 +1009,7 @@ impl Strategy for PythonBridgeStrategy {
 
         let worker = self.worker.as_mut().ok_or("PythonBridgeStrategy not initialized")?;
         worker.push_bar(closed_close, closed_volume, closed_timestamp)?;
+        self.bars_since_init += 1;
         let raw_signal = worker.compute_signal()?;
 
         if raw_signal == 0 {
@@ -1059,6 +1075,10 @@ impl Strategy for PythonBridgeStrategy {
 
     fn update_config(&mut self, config: StrategyConfig) {
         self.config = config;
+    }
+
+    fn bars_since_init(&self) -> Option<u32> {
+        Some(self.bars_since_init)
     }
 }
 
@@ -1133,6 +1153,22 @@ mod tests {
     fn create_strategy_falls_back_to_market_making_without_python_source() {
         let strategy = create_strategy(test_config(None)).unwrap();
         assert_eq!(strategy.config().id, "1");
+    }
+
+    #[test]
+    fn python_bridge_strategy_reports_zero_bars_since_init_freshly_constructed() {
+        let strategy = create_strategy(test_config(Some("class Strategy: pass"))).unwrap();
+        assert_eq!(strategy.bars_since_init(), Some(0));
+    }
+
+    #[test]
+    fn market_making_strategy_does_not_track_bars_since_init() {
+        // Falls back to SimpleMarketMakingStrategy, which relies on the
+        // Strategy trait's default `bars_since_init` -- confirms the default
+        // doesn't accidentally report Some(0) for an implementer that never
+        // tracks bars at all.
+        let strategy = create_strategy(test_config(None)).unwrap();
+        assert_eq!(strategy.bars_since_init(), None);
     }
 
     #[test]

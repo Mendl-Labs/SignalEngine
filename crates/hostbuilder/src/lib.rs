@@ -328,6 +328,13 @@ lazy_static! {
     /// tick. This is the write path behind the dashboard's "Last signal"
     /// recency indicator, which was previously never populated.
     pub static ref LAST_SIGNAL_EMITTED: DashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = DashMap::new();
+
+    /// Deployment id -> most recent bar count reported by the strategy
+    /// (`Strategy::bars_since_init`). Written by the market-data bridge (hot
+    /// loop: in-memory only), flushed to `deployed_strategies.bars_accumulated`
+    /// by the market-health writer's 30s tick -- the write path behind the
+    /// dashboard's "still warming up" indicator.
+    pub static ref LAST_BARS_ACCUMULATED: DashMap<uuid::Uuid, u32> = DashMap::new();
 }
 
 #[automock]
@@ -764,10 +771,16 @@ impl HostedObject {
                             spread: md.spread,
                         };
                         let signal_tx = signal_tx.clone();
-                        let signals = runtime.block_on(async move {
+                        let (signals, bars_since_init) = runtime.block_on(async move {
                             let mut s = strat.lock().await;
-                            s.generate_signals(&strat_md).await
+                            let result = s.generate_signals(&strat_md).await;
+                            (result, s.bars_since_init())
                         });
+                        if let Some(bars) = bars_since_init {
+                            // In-memory only (hot loop); the market-health
+                            // writer flushes this to bars_accumulated every 30s.
+                            LAST_BARS_ACCUMULATED.insert(deployment_id, bars);
+                        }
                         match signals {
                             Ok(sigs) => {
                                 if !sigs.is_empty() && signals_emitted < 10 {
