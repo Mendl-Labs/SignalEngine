@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.97"
 async-trait = "0.1.88"
-config = { path = "../config" }
+config = { path = "../config", package = "signalengine-config" }
 crossbeam = "0.8.4"
 ctrlc = "3.4.7"
 dashmap = "6.1.0"
@@ -24,6 +24,12 @@ smartorderrouter = { path = "../smartorderrouter" }
 strategyhandler = { path = "../strategyhandler" }
 strategyloader = { path = "../strategyloader" }
 databaseschema = { path = "../../../databaseschema", optional = true }
+# Reused for warm-starting a strategy's bar history from Polygon/Massive
+# historical candles on init, instead of starting from zero bars after
+# every restart -- forex backtests already use this same provider as a
+# proxy for Oanda (no historical Oanda candle API exists in this codebase),
+# so this isn't a new/different data source, just the same one reused live.
+dataloader = { path = "../../../BacktestingEngine/dataloader", optional = true }
 bigdecimal = { version = "0.4", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = "1.44.1"
@@ -43,4 +49,4 @@ serde = { workspace = true }
 
 [features]
 default = []
-postgres = ["databaseschema", "bigdecimal", "executionhandler/postgres", "smartorderrouter/postgres", "strategyloader/postgres"]
+postgres = ["databaseschema", "dataloader", "bigdecimal", "executionhandler/postgres", "smartorderrouter/postgres", "strategyloader/postgres"]

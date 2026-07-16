@@ -897,6 +897,43 @@ fn bar_bucket(timestamp_ns: u64, candle_interval_minutes: i64) -> i64 {
     (timestamp_ns / bucket_width_ns) as i64
 }
 
+/// Parses `config.parameters["warm_start_bars"]` (set by
+/// `hostbuilder::fetch_warm_start_bars`) into `(close, volume, timestamp_ns)`
+/// triples, chronological order. Returns an empty vec when the key is
+/// absent or malformed -- a warm-start is a nice-to-have, never something
+/// that should block `initialize()`.
+fn parse_warm_start_bars(parameters: &HashMap<String, serde_json::Value>) -> Vec<(f64, f64, i64)> {
+    parameters
+        .get("warm_start_bars")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let t = entry.as_array()?;
+                    let close = t.first()?.as_f64()?;
+                    let volume = t.get(1)?.as_f64()?;
+                    let timestamp = t.get(2)?.as_i64()?;
+                    Some((close, volume, timestamp))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Seeds the running bucket from the LAST warm-start bar (same shape as
+/// `generate_signals()`'s `None` branch for the first live tick) so the
+/// live tick stream continues that bucket seamlessly instead of
+/// double-counting it as a second, separate bar. Returns
+/// `(last_bucket, pending_close, pending_volume, pending_timestamp)`, or
+/// `None` when there are no warm-start bars to seed from.
+fn seed_bucket_from_warm_start(
+    bars: &[(f64, f64, i64)],
+    candle_interval_minutes: i64,
+) -> Option<(i64, f64, f64, i64)> {
+    let &(close, volume, timestamp) = bars.last()?;
+    Some((bar_bucket(timestamp as u64, candle_interval_minutes), close, volume, timestamp))
+}
+
 impl PythonBridgeStrategy {
     pub fn new(config: StrategyConfig) -> Self {
         Self {
@@ -955,10 +992,33 @@ impl Strategy for PythonBridgeStrategy {
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_CANDLE_INTERVAL_MINUTES);
 
+        // Warm-start the bar buffer from historical data (hostbuilder fetches
+        // it before constructing this config -- see
+        // hostbuilder::fetch_warm_start_bars) instead of starting from zero
+        // bars after every restart. Absent when the fetch failed/was
+        // skipped -- this must never block initialize() from succeeding.
+        let warm_start_bars = parse_warm_start_bars(&self.config.parameters);
+
+        if let Some(worker) = self.worker.as_mut() {
+            for &(close, volume, timestamp) in &warm_start_bars {
+                // Best-effort: a single bad historical bar shouldn't abort an
+                // otherwise-successful warm-start, or block initialize().
+                let _ = worker.push_bar(close, volume, timestamp);
+            }
+        }
+        if let Some(seed) = seed_bucket_from_warm_start(&warm_start_bars, self.candle_interval_minutes) {
+            self.last_bucket = Some(seed.0);
+            self.pending_close = seed.1;
+            self.pending_volume = seed.2;
+            self.pending_timestamp = seed.3;
+        }
+        self.bars_since_init = warm_start_bars.len() as u32;
+
         let logger = SignalEngineLogger::new("StrategyHandler").await;
         logger.info(&format!(
-            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?})",
-            self.config.name, self.candle_interval_minutes, self.resolved_params.get("position_size_pct")
+            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?}, warm_start_bars={})",
+            self.config.name, self.candle_interval_minutes, self.resolved_params.get("position_size_pct"),
+            self.bars_since_init,
         )).await;
         Ok(())
     }
@@ -1249,6 +1309,56 @@ mod tests {
         let one_minute_ns: u64 = 60 * 1_000_000_000;
         assert_eq!(bar_bucket(0, 0), bar_bucket(0, 1));
         assert_ne!(bar_bucket(one_minute_ns, 0), bar_bucket(2 * one_minute_ns, 0));
+    }
+
+    #[test]
+    fn parse_warm_start_bars_returns_empty_when_key_absent() {
+        let params: HashMap<String, serde_json::Value> = HashMap::new();
+        assert_eq!(parse_warm_start_bars(&params), vec![]);
+    }
+
+    #[test]
+    fn parse_warm_start_bars_extracts_valid_triples_in_order() {
+        let mut params = HashMap::new();
+        params.insert(
+            "warm_start_bars".to_string(),
+            serde_json::json!([[100.0, 5.0, 1000], [101.5, 3.0, 2000]]),
+        );
+        assert_eq!(
+            parse_warm_start_bars(&params),
+            vec![(100.0, 5.0, 1000), (101.5, 3.0, 2000)]
+        );
+    }
+
+    #[test]
+    fn parse_warm_start_bars_skips_malformed_entries_without_panicking() {
+        let mut params = HashMap::new();
+        params.insert(
+            "warm_start_bars".to_string(),
+            serde_json::json!([[100.0, 5.0, 1000], "not a triple", [102.0, 1.0]]),
+        );
+        // Second entry isn't an array, third is missing the timestamp --
+        // both silently dropped; only the well-formed entry survives.
+        assert_eq!(parse_warm_start_bars(&params), vec![(100.0, 5.0, 1000)]);
+    }
+
+    #[test]
+    fn parse_warm_start_bars_returns_empty_when_value_is_not_an_array() {
+        let mut params = HashMap::new();
+        params.insert("warm_start_bars".to_string(), serde_json::json!("oops"));
+        assert_eq!(parse_warm_start_bars(&params), vec![]);
+    }
+
+    #[test]
+    fn seed_bucket_from_warm_start_returns_none_for_empty_bars() {
+        assert_eq!(seed_bucket_from_warm_start(&[], 240), None);
+    }
+
+    #[test]
+    fn seed_bucket_from_warm_start_seeds_from_the_last_bar() {
+        let bars = vec![(100.0, 5.0, 1_000_000_000_000), (101.5, 3.0, 2_000_000_000_000)];
+        let seed = seed_bucket_from_warm_start(&bars, 240).expect("seed from last bar");
+        assert_eq!(seed, (bar_bucket(2_000_000_000_000, 240), 101.5, 3.0, 2_000_000_000_000));
     }
 
     #[test]

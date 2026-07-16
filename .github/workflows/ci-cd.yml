@@ -71,6 +71,13 @@ jobs:
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: SimulationEngine
 
+      - name: Checkout BacktestingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingEngine
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,8 +134,16 @@ jobs:
           # 14/14 pass every time; parallel: 3/14 intermittently fail with
           # "python worker thread dropped result sender").
           cargo test -p pythonbridge-worker -- --test-threads=1
+          # strategyhandler's PythonBridgeStrategy also spawns pythonbridge-worker
+          # subprocesses (create_strategy/initialize) -- same PyO3 process-wide
+          # interpreter contention as above. Confirmed locally: a freshly-added
+          # bars_since_init test deterministically fails under the default
+          # parallel runner (28/28 pass single-threaded every time; one
+          # consistently fails in parallel), same category as the two carve-outs
+          # above, not flaky/order-random.
+          cargo test -p strategyhandler -- --test-threads=1
           # Run all other tests in parallel
-          if cargo test --workspace --exclude datahandler --exclude pythonbridge-worker; then
+          if cargo test --workspace --exclude datahandler --exclude pythonbridge-worker --exclude strategyhandler; then
             echo "[OK] Tests passed!"
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else
@@ -207,6 +222,14 @@ jobs:
           path: SimulationEngine
           fetch-depth: 0
 
+      - name: Checkout BacktestingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingEngine
+          fetch-depth: 0
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -230,7 +253,7 @@ jobs:
           set -e
           echo "Building Docker image..."
 
-          REQUIRED_DEPS=("LoggingEngine" "MessageBrokerEngine" "databaseschema" "SimulationEngine")
+          REQUIRED_DEPS=("LoggingEngine" "MessageBrokerEngine" "databaseschema" "SimulationEngine" "BacktestingEngine")
           for DEP in "${REQUIRED_DEPS[@]}"; do
             if [ -d "$DEP" ]; then
               echo "[OK] Dependency found: $DEP"
@@ -477,6 +500,7 @@ jobs:
           OPTIONAL_SECRETS=(
             "ELASTIC-CLOUD-ENDPOINT" "ELASTIC-CLOUD-USERNAME" "ELASTIC-CLOUD-PASSWORD"
             "CREDENTIALS-ENCRYPTION-KEY"
+            "MASSIVE-API-KEY"
           )
 
           echo "[INFO] Fetching required secrets..."
@@ -563,6 +587,15 @@ jobs:
             --from-literal=endpoint="${ELASTIC_CLOUD_ENDPOINT:-}" \
             --from-literal=username="${ELASTIC_CLOUD_USERNAME:-}" \
             --from-literal=password="${ELASTIC_CLOUD_PASSWORD:-}" \
+            --namespace=${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # Massive API (Polygon.io market data) -- used to warm-start a
+          # strategy's bar history on init (hostbuilder::fetch_warm_start_bars).
+          # Optional: an empty key just skips warm-start gracefully, unlike
+          # BacktestingEngine where this same vault secret is required.
+          kubectl create secret generic signalengine-massive-secret \
+            --from-literal=apiKey="${MASSIVE_API_KEY:-}" \
             --namespace=${{ env.NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
 

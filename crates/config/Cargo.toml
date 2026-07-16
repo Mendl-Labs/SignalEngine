@@ -1,5 +1,13 @@
 [package]
-name = "config"
+# Renamed from "config" -- collided with BacktestingEngine's own unrelated
+# "config" crate (v0.1.0) once SignalEngine's hostbuilder started depending
+# on BacktestingEngine's dataloader crate (for warm-start historical bar
+# fetching), which itself depends on BacktestingEngine's config crate.
+# Cargo can't disambiguate two different physical crates sharing the same
+# name+version in one unified dependency graph. Dependents alias this back
+# to `config` via `package = "signalengine-config"` in their own Cargo.toml,
+# so no source code (`config::...`) needed to change.
+name = "signalengine-config"
 version = "0.1.0"
 edition = "2021"
 

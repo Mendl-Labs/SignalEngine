@@ -277,6 +277,9 @@ use ultra_logger::{ultra_info, ultra_warn, ultra_error};
 use ultra_signal::hash_symbol;
 use lazy_static::lazy_static;
 
+#[cfg(feature = "postgres")]
+use dataloader::{MassiveDataProvider, MarketDataProvider, DataRequest, CandleGranularity, Exchange, MarketData};
+
 // Re-export the global storage from datahandler and portfoliohandler
 pub use datahandler::ORDERBOOKS;
 pub use portfoliohandler::PORTFOLIOS;
@@ -335,6 +338,111 @@ lazy_static! {
     /// by the market-health writer's 30s tick -- the write path behind the
     /// dashboard's "still warming up" indicator.
     pub static ref LAST_BARS_ACCUMULATED: DashMap<uuid::Uuid, u32> = DashMap::new();
+}
+
+/// How many historical bars to warm-start with, comfortably under the
+/// worker's own `WINDOW_SIZE=200` rolling-window cap set in
+/// `worker.initialize()` (strategyhandler).
+#[cfg(feature = "postgres")]
+const WARM_START_BAR_COUNT: i64 = 100;
+
+/// Fetch up to `WARM_START_BAR_COUNT` historical bars to pre-seed a
+/// strategy's bar buffer on init, instead of starting from zero bars after
+/// every restart (a strategy's bar history lives only in the Python
+/// worker's in-memory state). Reuses BacktestingEngine's `dataloader` crate
+/// (Massive/Polygon.io) -- the same provider forex backtests already use as
+/// a proxy for Oanda (no historical Oanda candle API exists in this
+/// codebase), so this isn't a new/different data source for Oanda-traded
+/// deployments, just the same one reused live.
+///
+/// Returns `None` on ANY failure (missing `MASSIVE_API_KEY`, network error,
+/// no data returned, or a `candle_interval_minutes` with no matching
+/// granularity) -- a live deployment must never fail to start because a
+/// nice-to-have historical fetch failed. Returns `Some(vec![])` is never
+/// produced; an empty successful fetch is treated the same as a failure.
+#[cfg(feature = "postgres")]
+async fn fetch_warm_start_bars(
+    exchange: &str,
+    symbol: &str,
+    asset_class: Option<&str>,
+    candle_interval_minutes: i64,
+) -> Option<Vec<(f64, f64, i64)>> {
+    let provider = match MassiveDataProvider::from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            ultra_warn!(format!(
+                "Warm-start skipped for {}/{}: MASSIVE_API_KEY unavailable ({})",
+                exchange, symbol, e
+            ));
+            return None;
+        }
+    };
+
+    let granularity = CandleGranularity::from_minutes(candle_interval_minutes);
+    let to = chrono::Utc::now().date_naive();
+    // Generous padding (weekends/holidays/thin forex sessions can leave gaps)
+    // -- 3x the raw span comfortably covers WARM_START_BAR_COUNT real bars.
+    let span_minutes = candle_interval_minutes.max(1) * WARM_START_BAR_COUNT * 3;
+    let from = to - chrono::Duration::minutes(span_minutes);
+
+    let mut request = DataRequest::new(Exchange::from_str(exchange), symbol, from, to)
+        .with_granularity(granularity);
+    if let Some(ac) = asset_class {
+        request = request.with_asset_class(ac);
+    }
+
+    let bars = match provider.fetch(&request).await {
+        Ok(bars) => bars,
+        Err(e) => {
+            ultra_warn!(format!(
+                "Warm-start skipped for {}/{}: historical fetch failed ({})",
+                exchange, symbol, e
+            ));
+            return None;
+        }
+    };
+
+    let mut triples: Vec<(f64, f64, i64)> = bars
+        .into_iter()
+        .filter_map(|md| match md {
+            MarketData::Candle(c) => {
+                let ts_ns = c.timestamp.timestamp_nanos_opt()?;
+                Some((c.close, c.volume, ts_ns))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if triples.is_empty() {
+        ultra_warn!(format!(
+            "Warm-start skipped for {}/{}: provider returned no candle data",
+            exchange, symbol
+        ));
+        return None;
+    }
+
+    // Provider contract guarantees timestamp order, but keep only the most
+    // recent WARM_START_BAR_COUNT in case padding pulled in more.
+    if triples.len() > WARM_START_BAR_COUNT as usize {
+        triples.drain(0..(triples.len() - WARM_START_BAR_COUNT as usize));
+    }
+
+    ultra_info!(format!(
+        "\u{1f4c8} Warm-started {} historical bars for {}/{}, spanning {}..{}",
+        triples.len(), symbol, exchange, from, to
+    ));
+
+    Some(triples)
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn fetch_warm_start_bars(
+    _exchange: &str,
+    _symbol: &str,
+    _asset_class: Option<&str>,
+    _candle_interval_minutes: i64,
+) -> Option<Vec<(f64, f64, i64)>> {
+    None
 }
 
 #[automock]
@@ -1129,6 +1237,31 @@ impl HostedObject {
                                 "candle_interval_minutes".to_string(),
                                 serde_json::json!(interval),
                             );
+                        }
+                        // Warm-start the strategy's bar buffer from historical
+                        // data instead of starting from zero bars -- multi-symbol
+                        // portfolio deployments share ONE strategy instance with
+                        // single (not per-symbol) bar-bucketing state (see
+                        // PythonBridgeStrategy's fields), matching how live-mode
+                        // credential loading above already picks just
+                        // target_exchanges[0] for multi-exchange deployments, so
+                        // this uses just symbols[0]/target_exchanges[0] too.
+                        if let Some(interval) = strategy.candle_interval_minutes {
+                            if let (Some(symbol), Some(exchange)) =
+                                (strategy.symbols.first(), strategy.target_exchanges.first())
+                            {
+                                if let Some(bars) = fetch_warm_start_bars(
+                                    exchange,
+                                    symbol,
+                                    strategy.asset_class.as_deref(),
+                                    interval,
+                                ).await {
+                                    strat_params.insert(
+                                        "warm_start_bars".to_string(),
+                                        serde_json::json!(bars),
+                                    );
+                                }
+                            }
                         }
                         let strat_config = StrategyConfig {
                             id: strategy_id_hash.to_string(),

@@ -96,6 +96,14 @@ pub struct DeploymentPythonConfig {
     /// ticks (seconds) instead of ~100 hours, and its holding-period exit
     /// fire in seconds instead of hours.
     pub candle_interval_minutes: Option<i64>,
+    /// The strategy's declared asset class (`backtest_jobs.params_json.asset_class`,
+    /// e.g. "forex", "crypto"). Needed to warm-start a strategy's bar history
+    /// from Massive/Polygon historical data on init: Polygon's forex ticker
+    /// mapping (e.g. "USD-ZAR" -> "C:USDZAR") only fires when asset_class is
+    /// exactly "forex" -- it is never inferred from the exchange string, so
+    /// without this a forex warm-start fetch would silently use the wrong
+    /// (crypto-style) ticker format.
+    pub asset_class: Option<String>,
 }
 
 /// Information about a deployed strategy for tracking
@@ -158,6 +166,8 @@ pub struct DeployedStrategy {
     /// ticks into bars of this size before calling `compute_signals()` --
     /// see `DeploymentPythonConfig`'s doc for why this matters.
     pub candle_interval_minutes: Option<i64>,
+    /// The strategy's declared asset class, see `DeploymentPythonConfig::asset_class`.
+    pub asset_class: Option<String>,
 }
 
 impl DeployedStrategy {
@@ -230,6 +240,7 @@ impl DeployedStrategy {
             position_size_pct: risk_meta.get("position_size_pct").and_then(|v| v.as_f64()),
             python_source_code: python_config.python_source_code,
             candle_interval_minutes: python_config.candle_interval_minutes,
+            asset_class: python_config.asset_class,
         })
     }
 
@@ -344,20 +355,25 @@ impl DeploymentSubscriber {
                 .await
                 .ok()?;
 
-            // candle_interval_minutes lives on the originating backtest_jobs
-            // row's params_json, not on backtest_results itself -- same join
-            // reconcile_active_deployments_from_db already does.
-            let candle_interval_minutes: Option<i64> = backtest_jobs::table
+            // candle_interval_minutes and asset_class both live on the
+            // originating backtest_jobs row's params_json, not on
+            // backtest_results itself -- same join reconcile_active_deployments_from_db
+            // already does for candle_interval_minutes.
+            let params_json: Option<serde_json::Value> = backtest_jobs::table
                 .filter(backtest_jobs::result_id.eq(Some(backtest_result_id)))
                 .select(backtest_jobs::params_json)
                 .first::<serde_json::Value>(&mut conn)
                 .await
                 .optional()
                 .ok()
-                .flatten()
+                .flatten();
+            let candle_interval_minutes = params_json.as_ref()
                 .and_then(|params| params.get("candle_interval_minutes").and_then(|v| v.as_i64()));
+            let asset_class = params_json.as_ref()
+                .and_then(|params| params.get("asset_class").and_then(|v| v.as_str()))
+                .map(String::from);
 
-            Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes })
+            Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes, asset_class })
         }
 
         inner(strategy_id).await.unwrap_or_default()
@@ -610,12 +626,17 @@ impl DeploymentSubscriber {
             let candle_interval_minutes = params_json
                 .get("candle_interval_minutes")
                 .and_then(|v| v.as_i64());
+            let asset_class = params_json
+                .get("asset_class")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             Self::handle_deployment(
                 deployment_msg,
                 DeploymentPythonConfig {
                     python_source_code: backtest.python_source_code.clone(),
                     candle_interval_minutes,
+                    asset_class,
                 },
                 &self.deployed_strategies,
                 self.publisher.as_ref(),
@@ -1033,6 +1054,7 @@ mod tests {
             DeploymentPythonConfig {
                 python_source_code: Some("class Strategy:\n    pass".to_string()),
                 candle_interval_minutes: Some(240),
+                asset_class: Some("forex".to_string()),
             },
         )
         .unwrap();
@@ -1043,5 +1065,6 @@ mod tests {
             Some("class Strategy:\n    pass".to_string())
         );
         assert_eq!(strategy.candle_interval_minutes, Some(240));
+        assert_eq!(strategy.asset_class, Some("forex".to_string()));
     }
 }

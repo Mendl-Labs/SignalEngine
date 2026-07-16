@@ -128,6 +128,15 @@ spec:
                   name: signalengine-credentials-encryption
                   key: key
                   optional: true
+            # Massive API (Polygon.io market data) -- used to warm-start a
+            # strategy's bar history on init. Optional: absent/empty just
+            # skips warm-start gracefully, never blocks startup.
+            - name: MASSIVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-massive-secret
+                  key: apiKey
+                  optional: true
             # System environment variables
             - name: POD_NAME
               valueFrom:
