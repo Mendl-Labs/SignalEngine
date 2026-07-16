@@ -106,6 +106,31 @@ pub struct DeploymentPythonConfig {
     pub asset_class: Option<String>,
 }
 
+/// Resolves `asset_class` from a `backtest_jobs.params_json` value. Checks
+/// the top-level key first, but every observed portfolio deployment (2+
+/// symbols, e.g. a forex portfolio) leaves that top-level key `null` --
+/// asset_class only gets set per-asset inside `portfolio_assets[].asset_class`
+/// (a single top-level field can't represent a portfolio that could mix
+/// asset classes). Falls back to the FIRST portfolio asset's declared
+/// class, matching the existing simplification elsewhere in this codebase
+/// of treating `symbols[0]`/`target_exchanges[0]` as the representative
+/// symbol/exchange for a multi-symbol deployment (e.g. hostbuilder's
+/// warm-start fetch and its live-mode credential loading).
+#[cfg(feature = "postgres")]
+fn resolve_asset_class(params_json: &serde_json::Value) -> Option<String> {
+    if let Some(s) = params_json.get("asset_class").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+    params_json
+        .get("portfolio_assets")?
+        .as_array()?
+        .iter()
+        .next()?
+        .get("asset_class")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Information about a deployed strategy for tracking
 #[derive(Debug)]
 pub struct DeployedStrategy {
@@ -369,9 +394,7 @@ impl DeploymentSubscriber {
                 .flatten();
             let candle_interval_minutes = params_json.as_ref()
                 .and_then(|params| params.get("candle_interval_minutes").and_then(|v| v.as_i64()));
-            let asset_class = params_json.as_ref()
-                .and_then(|params| params.get("asset_class").and_then(|v| v.as_str()))
-                .map(String::from);
+            let asset_class = params_json.as_ref().and_then(resolve_asset_class);
 
             Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes, asset_class })
         }
@@ -626,10 +649,7 @@ impl DeploymentSubscriber {
             let candle_interval_minutes = params_json
                 .get("candle_interval_minutes")
                 .and_then(|v| v.as_i64());
-            let asset_class = params_json
-                .get("asset_class")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let asset_class = resolve_asset_class(&params_json);
 
             Self::handle_deployment(
                 deployment_msg,
@@ -992,6 +1012,51 @@ mod tests {
     fn test_topic_constants() {
         assert_eq!(topics::STRATEGY_DEPLOYMENT, "strategy.deployment");
         assert_eq!(topics::STRATEGY_DEACTIVATION, "strategy.deactivation");
+    }
+
+    #[test]
+    fn resolve_asset_class_prefers_top_level_key() {
+        let params = serde_json::json!({
+            "asset_class": "crypto",
+            "portfolio_assets": [{"asset_class": "forex"}],
+        });
+        assert_eq!(resolve_asset_class(&params), Some("crypto".to_string()));
+    }
+
+    #[test]
+    fn resolve_asset_class_falls_back_to_first_portfolio_asset() {
+        // Confirmed live in production: every observed oanda portfolio
+        // deployment leaves the top-level asset_class null and only sets it
+        // per-asset inside portfolio_assets.
+        let params = serde_json::json!({
+            "asset_class": null,
+            "portfolio_assets": [
+                {"symbol": "USD-ZAR", "asset_class": "forex"},
+                {"symbol": "AUD-NZD", "asset_class": "forex"},
+            ],
+        });
+        assert_eq!(resolve_asset_class(&params), Some("forex".to_string()));
+    }
+
+    #[test]
+    fn resolve_asset_class_none_when_both_sources_absent() {
+        let params = serde_json::json!({"asset_class": null});
+        assert_eq!(resolve_asset_class(&params), None);
+    }
+
+    #[test]
+    fn resolve_asset_class_none_when_portfolio_assets_is_empty() {
+        let params = serde_json::json!({"asset_class": null, "portfolio_assets": []});
+        assert_eq!(resolve_asset_class(&params), None);
+    }
+
+    #[test]
+    fn resolve_asset_class_none_when_first_portfolio_asset_lacks_the_field() {
+        let params = serde_json::json!({
+            "asset_class": null,
+            "portfolio_assets": [{"symbol": "USD-ZAR"}],
+        });
+        assert_eq!(resolve_asset_class(&params), None);
     }
 
     #[test]
