@@ -35,7 +35,14 @@ use crate::core::traits::ExchangeConnector;
 pub struct PaperTradingConfig {
     /// Simulated slippage in basis points
     pub slippage_bps: f64,
-    /// Probability of partial fills (0.0 to 1.0)
+    /// Probability of a fill being randomly shrunk to 10-80% of the
+    /// requested quantity, independent of the mock order book's actual
+    /// depth (0.0 to 1.0). Separate from, and stacks on top of, the
+    /// legitimate per-level depth clip in `simulate_market_order` — this
+    /// is pure simulated noise, not a liquidity model. Defaults to 0 so
+    /// paper-trading deployments (whose whole purpose is validating real
+    /// strategy sizing behavior) aren't corrupted by unexplained random
+    /// fill-size variance.
     pub partial_fill_probability: f64,
     /// Base latency for simulated execution in milliseconds
     pub base_latency_ms: f64,
@@ -49,7 +56,7 @@ impl Default for PaperTradingConfig {
     fn default() -> Self {
         Self {
             slippage_bps: 5.0,
-            partial_fill_probability: 0.1,
+            partial_fill_probability: 0.0,
             base_latency_ms: 10.0,
             taker_fee_bps: 10.0,
             realism: None,
@@ -551,7 +558,7 @@ mod tests {
     fn test_config_default() {
         let cfg = PaperTradingConfig::default();
         assert!((cfg.slippage_bps - 5.0).abs() < f64::EPSILON);
-        assert!((cfg.partial_fill_probability - 0.1).abs() < f64::EPSILON);
+        assert!((cfg.partial_fill_probability - 0.0).abs() < f64::EPSILON);
         assert!((cfg.base_latency_ms - 10.0).abs() < f64::EPSILON);
     }
 
