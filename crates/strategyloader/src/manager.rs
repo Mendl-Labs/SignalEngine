@@ -377,7 +377,39 @@ impl StrategyManager {
     ///
     /// Signals generated via `on_bar()` are stored and fanned out through the
     /// same signal handlers as tick-level signals.
+    ///
+    /// Also refreshes any registered paper-connector order book for this
+    /// symbol/exchange with the bar's own close price, same as
+    /// `on_market_data` does for live bid/ask ticks. Before this, a
+    /// bar-driven strategy's signals and a paper connector's mock order book
+    /// were fed by two completely independent sources -- `on_bar` (this
+    /// method) never touched `paper_book_sinks` at all, only
+    /// `on_market_data`'s separate bid/ask tick stream did. For a thinly
+    /// traded pair whose tick stream can go quiet for hours (confirmed live:
+    /// a 4H-bar USD-ZAR strategy filled two market orders hours, and once a
+    /// full weekend, apart at the exact same price to 8 decimal places --
+    /// the mock book simply hadn't been refreshed since a live tick last
+    /// arrived), a signal could fire on schedule every 4 hours while its
+    /// fill price silently went stale for however long the independent tick
+    /// feed happened to lag. Forwarding the bar's close here means the book
+    /// is always synchronized with the exact price that generated the
+    /// signal, regardless of whether the tick feed has said anything
+    /// recently -- done unconditionally on every bar, not just bars that
+    /// produce a signal, so the book never lags behind the strategy's own
+    /// view of price at all.
     pub async fn on_bar(&self, event: &BarEvent) -> Vec<Signal> {
+        {
+            let key = (event.symbol.to_uppercase(), event.exchange.to_lowercase());
+            let sinks = self.paper_book_sinks.read();
+            if let Some(sink_list) = sinks.get(&key) {
+                let bids = vec![(event.close, 1.0)];
+                let asks = vec![(event.close, 1.0)];
+                for sink in sink_list {
+                    sink(&event.symbol, bids.clone(), asks.clone());
+                }
+            }
+        }
+
         let mut all_signals = Vec::new();
 
         // Route by symbol/exchange — same router as tick data.
@@ -692,5 +724,77 @@ mod tests {
         let asset_state = state.get_asset("BTC/USD", "kraken");
         assert!(asset_state.is_some());
         assert!(asset_state.unwrap().price_history.len() > 0);
+    }
+
+    fn test_bar_event(symbol: &str, exchange: &str, close: f64) -> BarEvent {
+        BarEvent {
+            symbol: symbol.into(),
+            exchange: exchange.into(),
+            bar_start_ms: 0,
+            bar_end_ms: 14_400_000,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 100.0,
+            trade_count: 1,
+            interval_secs: 14_400,
+        }
+    }
+
+    // Regression: `on_bar` used to never touch `paper_book_sinks` at all --
+    // only `on_market_data`'s independent bid/ask tick stream refreshed a
+    // paper connector's mock order book. A bar-driven strategy (e.g. a 4H
+    // Z-score mean reversion) could fire a signal every bar on schedule
+    // while its paper fill silently priced against a tick feed that hadn't
+    // said anything in hours -- confirmed live on a thinly-traded USD-ZAR
+    // pair where two market orders filled at the identical price to 8
+    // decimal places, once 8 hours and once a full weekend apart.
+    #[tokio::test]
+    async fn on_bar_refreshes_the_paper_order_book_with_the_bars_own_close() {
+        let loader = MockLoader { strategies: vec![] };
+        let manager = StrategyManager::new(Arc::new(loader)).await;
+
+        let received: Arc<parking_lot::Mutex<Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        manager.register_paper_book_sink(
+            "USD-ZAR",
+            "oanda",
+            Arc::new(move |symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>| {
+                received_clone.lock().push((symbol.to_string(), bids, asks));
+            }),
+        );
+
+        let event = test_bar_event("USD-ZAR", "oanda", 16.55123456);
+        let _signals = manager.on_bar(&event).await;
+
+        let calls = received.lock();
+        assert_eq!(calls.len(), 1, "on_bar must refresh the registered paper book sink exactly once per bar");
+        let (symbol, bids, asks) = &calls[0];
+        assert_eq!(symbol, "USD-ZAR");
+        assert_eq!(bids, &vec![(16.55123456, 1.0)]);
+        assert_eq!(asks, &vec![(16.55123456, 1.0)]);
+    }
+
+    #[tokio::test]
+    async fn on_bar_does_not_touch_unrelated_symbol_sinks() {
+        let loader = MockLoader { strategies: vec![] };
+        let manager = StrategyManager::new(Arc::new(loader)).await;
+
+        let received: Arc<parking_lot::Mutex<Vec<f64>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        manager.register_paper_book_sink(
+            "EUR-USD",
+            "oanda",
+            Arc::new(move |_symbol: &str, bids: Vec<(f64, f64)>, _asks: Vec<(f64, f64)>| {
+                received_clone.lock().push(bids[0].0);
+            }),
+        );
+
+        let event = test_bar_event("USD-ZAR", "oanda", 16.55123456);
+        let _signals = manager.on_bar(&event).await;
+
+        assert!(received.lock().is_empty(), "a bar for a different symbol must not trigger an unrelated sink");
     }
 }
