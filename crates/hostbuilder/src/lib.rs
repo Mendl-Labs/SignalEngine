@@ -1341,14 +1341,16 @@ impl HostedObject {
                             );
                         }
                         // Warm-start the strategy's bar buffer from historical
-                        // data instead of starting from zero bars -- multi-symbol
-                        // portfolio deployments share ONE strategy instance with
-                        // single (not per-symbol) bar-bucketing state (see
-                        // PythonBridgeStrategy's fields), so this still only
-                        // warm-starts from symbols[0]/target_exchanges[0] --
-                        // orthogonal to the venues-list plumbing below, which is
-                        // about market-data tagging and credential loading, not
-                        // per-symbol/per-venue bar state.
+                        // data instead of starting from zero bars. PythonBridgeStrategy
+                        // now keeps fully independent bar/position state per
+                        // (symbol, exchange) leg (each leg gets its own worker
+                        // process -- see PythonBridgeStrategy::legs's doc for the
+                        // cross-leg contamination bug this fixed), but historical
+                        // data is only ever fetched here for the deployment's
+                        // primary leg (symbols[0]/target_exchanges[0]) -- every
+                        // other leg still starts from zero bars and warms up
+                        // live. Extending warm-start fetch to every leg is a
+                        // separate, larger change than that contamination fix.
                         if let Some(interval) = strategy.candle_interval_minutes {
                             if let (Some(symbol), Some(exchange)) =
                                 (strategy.symbols.first(), strategy.target_exchanges.first())

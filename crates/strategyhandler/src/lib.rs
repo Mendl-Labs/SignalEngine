@@ -827,19 +827,36 @@ impl Strategy for SimpleMarketMakingStrategy {
 /// function's doc).
 pub struct PythonBridgeStrategy {
     config: StrategyConfig,
-    worker: Option<pythonbridge_worker::client::WorkerProcess>,
-    /// This strategy's own last non-flat signal direction (+1 long, -1
-    /// short), used only to size a CLOSE signal's flattening order. NOT
-    /// authoritative against the real broker/deployment_positions state --
-    /// after a worker restart this resets to `None`, so a CLOSE signal
-    /// arriving with no locally-tracked entry is dropped (logged, not
-    /// acted on) rather than guessed. Real position truth lives downstream
-    /// in `deployment_positions`, which nets correctly regardless via the
-    /// avg-cost engine even if this local proxy's size is imprecise.
-    last_side: Option<i8>,
-    last_quantity: f64,
+    /// One independent `LegState` -- its own Python worker process, bar
+    /// accumulator, and position-tracking proxy -- per `(symbol, exchange)`
+    /// leg this deployment has seen a tick for, spawned lazily on first use
+    /// (see `spawn_leg`). NEVER shared across legs.
+    ///
+    /// This used to be a set of single, deployment-wide fields (one shared
+    /// `worker`, one shared `last_side`/`last_quantity`, one shared bar
+    /// accumulator) even though a multi-asset portfolio deployment shares
+    /// ONE `PythonBridgeStrategy` instance across every symbol it trades.
+    /// That meant a bar closed from one symbol's tick could feed the shared
+    /// worker's rolling window, and -- critically -- a CLOSE-type signal
+    /// computed while processing a *different* symbol's tick would reuse
+    /// the stale shared `last_quantity`/`last_side` left over from whichever
+    /// symbol traded last, executing an order sized and directioned for one
+    /// asset but tagged and filled against a completely different one. This
+    /// is precisely the bug that produced an apparent ~13.7x oversized,
+    /// wrong-symbol order on a live 3-asset forex portfolio deployment: a
+    /// quantity sized off one currency pair's price got executed against a
+    /// different pair whose price-per-unit was ~13.7x higher, and looked
+    /// like accidental leverage even though no leverage concept exists
+    /// anywhere in the sizing formula.
+    ///
+    /// Keying by `(symbol, exchange)` rather than just `symbol` also makes
+    /// this correct for cross-venue portfolios (e.g. the same symbol traded
+    /// on two different exchanges as an arbitrage pair) -- each leg gets
+    /// its own fully independent state regardless of whether legs share a
+    /// symbol, share a venue, both, or neither.
+    legs: HashMap<(String, String), LegState>,
     /// Bar interval (minutes) ticks are aggregated into before being pushed
-    /// to the worker. Resolved once in `initialize()` from
+    /// to a leg's worker. Resolved once in `initialize()` from
     /// `config.parameters["candle_interval_minutes"]` (defaults to
     /// `DEFAULT_CANDLE_INTERVAL_MINUTES` when absent). Without this, every
     /// tick would be pushed as its own "bar" -- a strategy tuned for e.g.
@@ -847,31 +864,107 @@ pub struct PythonBridgeStrategy {
     /// instead of ~100 hours, and its holding-period exit fire in seconds
     /// instead of hours (this is exactly the bug being fixed here).
     candle_interval_minutes: i64,
+    /// The strategy's own resolved `self.params`, reported back by the
+    /// worker after a leg's `initialize()` call -- the only reliable source
+    /// for values like `position_size_pct` that AI-generated strategies bake
+    /// directly into source rather than expose as a separate structured DB
+    /// field (`config.parameters["position_size_pct"]`, sourced from
+    /// `backtest_jobs.params_json`, is `None` in practice for these
+    /// strategies -- see `DeployedStrategy::position_size_pct`'s doc).
+    /// Identical across every leg (same Python source), so kept as one
+    /// deployment-wide value rather than duplicated per leg.
+    resolved_params: HashMap<String, f64>,
+}
+
+/// One `(symbol, exchange)` leg's independent state within a
+/// `PythonBridgeStrategy` instance. See `PythonBridgeStrategy::legs`'s doc
+/// for why this exists.
+struct LegState {
+    worker: pythonbridge_worker::client::WorkerProcess,
+    /// This leg's own last non-flat signal direction (+1 long, -1 short),
+    /// used only to size a CLOSE signal's flattening order. NOT
+    /// authoritative against the real broker/deployment_positions state --
+    /// after a worker restart this resets to `None`, so a CLOSE signal
+    /// arriving with no locally-tracked entry is dropped (logged, not acted
+    /// on) rather than guessed. Real position truth lives downstream in
+    /// `deployment_positions`, which nets correctly regardless via the
+    /// avg-cost engine even if this local proxy's size is imprecise.
+    last_side: Option<i8>,
+    last_quantity: f64,
+    /// This leg's bar accumulator -- see `BarAccumulator`'s doc.
+    acc: BarAccumulator,
+    /// How many bars have been pushed to this leg's worker since it was
+    /// spawned -- surfaced to the dashboard so "still building required
+    /// history" (e.g. a 25-bar lookback strategy needs 25 closed bars
+    /// before it can compute anything) is never mistaken for a broken
+    /// deployment. Starts at 0, or at the warm-start count for the primary
+    /// leg (see `PythonBridgeStrategy::spawn_leg`).
+    bars_since_init: u32,
+}
+
+/// A `(symbol, exchange)` leg's bar-bucketing state: accumulates ticks into
+/// the current, not-yet-closed bar and reports the just-closed bar's
+/// (close, volume, timestamp) once a tick lands in a new bucket. Pure state
+/// with no I/O, so the per-leg independence `PythonBridgeStrategy::legs`
+/// relies on is directly unit-testable without spawning a real Python
+/// worker subprocess -- see `accumulate_tick`'s tests.
+#[derive(Debug, Clone, Default)]
+struct BarAccumulator {
     /// The last tick's bar-bucket index (see `bar_bucket`). `None` until
-    /// the first tick ever seen -- there's nothing to close yet at that
-    /// point, so it's just recorded, not pushed.
+    /// the first tick this leg has ever seen -- there's nothing to close
+    /// yet at that point, so it's just recorded, not pushed.
     last_bucket: Option<i64>,
-    /// Accumulated close price/volume/timestamp for the CURRENT,
-    /// not-yet-closed bar (updated on every tick within the same bucket;
-    /// pushed to the worker only once a tick lands in a new bucket).
     pending_close: f64,
     pending_volume: f64,
     pending_timestamp: i64,
-    /// The strategy's own resolved `self.params`, reported back by the
-    /// worker after `initialize()` -- the only reliable source for values
-    /// like `position_size_pct` that AI-generated strategies bake directly
-    /// into source rather than expose as a separate structured DB field
-    /// (`config.parameters["position_size_pct"]`, sourced from
-    /// `backtest_jobs.params_json`, is `None` in practice for these
-    /// strategies -- see `DeployedStrategy::position_size_pct`'s doc).
-    resolved_params: HashMap<String, f64>,
-    /// How many bars have been pushed to the worker since this instance was
-    /// (re)initialized -- surfaced to the dashboard so "still building
-    /// required history" (e.g. a 25-bar lookback strategy needs 25 closed
-    /// bars before it can compute anything) is never mistaken for a broken
-    /// deployment. Starts at 0, or at the warm-start count when historical
-    /// bars are seeded in `initialize()`.
-    bars_since_init: u32,
+}
+
+/// Feed one tick into a leg's bar accumulator. Returns `Some((close,
+/// volume, timestamp))` for the bar that just closed when this tick crossed
+/// a bucket boundary, or `None` when the tick just extended the still-open
+/// bar (the common case -- most ticks don't close a bar).
+fn accumulate_tick(
+    acc: &mut BarAccumulator,
+    bucket: i64,
+    mid_price: f64,
+    volume: f64,
+    timestamp_ns: u64,
+) -> Option<(f64, f64, i64)> {
+    match acc.last_bucket {
+        None => {
+            acc.last_bucket = Some(bucket);
+            acc.pending_close = mid_price;
+            acc.pending_volume = volume;
+            acc.pending_timestamp = timestamp_ns as i64;
+            None
+        }
+        Some(prev) if prev == bucket => {
+            acc.pending_close = mid_price;
+            acc.pending_volume += volume;
+            acc.pending_timestamp = timestamp_ns as i64;
+            None
+        }
+        Some(_) => {
+            let closed = (acc.pending_close, acc.pending_volume, acc.pending_timestamp);
+            acc.last_bucket = Some(bucket);
+            acc.pending_close = mid_price;
+            acc.pending_volume = volume;
+            acc.pending_timestamp = timestamp_ns as i64;
+            Some(closed)
+        }
+    }
+}
+
+/// Whether `(symbol, exchange)` is this deployment's primary leg --
+/// `config.symbols[0]`/`config.exchanges[0]`. Only the primary leg gets
+/// warm-started from historical bars (see `spawn_leg`), matching the
+/// pre-existing, unchanged limitation that `hostbuilder::fetch_warm_start_bars`
+/// only ever fetches warm-start data for that one leg -- extending
+/// warm-start to every leg of a portfolio is a separate, larger change than
+/// the cross-leg contamination bug this fixes.
+fn is_primary_leg(config_symbols: &[String], config_exchanges: &[String], symbol: &str, exchange: &str) -> bool {
+    config_symbols.first().map(String::as_str) == Some(symbol)
+        && config_exchanges.first().map(String::as_str) == Some(exchange)
 }
 
 /// Default bar interval when a deployment doesn't declare
@@ -933,27 +1026,16 @@ impl PythonBridgeStrategy {
     pub fn new(config: StrategyConfig) -> Self {
         Self {
             config,
-            worker: None,
-            last_side: None,
-            last_quantity: 0.0,
+            legs: HashMap::new(),
             candle_interval_minutes: DEFAULT_CANDLE_INTERVAL_MINUTES,
-            last_bucket: None,
-            pending_close: 0.0,
-            pending_volume: 0.0,
-            pending_timestamp: 0,
             resolved_params: HashMap::new(),
-            bars_since_init: 0,
         }
     }
-}
 
-#[async_trait]
-impl Strategy for PythonBridgeStrategy {
-    fn config(&self) -> &StrategyConfig {
-        &self.config
-    }
-
-    async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Spawn and initialize a fresh worker process + bar/position state for
+    /// a newly-seen `(symbol, exchange)` leg. Warm-starts from historical
+    /// bars only for the primary leg -- see `is_primary_leg`'s doc.
+    fn spawn_leg(&mut self, symbol: &str, exchange: &str) -> Result<LegState, Box<dyn Error>> {
         let source_code = self
             .config
             .parameters
@@ -978,8 +1060,48 @@ impl Strategy for PythonBridgeStrategy {
         let binary_path = pythonbridge_worker::client::default_binary_path();
         let mut worker = pythonbridge_worker::client::WorkerProcess::spawn(&binary_path)?;
         self.resolved_params = worker.initialize(source_code, parameters, TIMEOUT_SECS, WINDOW_SIZE)?;
-        self.worker = Some(worker);
 
+        let mut leg = LegState {
+            worker,
+            last_side: None,
+            last_quantity: 0.0,
+            acc: BarAccumulator::default(),
+            bars_since_init: 0,
+        };
+
+        if is_primary_leg(&self.config.symbols, &self.config.exchanges, symbol, exchange) {
+            // Warm-start the bar buffer from historical data (hostbuilder
+            // fetches it before constructing this config -- see
+            // hostbuilder::fetch_warm_start_bars) instead of starting from
+            // zero bars after every restart. Absent when the fetch
+            // failed/was skipped -- this must never block spawn_leg from
+            // succeeding.
+            let warm_start_bars = parse_warm_start_bars(&self.config.parameters);
+            for &(close, volume, timestamp) in &warm_start_bars {
+                // Best-effort: a single bad historical bar shouldn't abort an
+                // otherwise-successful warm-start.
+                let _ = leg.worker.push_bar(close, volume, timestamp);
+            }
+            if let Some(seed) = seed_bucket_from_warm_start(&warm_start_bars, self.candle_interval_minutes) {
+                leg.acc.last_bucket = Some(seed.0);
+                leg.acc.pending_close = seed.1;
+                leg.acc.pending_volume = seed.2;
+                leg.acc.pending_timestamp = seed.3;
+            }
+            leg.bars_since_init = warm_start_bars.len() as u32;
+        }
+
+        Ok(leg)
+    }
+}
+
+#[async_trait]
+impl Strategy for PythonBridgeStrategy {
+    fn config(&self) -> &StrategyConfig {
+        &self.config
+    }
+
+    async fn initialize(&mut self) -> Result<(), Box<dyn Error>> {
         self.candle_interval_minutes = self
             .config
             .parameters
@@ -987,85 +1109,58 @@ impl Strategy for PythonBridgeStrategy {
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_CANDLE_INTERVAL_MINUTES);
 
-        // Warm-start the bar buffer from historical data (hostbuilder fetches
-        // it before constructing this config -- see
-        // hostbuilder::fetch_warm_start_bars) instead of starting from zero
-        // bars after every restart. Absent when the fetch failed/was
-        // skipped -- this must never block initialize() from succeeding.
-        let warm_start_bars = parse_warm_start_bars(&self.config.parameters);
-
-        if let Some(worker) = self.worker.as_mut() {
-            for &(close, volume, timestamp) in &warm_start_bars {
-                // Best-effort: a single bad historical bar shouldn't abort an
-                // otherwise-successful warm-start, or block initialize().
-                let _ = worker.push_bar(close, volume, timestamp);
-            }
-        }
-        if let Some(seed) = seed_bucket_from_warm_start(&warm_start_bars, self.candle_interval_minutes) {
-            self.last_bucket = Some(seed.0);
-            self.pending_close = seed.1;
-            self.pending_volume = seed.2;
-            self.pending_timestamp = seed.3;
-        }
-        self.bars_since_init = warm_start_bars.len() as u32;
+        // Eagerly spawn + warm-start only the primary leg here, so deploy-
+        // time validation (a broken Python strategy rejects the deployment
+        // immediately -- see hostbuilder's deploy handler -- rather than
+        // silently failing on its first tick) and warm-start timing are
+        // unchanged from before this fix. Every other leg of a multi-asset
+        // or cross-venue portfolio spawns lazily on its own first tick (see
+        // `spawn_leg`, called from `generate_signals`).
+        let primary_symbol = self.config.symbols.first().cloned().unwrap_or_default();
+        let primary_exchange = self.config.exchanges.first().cloned().unwrap_or_default();
+        let primary_leg = self.spawn_leg(&primary_symbol, &primary_exchange)?;
+        let bars_since_init = primary_leg.bars_since_init;
+        self.legs.insert((primary_symbol.clone(), primary_exchange.clone()), primary_leg);
 
         let logger = SignalEngineLogger::new("StrategyHandler").await;
         logger.info(&format!(
-            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?}, warm_start_bars={})",
+            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?}, warm_start_bars={}, primary_leg=({}, {}))",
             self.config.name, self.candle_interval_minutes, self.resolved_params.get("position_size_pct"),
-            self.bars_since_init,
+            bars_since_init, primary_symbol, primary_exchange,
         )).await;
         Ok(())
     }
 
     async fn generate_signals(&mut self, market_data: &MarketData) -> Result<Vec<Signal>, Box<dyn Error>> {
-        if self.worker.is_none() {
+        if self.legs.is_empty() {
             return Err("PythonBridgeStrategy not initialized".into());
         }
 
+        // Resolve (and lazily spawn, if this is the first tick seen for it)
+        // this tick's own leg -- see `PythonBridgeStrategy::legs`'s doc for
+        // why every leg must have fully independent state.
+        let leg_key = (market_data.symbol.clone(), market_data.exchange.clone());
+        if !self.legs.contains_key(&leg_key) {
+            let leg = self.spawn_leg(&market_data.symbol, &market_data.exchange)?;
+            self.legs.insert(leg_key.clone(), leg);
+        }
+        let leg = self.legs.get_mut(&leg_key).expect("just inserted above if missing");
+
         // Aggregate raw ticks into bars of candle_interval_minutes before
-        // ever calling into the worker -- see the struct's field docs for
-        // why. Only a bucket-boundary crossing pushes a completed bar and
-        // asks for a signal; every other tick just updates the running
+        // ever calling into this leg's worker -- see `BarAccumulator`'s doc
+        // for why. Only a bucket-boundary crossing pushes a completed bar
+        // and asks for a signal; every other tick just updates the running
         // accumulator and returns no signal.
         let bucket = bar_bucket(market_data.timestamp, self.candle_interval_minutes);
-        let bar_closed = match self.last_bucket {
-            None => {
-                // First tick ever -- nothing to close yet.
-                self.last_bucket = Some(bucket);
-                self.pending_close = market_data.mid_price;
-                self.pending_volume = market_data.volume;
-                self.pending_timestamp = market_data.timestamp as i64;
-                false
-            }
-            Some(prev) if prev == bucket => {
-                // Still inside the same bar -- keep accumulating.
-                self.pending_close = market_data.mid_price;
-                self.pending_volume += market_data.volume;
-                self.pending_timestamp = market_data.timestamp as i64;
-                false
-            }
-            Some(_) => true, // bucket changed -- the previous bar just closed
+        let closed_bar = accumulate_tick(&mut leg.acc, bucket, market_data.mid_price, market_data.volume, market_data.timestamp);
+
+        let Some((closed_close, closed_volume, closed_timestamp)) = closed_bar else {
+            return Ok(Vec::new());
         };
 
-        if !bar_closed {
-            return Ok(Vec::new());
-        }
-
-        // Push the just-closed bar, then start the new bucket's accumulator
-        // from this tick.
-        let closed_close = self.pending_close;
-        let closed_volume = self.pending_volume;
-        let closed_timestamp = self.pending_timestamp;
-        self.last_bucket = Some(bucket);
-        self.pending_close = market_data.mid_price;
-        self.pending_volume = market_data.volume;
-        self.pending_timestamp = market_data.timestamp as i64;
-
-        let worker = self.worker.as_mut().ok_or("PythonBridgeStrategy not initialized")?;
-        worker.push_bar(closed_close, closed_volume, closed_timestamp)?;
-        self.bars_since_init += 1;
-        let raw_signal = worker.compute_signal()?;
+        leg.worker.push_bar(closed_close, closed_volume, closed_timestamp)?;
+        leg.bars_since_init += 1;
+        let raw_signal = leg.worker.compute_signal()?;
 
         if raw_signal == 0 {
             return Ok(Vec::new());
@@ -1080,20 +1175,20 @@ impl Strategy for PythonBridgeStrategy {
         let (action, quantity) = match raw_signal {
             1 => {
                 let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
-                self.last_side = Some(1);
-                self.last_quantity = qty;
+                leg.last_side = Some(1);
+                leg.last_quantity = qty;
                 (SignalAction::Buy, qty)
             }
             -1 => {
                 let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
-                self.last_side = Some(-1);
-                self.last_quantity = qty;
+                leg.last_side = Some(-1);
+                leg.last_quantity = qty;
                 (SignalAction::Sell, qty)
             }
-            2 => match self.last_side.take() {
-                Some(1) => (SignalAction::Sell, self.last_quantity),
-                Some(-1) => (SignalAction::Buy, self.last_quantity),
-                _ => return Ok(Vec::new()), // nothing locally tracked to close
+            2 => match leg.last_side.take() {
+                Some(1) => (SignalAction::Sell, leg.last_quantity),
+                Some(-1) => (SignalAction::Buy, leg.last_quantity),
+                _ => return Ok(Vec::new()), // nothing locally tracked to close for THIS leg
             },
             _ => return Ok(Vec::new()),
         };
@@ -1107,11 +1202,12 @@ impl Strategy for PythonBridgeStrategy {
 
     fn update_state(&mut self, _market_data: &MarketData) {
         // Window/state updates happen in generate_signals (push_bar advances
-        // the worker's rolling window there); nothing additional to do here.
+        // the relevant leg's rolling window there); nothing additional to
+        // do here.
     }
 
     async fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
-        self.worker = None; // WorkerProcess::drop() shuts the child process down
+        self.legs.clear(); // each LegState's WorkerProcess::drop() shuts its child down
         Ok(())
     }
 
@@ -1124,7 +1220,13 @@ impl Strategy for PythonBridgeStrategy {
     }
 
     fn bars_since_init(&self) -> Option<u32> {
-        Some(self.bars_since_init)
+        // The deployment isn't fully warmed up until EVERY leg has enough
+        // bars, so report the minimum across legs rather than any single
+        // one -- the more conservative choice for a "still warming up"
+        // indicator. `None` only before `initialize()` has run (no legs
+        // exist yet); it always inserts the primary leg, so in practice
+        // this is `Some` immediately after a successful initialize().
+        self.legs.values().map(|l| l.bars_since_init).min()
     }
 }
 
@@ -1389,6 +1491,98 @@ mod tests {
     #[test]
     fn resolve_position_size_pct_none_when_neither_source_has_it() {
         assert_eq!(resolve_position_size_pct(&HashMap::new(), &HashMap::new()), None);
+    }
+
+    // --- accumulate_tick / BarAccumulator (Gap: cross-leg state contamination fix) ---
+
+    #[test]
+    fn accumulate_tick_records_the_first_tick_without_closing_a_bar() {
+        let mut acc = BarAccumulator::default();
+        let closed = accumulate_tick(&mut acc, 100, 1.5, 10.0, 1_000);
+        assert_eq!(closed, None);
+        assert_eq!(acc.last_bucket, Some(100));
+        assert_eq!(acc.pending_close, 1.5);
+    }
+
+    #[test]
+    fn accumulate_tick_stays_open_within_the_same_bucket() {
+        let mut acc = BarAccumulator::default();
+        accumulate_tick(&mut acc, 100, 1.5, 10.0, 1_000);
+        let closed = accumulate_tick(&mut acc, 100, 1.6, 5.0, 2_000);
+        assert_eq!(closed, None);
+        assert_eq!(acc.pending_close, 1.6);
+        assert_eq!(acc.pending_volume, 15.0); // accumulated across both ticks
+    }
+
+    #[test]
+    fn accumulate_tick_closes_the_bar_on_a_bucket_boundary_crossing() {
+        let mut acc = BarAccumulator::default();
+        accumulate_tick(&mut acc, 100, 1.5, 10.0, 1_000);
+        accumulate_tick(&mut acc, 100, 1.6, 5.0, 2_000);
+        let closed = accumulate_tick(&mut acc, 101, 1.7, 3.0, 3_000);
+        assert_eq!(closed, Some((1.6, 15.0, 2_000))); // the bar that just closed
+        // the new bucket starts fresh from the tick that closed the old one
+        assert_eq!(acc.last_bucket, Some(101));
+        assert_eq!(acc.pending_close, 1.7);
+        assert_eq!(acc.pending_volume, 3.0);
+    }
+
+    #[test]
+    fn two_bar_accumulators_never_see_each_others_prices() {
+        // This is the direct regression test for the cross-leg contamination
+        // bug: two symbols' accumulators, fed interleaved ticks at very
+        // different price levels (mirroring AUD-NZD ~1.2 vs USD-ZAR ~16.5),
+        // must never mix each other's pending close price.
+        let mut aud_nzd = BarAccumulator::default();
+        let mut usd_zar = BarAccumulator::default();
+
+        accumulate_tick(&mut aud_nzd, 100, 1.20, 1.0, 1_000);
+        accumulate_tick(&mut usd_zar, 100, 16.46, 1.0, 1_100);
+        accumulate_tick(&mut aud_nzd, 100, 1.21, 1.0, 1_200);
+        accumulate_tick(&mut usd_zar, 100, 16.50, 1.0, 1_300);
+
+        assert_eq!(aud_nzd.pending_close, 1.21);
+        assert_eq!(usd_zar.pending_close, 16.50);
+
+        let aud_nzd_closed = accumulate_tick(&mut aud_nzd, 101, 1.22, 1.0, 1_400);
+        let usd_zar_closed = accumulate_tick(&mut usd_zar, 101, 16.55, 1.0, 1_500);
+
+        // Each leg's closed bar reflects only its OWN price history.
+        assert_eq!(aud_nzd_closed, Some((1.21, 2.0, 1_200)));
+        assert_eq!(usd_zar_closed, Some((16.50, 2.0, 1_300)));
+    }
+
+    // --- is_primary_leg ---
+
+    #[test]
+    fn is_primary_leg_true_for_the_first_symbol_and_exchange() {
+        let symbols = vec!["AUD-NZD".to_string(), "USD-ZAR".to_string()];
+        let exchanges = vec!["oanda".to_string()];
+        assert!(is_primary_leg(&symbols, &exchanges, "AUD-NZD", "oanda"));
+    }
+
+    #[test]
+    fn is_primary_leg_false_for_a_secondary_symbol_on_the_same_exchange() {
+        let symbols = vec!["AUD-NZD".to_string(), "USD-ZAR".to_string()];
+        let exchanges = vec!["oanda".to_string()];
+        assert!(!is_primary_leg(&symbols, &exchanges, "USD-ZAR", "oanda"));
+    }
+
+    #[test]
+    fn is_primary_leg_false_for_the_same_symbol_on_a_different_exchange() {
+        // Cross-venue case: the same symbol traded on two venues (e.g. an
+        // arbitrage pair) must only treat the FIRST (symbol, exchange)
+        // combination as primary, not just match on symbol alone.
+        let symbols = vec!["BTC-USD".to_string()];
+        let exchanges = vec!["kraken".to_string(), "coinbase".to_string()];
+        assert!(is_primary_leg(&symbols, &exchanges, "BTC-USD", "kraken"));
+        assert!(!is_primary_leg(&symbols, &exchanges, "BTC-USD", "coinbase"));
+    }
+
+    #[test]
+    fn is_primary_leg_false_when_symbols_or_exchanges_are_empty() {
+        assert!(!is_primary_leg(&[], &["oanda".to_string()], "AUD-NZD", "oanda"));
+        assert!(!is_primary_leg(&["AUD-NZD".to_string()], &[], "AUD-NZD", "oanda"));
     }
 
     #[test]
