@@ -20,6 +20,13 @@ pub struct TechnicalIndicator {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketData {
     pub symbol: String,
+    /// The real exchange this tick actually originated from (e.g. "kraken",
+    /// "coinbase"), as tagged by DataEngine's per-exchange subscription.
+    /// Needed so a multi-venue deployment's tick-matching loop can tell which
+    /// of its configured venues a given tick belongs to, instead of every
+    /// tick being silently mislabeled with the deployment's single stored
+    /// exchange regardless of where it actually came from.
+    pub exchange: String,
     pub price: f64,
     pub volume: f64,
     pub timestamp: u64, // RDTSC timestamp for nanosecond precision
@@ -718,6 +725,7 @@ mod tests {
         
         let market_data = MarketData {
             symbol: "BTC/USD".to_string(),
+            exchange: "kraken".to_string(),
             price: 50000.0,
             volume: 1000000.0,
             timestamp: 1234567890,
@@ -744,6 +752,7 @@ mod tests {
         
         let market_data = MarketData {
             symbol: "ETH/USD".to_string(),
+            exchange: "kraken".to_string(),
             price: 3000.0,
             volume: 2000000.0, // High volume (4x average for ETH/USD)
             timestamp: 1234567890,
@@ -769,6 +778,7 @@ mod tests {
         
         let market_data = MarketData {
             symbol: "BTC/USD".to_string(),
+            exchange: "kraken".to_string(),
             price: 51000.0,
             volume: 800000.0,
             timestamp: 1234567890,
@@ -801,6 +811,7 @@ mod tests {
         
         let market_data = MarketData {
             symbol: "BTC/USD".to_string(),
+            exchange: "kraken".to_string(),
             price: 52000.0,
             volume: 5000000.0,   // Very high volume (5x average for BTC/USD)
             timestamp: 1234567890,

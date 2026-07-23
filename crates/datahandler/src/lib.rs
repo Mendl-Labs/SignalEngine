@@ -785,6 +785,7 @@ impl DataHandler {
                 if metrics.best_bid > 0.0 && metrics.best_ask > 0.0 {
                     return Some(MarketData {
                         symbol: symbol.to_string(),
+                        exchange: exchange.to_string(),
                         price: (metrics.best_bid + metrics.best_ask) / 2.0, // Mid price calculation
                         volume: 1000000.0, // Mock volume data
                     timestamp: SystemTime::now()

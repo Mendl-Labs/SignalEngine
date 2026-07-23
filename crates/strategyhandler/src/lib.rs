@@ -752,12 +752,7 @@ impl Strategy for SimpleMarketMakingStrategy {
 
         if bid_changed || ask_changed {
             let symbol_hash = hash_symbol(&market_data.symbol);
-            let exchange_id = match market_data.exchange.to_lowercase().as_str() {
-                "binance" => ExchangeId::Binance,
-                "coinbase" | "coinbase_pro" => ExchangeId::Coinbase,
-                "kraken" => ExchangeId::Kraken,
-                _ => ExchangeId::Binance,
-            };
+            let exchange_id = ExchangeId::from_venue_name(&market_data.exchange);
             let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
             let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
             let position_size_pct = self.config.parameters.get("position_size_pct").and_then(|v| v.as_f64());
@@ -1079,16 +1074,7 @@ impl Strategy for PythonBridgeStrategy {
         let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
         let position_size_pct = resolve_position_size_pct(&self.resolved_params, &self.config.parameters);
         let symbol_hash = hash_symbol(&market_data.symbol);
-        let exchange_id = match market_data.exchange.to_lowercase().as_str() {
-            "binance" => ExchangeId::Binance,
-            "coinbase" | "coinbase_pro" => ExchangeId::Coinbase,
-            "kraken" => ExchangeId::Kraken,
-            // No native oanda (or most other live venues) variant exists on
-            // ExchangeId yet -- SimpleMarketMakingStrategy has this exact
-            // same gap. This field only affects internal Signal routing,
-            // not the exchange string actually persisted to trade_history.
-            _ => ExchangeId::Binance,
-        };
+        let exchange_id = ExchangeId::from_venue_name(&market_data.exchange);
         let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
 
         let (action, quantity) = match raw_signal {

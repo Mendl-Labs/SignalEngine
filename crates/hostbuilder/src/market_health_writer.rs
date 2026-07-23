@@ -76,7 +76,9 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
         for entry in registry.iter() {
             let m = entry.value();
             for sym in &m.symbols {
-                tuples.insert((m.tenant_id, m.real_exchange.clone(), canon(sym)));
+                for exch in &m.venues {
+                    tuples.insert((m.tenant_id, exch.clone(), canon(sym)));
+                }
             }
         }
 
@@ -113,13 +115,15 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
             .filter(|entry| {
                 let m = entry.value();
                 m.symbols.iter().any(|sym| {
-                    snaps
-                        .get(&(m.tenant_id, m.real_exchange.clone(), canon(sym)))
-                        .map(|s| {
-                            let newest = s.last_tick_at.max(s.last_orderbook_at);
-                            newest.map_or(false, |t| (now - t).num_seconds() < FRESH_WINDOW_SECS)
-                        })
-                        .unwrap_or(false)
+                    m.venues.iter().any(|exch| {
+                        snaps
+                            .get(&(m.tenant_id, exch.clone(), canon(sym)))
+                            .map(|s| {
+                                let newest = s.last_tick_at.max(s.last_orderbook_at);
+                                newest.map_or(false, |t| (now - t).num_seconds() < FRESH_WINDOW_SECS)
+                            })
+                            .unwrap_or(false)
+                    })
                 })
             })
             .map(|entry| *entry.key())

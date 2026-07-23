@@ -86,6 +86,26 @@ pub enum ExchangeId {
     // ... up to 255 exchanges
 }
 
+impl ExchangeId {
+    /// Map a live-deployment venue name (e.g. "kraken", "coinbase") to its
+    /// `ExchangeId`. Single source of truth for the id<->name mapping used
+    /// both when a strategy stamps a signal's `exchange_id` from the tick it
+    /// saw, and when the cross-venue coordinator needs to resolve which of a
+    /// dual-venue deployment's two venues a given signal's `exchange_id`
+    /// refers to.
+    pub fn from_venue_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "binance" => ExchangeId::Binance,
+            "coinbase" | "coinbase_pro" => ExchangeId::Coinbase,
+            "kraken" => ExchangeId::Kraken,
+            // No native variant exists for most other live venues (e.g.
+            // oanda) yet. This only affects internal Signal routing, not the
+            // exchange string actually persisted to trade_history.
+            _ => ExchangeId::Binance,
+        }
+    }
+}
+
 // Signal flags for ultra-fast processing
 pub mod signal_flags {
     pub const IMMEDIATE_OR_CANCEL: u32 = 1 << 0;

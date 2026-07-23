@@ -2,6 +2,7 @@
 pub mod paper_trade_writer;
 #[cfg(feature = "postgres")]
 pub mod market_health_writer;
+pub mod cross_venue_coordinator;
 
 use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
 use executionhandler::signal::{Signal as ExecSignal, SignalAction as ExecSignalAction};
@@ -291,10 +292,22 @@ pub struct PaperDeploymentMeta {
     pub tenant_id: uuid::Uuid,
     pub deployment_id: uuid::Uuid,
     pub strategy_id_hash: u16,
-    /// Connector key inside `ExecutionHandler.connectors` (e.g. `"paper_{uuid}"`)
+    /// Connector key inside `ExecutionHandler.connectors` (e.g. `"paper_{uuid}"`).
+    /// For a dual-venue deployment this is leg 0's connector (live mode:
+    /// venues[0]'s own name; paper mode: a dedicated per-leg paper connector).
     pub paper_exchange: String,
-    /// The real exchange name used for `ORDERBOOKS` lookups (e.g. `"kraken"`)
-    pub real_exchange: String,
+    /// Leg 1's connector key for a dual-venue PAPER deployment (`None` for
+    /// single-venue deployments and for live mode, where each venue's own
+    /// name already is its connector key -- see
+    /// `cross_venue_coordinator::connector_key_for_leg`).
+    pub paper_exchange_2: Option<String>,
+    /// The real exchange venue(s) used for `ORDERBOOKS` lookups (e.g.
+    /// `["kraken"]`, or `["kraken", "coinbase"]` for a dual-venue strategy).
+    /// Capped at 2 venues per live deployment -- real-money coordination
+    /// complexity grows sharply past a two-legged trade. `venues[0]` is the
+    /// single value every pre-existing single-venue deployment used to store
+    /// as `real_exchange`.
+    pub venues: Vec<String>,
     pub symbols: Vec<String>,
     /// Deployment mode: "paper" or "live"
     pub mode: String,
@@ -312,12 +325,61 @@ pub type PaperDeploymentRegistry = Arc<DashMap<uuid::Uuid, PaperDeploymentMeta>>
 pub struct DeployedStrategyEntry {
     pub strategy_id_hash: u16,
     pub symbols: Vec<String>,
-    pub real_exchange: String,
+    /// Venue(s) this deployment is configured for -- see
+    /// `PaperDeploymentMeta::venues` for the capped-at-2 rationale.
+    pub venues: Vec<String>,
     pub strategy: Arc<tokio::sync::Mutex<Box<dyn Strategy>>>,
 }
 
 /// Registry of deployed strategies keyed by deployment instance_id (Uuid).
 pub type DeployedStrategyRegistry = Arc<DashMap<uuid::Uuid, DeployedStrategyEntry>>;
+
+/// Normalize a symbol for matching: uppercase + strip separators, so
+/// "BTC/USD" (Kraken trade) matches "BTC-USD" (deployment).
+fn norm_sym(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '/' | '-' | '_' | ' '))
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Uppercase-only compare for exchange names (no separators to strip).
+fn canon_exch(s: &str) -> String {
+    s.to_uppercase()
+}
+
+/// Decide whether a market-data tick belongs to a deployment, and if so,
+/// which of the deployment's configured venues it should be tagged with.
+///
+/// Single-venue deployments (the common case) match by symbol alone, same
+/// as the original symbol-only bridge behavior -- the tick's true origin
+/// doesn't matter when there's only one configured venue to route to.
+/// Multi-venue deployments additionally require the tick's own originating
+/// exchange to match one of the configured venues, since a dual-venue
+/// strategy needs to know WHICH of its two venues a given tick belongs to
+/// (arbitrage/stat-arb only works if the two legs' data streams are kept
+/// distinct). The returned venue is always the deployment's OWN canonical
+/// venue string, never the tick's raw exchange label, so downstream
+/// exchange_id mapping (see strategyhandler) keeps working exactly as it
+/// did before venues-list support was added.
+fn match_deployment_venue(
+    deployment_venues: &[String],
+    deployment_symbols: &[String],
+    tick_symbol: &str,
+    tick_exchange: &str,
+) -> Option<String> {
+    if !deployment_symbols.iter().any(|s| norm_sym(s) == norm_sym(tick_symbol)) {
+        return None;
+    }
+    if deployment_venues.len() <= 1 {
+        return deployment_venues.first().cloned();
+    }
+    let tick_exch = canon_exch(tick_exchange);
+    deployment_venues
+        .iter()
+        .find(|venue| canon_exch(venue) == tick_exch)
+        .cloned()
+}
 
 lazy_static! {
     /// Global symbol_hash -> canonical symbol name map. Populated when a
@@ -822,6 +884,8 @@ impl HostedObject {
         // ======================================================================
         if let Some(signal_tx) = self.signal_tx.clone() {
             let bridge_registry = deployed_strategies.clone();
+            let bridge_paper_registry = paper_registry.clone();
+            let bridge_ultra_order_manager = self.ultra_order_manager.clone();
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
                 ultra_logger::ultra_info!(
@@ -829,31 +893,21 @@ impl HostedObject {
                 );
                 let mut tick_count: u64 = 0;
                 let mut signals_emitted: u64 = 0;
-                // Normalize symbols for matching: uppercase + strip '/' '-' '_'
-                // so that "BTC/USD" (Kraken trade) matches "BTC-USD" (deployment).
-                fn norm_sym(s: &str) -> String {
-                    s.chars()
-                        .filter(|c| !matches!(c, '/' | '-' | '_' | ' '))
-                        .flat_map(|c| c.to_uppercase())
-                        .collect()
-                }
                 while let Ok(md) = market_data_rx.recv() {
                     tick_count += 1;
 
-                    let md_norm = norm_sym(&md.symbol);
                     // Snapshot matching deployments (drop iterator before await to
-                    // avoid holding the DashMap shard lock across awaits).
-                    let matches: Vec<(uuid::Uuid, u16, String, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
+                    // avoid holding the DashMap shard lock across awaits). Halted
+                    // deployments (a prior dual-venue partial fill requiring human
+                    // intervention -- see cross_venue_coordinator) stop generating
+                    // signals entirely, not just stop having them executed.
+                    let matches: Vec<(uuid::Uuid, u16, String, Vec<String>, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
                         .iter()
-                        .filter(|e| {
-                            e.value()
-                                .symbols
-                                .iter()
-                                .any(|s| norm_sym(s) == md_norm)
-                        })
-                        .map(|e| {
+                        .filter(|e| !cross_venue_coordinator::HALTED_DEPLOYMENTS.contains_key(e.key()))
+                        .filter_map(|e| {
                             let v = e.value();
-                            (*e.key(), v.strategy_id_hash, v.real_exchange.clone(), v.strategy.clone())
+                            match_deployment_venue(&v.venues, &v.symbols, &md.symbol, &md.exchange)
+                                .map(|venue| (*e.key(), v.strategy_id_hash, venue, v.venues.clone(), v.strategy.clone()))
                         })
                         .collect();
 
@@ -861,10 +915,10 @@ impl HostedObject {
                         continue;
                     }
 
-                    // Build the strategyhandler::MarketData expected by Strategy::generate_signals.
-                    // signalgenerator::MarketData lacks an exchange field, so we use the
-                    // deployment's real_exchange.
-                    for (deployment_id, sid_hash, exch, strat) in matches {
+                    // Build the strategyhandler::MarketData expected by Strategy::generate_signals,
+                    // stamping the deployment's own matched venue string (resolved above),
+                    // not the tick's raw exchange label.
+                    for (deployment_id, sid_hash, exch, venues, strat) in matches {
                         let strat_md = StratMarketData {
                             symbol: md.symbol.clone(),
                             exchange: exch,
@@ -890,18 +944,66 @@ impl HostedObject {
                             LAST_BARS_ACCUMULATED.insert(deployment_id, bars);
                         }
                         match signals {
-                            Ok(sigs) => {
+                            Ok(mut sigs) => {
+                                for sig in sigs.iter_mut() {
+                                    // Stamp the deployment's strategy_id_hash so both the
+                                    // downstream signal loop and the dual-venue coordinator
+                                    // below can match it to paper_registry.
+                                    sig.strategy_id = sid_hash;
+                                }
                                 if !sigs.is_empty() && signals_emitted < 10 {
                                     ultra_logger::ultra_info!(format!(
                                         "🔗 Bridge: strategy emitted {} signals (sid_hash={}, sym={}, bid={}, ask={})",
                                         sigs.len(), sid_hash, md.symbol, md.bid, md.ask
                                     ));
                                 }
+
+                                // A correlated 2-leg pair (dual-venue arbitrage/stat-arb
+                                // decision) is submitted through the coordinator --
+                                // sequenced leg1-then-leg2, halt-and-alert on a leg-2
+                                // failure -- instead of the independent per-signal path
+                                // below. Only possible for a multi-venue deployment;
+                                // single-venue deployments never produce a batch shape
+                                // is_correlated_pair recognizes as a pair.
+                                let pair = if venues.len() == 2 {
+                                    cross_venue_coordinator::is_correlated_pair(&sigs)
+                                } else {
+                                    None
+                                };
+
+                                if let Some((leg1, leg2)) = pair {
+                                    let meta = bridge_paper_registry
+                                        .get(&deployment_id)
+                                        .map(|e| e.value().clone());
+                                    match (meta, bridge_ultra_order_manager.clone()) {
+                                        (Some(meta), Some(mgr)) => {
+                                            let symbol = md.symbol.clone();
+                                            let outcome = runtime.block_on(async move {
+                                                cross_venue_coordinator::execute_dual_venue_pair(
+                                                    deployment_id, &symbol, &meta, leg1, leg2, &mgr,
+                                                ).await
+                                            });
+                                            ultra_logger::ultra_info!(format!(
+                                                "🔗 Dual-venue pair for deployment {} (sid_hash={}): {:?}",
+                                                deployment_id, sid_hash, outcome
+                                            ));
+                                            if outcome == cross_venue_coordinator::DualVenueOutcome::BothFilled {
+                                                LAST_SIGNAL_EMITTED.insert(deployment_id, chrono::Utc::now());
+                                            }
+                                        }
+                                        _ => {
+                                            ultra_logger::ultra_warn!(format!(
+                                                "Dual-venue pair detected for deployment {} but no paper_meta/order \
+                                                 manager available -- dropping both legs without submitting either.",
+                                                deployment_id
+                                            ));
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 let mut any_sent = false;
-                                for mut sig in sigs {
-                                    // Stamp the deployment's strategy_id_hash so the
-                                    // downstream signal loop matches it to paper_registry.
-                                    sig.strategy_id = sid_hash;
+                                for sig in sigs {
                                     if signal_tx.try_send(sig).is_ok() {
                                         signals_emitted += 1;
                                         any_sent = true;
@@ -1242,10 +1344,11 @@ impl HostedObject {
                         // data instead of starting from zero bars -- multi-symbol
                         // portfolio deployments share ONE strategy instance with
                         // single (not per-symbol) bar-bucketing state (see
-                        // PythonBridgeStrategy's fields), matching how live-mode
-                        // credential loading above already picks just
-                        // target_exchanges[0] for multi-exchange deployments, so
-                        // this uses just symbols[0]/target_exchanges[0] too.
+                        // PythonBridgeStrategy's fields), so this still only
+                        // warm-starts from symbols[0]/target_exchanges[0] --
+                        // orthogonal to the venues-list plumbing below, which is
+                        // about market-data tagging and credential loading, not
+                        // per-symbol/per-venue bar state.
                         if let Some(interval) = strategy.candle_interval_minutes {
                             if let (Some(symbol), Some(exchange)) =
                                 (strategy.symbols.first(), strategy.target_exchanges.first())
@@ -1305,57 +1408,77 @@ impl HostedObject {
 
                         if is_live {
                             // Live mode — use real exchange connectors (already configured via YAML)
-                            // The exchange name matches target_exchanges from the deployment
-                            let exchange_name = strategy.target_exchanges[0].clone();
+                            // Cap at 2 venues per live deployment: real-money coordination
+                            // complexity grows sharply past a two-legged trade, and no
+                            // cross-venue execution coordinator exists yet for N > 2 (see
+                            // DeployedStrategyEntry::venues doc).
+                            let venues: Vec<String> = strategy.target_exchanges.iter().take(2).cloned().collect();
+                            // NOTE: order EXECUTION dispatch (the Phase-2 signal loop below)
+                            // is not yet venue-aware per-signal — it routes every signal for
+                            // this deployment to a single connector key. Until that lands,
+                            // multi-venue live deployments load credentials for every
+                            // configured venue (so market data/signals are correctly
+                            // venue-tagged), but orders still execute against venues[0]'s
+                            // connector regardless of which venue a signal was meant for.
+                            // This is a known, explicitly-flagged limitation, not a silent gap.
+                            let exchange_name = venues[0].clone();
 
-                            // Lazily (re)load the per-tenant credential for this
-                            // exchange from the DB and register/refresh the
-                            // connector. This is idempotent — every Deploy event
-                            // rebuilds the connector with the latest stored keys
-                            // so users who rotate their API keys in the Settings
-                            // UI take effect on the next deploy without a pod
-                            // restart. If no enabled credential exists, reject.
+                            // Lazily (re)load the per-tenant credential for each configured
+                            // venue from the DB and register/refresh its connector. This is
+                            // idempotent — every Deploy event rebuilds the connector with the
+                            // latest stored keys so users who rotate their API keys in the
+                            // Settings UI take effect on the next deploy without a pod
+                            // restart. If any configured venue lacks an enabled credential,
+                            // reject the whole deployment (fail-closed).
                             #[cfg(feature = "postgres")]
                             {
                                 if let (Some(ref ultra_mgr), Some(ref pool)) =
                                     (deployment_ultra_mgr.as_ref(), deploy_db_pool_for_handler.as_ref())
                                 {
-                                    let mut handler = ultra_mgr.execution_handler().write().await;
-                                    // live_only=true: a live deployment must
-                                    // never bind to a testnet/sandbox key.
-                                    match handler
-                                        .ensure_exchange_for_tenant(pool, strategy.tenant_id, &exchange_name, true)
-                                        .await
-                                    {
-                                        Ok(true) => {
-                                            ultra_logger::ultra_info!(format!(
-                                                "🔑 Loaded {} credential for tenant {} (deployment {})",
-                                                exchange_name, strategy.tenant_id, strategy.instance_id
-                                            ));
+                                    let mut rejected = false;
+                                    for venue in &venues {
+                                        let mut handler = ultra_mgr.execution_handler().write().await;
+                                        // live_only=true: a live deployment must
+                                        // never bind to a testnet/sandbox key.
+                                        match handler
+                                            .ensure_exchange_for_tenant(pool, strategy.tenant_id, venue, true)
+                                            .await
+                                        {
+                                            Ok(true) => {
+                                                ultra_logger::ultra_info!(format!(
+                                                    "🔑 Loaded {} credential for tenant {} (deployment {})",
+                                                    venue, strategy.tenant_id, strategy.instance_id
+                                                ));
+                                            }
+                                            Ok(false) => {
+                                                ultra_logger::ultra_error!(format!(
+                                                    "❌ Rejected live deployment {} ({}): no enabled \
+                                                     non-testnet credential for exchange '{}' on tenant {}. \
+                                                     Add production API keys via the Settings UI and re-publish.",
+                                                    strategy.strategy_name,
+                                                    strategy.instance_id,
+                                                    venue,
+                                                    strategy.tenant_id,
+                                                ));
+                                                rejected = true;
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                ultra_logger::ultra_error!(format!(
+                                                    "❌ Rejected live deployment {} ({}): credential load \
+                                                     failed for exchange '{}': {:?}",
+                                                    strategy.strategy_name,
+                                                    strategy.instance_id,
+                                                    venue,
+                                                    e,
+                                                ));
+                                                rejected = true;
+                                                break;
+                                            }
                                         }
-                                        Ok(false) => {
-                                            ultra_logger::ultra_error!(format!(
-                                                "❌ Rejected live deployment {} ({}): no enabled \
-                                                 non-testnet credential for exchange '{}' on tenant {}. \
-                                                 Add production API keys via the Settings UI and re-publish.",
-                                                strategy.strategy_name,
-                                                strategy.instance_id,
-                                                exchange_name,
-                                                strategy.tenant_id,
-                                            ));
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            ultra_logger::ultra_error!(format!(
-                                                "❌ Rejected live deployment {} ({}): credential load \
-                                                 failed for exchange '{}': {:?}",
-                                                strategy.strategy_name,
-                                                strategy.instance_id,
-                                                exchange_name,
-                                                e,
-                                            ));
-                                            continue;
-                                        }
+                                    }
+                                    if rejected {
+                                        continue;
                                     }
                                 } else {
                                     ultra_logger::ultra_error!(format!(
@@ -1372,7 +1495,11 @@ impl HostedObject {
                                 deployment_id: strategy.instance_id,
                                 strategy_id_hash,
                                 paper_exchange: exchange_name.clone(),
-                                real_exchange: exchange_name.clone(),
+                                // Live mode never needs a second stored connector name --
+                                // each venue's own name IS its connector key (see
+                                // `ExecutionHandler.connectors`, keyed by credential.exchange).
+                                paper_exchange_2: None,
+                                venues: venues.clone(),
                                 symbols: strategy.symbols.clone(),
                                 mode: "live".to_string(),
                                 is_market_making: false,
@@ -1381,7 +1508,7 @@ impl HostedObject {
                             deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
                                 strategy_id_hash,
                                 symbols: strategy.symbols.clone(),
-                                real_exchange: exchange_name.clone(),
+                                venues: venues.clone(),
                                 strategy: strat_instance.clone(),
                             });
 
@@ -1390,15 +1517,27 @@ impl HostedObject {
                                 strategy.strategy_name, strategy.instance_id, exchange_name
                             ));
                         } else {
-                            // Paper mode — create a paper trading connector
+                            // Paper mode — create a paper trading connector.
+                            // Capped at 2 venues, same rationale as the live-mode branch above.
                             let paper_exchange_name = format!("paper_{}", strategy.instance_id);
-                            let real_exchange = strategy.target_exchanges[0].clone();
+                            let venues: Vec<String> = strategy.target_exchanges.iter().take(2).cloned().collect();
+                            // For a genuinely dual-venue deployment, provision a SECOND
+                            // paper connector so each leg fills against its own venue's
+                            // real order book (via the book-sync task above) instead of
+                            // both legs sharing one synthetic book. Single-venue
+                            // deployments keep today's one-connector behavior exactly.
+                            let paper_exchange_name_2 = if venues.len() == 2 {
+                                Some(format!("paper_{}_leg1", strategy.instance_id))
+                            } else {
+                                None
+                            };
                             deploy_registry.insert(strategy.instance_id, PaperDeploymentMeta {
                                 tenant_id: strategy.tenant_id,
                                 deployment_id: strategy.instance_id,
                                 strategy_id_hash,
                                 paper_exchange: paper_exchange_name.clone(),
-                                real_exchange: real_exchange.clone(),
+                                paper_exchange_2: paper_exchange_name_2.clone(),
+                                venues: venues.clone(),
                                 symbols: strategy.symbols.clone(),
                                 mode: "paper".to_string(),
                                 is_market_making: strategyloader::is_market_making_strategy_type(&strategy.strategy_type),
@@ -1407,10 +1546,10 @@ impl HostedObject {
                             deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
                                 strategy_id_hash,
                                 symbols: strategy.symbols.clone(),
-                                real_exchange: real_exchange.clone(),
+                                venues: venues.clone(),
                                 strategy: strat_instance.clone(),
                             });
-                            
+
                             // Build PaperTradingConfig from deployment sim config fields,
                             // falling back to sensible defaults when not specified.
                             let sim_config = executionhandler::PaperTradingConfig {
@@ -1418,10 +1557,10 @@ impl HostedObject {
                                 ..Default::default()
                             };
 
-                            // Register a paper trading connector for this deployment instance
+                            // Register paper trading connector(s) for this deployment instance.
                             if let Some(ref ultra_mgr) = deployment_ultra_mgr {
                                 let mut handler = ultra_mgr.execution_handler().write().await;
-                                match handler.add_paper_exchange(paper_exchange_name.clone(), sim_config).await {
+                                match handler.add_paper_exchange(paper_exchange_name.clone(), sim_config.clone()).await {
                                     Ok(_) => {
                                         ultra_logger::ultra_info!(format!(
                                             "✅ Paper trading connector '{}' registered for strategy {}",
@@ -1435,8 +1574,24 @@ impl HostedObject {
                                         ));
                                     }
                                 }
+                                if let Some(ref leg1_name) = paper_exchange_name_2 {
+                                    match handler.add_paper_exchange(leg1_name.clone(), sim_config).await {
+                                        Ok(_) => {
+                                            ultra_logger::ultra_info!(format!(
+                                                "✅ Second-leg paper trading connector '{}' registered for strategy {}",
+                                                leg1_name, strategy.strategy_name
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            ultra_logger::ultra_warn!(format!(
+                                                "⚠️ Failed to register second-leg paper connector for {}: {:?}",
+                                                strategy.strategy_name, e
+                                            ));
+                                        }
+                                    }
+                                }
                             }
-                            
+
                             ultra_logger::ultra_info!(format!(
                                 "✅ Strategy {} ({}) deployed for PAPER trading",
                                 strategy.strategy_name, strategy.instance_id
@@ -1473,12 +1628,12 @@ impl HostedObject {
                 // DashMap lock across awaits. Without this, non-MM paper strategies
                 // fill against the MockExchange default book (~$50000 mid) and never
                 // realize P&L because every fill is at the same flat price.
-                let mm_deployments: Vec<(String, String, Vec<String>)> = book_sync_registry
+                let mm_deployments: Vec<(String, Vec<String>, Vec<String>)> = book_sync_registry
                     .iter()
                     .filter(|e| e.value().mode == "paper")
                     .map(|e| {
                         let m = e.value();
-                        (m.paper_exchange.clone(), m.real_exchange.clone(), m.symbols.clone())
+                        (m.paper_exchange.clone(), m.venues.clone(), m.symbols.clone())
                     })
                     .collect();
 
@@ -1489,39 +1644,47 @@ impl HostedObject {
                     s.replace('/', "-").to_uppercase()
                 }
 
-                for (paper_exchange, real_exchange, symbols) in mm_deployments {
-                    let canon_real_exchange = canon(&real_exchange);
-                    for symbol in &symbols {
-                        let canon_symbol = canon(symbol);
-                        // Find the orderbook by canonical match — DataHandler may
-                        // have stored it under a slightly different symbol/exchange
-                        // string than the deployment metadata uses.
-                        let maybe_levels: Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> = {
-                            let mut found = None;
-                            for entry in datahandler::ORDERBOOKS.iter() {
-                                let (sym, exch) = entry.key();
-                                if canon(sym) == canon_symbol
-                                    && canon(exch) == canon_real_exchange
-                                {
-                                    found = entry.value().clone().read().ok()
-                                        .and_then(|ob| ob.get_orderbook_levels(20).ok());
-                                    break;
+                for (paper_exchange, venues, symbols) in mm_deployments {
+                    // NOTE: today's paper connector is a single synthetic book per
+                    // deployment. For a dual-venue deployment this pushes both
+                    // venues' books into the SAME connector (last write per tick
+                    // wins) -- a reasonable best-effort approximation for now, but
+                    // not a true per-leg simulation. Per-leg paper connectors are
+                    // part of the still-pending cross-venue execution coordinator.
+                    for real_exchange in &venues {
+                        let canon_real_exchange = canon(real_exchange);
+                        for symbol in &symbols {
+                            let canon_symbol = canon(symbol);
+                            // Find the orderbook by canonical match — DataHandler may
+                            // have stored it under a slightly different symbol/exchange
+                            // string than the deployment metadata uses.
+                            let maybe_levels: Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> = {
+                                let mut found = None;
+                                for entry in datahandler::ORDERBOOKS.iter() {
+                                    let (sym, exch) = entry.key();
+                                    if canon(sym) == canon_symbol
+                                        && canon(exch) == canon_real_exchange
+                                    {
+                                        found = entry.value().clone().read().ok()
+                                            .and_then(|ob| ob.get_orderbook_levels(20).ok());
+                                        break;
+                                    }
                                 }
-                            }
-                            found
-                        };
+                                found
+                            };
 
-                        if let Some((bids, asks)) = maybe_levels {
-                            if !bids.is_empty() {
-                                if let Some(ref mgr) = book_sync_ultra_mgr {
-                                    let handler = mgr.execution_handler().read().await;
-                                    handler.update_connector_book(
-                                        &paper_exchange,
-                                        symbol,
-                                        bids,
-                                        asks,
-                                    ).await;
-                                    sync_count += 1;
+                            if let Some((bids, asks)) = maybe_levels {
+                                if !bids.is_empty() {
+                                    if let Some(ref mgr) = book_sync_ultra_mgr {
+                                        let handler = mgr.execution_handler().read().await;
+                                        handler.update_connector_book(
+                                            &paper_exchange,
+                                            symbol,
+                                            bids,
+                                            asks,
+                                        ).await;
+                                        sync_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -1733,5 +1896,75 @@ mod tests {
         
         let obj_with_path = HostedObject::with_config_path("/test/path".to_string());
         assert_eq!(obj_with_path.config_path, Some("/test/path".to_string()));
+    }
+
+    // --- match_deployment_venue (Gap 3a/3b: venues-list + exchange-aware matching) ---
+
+    #[test]
+    fn match_deployment_venue_matches_by_symbol_alone_for_single_venue_deployments() {
+        let venues = vec!["kraken".to_string()];
+        let symbols = vec!["BTC/USD".to_string()];
+        // Tick claims to be from a totally different exchange -- single-venue
+        // deployments don't care, preserving pre-venues-list behavior.
+        let result = match_deployment_venue(&venues, &symbols, "BTC-USD", "massive");
+        assert_eq!(result, Some("kraken".to_string()));
+    }
+
+    #[test]
+    fn match_deployment_venue_rejects_a_non_matching_symbol() {
+        let venues = vec!["kraken".to_string()];
+        let symbols = vec!["BTC/USD".to_string()];
+        assert_eq!(match_deployment_venue(&venues, &symbols, "ETH/USD", "kraken"), None);
+    }
+
+    #[test]
+    fn match_deployment_venue_normalizes_symbol_separators_and_case() {
+        let venues = vec!["kraken".to_string()];
+        let symbols = vec!["btc-usd".to_string()];
+        assert_eq!(
+            match_deployment_venue(&venues, &symbols, "BTC/USD", "kraken"),
+            Some("kraken".to_string())
+        );
+    }
+
+    #[test]
+    fn match_deployment_venue_picks_the_matching_leg_for_dual_venue_deployments() {
+        let venues = vec!["kraken".to_string(), "coinbase".to_string()];
+        let symbols = vec!["BTC/USD".to_string()];
+        assert_eq!(
+            match_deployment_venue(&venues, &symbols, "BTC/USD", "coinbase"),
+            Some("coinbase".to_string())
+        );
+        assert_eq!(
+            match_deployment_venue(&venues, &symbols, "BTC/USD", "kraken"),
+            Some("kraken".to_string())
+        );
+    }
+
+    #[test]
+    fn match_deployment_venue_normalizes_exchange_case_for_dual_venue_deployments() {
+        let venues = vec!["Kraken".to_string(), "Coinbase".to_string()];
+        let symbols = vec!["BTC/USD".to_string()];
+        assert_eq!(
+            match_deployment_venue(&venues, &symbols, "BTC/USD", "COINBASE"),
+            Some("Coinbase".to_string())
+        );
+    }
+
+    #[test]
+    fn match_deployment_venue_drops_a_tick_from_neither_configured_venue() {
+        let venues = vec!["kraken".to_string(), "coinbase".to_string()];
+        let symbols = vec!["BTC/USD".to_string()];
+        // A dual-venue deployment must not silently attribute a tick from an
+        // unconfigured exchange to one of its two legs -- that would corrupt
+        // the arbitrage/stat-arb comparison the whole strategy depends on.
+        assert_eq!(match_deployment_venue(&venues, &symbols, "BTC/USD", "binance"), None);
+    }
+
+    #[test]
+    fn match_deployment_venue_handles_a_deployment_with_no_configured_venues() {
+        let venues: Vec<String> = vec![];
+        let symbols = vec!["BTC/USD".to_string()];
+        assert_eq!(match_deployment_venue(&venues, &symbols, "BTC/USD", "kraken"), None);
     }
 }
