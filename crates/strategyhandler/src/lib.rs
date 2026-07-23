@@ -1220,12 +1220,16 @@ impl Strategy for PythonBridgeStrategy {
     }
 
     fn bars_since_init(&self) -> Option<u32> {
-        // The deployment isn't fully warmed up until EVERY leg has enough
-        // bars, so report the minimum across legs rather than any single
-        // one -- the more conservative choice for a "still warming up"
-        // indicator. `None` only before `initialize()` has run (no legs
-        // exist yet); it always inserts the primary leg, so in practice
-        // this is `Some` immediately after a successful initialize().
+        // Some(0) before any leg exists yet (freshly constructed via `new()`,
+        // not yet `initialize()`d) -- matches the pre-leg-isolation behavior,
+        // where `bars_since_init` was a plain field defaulting to 0 at
+        // construction. Once legs exist, report the MINIMUM across all of
+        // them rather than any single one -- the deployment isn't fully
+        // warmed up until EVERY leg has enough bars, so this is the more
+        // conservative choice for a "still warming up" indicator.
+        if self.legs.is_empty() {
+            return Some(0);
+        }
         self.legs.values().map(|l| l.bars_since_init).min()
     }
 }
