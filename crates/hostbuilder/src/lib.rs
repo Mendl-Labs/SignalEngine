@@ -1328,6 +1328,12 @@ impl HostedObject {
                                 serde_json::json!(pct),
                             );
                         }
+                        // Always present (defaults to 1.0 = unleveraged) -- see
+                        // `size_order_from_capital`'s leverage parameter.
+                        strat_params.insert(
+                            "leverage".to_string(),
+                            serde_json::json!(strategy.leverage),
+                        );
                         if let Some(source) = &strategy.python_source_code {
                             strat_params.insert(
                                 "python_source_code".to_string(),

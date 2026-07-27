@@ -658,21 +658,25 @@ impl StrategyManager {
 const DEFAULT_POSITION_SIZE_PCT: f64 = 0.02;
 
 /// Size an order as a fraction of allocated capital, ported from
-/// `BacktestingEngine/portfoliomanager/src/margin.rs::size_leveraged_order`
-/// (leverage fixed at 1.0 here -- no leverage data is plumbed through to
-/// live deployments yet). Falls back to `fallback_quantity` when capital
-/// context isn't available, preserving today's behavior for deployments
-/// that don't carry a `capital_allocation`.
+/// `BacktestingEngine/portfoliomanager/src/margin.rs::size_leveraged_order`.
+/// `leverage` multiplies notional exactly as the backtest-side formula does
+/// (`notional = equity * position_size_pct * leverage`); pass `1.0` for
+/// unleveraged sizing (identical to this function's original behavior).
+/// Falls back to `fallback_quantity` when capital context isn't available,
+/// preserving today's behavior for deployments that don't carry a
+/// `capital_allocation`.
 fn size_order_from_capital(
     capital_allocation: Option<f64>,
     position_size_pct: Option<f64>,
+    leverage: f64,
     price: f64,
     fallback_quantity: f64,
 ) -> f64 {
     match capital_allocation {
         Some(equity) if equity > 0.0 && price > 0.0 => {
             let pct = position_size_pct.unwrap_or(DEFAULT_POSITION_SIZE_PCT);
-            let notional = equity * pct;
+            let leverage = if leverage > 0.0 { leverage } else { 1.0 };
+            let notional = equity * pct * leverage;
             notional / price
         }
         _ => fallback_quantity,
@@ -693,6 +697,21 @@ fn resolve_position_size_pct(
         .get("position_size_pct")
         .copied()
         .or_else(|| config_parameters.get("position_size_pct").and_then(|v| v.as_f64()))
+}
+
+/// Resolve the leverage multiplier for order sizing, same precedence as
+/// `resolve_position_size_pct`. Defaults to `1.0` (unleveraged) when neither
+/// source has it -- true for deployments predating the `leverage` column/
+/// wire field.
+fn resolve_leverage(
+    resolved_params: &HashMap<String, f64>,
+    config_parameters: &HashMap<String, serde_json::Value>,
+) -> f64 {
+    resolved_params
+        .get("leverage")
+        .copied()
+        .or_else(|| config_parameters.get("leverage").and_then(|v| v.as_f64()))
+        .unwrap_or(1.0)
 }
 
 /// Simple Market Making Strategy (comprehensive implementation)
@@ -756,9 +775,11 @@ impl Strategy for SimpleMarketMakingStrategy {
             let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
             let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
             let position_size_pct = self.config.parameters.get("position_size_pct").and_then(|v| v.as_f64());
+            let leverage = self.config.parameters.get("leverage").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let base_quantity = size_order_from_capital(
                 capital_allocation,
                 position_size_pct,
+                leverage,
                 market_data.mid_price,
                 0.01, // fallback for deployments with no capital context
             );
@@ -1168,19 +1189,20 @@ impl Strategy for PythonBridgeStrategy {
 
         let capital_allocation = self.config.parameters.get("capital_allocation").and_then(|v| v.as_f64());
         let position_size_pct = resolve_position_size_pct(&self.resolved_params, &self.config.parameters);
+        let leverage = resolve_leverage(&self.resolved_params, &self.config.parameters);
         let symbol_hash = hash_symbol(&market_data.symbol);
         let exchange_id = ExchangeId::from_venue_name(&market_data.exchange);
         let strategy_id = self.config.id.parse::<u16>().unwrap_or(1);
 
         let (action, quantity) = match raw_signal {
             1 => {
-                let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
+                let qty = size_order_from_capital(capital_allocation, position_size_pct, leverage, market_data.mid_price, 0.01);
                 leg.last_side = Some(1);
                 leg.last_quantity = qty;
                 (SignalAction::Buy, qty)
             }
             -1 => {
-                let qty = size_order_from_capital(capital_allocation, position_size_pct, market_data.mid_price, 0.01);
+                let qty = size_order_from_capital(capital_allocation, position_size_pct, leverage, market_data.mid_price, 0.01);
                 leg.last_side = Some(-1);
                 leg.last_quantity = qty;
                 (SignalAction::Sell, qty)
@@ -1456,21 +1478,34 @@ mod tests {
     #[test]
     fn size_order_from_capital_uses_position_size_pct_of_equity() {
         // $10,000 equity, 25% position size, price 16.35 -> notional $2,500
-        let qty = size_order_from_capital(Some(10_000.0), Some(0.25), 16.35, 0.01);
+        let qty = size_order_from_capital(Some(10_000.0), Some(0.25), 1.0, 16.35, 0.01);
         assert!((qty - (2_500.0 / 16.35)).abs() < 1e-9);
     }
 
     #[test]
     fn size_order_from_capital_falls_back_to_default_pct_when_unset() {
-        let qty = size_order_from_capital(Some(10_000.0), None, 100.0, 0.01);
+        let qty = size_order_from_capital(Some(10_000.0), None, 1.0, 100.0, 0.01);
         assert!((qty - (10_000.0 * DEFAULT_POSITION_SIZE_PCT / 100.0)).abs() < 1e-9);
     }
 
     #[test]
     fn size_order_from_capital_falls_back_to_fixed_quantity_without_capital_context() {
-        assert_eq!(size_order_from_capital(None, Some(0.25), 16.35, 0.01), 0.01);
-        assert_eq!(size_order_from_capital(Some(0.0), Some(0.25), 16.35, 0.01), 0.01);
-        assert_eq!(size_order_from_capital(Some(10_000.0), Some(0.25), 0.0, 0.01), 0.01);
+        assert_eq!(size_order_from_capital(None, Some(0.25), 1.0, 16.35, 0.01), 0.01);
+        assert_eq!(size_order_from_capital(Some(0.0), Some(0.25), 1.0, 16.35, 0.01), 0.01);
+        assert_eq!(size_order_from_capital(Some(10_000.0), Some(0.25), 1.0, 0.0, 0.01), 0.01);
+    }
+
+    #[test]
+    fn size_order_from_capital_multiplies_notional_by_leverage() {
+        // $10,000 equity, 25% position size, 3x leverage, price 16.35 -> notional $7,500
+        let qty = size_order_from_capital(Some(10_000.0), Some(0.25), 3.0, 16.35, 0.01);
+        assert!((qty - (7_500.0 / 16.35)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn size_order_from_capital_treats_non_positive_leverage_as_unleveraged() {
+        let qty = size_order_from_capital(Some(10_000.0), Some(0.25), 0.0, 16.35, 0.01);
+        assert!((qty - (2_500.0 / 16.35)).abs() < 1e-9);
     }
 
     #[test]
@@ -1495,6 +1530,30 @@ mod tests {
     #[test]
     fn resolve_position_size_pct_none_when_neither_source_has_it() {
         assert_eq!(resolve_position_size_pct(&HashMap::new(), &HashMap::new()), None);
+    }
+
+    #[test]
+    fn resolve_leverage_prefers_resolved_params_over_config() {
+        let mut resolved = HashMap::new();
+        resolved.insert("leverage".to_string(), 3.0);
+        let mut config = HashMap::new();
+        config.insert("leverage".to_string(), serde_json::json!(2.0));
+
+        assert_eq!(resolve_leverage(&resolved, &config), 3.0);
+    }
+
+    #[test]
+    fn resolve_leverage_falls_back_to_config_when_not_resolved() {
+        let resolved = HashMap::new();
+        let mut config = HashMap::new();
+        config.insert("leverage".to_string(), serde_json::json!(2.0));
+
+        assert_eq!(resolve_leverage(&resolved, &config), 2.0);
+    }
+
+    #[test]
+    fn resolve_leverage_defaults_to_one_when_neither_source_has_it() {
+        assert_eq!(resolve_leverage(&HashMap::new(), &HashMap::new()), 1.0);
     }
 
     // --- accumulate_tick / BarAccumulator (Gap: cross-leg state contamination fix) ---

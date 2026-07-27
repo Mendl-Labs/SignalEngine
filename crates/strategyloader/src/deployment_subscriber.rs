@@ -185,6 +185,12 @@ pub struct DeployedStrategy {
     /// the single source of truth), not try to duplicate/parse the value
     /// from SQL. Not fixed here -- flagged as a follow-up.
     pub position_size_pct: Option<f64>,
+    /// Leverage multiplier for margined order sizing (mirrors
+    /// `deployed_strategies.leverage` / BacktestingEngine's
+    /// `config::BacktestConfig.leverage`). Defaults to `1.0` (unleveraged)
+    /// when absent from `risk_metrics`, matching pre-existing sizing
+    /// behavior for deployments that predate this field.
+    pub leverage: f64,
     /// The deployment's actual Python strategy source (`backtest_results.python_source_code`),
     /// fetched by strategy_id since it isn't carried on the `StrategyDeployment`
     /// wire message. `None` for genuine (non-AI-authored) strategy types, or
@@ -268,6 +274,7 @@ impl DeployedStrategy {
             taker_fee_bps,
             capital_allocation: msg.initial_capital,
             position_size_pct: risk_meta.get("position_size_pct").and_then(|v| v.as_f64()),
+            leverage: risk_meta.get("leverage").and_then(|v| v.as_f64()).unwrap_or(1.0),
             python_source_code: python_config.python_source_code,
             candle_interval_minutes: python_config.candle_interval_minutes,
             asset_class: python_config.asset_class,
@@ -620,15 +627,22 @@ impl DeploymentSubscriber {
             let symbols = Self::resolve_reconcile_symbols(&backtest.symbol, &params_json);
 
             // Carry the strategy's own declared position_size_pct (if present in
-            // the backtest's params) through risk_metrics -- from_deployment()
-            // reads it back out on the other side. capital_allocation goes
-            // through the dedicated initial_capital field.
+            // the backtest's params) and its deployed leverage through
+            // risk_metrics -- from_deployment() reads both back out on the
+            // other side. capital_allocation goes through the dedicated
+            // initial_capital field. leverage comes from the deployment row
+            // itself (resolved once at deploy time), not params_json, since
+            // that's the actual value the deployment was created with.
             let position_size_pct = params_json
                 .get("position_size_pct")
                 .or_else(|| params_json.get("risk_per_trade"));
-            let risk_metrics = position_size_pct
-                .map(|v| serde_json::json!({ "position_size_pct": v }))
-                .and_then(|v| serde_json::to_vec(&v).ok())
+            let leverage = deployment.leverage.to_f64().unwrap_or(1.0);
+            let mut risk_metrics_map = serde_json::Map::new();
+            if let Some(v) = position_size_pct {
+                risk_metrics_map.insert("position_size_pct".to_string(), v.clone());
+            }
+            risk_metrics_map.insert("leverage".to_string(), serde_json::json!(leverage));
+            let risk_metrics = serde_json::to_vec(&serde_json::Value::Object(risk_metrics_map))
                 .unwrap_or_default();
 
             let deployment_msg = StrategyDeployment {
@@ -1092,8 +1106,40 @@ mod tests {
         assert!(strategy.is_active.load(Ordering::Relaxed));
         assert_eq!(strategy.capital_allocation, 10000.0);
         assert_eq!(strategy.position_size_pct, None);
+        assert_eq!(strategy.leverage, 1.0);
         assert_eq!(strategy.python_source_code, None);
         assert_eq!(strategy.candle_interval_minutes, None);
+    }
+
+    #[test]
+    fn test_deployed_strategy_reads_leverage_from_risk_metrics() {
+        let deployment = StrategyDeployment {
+            strategy_id: Uuid::new_v4().to_string(),
+            instance_id: Uuid::new_v4().to_string(),
+            tenant_id: Uuid::new_v4().to_string(),
+            strategy_type: "custom".to_string(),
+            strategy_name: "LeveragedMomentum".to_string(),
+            version: "1.0.0".to_string(),
+            parameters: Vec::new(),
+            initial_capital: 10000.0,
+            target_exchanges: vec!["kraken".to_string()],
+            symbols: vec!["BTCUSD".to_string()],
+            approved_by: "admin".to_string(),
+            approved_at: "2026-01-25T12:00:00Z".to_string(),
+            performance_summary: vec![],
+            risk_metrics: serde_json::to_vec(
+                &serde_json::json!({"position_size_pct": 0.1, "leverage": 3.0}),
+            )
+            .unwrap(),
+            admin_approved: true,
+            timestamp: 0,
+            mode: "paper".to_string(),
+        };
+
+        let strategy =
+            DeployedStrategy::from_deployment(&deployment, DeploymentPythonConfig::default()).unwrap();
+        assert_eq!(strategy.leverage, 3.0);
+        assert_eq!(strategy.position_size_pct, Some(0.1));
     }
 
     #[test]
