@@ -242,8 +242,16 @@ impl PortfolioHandlerTrait for PortfolioHandler {
                         )).await;
                     });
                     
-                    // If connection is stale (no messages for a while), reconnect
-                    if self.subscriber.is_stale(5000) {
+                    // If connection is stale (no messages for a while), reconnect.
+                    // Portfolio-topic traffic is inherently bursty (only fires on
+                    // trades/fills), not continuous like market data ticks, so a
+                    // short threshold checked every stats_interval (60s) treated
+                    // a perfectly healthy but quiet connection as "stale" on
+                    // essentially every cycle -- observed in prod as a permanent
+                    // reconnect loop. Use a threshold well above one idle trading
+                    // lull instead of one just above the check cadence.
+                    const PORTFOLIO_STALE_THRESHOLD_MS: u64 = 300_000; // 5 minutes
+                    if self.subscriber.is_stale(PORTFOLIO_STALE_THRESHOLD_MS) {
                         let logger = self.logger.clone();
                         tokio::spawn(async move {
                             logger.warn("Connection appears stale, attempting reconnect").await;
