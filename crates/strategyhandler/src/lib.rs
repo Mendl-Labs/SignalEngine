@@ -850,8 +850,12 @@ pub struct PythonBridgeStrategy {
     config: StrategyConfig,
     /// One independent `LegState` -- its own Python worker process, bar
     /// accumulator, and position-tracking proxy -- per `(symbol, exchange)`
-    /// leg this deployment has seen a tick for, spawned lazily on first use
-    /// (see `spawn_leg`). NEVER shared across legs.
+    /// leg. Every leg is spawned eagerly up front in `initialize()` (so
+    /// every leg's indicators are warm-started from historical bars before
+    /// any live tick arrives, not just the primary leg's); a leg only ever
+    /// spawns lazily on its own first tick (see `spawn_leg`, called from
+    /// `generate_signals`) as a fallback if its eager spawn in
+    /// `initialize()` failed. NEVER shared across legs.
     ///
     /// This used to be a set of single, deployment-wide fields (one shared
     /// `worker`, one shared `last_side`/`last_quantity`, one shared bar
@@ -918,8 +922,10 @@ struct LegState {
     /// spawned -- surfaced to the dashboard so "still building required
     /// history" (e.g. a 25-bar lookback strategy needs 25 closed bars
     /// before it can compute anything) is never mistaken for a broken
-    /// deployment. Starts at 0, or at the warm-start count for the primary
-    /// leg (see `PythonBridgeStrategy::spawn_leg`).
+    /// deployment. Starts at 0, or at the leg's own warm-start count when
+    /// `hostbuilder` fetched historical bars for it (see
+    /// `PythonBridgeStrategy::spawn_leg`) -- true for every leg now that
+    /// all of them are warm-started, not just the primary.
     bars_since_init: u32,
 }
 
@@ -976,16 +982,27 @@ fn accumulate_tick(
     }
 }
 
-/// Whether `(symbol, exchange)` is this deployment's primary leg --
-/// `config.symbols[0]`/`config.exchanges[0]`. Only the primary leg gets
-/// warm-started from historical bars (see `spawn_leg`), matching the
-/// pre-existing, unchanged limitation that `hostbuilder::fetch_warm_start_bars`
-/// only ever fetches warm-start data for that one leg -- extending
-/// warm-start to every leg of a portfolio is a separate, larger change than
-/// the cross-leg contamination bug this fixes.
-fn is_primary_leg(config_symbols: &[String], config_exchanges: &[String], symbol: &str, exchange: &str) -> bool {
-    config_symbols.first().map(String::as_str) == Some(symbol)
-        && config_exchanges.first().map(String::as_str) == Some(exchange)
+/// Key used to look up a `(symbol, exchange)` leg's historical bars inside
+/// `config.parameters["warm_start_bars_by_leg"]`. Shared between
+/// `hostbuilder` (which populates the map per-leg before constructing this
+/// config) and `spawn_leg` (which looks it up for every leg -- primary or
+/// lazily-spawned -- not just the deployment's first symbol/exchange).
+pub fn warm_start_leg_key(symbol: &str, exchange: &str) -> String {
+    format!("{symbol}|{exchange}")
+}
+
+/// True when `(symbol, exchange)` is the deployment's primary leg -- the
+/// first entry of both `symbols` and `exchanges` (see
+/// `PythonBridgeStrategy::initialize`'s eager-spawn doc). Only ever true for
+/// one `(symbol, exchange)` pair, even in the cross-venue case where the
+/// same symbol trades on multiple exchanges (or vice versa) -- both the
+/// symbol AND the exchange must match their respective first entry, not
+/// just one of them. False whenever either list is empty.
+fn is_primary_leg(symbols: &[String], exchanges: &[String], symbol: &str, exchange: &str) -> bool {
+    match (symbols.first(), exchanges.first()) {
+        (Some(s), Some(e)) => s == symbol && e == exchange,
+        _ => false,
+    }
 }
 
 /// Default bar interval when a deployment doesn't declare
@@ -1006,14 +1023,21 @@ fn bar_bucket(timestamp_ns: u64, candle_interval_minutes: i64) -> i64 {
     (timestamp_ns / bucket_width_ns) as i64
 }
 
-/// Parses `config.parameters["warm_start_bars"]` (set by
-/// `hostbuilder::fetch_warm_start_bars`) into `(close, volume, timestamp_ns)`
-/// triples, chronological order. Returns an empty vec when the key is
-/// absent or malformed -- a warm-start is a nice-to-have, never something
-/// that should block `initialize()`.
-fn parse_warm_start_bars(parameters: &HashMap<String, serde_json::Value>) -> Vec<(f64, f64, i64)> {
+/// Parses `config.parameters["warm_start_bars_by_leg"][warm_start_leg_key(symbol, exchange)]`
+/// (set by `hostbuilder`'s deploy handler, one entry per `(symbol, exchange)`
+/// leg) into `(close, volume, timestamp_ns)` triples, chronological order.
+/// Returns an empty vec when the leg's key is absent or malformed -- a
+/// warm-start is a nice-to-have, never something that should block
+/// `spawn_leg()`.
+fn parse_warm_start_bars(
+    parameters: &HashMap<String, serde_json::Value>,
+    symbol: &str,
+    exchange: &str,
+) -> Vec<(f64, f64, i64)> {
     parameters
-        .get("warm_start_bars")
+        .get("warm_start_bars_by_leg")
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get(&warm_start_leg_key(symbol, exchange)))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -1055,7 +1079,8 @@ impl PythonBridgeStrategy {
 
     /// Spawn and initialize a fresh worker process + bar/position state for
     /// a newly-seen `(symbol, exchange)` leg. Warm-starts from historical
-    /// bars only for the primary leg -- see `is_primary_leg`'s doc.
+    /// bars whenever `hostbuilder` fetched them for this specific leg --
+    /// see `warm_start_leg_key`'s doc.
     fn spawn_leg(&mut self, symbol: &str, exchange: &str) -> Result<LegState, Box<dyn Error>> {
         let source_code = self
             .config
@@ -1090,27 +1115,24 @@ impl PythonBridgeStrategy {
             bars_since_init: 0,
         };
 
-        if is_primary_leg(&self.config.symbols, &self.config.exchanges, symbol, exchange) {
-            // Warm-start the bar buffer from historical data (hostbuilder
-            // fetches it before constructing this config -- see
-            // hostbuilder::fetch_warm_start_bars) instead of starting from
-            // zero bars after every restart. Absent when the fetch
-            // failed/was skipped -- this must never block spawn_leg from
-            // succeeding.
-            let warm_start_bars = parse_warm_start_bars(&self.config.parameters);
-            for &(close, volume, timestamp) in &warm_start_bars {
-                // Best-effort: a single bad historical bar shouldn't abort an
-                // otherwise-successful warm-start.
-                let _ = leg.worker.push_bar(close, volume, timestamp);
-            }
-            if let Some(seed) = seed_bucket_from_warm_start(&warm_start_bars, self.candle_interval_minutes) {
-                leg.acc.last_bucket = Some(seed.0);
-                leg.acc.pending_close = seed.1;
-                leg.acc.pending_volume = seed.2;
-                leg.acc.pending_timestamp = seed.3;
-            }
-            leg.bars_since_init = warm_start_bars.len() as u32;
+        // Warm-start the bar buffer from historical data (hostbuilder
+        // fetches it per-leg before constructing this config -- see
+        // hostbuilder's deploy handler) instead of starting from zero bars
+        // after every restart. Absent when the fetch failed/was skipped for
+        // this leg -- this must never block spawn_leg from succeeding.
+        let warm_start_bars = parse_warm_start_bars(&self.config.parameters, symbol, exchange);
+        for &(close, volume, timestamp) in &warm_start_bars {
+            // Best-effort: a single bad historical bar shouldn't abort an
+            // otherwise-successful warm-start.
+            let _ = leg.worker.push_bar(close, volume, timestamp);
         }
+        if let Some(seed) = seed_bucket_from_warm_start(&warm_start_bars, self.candle_interval_minutes) {
+            leg.acc.last_bucket = Some(seed.0);
+            leg.acc.pending_close = seed.1;
+            leg.acc.pending_volume = seed.2;
+            leg.acc.pending_timestamp = seed.3;
+        }
+        leg.bars_since_init = warm_start_bars.len() as u32;
 
         Ok(leg)
     }
@@ -1130,13 +1152,10 @@ impl Strategy for PythonBridgeStrategy {
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_CANDLE_INTERVAL_MINUTES);
 
-        // Eagerly spawn + warm-start only the primary leg here, so deploy-
-        // time validation (a broken Python strategy rejects the deployment
-        // immediately -- see hostbuilder's deploy handler -- rather than
-        // silently failing on its first tick) and warm-start timing are
-        // unchanged from before this fix. Every other leg of a multi-asset
-        // or cross-venue portfolio spawns lazily on its own first tick (see
-        // `spawn_leg`, called from `generate_signals`).
+        // Eagerly spawn the primary leg here, so deploy-time validation (a
+        // broken Python strategy rejects the deployment immediately -- see
+        // hostbuilder's deploy handler -- rather than silently failing on
+        // its first tick) happens up front.
         let primary_symbol = self.config.symbols.first().cloned().unwrap_or_default();
         let primary_exchange = self.config.exchanges.first().cloned().unwrap_or_default();
         let primary_leg = self.spawn_leg(&primary_symbol, &primary_exchange)?;
@@ -1144,10 +1163,53 @@ impl Strategy for PythonBridgeStrategy {
         self.legs.insert((primary_symbol.clone(), primary_exchange.clone()), primary_leg);
 
         let logger = SignalEngineLogger::new("StrategyHandler").await;
+
+        // Also eagerly spawn every OTHER leg of a multi-asset/cross-venue
+        // deployment (the full symbols x exchanges cross product --
+        // deployments are either "N symbols on 1 exchange" or "1 symbol on
+        // up to 2 exchanges", so one of the two lists always has length 1
+        // in practice; hostbuilder's warm-start fetch uses this same cross
+        // product). Without this, a secondary leg stayed cold (0 bars, no
+        // warm-start) until its own first live tick, even though
+        // `hostbuilder` already fetched historical bars for it up front --
+        // now every leg is warm-started at deploy time, not just the
+        // primary. A secondary leg's spawn failure is logged and left to
+        // retry lazily on its first tick (see `generate_signals`) rather
+        // than rejecting an otherwise-working deployment whose primary leg
+        // (and thus Python source) already validated successfully above.
+        let mut legs_warm_started = 1usize;
+        for symbol in self.config.symbols.clone() {
+            for exchange in self.config.exchanges.clone() {
+                if is_primary_leg(&self.config.symbols, &self.config.exchanges, &symbol, &exchange) {
+                    continue; // already spawned above
+                }
+                // `.map_err` converts to `String` immediately -- `Box<dyn
+                // Error>` is not `Send`, and letting it live in a `match`
+                // binding held across the `.await` below (even briefly)
+                // would make this whole async fn's future non-`Send`.
+                match self.spawn_leg(&symbol, &exchange).map_err(|e| e.to_string()) {
+                    Ok(leg) => {
+                        legs_warm_started += 1;
+                        logger.info(&format!(
+                            "Eagerly warm-started additional leg ({}, {}) for {}: {} bars",
+                            symbol, exchange, self.config.name, leg.bars_since_init,
+                        )).await;
+                        self.legs.insert((symbol.clone(), exchange.clone()), leg);
+                    }
+                    Err(err_msg) => {
+                        logger.info(&format!(
+                            "Eager warm-start failed for leg ({}, {}) of {}: {} -- will retry lazily on its first tick",
+                            symbol, exchange, self.config.name, err_msg,
+                        )).await;
+                    }
+                }
+            }
+        }
+
         logger.info(&format!(
-            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?}, warm_start_bars={}, primary_leg=({}, {}))",
+            "Initialized PythonBridgeStrategy: {} (candle_interval_minutes={}, resolved position_size_pct={:?}, warm_start_bars={}, primary_leg=({}, {}), legs_warm_started={})",
             self.config.name, self.candle_interval_minutes, self.resolved_params.get("position_size_pct"),
-            bars_since_init, primary_symbol, primary_exchange,
+            bars_since_init, primary_symbol, primary_exchange, legs_warm_started,
         )).await;
         Ok(())
     }
@@ -1428,18 +1490,19 @@ mod tests {
     #[test]
     fn parse_warm_start_bars_returns_empty_when_key_absent() {
         let params: HashMap<String, serde_json::Value> = HashMap::new();
-        assert_eq!(parse_warm_start_bars(&params), vec![]);
+        assert_eq!(parse_warm_start_bars(&params, "AUD-NZD", "oanda"), vec![]);
     }
 
     #[test]
     fn parse_warm_start_bars_extracts_valid_triples_in_order() {
         let mut params = HashMap::new();
+        let key = warm_start_leg_key("AUD-NZD", "oanda");
         params.insert(
-            "warm_start_bars".to_string(),
-            serde_json::json!([[100.0, 5.0, 1000], [101.5, 3.0, 2000]]),
+            "warm_start_bars_by_leg".to_string(),
+            serde_json::json!({ key: [[100.0, 5.0, 1000], [101.5, 3.0, 2000]] }),
         );
         assert_eq!(
-            parse_warm_start_bars(&params),
+            parse_warm_start_bars(&params, "AUD-NZD", "oanda"),
             vec![(100.0, 5.0, 1000), (101.5, 3.0, 2000)]
         );
     }
@@ -1447,20 +1510,25 @@ mod tests {
     #[test]
     fn parse_warm_start_bars_skips_malformed_entries_without_panicking() {
         let mut params = HashMap::new();
+        let key = warm_start_leg_key("AUD-NZD", "oanda");
         params.insert(
-            "warm_start_bars".to_string(),
-            serde_json::json!([[100.0, 5.0, 1000], "not a triple", [102.0, 1.0]]),
+            "warm_start_bars_by_leg".to_string(),
+            serde_json::json!({ key: [[100.0, 5.0, 1000], "not a triple", [102.0, 1.0]] }),
         );
         // Second entry isn't an array, third is missing the timestamp --
         // both silently dropped; only the well-formed entry survives.
-        assert_eq!(parse_warm_start_bars(&params), vec![(100.0, 5.0, 1000)]);
+        assert_eq!(parse_warm_start_bars(&params, "AUD-NZD", "oanda"), vec![(100.0, 5.0, 1000)]);
     }
 
     #[test]
     fn parse_warm_start_bars_returns_empty_when_value_is_not_an_array() {
         let mut params = HashMap::new();
-        params.insert("warm_start_bars".to_string(), serde_json::json!("oops"));
-        assert_eq!(parse_warm_start_bars(&params), vec![]);
+        let key = warm_start_leg_key("AUD-NZD", "oanda");
+        params.insert(
+            "warm_start_bars_by_leg".to_string(),
+            serde_json::json!({ key: "oops" }),
+        );
+        assert_eq!(parse_warm_start_bars(&params, "AUD-NZD", "oanda"), vec![]);
     }
 
     #[test]

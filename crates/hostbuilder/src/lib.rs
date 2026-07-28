@@ -1346,32 +1346,40 @@ impl HostedObject {
                                 serde_json::json!(interval),
                             );
                         }
-                        // Warm-start the strategy's bar buffer from historical
-                        // data instead of starting from zero bars. PythonBridgeStrategy
-                        // now keeps fully independent bar/position state per
-                        // (symbol, exchange) leg (each leg gets its own worker
-                        // process -- see PythonBridgeStrategy::legs's doc for the
-                        // cross-leg contamination bug this fixed), but historical
-                        // data is only ever fetched here for the deployment's
-                        // primary leg (symbols[0]/target_exchanges[0]) -- every
-                        // other leg still starts from zero bars and warms up
-                        // live. Extending warm-start fetch to every leg is a
-                        // separate, larger change than that contamination fix.
+                        // Warm-start every (symbol, exchange) leg's bar
+                        // buffer from historical data instead of starting
+                        // from zero bars, matching PythonBridgeStrategy's
+                        // fully independent per-leg worker/bar state (see
+                        // PythonBridgeStrategy::legs's doc for the cross-leg
+                        // contamination bug this fixed). Deployments are
+                        // either "N symbols on 1 exchange" (multi-asset
+                        // portfolio) or "1 symbol on up to 2 exchanges"
+                        // (dual-venue arbitrage) -- the full symbols x
+                        // target_exchanges cross product covers both shapes
+                        // without special-casing either, since one of the
+                        // two lists always has length 1 in practice.
                         if let Some(interval) = strategy.candle_interval_minutes {
-                            if let (Some(symbol), Some(exchange)) =
-                                (strategy.symbols.first(), strategy.target_exchanges.first())
-                            {
-                                if let Some(bars) = fetch_warm_start_bars(
-                                    exchange,
-                                    symbol,
-                                    strategy.asset_class.as_deref(),
-                                    interval,
-                                ).await {
-                                    strat_params.insert(
-                                        "warm_start_bars".to_string(),
-                                        serde_json::json!(bars),
-                                    );
+                            let mut warm_start_by_leg = serde_json::Map::new();
+                            for symbol in &strategy.symbols {
+                                for exchange in &strategy.target_exchanges {
+                                    if let Some(bars) = fetch_warm_start_bars(
+                                        exchange,
+                                        symbol,
+                                        strategy.asset_class.as_deref(),
+                                        interval,
+                                    ).await {
+                                        warm_start_by_leg.insert(
+                                            strategyhandler::warm_start_leg_key(symbol, exchange),
+                                            serde_json::json!(bars),
+                                        );
+                                    }
                                 }
+                            }
+                            if !warm_start_by_leg.is_empty() {
+                                strat_params.insert(
+                                    "warm_start_bars_by_leg".to_string(),
+                                    serde_json::Value::Object(warm_start_by_leg),
+                                );
                             }
                         }
                         let strat_config = StrategyConfig {
