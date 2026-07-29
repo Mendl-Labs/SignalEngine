@@ -907,13 +907,17 @@ pub struct PythonBridgeStrategy {
 struct LegState {
     worker: pythonbridge_worker::client::WorkerProcess,
     /// This leg's own last non-flat signal direction (+1 long, -1 short),
-    /// used only to size a CLOSE signal's flattening order. NOT
-    /// authoritative against the real broker/deployment_positions state --
-    /// after a worker restart this resets to `None`, so a CLOSE signal
-    /// arriving with no locally-tracked entry is dropped (logged, not acted
-    /// on) rather than guessed. Real position truth lives downstream in
-    /// `deployment_positions`, which nets correctly regardless via the
-    /// avg-cost engine even if this local proxy's size is imprecise.
+    /// used only to size a CLOSE signal's flattening order. Seeded from the
+    /// real `deployment_positions` row at spawn time (see
+    /// `parse_open_position`/`spawn_leg`) so a worker restart doesn't forget
+    /// a position that's still genuinely open -- before this seeding
+    /// existed, every restart reset this to `None`, and any CLOSE signal
+    /// computed afterward for an already-open position was silently
+    /// dropped (`spawn_leg`/`generate_signals`'s `_ => return
+    /// Ok(Vec::new())` branch) because there was nothing locally tracked to
+    /// flatten, stranding the position indefinitely. Confirmed live: a
+    /// forex portfolio deployment's USD-ZAR/AUD-NZD pair sat open for 5+
+    /// days across a restart with no way to close.
     last_side: Option<i8>,
     last_quantity: f64,
     /// This leg's bar accumulator -- see `BarAccumulator`'s doc.
@@ -1067,6 +1071,33 @@ fn seed_bucket_from_warm_start(
     Some((bar_bucket(timestamp as u64, candle_interval_minutes), close, volume, timestamp))
 }
 
+/// Parses `config.parameters["open_position_by_leg"][warm_start_leg_key(symbol, exchange)]`
+/// (set by `hostbuilder`'s deploy handler from the real `deployment_positions`
+/// row, both on a fresh deploy and on `reconcile_active_deployments_from_db`'s
+/// restart replay) into `(side, quantity)` -- `side` is `+1` for a long
+/// position, `-1` for short. Returns `None` when the leg's key is absent,
+/// malformed, or the position is flat (`quantity <= 0`) -- this seeds
+/// `LegState::last_side`/`last_quantity` in `spawn_leg` so a worker restart
+/// doesn't forget a position that's still genuinely open (see
+/// `LegState::last_side`'s doc for the incident this fixes).
+fn parse_open_position(
+    parameters: &HashMap<String, serde_json::Value>,
+    symbol: &str,
+    exchange: &str,
+) -> Option<(i8, f64)> {
+    let entry = parameters
+        .get("open_position_by_leg")
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get(&warm_start_leg_key(symbol, exchange)))?;
+    let side = entry.get("side")?.as_i64()?;
+    let side = if side >= 0 { 1i8 } else { -1i8 };
+    let quantity = entry.get("quantity")?.as_f64()?;
+    if quantity <= 0.0 {
+        return None;
+    }
+    Some((side, quantity))
+}
+
 impl PythonBridgeStrategy {
     pub fn new(config: StrategyConfig) -> Self {
         Self {
@@ -1114,6 +1145,18 @@ impl PythonBridgeStrategy {
             acc: BarAccumulator::default(),
             bars_since_init: 0,
         };
+
+        // Reconcile this leg's position-side memory from the real
+        // `deployment_positions` row (hostbuilder fetches it per-leg before
+        // constructing this config, same pattern as the warm-start bars
+        // below) -- without this, a leg that already has a genuinely open
+        // position (opened by a prior process instance, before this
+        // restart) would have no way to ever emit a CLOSE order for it: see
+        // `LegState::last_side`'s doc.
+        if let Some((side, quantity)) = parse_open_position(&self.config.parameters, symbol, exchange) {
+            leg.last_side = Some(side);
+            leg.last_quantity = quantity;
+        }
 
         // Warm-start the bar buffer from historical data (hostbuilder
         // fetches it per-leg before constructing this config -- see
@@ -1541,6 +1584,46 @@ mod tests {
         let bars = vec![(100.0, 5.0, 1_000_000_000_000), (101.5, 3.0, 2_000_000_000_000)];
         let seed = seed_bucket_from_warm_start(&bars, 240).expect("seed from last bar");
         assert_eq!(seed, (bar_bucket(2_000_000_000_000, 240), 101.5, 3.0, 2_000_000_000_000));
+    }
+
+    #[test]
+    fn parse_open_position_returns_none_when_key_absent() {
+        let params: HashMap<String, serde_json::Value> = HashMap::new();
+        assert_eq!(parse_open_position(&params, "USD-ZAR", "oanda"), None);
+    }
+
+    #[test]
+    fn parse_open_position_extracts_long_and_short_sides() {
+        let mut params = HashMap::new();
+        params.insert(
+            "open_position_by_leg".to_string(),
+            serde_json::json!({
+                warm_start_leg_key("USD-ZAR", "oanda"): { "side": 1, "quantity": 2080.93 },
+                warm_start_leg_key("AUD-NZD", "oanda"): { "side": -1, "quantity": 2080.93 },
+            }),
+        );
+        assert_eq!(parse_open_position(&params, "USD-ZAR", "oanda"), Some((1, 2080.93)));
+        assert_eq!(parse_open_position(&params, "AUD-NZD", "oanda"), Some((-1, 2080.93)));
+    }
+
+    #[test]
+    fn parse_open_position_returns_none_for_a_flat_or_zero_quantity_leg() {
+        let mut params = HashMap::new();
+        params.insert(
+            "open_position_by_leg".to_string(),
+            serde_json::json!({ warm_start_leg_key("CHF-ZAR", "oanda"): { "side": 1, "quantity": 0.0 } }),
+        );
+        assert_eq!(parse_open_position(&params, "CHF-ZAR", "oanda"), None);
+    }
+
+    #[test]
+    fn parse_open_position_returns_none_for_a_different_legs_key() {
+        let mut params = HashMap::new();
+        params.insert(
+            "open_position_by_leg".to_string(),
+            serde_json::json!({ warm_start_leg_key("USD-ZAR", "oanda"): { "side": 1, "quantity": 100.0 } }),
+        );
+        assert_eq!(parse_open_position(&params, "USD-ZAR", "kraken"), None);
     }
 
     #[test]

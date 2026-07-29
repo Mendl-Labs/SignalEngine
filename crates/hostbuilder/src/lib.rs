@@ -1382,6 +1382,60 @@ impl HostedObject {
                                 );
                             }
                         }
+                        // Reconcile each leg's real open position from
+                        // `deployment_positions` (the avg-cost engine's source
+                        // of truth) into `open_position_by_leg`, so a worker
+                        // restart doesn't forget a position that's still
+                        // genuinely open -- see
+                        // `strategyhandler::LegState::last_side`'s doc for the
+                        // incident this fixes (a forex portfolio's
+                        // USD-ZAR/AUD-NZD pair stuck open for 5+ days because
+                        // the only in-process record of "which side am I on"
+                        // was wiped by a restart). Best-effort: a failed or
+                        // skipped lookup just leaves legs blank, matching
+                        // pre-fix behavior -- never blocks a deploy.
+                        #[cfg(feature = "postgres")]
+                        if let Some(pool) = deploy_db_pool_for_handler.as_ref() {
+                            use bigdecimal::ToPrimitive;
+                            match pool.get().await {
+                                Ok(mut conn) => match databaseschema::ops::deployment_position_ops::get_positions_for_deployment(
+                                    &mut conn, strategy.instance_id,
+                                ).await {
+                                    Ok(positions) => {
+                                        let mut open_position_by_leg = serde_json::Map::new();
+                                        for pos in positions {
+                                            let qty = pos.qty.to_f64().unwrap_or(0.0);
+                                            if qty == 0.0 {
+                                                continue;
+                                            }
+                                            let key = strategyhandler::warm_start_leg_key(&pos.symbol, &pos.exchange);
+                                            open_position_by_leg.insert(key, serde_json::json!({
+                                                "side": if qty >= 0.0 { 1 } else { -1 },
+                                                "quantity": qty.abs(),
+                                            }));
+                                        }
+                                        if !open_position_by_leg.is_empty() {
+                                            ultra_logger::ultra_info!(format!(
+                                                "🔁 Reconciled {} open position(s) from deployment_positions for {} ({})",
+                                                open_position_by_leg.len(), strategy.strategy_name, strategy.instance_id
+                                            ));
+                                            strat_params.insert(
+                                                "open_position_by_leg".to_string(),
+                                                serde_json::Value::Object(open_position_by_leg),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => ultra_logger::ultra_warn!(format!(
+                                        "Open-position reconcile query failed for {}: {}",
+                                        strategy.instance_id, e
+                                    )),
+                                },
+                                Err(e) => ultra_logger::ultra_warn!(format!(
+                                    "Open-position reconcile: DB connect failed for {}: {}",
+                                    strategy.instance_id, e
+                                )),
+                            }
+                        }
                         let strat_config = StrategyConfig {
                             id: strategy_id_hash.to_string(),
                             name: strategy.strategy_name.clone(),
