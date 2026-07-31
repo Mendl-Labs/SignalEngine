@@ -958,29 +958,55 @@ impl HostedObject {
                                     ));
                                 }
 
-                                // A correlated 2-leg pair (dual-venue arbitrage/stat-arb
-                                // decision) is submitted through the coordinator --
-                                // sequenced leg1-then-leg2, halt-and-alert on a leg-2
-                                // failure -- instead of the independent per-signal path
-                                // below. Only possible for a multi-venue deployment;
+                                // A correlated 2-leg pair (dual-venue arbitrage) is
+                                // submitted through the coordinator -- sequenced
+                                // leg1-then-leg2, halt-and-alert on a leg-2 failure --
+                                // instead of the independent per-signal path below.
+                                // Only possible for a multi-venue deployment;
                                 // single-venue deployments never produce a batch shape
                                 // is_correlated_pair recognizes as a pair.
+                                //
+                                // A classic pairs trade (PairPythonBridgeStrategy's two
+                                // legs, different symbols -- see
+                                // strategyhandler::pair_strategy) is a SEPARATE, mutually
+                                // exclusive batch shape (is_pairs_trade_batch requires
+                                // different symbol_hash where is_correlated_pair requires
+                                // equal), routed through the same coordinator but with
+                                // each leg's own symbol string instead of one shared one.
+                                let dispatch_meta = bridge_paper_registry
+                                    .get(&deployment_id)
+                                    .map(|e| e.value().clone());
+
                                 let pair = if venues.len() == 2 {
                                     cross_venue_coordinator::is_correlated_pair(&sigs)
+                                        .map(|(l1, l2)| (l1, l2, md.symbol.clone(), md.symbol.clone()))
+                                        .or_else(|| {
+                                            cross_venue_coordinator::is_pairs_trade_batch(&sigs).and_then(|(l1, l2)| {
+                                                let meta_symbols = dispatch_meta.as_ref().map(|m| m.symbols.clone()).unwrap_or_default();
+                                                if meta_symbols.len() >= 2 {
+                                                    Some((l1, l2, meta_symbols[0].clone(), meta_symbols[1].clone()))
+                                                } else {
+                                                    ultra_logger::ultra_warn!(format!(
+                                                        "Pairs-trade batch detected for deployment {} but fewer than 2 \
+                                                         declared symbols ({:?}) -- cannot resolve each leg's own symbol, \
+                                                         falling back to independent per-signal submission.",
+                                                        deployment_id, meta_symbols
+                                                    ));
+                                                    None
+                                                }
+                                            })
+                                        })
                                 } else {
                                     None
                                 };
 
-                                if let Some((leg1, leg2)) = pair {
-                                    let meta = bridge_paper_registry
-                                        .get(&deployment_id)
-                                        .map(|e| e.value().clone());
+                                if let Some((leg1, leg2, symbol1, symbol2)) = pair {
+                                    let meta = dispatch_meta.clone();
                                     match (meta, bridge_ultra_order_manager.clone()) {
                                         (Some(meta), Some(mgr)) => {
-                                            let symbol = md.symbol.clone();
                                             let outcome = runtime.block_on(async move {
                                                 cross_venue_coordinator::execute_dual_venue_pair(
-                                                    deployment_id, &symbol, &meta, leg1, leg2, &mgr,
+                                                    deployment_id, &symbol1, &symbol2, &meta, leg1, leg2, &mgr,
                                                 ).await
                                             });
                                             ultra_logger::ultra_info!(format!(
@@ -1345,6 +1371,13 @@ impl HostedObject {
                                 "candle_interval_minutes".to_string(),
                                 serde_json::json!(interval),
                             );
+                        }
+                        // Pairs-trading declaration -- presence of this key is what
+                        // strategyhandler::create_strategy checks to construct a
+                        // PairPythonBridgeStrategy instead of the ordinary
+                        // per-leg-isolated PythonBridgeStrategy.
+                        if let Some(pair_spec) = &strategy.pair_spec {
+                            strat_params.insert("pair_spec".to_string(), pair_spec.clone());
                         }
                         // Warm-start every (symbol, exchange) leg's bar
                         // buffer from historical data instead of starting

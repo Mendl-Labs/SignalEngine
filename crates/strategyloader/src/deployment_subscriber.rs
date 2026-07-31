@@ -104,6 +104,19 @@ pub struct DeploymentPythonConfig {
     /// without this a forex warm-start fetch would silently use the wrong
     /// (crypto-style) ticker format.
     pub asset_class: Option<String>,
+    /// Pairs-trading declaration (`backtest_jobs.params_json.pair_spec`), a
+    /// JSON object shaped `{symbol_a, exchange_a, symbol_b, exchange_b,
+    /// hedge_ratio_mode, hedge_ratio}` -- the same shape a pairs strategy's
+    /// own Python `pair_spec()` method returns for backtest (see
+    /// `BacktestingEngine/strategy/src/strategies/python_strategy.rs`).
+    /// Whatever constructs a `validation_mode: "pairs"` job is responsible
+    /// for setting this at submission time so live deployment can construct
+    /// a `PairPythonBridgeStrategy` without executing Python just to learn
+    /// which two legs it trades -- it must describe the same relationship
+    /// the strategy's own `pair_spec()` declares, the same way
+    /// `edge_mechanism`/`asset_class` are submitter-declared metadata
+    /// mirrored by (not derived from) the strategy code.
+    pub pair_spec: Option<serde_json::Value>,
 }
 
 /// Resolves `asset_class` from a `backtest_jobs.params_json` value. Checks
@@ -204,6 +217,8 @@ pub struct DeployedStrategy {
     pub candle_interval_minutes: Option<i64>,
     /// The strategy's declared asset class, see `DeploymentPythonConfig::asset_class`.
     pub asset_class: Option<String>,
+    /// Pairs-trading declaration, see `DeploymentPythonConfig::pair_spec`.
+    pub pair_spec: Option<serde_json::Value>,
 }
 
 impl DeployedStrategy {
@@ -278,6 +293,7 @@ impl DeployedStrategy {
             python_source_code: python_config.python_source_code,
             candle_interval_minutes: python_config.candle_interval_minutes,
             asset_class: python_config.asset_class,
+            pair_spec: python_config.pair_spec,
         })
     }
 
@@ -407,8 +423,9 @@ impl DeploymentSubscriber {
             let candle_interval_minutes = params_json.as_ref()
                 .and_then(|params| params.get("candle_interval_minutes").and_then(|v| v.as_i64()));
             let asset_class = params_json.as_ref().and_then(resolve_asset_class);
+            let pair_spec = params_json.as_ref().and_then(|params| params.get("pair_spec")).cloned();
 
-            Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes, asset_class })
+            Some(DeploymentPythonConfig { python_source_code, candle_interval_minutes, asset_class, pair_spec })
         }
 
         inner(strategy_id).await.unwrap_or_default()
@@ -669,6 +686,7 @@ impl DeploymentSubscriber {
                 .get("candle_interval_minutes")
                 .and_then(|v| v.as_i64());
             let asset_class = resolve_asset_class(&params_json);
+            let pair_spec = params_json.get("pair_spec").cloned();
 
             Self::handle_deployment(
                 deployment_msg,
@@ -676,6 +694,7 @@ impl DeploymentSubscriber {
                     python_source_code: backtest.python_source_code.clone(),
                     candle_interval_minutes,
                     asset_class,
+                    pair_spec,
                 },
                 &self.deployed_strategies,
                 self.publisher.as_ref(),
@@ -1171,6 +1190,7 @@ mod tests {
                 python_source_code: Some("class Strategy:\n    pass".to_string()),
                 candle_interval_minutes: Some(240),
                 asset_class: Some("forex".to_string()),
+                pair_spec: None,
             },
         )
         .unwrap();

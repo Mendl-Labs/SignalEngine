@@ -41,6 +41,12 @@ lazy_static! {
 /// symbols, both signals for the same venue, either leg a Hold/Cancel)
 /// falls through to the existing independent per-signal path instead of
 /// being misinterpreted as a pair.
+///
+/// This is the cross-VENUE case: the SAME symbol, arbitraged across two
+/// exchanges. See `is_pairs_trade_batch` for the cross-SYMBOL case (classic
+/// pairs trading / statistical arbitrage) -- the two are mutually exclusive
+/// by construction (this function requires equal `symbol_hash`, that one
+/// requires different `symbol_hash`), so a caller can safely try both.
 pub fn is_correlated_pair(sigs: &[Signal]) -> Option<(Signal, Signal)> {
     if sigs.len() != 2 {
         return None;
@@ -50,6 +56,29 @@ pub fn is_correlated_pair(sigs: &[Signal]) -> Option<(Signal, Signal)> {
         return None;
     }
     if a.exchange_id == b.exchange_id {
+        return None;
+    }
+    let is_actionable = |s: &Signal| !matches!(s.action, SignalAction::Hold | SignalAction::Cancel);
+    if !is_actionable(&a) || !is_actionable(&b) {
+        return None;
+    }
+    Some((a, b))
+}
+
+/// Detect whether a strategy's signal batch looks like a classic pairs
+/// trade: exactly two actionable signals for two DIFFERENT symbols (the
+/// hedge's two legs), emitted together by a single `PairPythonBridgeStrategy`
+/// instance (see `strategyhandler::pair_strategy`) -- as opposed to
+/// `is_correlated_pair`'s cross-venue-arbitrage case (same symbol, different
+/// exchange). The two legs may share an exchange or use different ones --
+/// unlike cross-venue arb, that distinction doesn't matter here, since the
+/// hedge relationship is between the two SYMBOLS, not between venues.
+pub fn is_pairs_trade_batch(sigs: &[Signal]) -> Option<(Signal, Signal)> {
+    if sigs.len() != 2 {
+        return None;
+    }
+    let (a, b) = (sigs[0], sigs[1]);
+    if a.symbol_hash == b.symbol_hash {
         return None;
     }
     let is_actionable = |s: &Signal| !matches!(s.action, SignalAction::Hold | SignalAction::Cancel);
@@ -111,9 +140,16 @@ pub enum DualVenueOutcome {
 /// confirms filled. On leg-2 failure, halts the deployment (recorded in
 /// `HALTED_DEPLOYMENTS`) and logs loudly -- it deliberately does NOT attempt
 /// to automatically unwind leg 1's fill (see module doc).
+///
+/// `symbol1`/`symbol2` are each leg's own trading symbol -- equal for
+/// `is_correlated_pair`'s cross-venue-arbitrage case (same instrument, two
+/// exchanges), different for `is_pairs_trade_batch`'s classic-pairs case
+/// (two different instruments). Passing the same string twice preserves the
+/// original cross-venue-arb behavior exactly.
 pub async fn execute_dual_venue_pair(
     deployment_id: Uuid,
-    symbol: &str,
+    symbol1: &str,
+    symbol2: &str,
     meta: &PaperDeploymentMeta,
     leg1: Signal,
     leg2: Signal,
@@ -135,7 +171,7 @@ pub async fn execute_dual_venue_pair(
 
     let leg1_result = ultra_order_manager
         .process_signal_order(
-            symbol,
+            symbol1,
             &connector1,
             leg1.side,
             if leg1.is_market_order() { OrderType::Market } else { OrderType::Limit },
@@ -157,7 +193,7 @@ pub async fn execute_dual_venue_pair(
 
     let leg2_result = ultra_order_manager
         .process_signal_order(
-            symbol,
+            symbol2,
             &connector2,
             leg2.side,
             if leg2.is_market_order() { OrderType::Market } else { OrderType::Limit },
@@ -246,6 +282,44 @@ mod tests {
         let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Hold, 1.0);
         let b = sig(1, 42, ExchangeId::Coinbase, SignalAction::Sell, 1.0);
         assert!(is_correlated_pair(&[a, b]).is_none());
+    }
+
+    // --- is_pairs_trade_batch ---
+
+    #[test]
+    fn is_pairs_trade_batch_matches_two_different_symbols_same_exchange() {
+        let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Buy, 1.0);
+        let b = sig(1, 99, ExchangeId::Kraken, SignalAction::Sell, 2.0);
+        assert!(is_pairs_trade_batch(&[a, b]).is_some());
+    }
+
+    #[test]
+    fn is_pairs_trade_batch_matches_two_different_symbols_different_exchanges() {
+        let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Buy, 1.0);
+        let b = sig(1, 99, ExchangeId::Coinbase, SignalAction::Sell, 2.0);
+        assert!(is_pairs_trade_batch(&[a, b]).is_some());
+    }
+
+    #[test]
+    fn is_pairs_trade_batch_rejects_matching_symbols() {
+        // Same symbol => this is is_correlated_pair's cross-venue-arb case,
+        // not a pairs trade -- the two predicates must be mutually exclusive.
+        let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Buy, 1.0);
+        let b = sig(1, 42, ExchangeId::Coinbase, SignalAction::Sell, 1.0);
+        assert!(is_pairs_trade_batch(&[a, b]).is_none());
+    }
+
+    #[test]
+    fn is_pairs_trade_batch_rejects_wrong_batch_size() {
+        let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Buy, 1.0);
+        assert!(is_pairs_trade_batch(&[a]).is_none());
+    }
+
+    #[test]
+    fn is_pairs_trade_batch_rejects_a_hold_leg() {
+        let a = sig(1, 42, ExchangeId::Kraken, SignalAction::Hold, 1.0);
+        let b = sig(1, 99, ExchangeId::Kraken, SignalAction::Sell, 1.0);
+        assert!(is_pairs_trade_batch(&[a, b]).is_none());
     }
 
     // --- resolve_venue_for_exchange_id ---

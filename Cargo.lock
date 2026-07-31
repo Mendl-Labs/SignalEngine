@@ -3230,6 +3230,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "quanta"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4090,6 +4097,7 @@ dependencies = [
  "orderbook",
  "portfolio",
  "pythonbridge-worker",
+ "quant-diagnostics",
  "serde",
  "serde_json",
  "signal_dispatcher",

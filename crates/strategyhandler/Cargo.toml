@@ -23,6 +23,11 @@ dashmap = "6.1.0"
 ultra_signal = { path = "../signal" }
 signal_dispatcher = { path = "../signaldispatcher" }
 pythonbridge-worker = { path = "../pythonbridge-worker" }
+# Pairs-trading hedge-ratio estimation (OLS) -- pure-Rust, dependency-light,
+# shared with BacktestingEngine's research-time cointegration tooling; see
+# that crate's own doc comment ("shared between research-time and, in the
+# future, live-time (SignalEngine) callers") for why this is the intended reuse.
+quant-diagnostics = { path = "../../../BacktestingEngine/quant-diagnostics" }
 # Ultra-low latency logging
 ultra-logger = { workspace = true }
 tracing = "0.1.40"

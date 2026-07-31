@@ -251,6 +251,15 @@ pub struct PositionLimitChecker {
     limits: PositionLimits,
     /// Current positions: (symbol, exchange) -> (quantity, value)
     positions: Arc<RwLock<HashMap<(String, String), (f64, f64)>>>,
+    /// Pairs-trading support: maps a leg's `(symbol, exchange)` key to its
+    /// sibling leg's key when the two are registered as one hedged pair (see
+    /// `register_pair_link`). A pair's two legs are opposite-signed by
+    /// construction (long one, short the other), so summing their *signed*
+    /// notional nets to roughly zero for a well-hedged pair -- treating them
+    /// as two independent gross exposures (the default behavior for any
+    /// unregistered position) would double-count a hedge as risk instead of
+    /// recognizing it reduces risk, which is backwards for a pairs strategy.
+    pair_links: Arc<RwLock<HashMap<(String, String), (String, String)>>>,
 }
 
 impl PositionLimitChecker {
@@ -258,6 +267,27 @@ impl PositionLimitChecker {
         Self {
             limits,
             positions: Arc::new(RwLock::new(HashMap::new())),
+            pair_links: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register `leg_a` and `leg_b` as the two sibling legs of one hedged
+    /// pairs-trading position, so portfolio-value exposure nets them instead
+    /// of summing their gross values. Idempotent -- safe to call again for
+    /// the same pair (e.g. on every entry) with no effect beyond overwriting
+    /// the same link.
+    pub async fn register_pair_link(&self, leg_a: (String, String), leg_b: (String, String)) {
+        let mut links = self.pair_links.write().await;
+        links.insert(leg_a.clone(), leg_b.clone());
+        links.insert(leg_b, leg_a);
+    }
+
+    /// Remove a pair link (e.g. once the pair position is fully closed) --
+    /// both legs revert to being treated as independent gross exposures.
+    pub async fn unregister_pair_link(&self, leg_a: &(String, String)) {
+        let mut links = self.pair_links.write().await;
+        if let Some(leg_b) = links.remove(leg_a) {
+            links.remove(&leg_b);
         }
     }
 
@@ -326,11 +356,14 @@ impl PositionLimitChecker {
             });
         }
 
-        // Check portfolio value limit
-        let total_value: f64 = positions.iter()
-            .filter(|(k, _)| *k != &key)
-            .map(|(_, (_, v))| *v)
-            .sum::<f64>() + new_value;
+        // Check portfolio value limit. Candidate positions after this order:
+        // every existing position, with `key`'s value replaced by `new_qty`/
+        // `new_value` (order_price is this leg's own price, used for both
+        // the new gross value and, when paired, the new signed notional).
+        let mut candidate: HashMap<(String, String), (f64, f64)> = positions.clone();
+        candidate.insert(key.clone(), (new_qty, new_value));
+        let pair_links = self.pair_links.read().await;
+        let total_value = netted_portfolio_exposure(&candidate, &pair_links);
 
         if total_value > self.limits.max_portfolio_value {
             return Err(PositionLimitError::PortfolioValueTooLarge {
@@ -382,6 +415,53 @@ impl PositionLimitChecker {
         let mut positions = self.positions.write().await;
         *positions = new_positions;
     }
+}
+
+/// Signed dollar notional of a `(qty, value)` position tuple. `value` is
+/// always non-negative (`qty.abs() * price`), so the sign has to come from
+/// `qty` — this recovers "long positions add exposure, short positions
+/// subtract it" for the netting calculation below.
+fn signed_notional(qty: f64, value: f64) -> f64 {
+    if qty > 0.0 {
+        value
+    } else if qty < 0.0 {
+        -value
+    } else {
+        0.0
+    }
+}
+
+/// Total portfolio exposure across `positions`, netting any pair registered
+/// in `pair_links` (summing the two legs' *signed* notional, not their gross
+/// values) instead of summing every position's gross value independently.
+/// A pair whose sibling leg isn't currently open (e.g. only one leg has
+/// filled so far) falls back to gross for that leg — there's no actual
+/// hedge in place yet to net against.
+fn netted_portfolio_exposure(
+    positions: &HashMap<(String, String), (f64, f64)>,
+    pair_links: &HashMap<(String, String), (String, String)>,
+) -> f64 {
+    let mut visited: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut total = 0.0;
+
+    for (key, &(qty, value)) in positions.iter() {
+        if visited.contains(key) {
+            continue;
+        }
+        if let Some(sibling_key) = pair_links.get(key) {
+            if let Some(&(sib_qty, sib_value)) = positions.get(sibling_key) {
+                let net = (signed_notional(qty, value) + signed_notional(sib_qty, sib_value)).abs();
+                total += net;
+                visited.insert(key.clone());
+                visited.insert(sibling_key.clone());
+                continue;
+            }
+        }
+        total += value;
+        visited.insert(key.clone());
+    }
+
+    total
 }
 
 /// Position limit error types
@@ -852,5 +932,82 @@ mod tests {
             cb.record_order_attempt(),
             Err(CircuitBreakerTrip::RateLimitSecond)
         ));
+    }
+
+    #[test]
+    fn signed_notional_uses_qty_sign_not_value_sign() {
+        assert_eq!(signed_notional(2.0, 100.0), 100.0);
+        assert_eq!(signed_notional(-2.0, 100.0), -100.0);
+        assert_eq!(signed_notional(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn netted_exposure_nets_a_registered_pair_instead_of_summing_gross() {
+        let mut positions = HashMap::new();
+        // Long $10k of A, short $10k of B -- a well-hedged pair.
+        positions.insert(("AAA".to_string(), "kraken".to_string()), (100.0, 10_000.0));
+        positions.insert(("BBB".to_string(), "kraken".to_string()), (-50.0, 10_000.0));
+
+        let mut links = HashMap::new();
+        links.insert(("AAA".to_string(), "kraken".to_string()), ("BBB".to_string(), "kraken".to_string()));
+        links.insert(("BBB".to_string(), "kraken".to_string()), ("AAA".to_string(), "kraken".to_string()));
+
+        let net = netted_portfolio_exposure(&positions, &links);
+        assert!(net.abs() < 1e-9, "expected ~0 net exposure for a perfectly offsetting pair, got {}", net);
+    }
+
+    #[test]
+    fn netted_exposure_falls_back_to_gross_for_unlinked_positions() {
+        let mut positions = HashMap::new();
+        positions.insert(("AAA".to_string(), "kraken".to_string()), (100.0, 10_000.0));
+        positions.insert(("CCC".to_string(), "kraken".to_string()), (50.0, 5_000.0));
+
+        let links = HashMap::new();
+        let total = netted_portfolio_exposure(&positions, &links);
+        assert!((total - 15_000.0).abs() < 1e-9, "expected gross sum 15000, got {}", total);
+    }
+
+    #[test]
+    fn netted_exposure_uses_gross_for_a_pair_whose_sibling_leg_is_not_yet_open() {
+        let mut positions = HashMap::new();
+        positions.insert(("AAA".to_string(), "kraken".to_string()), (100.0, 10_000.0));
+        // BBB not in positions -- sibling hasn't filled yet.
+
+        let mut links = HashMap::new();
+        links.insert(("AAA".to_string(), "kraken".to_string()), ("BBB".to_string(), "kraken".to_string()));
+
+        let total = netted_portfolio_exposure(&positions, &links);
+        assert!((total - 10_000.0).abs() < 1e-9, "expected gross fallback 10000, got {}", total);
+    }
+
+    #[tokio::test]
+    async fn check_order_allows_a_hedged_pair_that_would_exceed_gross_portfolio_limit() {
+        // max_portfolio_value is set BELOW what the two legs would sum to
+        // gross ($20k), but well above their netted (~$0) exposure -- an
+        // order completing the hedge should be allowed once pair-linked.
+        let limits = PositionLimits {
+            max_order_size: 1000.0,
+            max_order_value: 50_000.0,
+            max_position_size: 1000.0,
+            max_position_value: 50_000.0,
+            max_portfolio_value: 12_000.0,
+            max_open_positions: 10,
+        };
+        let checker = PositionLimitChecker::new(limits);
+        KILL_SWITCH.reset();
+
+        let leg_a = ("AAA".to_string(), "kraken".to_string());
+        let leg_b = ("BBB".to_string(), "kraken".to_string());
+        checker.register_pair_link(leg_a.clone(), leg_b.clone()).await;
+
+        // Open leg A: long $10k.
+        checker.check_order("AAA", "kraken", 100.0, 100.0, true).await.unwrap();
+        checker.update_position("AAA", "kraken", 100.0, 100.0).await;
+
+        // Opening leg B (short $10k) would push gross exposure to $20k --
+        // over the $12k limit -- but nets to ~$0 once linked, so it should
+        // still be allowed.
+        let result = checker.check_order("BBB", "kraken", 100.0, 100.0, false).await;
+        assert!(result.is_ok(), "expected hedged pair leg to be allowed, got {:?}", result);
     }
 }

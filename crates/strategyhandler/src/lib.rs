@@ -2,6 +2,7 @@
 // Combines lock-free operations with comprehensive strategy management
 
 pub mod strategies;
+pub mod pair_strategy;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Mutex};
@@ -1386,7 +1387,14 @@ fn python_bridge_strategy_enabled() -> bool {
 /// been flipped off.
 pub fn create_strategy(config: StrategyConfig) -> Result<Box<dyn Strategy>, Box<dyn Error>> {
     let has_python_source = config.parameters.get("python_source_code").and_then(|v| v.as_str()).is_some();
-    if has_python_source && python_bridge_strategy_enabled() {
+    let has_pair_spec = config.parameters.contains_key("pair_spec");
+    if has_pair_spec && has_python_source && python_bridge_strategy_enabled() {
+        // Pairs-trading deployment: one shared worker trading the spread
+        // between two declared legs -- see pair_strategy.rs's module doc for
+        // why this is a separate Strategy impl, not a PythonBridgeStrategy
+        // variant.
+        Ok(Box::new(pair_strategy::PairPythonBridgeStrategy::new(config)))
+    } else if has_python_source && python_bridge_strategy_enabled() {
         Ok(Box::new(PythonBridgeStrategy::new(config)))
     } else {
         Ok(Box::new(SimpleMarketMakingStrategy::new(config)))
