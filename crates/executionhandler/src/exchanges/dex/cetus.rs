@@ -473,52 +473,6 @@ impl CetusConnector {
         })
     }
     
-    /// Select coins for swap input
-    #[allow(dead_code)]
-    async fn select_coins(&self, coin_type: &str, amount_needed: u64) -> Result<Vec<String>, ExecutionError> {
-        let wallet = self.get_wallet()?;
-        
-        // Query owned coins
-        let coins_result = wallet.get_coins(coin_type).await?;
-        
-        // Parse coin objects and select enough to cover amount
-        let mut selected_coins = Vec::new();
-        let mut total_amount = 0u64;
-        
-        // Get the data array from the result
-        if let Some(data) = coins_result.get("data").and_then(|v| v.as_array()) {
-            for coin in data.iter() {
-                if let Some(coin_obj) = coin.as_object() {
-                    // Extract balance from coin object
-                    if let Some(balance) = coin_obj.get("balance")
-                        .and_then(|b| b.as_str())
-                        .and_then(|s| s.parse::<u64>().ok()) 
-                    {
-                        // Extract object ID
-                        if let Some(coin_id) = coin_obj.get("coinObjectId")
-                            .or_else(|| coin_obj.get("objectId"))
-                            .and_then(|id| id.as_str()) 
-                        {
-                            selected_coins.push(coin_id.to_string());
-                            total_amount += balance;
-                            
-                            if total_amount >= amount_needed {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        if total_amount < amount_needed {
-            return Err(ExecutionError::Validation(
-                format!("Insufficient balance: need {} but only have {}", amount_needed, total_amount)
-            ));
-        }
-        
-        Ok(selected_coins)
-    }
 }
 
 /// Pool information from Cetus

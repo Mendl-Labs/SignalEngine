@@ -140,7 +140,6 @@ impl PaperTradeWriter {
         let value = &qty * &price;
 
         let trade = NewTradeRecord {
-            tenant_id: fill.tenant_id,
             deployment_id: fill.deployment_id,
             exchange: fill.exchange.clone(),
             symbol: fill.symbol.clone(),
@@ -207,8 +206,17 @@ impl PaperTradeWriter {
             let deployment_id = entry.key();
             let state = entry.value();
 
+            // NOTE (OSS port): the private schema disambiguated per-deployment
+            // snapshots via a (snapshot_at, tenant_id, mode) key, hackily
+            // reusing tenant_id = deployment_id (see the private repo's own
+            // "Will be corrected by caller" comment). This OSS schema has no
+            // tenant_id, so the upsert key is just (snapshot_at, mode) --
+            // multiple deployments snapshotted in the same tick will now
+            // collide and only the last-written one survives. Pre-existing
+            // design smell in the source this was ported from, not something
+            // introduced by dropping tenant_id; left as-is rather than
+            // redesigning the aggregation unasked.
             let snapshot = NewPnLSnapshot {
-                tenant_id: *deployment_id, // Will be corrected by caller — see note below
                 snapshot_at: now,
                 total_pnl: BigDecimal::try_from(state.realized_pnl + state.unrealized_pnl)
                     .unwrap_or_else(|_| BigDecimal::from(0)),

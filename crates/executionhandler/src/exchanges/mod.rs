@@ -1,4 +1,3 @@
-pub mod kraken;
 pub mod factory;
 pub mod dex;
 pub mod generic;

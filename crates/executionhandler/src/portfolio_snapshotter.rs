@@ -72,7 +72,6 @@ impl PortfolioSnapshotter {
                 let by_exchange_json = serde_json::to_value(&by_exchange).unwrap_or_default();
 
                 let snapshot = NewPnLSnapshot::new(
-                    config.tenant_id,
                     Utc::now(),
                     BigDecimal::try_from(pnl.total_pnl).unwrap_or_default(),
                     BigDecimal::try_from(pnl.realized_pnl).unwrap_or_default(),

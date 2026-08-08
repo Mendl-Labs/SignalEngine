@@ -17,8 +17,6 @@ pub mod cetus;
 pub mod cetus_constants;
 pub mod deepbook;
 pub mod deepbook_constants;
-pub mod uniswap_v3;
-pub mod jupiter;
 pub mod adapter;
 
 pub use traits::{DexConnector, DexConfig, BlockchainNetwork};
@@ -28,6 +26,4 @@ pub use cetus::CetusConnector;
 pub use cetus_constants as cetus_config;
 pub use deepbook::DeepBookConnector;
 pub use deepbook_constants as deepbook_config;
-pub use uniswap_v3::UniswapV3Connector;
-pub use jupiter::JupiterConnector;
 pub use adapter::DexToExchangeAdapter;

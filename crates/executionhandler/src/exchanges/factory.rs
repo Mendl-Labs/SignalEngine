@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use log::{info, warn, error, debug};
 use crate::core::{ExchangeConnector, ExchangeConfig, ExecutionError};
-use crate::exchanges::kraken::KrakenConnector;
 use crate::exchanges::generic::{GenericConnector, ExchangePreset};
 use crate::exchanges::dex::{DexToExchangeAdapter, BlockchainNetwork};
 use crate::paper_connector::{PaperTradingConnector, PaperTradingConfig};
@@ -61,24 +60,6 @@ impl ExchangeFactory {
         }
     }
     
-    /// Create a connector using the legacy Kraken-specific implementation
-    /// This is kept for backward compatibility and testing
-    #[deprecated(note = "Use create_connector with exchange name 'kraken' instead")]
-    pub async fn create_kraken_connector(config: ExchangeConfig) -> Result<Box<dyn ExchangeConnector>, ExecutionError> {
-        debug!("[FACTORY] Using legacy KrakenConnector");
-        let mut connector = KrakenConnector::new();
-        match connector.initialize(config).await {
-            Ok(_) => {
-                info!("[FACTORY] Legacy Kraken connector created successfully");
-                Ok(Box::new(connector))
-            }
-            Err(e) => {
-                error!("[FACTORY] Failed to initialize legacy Kraken connector: {}", e);
-                Err(e)
-            }
-        }
-    }
-
     /// Get list of supported exchanges
     pub fn supported_exchanges() -> Vec<&'static str> {
         vec![

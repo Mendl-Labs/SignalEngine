@@ -8,8 +8,6 @@ use exchangemetricaggregator::ExchangeMetricsAggregator;
 use dashmap::DashMap;
 use crossbeam::utils::CachePadded;
 
-pub mod database_integration_example;
-
 #[cfg(feature = "postgres")]
 pub mod database;
 
@@ -33,7 +31,6 @@ pub type DbPool = ();
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeCredential {
     pub id: uuid::Uuid,
-    pub tenant_id: uuid::Uuid,
     pub exchange: String,
     pub label: String,
     pub api_key: String,
@@ -46,7 +43,6 @@ pub struct ExchangeCredential {
 #[cfg(not(feature = "postgres"))]
 pub async fn load_exchange_credentials(
     _pool: &DbPool,
-    _tenant_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<ExchangeCredential>> {
     Ok(vec![])
 }
@@ -54,7 +50,6 @@ pub async fn load_exchange_credentials(
 #[cfg(not(feature = "postgres"))]
 pub async fn load_credentials_for_exchange(
     _pool: &DbPool,
-    _tenant_id: uuid::Uuid,
     _exchange: &str,
     _live_only: bool,
 ) -> anyhow::Result<Option<ExchangeCredential>> {

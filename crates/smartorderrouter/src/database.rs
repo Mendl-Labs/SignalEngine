@@ -216,7 +216,6 @@ impl OrderDatabasePersistence {
         quantity: f64,
         price: f64,
         fees: f64,
-        tenant_id: Uuid,
         deployment_id: Uuid,
         exchange: &str,
         symbol: &str,
@@ -262,7 +261,6 @@ impl OrderDatabasePersistence {
         let now = Utc::now();
 
         let trade_record = NewTradeRecord {
-            tenant_id,
             deployment_id,
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
@@ -474,7 +472,6 @@ fn decrypt_credential_value(encrypted: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct ExchangeCredential {
     pub id: Uuid,
-    pub tenant_id: Uuid,
     pub exchange: String,
     pub label: String,
     pub api_key: String,
@@ -484,10 +481,9 @@ pub struct ExchangeCredential {
     pub is_enabled: bool,
 }
 
-/// Load exchange credentials for a tenant from the database
+/// Load all enabled exchange credentials from the database.
 pub async fn load_exchange_credentials(
     pool: &DbPool,
-    tenant_id: Uuid,
 ) -> Result<Vec<ExchangeCredential>> {
     use databaseschema::schema::exchange_credentials;
     use diesel_async::RunQueryDsl;
@@ -495,13 +491,10 @@ pub async fn load_exchange_credentials(
     let mut conn = pool.get().await
         .context("Failed to get database connection")?;
 
-    // Query all enabled credentials for this tenant
     let query = exchange_credentials::table
-        .filter(exchange_credentials::tenant_id.eq(tenant_id))
         .filter(exchange_credentials::is_enabled.eq(true))
         .select((
             exchange_credentials::id,
-            exchange_credentials::tenant_id,
             exchange_credentials::exchange,
             exchange_credentials::label,
             exchange_credentials::api_key_encrypted,
@@ -510,8 +503,8 @@ pub async fn load_exchange_credentials(
             exchange_credentials::is_testnet,
             exchange_credentials::is_enabled,
         ));
-    
-    let rows: Vec<(Uuid, Uuid, String, String, String, String, Option<String>, bool, bool)> = 
+
+    let rows: Vec<(Uuid, String, String, String, String, Option<String>, bool, bool)> =
         RunQueryDsl::load(query, &mut conn)
             .await
             .context("Failed to load exchange credentials")?;
@@ -519,7 +512,7 @@ pub async fn load_exchange_credentials(
     // Decrypt and convert
     let credentials: Vec<ExchangeCredential> = rows
         .into_iter()
-        .filter_map(|(id, tenant_id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
+        .filter_map(|(id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
             // Decrypt values
             let api_key = decrypt_credential_value(&api_key_enc)?;
             let api_secret = decrypt_credential_value(&api_secret_enc)?;
@@ -527,7 +520,6 @@ pub async fn load_exchange_credentials(
 
             Some(ExchangeCredential {
                 id,
-                tenant_id,
                 exchange,
                 label,
                 api_key,
@@ -545,14 +537,13 @@ pub async fn load_exchange_credentials(
 /// Load credentials for a specific exchange.
 ///
 /// `live_only: true` restricts the lookup to non-testnet credentials — REQUIRED
-/// for live deployments. Without it the first enabled row wins, and a tenant
-/// holding both sandbox and production keys for the same exchange could have
-/// live orders signed with the sandbox key (orders silently go nowhere real)
-/// or, inverted, a "sandbox" flow hit production. Paper/simulation flows may
+/// for live deployments. Without it the first enabled row wins, and holding
+/// both sandbox and production keys for the same exchange could have live
+/// orders signed with the sandbox key (orders silently go nowhere real) or,
+/// inverted, a "sandbox" flow hit production. Paper/simulation flows may
 /// pass `false` to accept either.
 pub async fn load_credentials_for_exchange(
     pool: &DbPool,
-    tenant_id: Uuid,
     exchange: &str,
     live_only: bool,
 ) -> Result<Option<ExchangeCredential>> {
@@ -563,7 +554,6 @@ pub async fn load_credentials_for_exchange(
         .context("Failed to get database connection")?;
 
     let mut query = exchange_credentials::table
-        .filter(exchange_credentials::tenant_id.eq(tenant_id))
         .filter(exchange_credentials::exchange.eq(exchange.to_lowercase()))
         .filter(exchange_credentials::is_enabled.eq(true))
         .into_boxed();
@@ -573,7 +563,6 @@ pub async fn load_credentials_for_exchange(
     let query = query
         .select((
             exchange_credentials::id,
-            exchange_credentials::tenant_id,
             exchange_credentials::exchange,
             exchange_credentials::label,
             exchange_credentials::api_key_encrypted,
@@ -583,20 +572,19 @@ pub async fn load_credentials_for_exchange(
             exchange_credentials::is_enabled,
         ));
 
-    let row: Option<(Uuid, Uuid, String, String, String, String, Option<String>, bool, bool)> = 
+    let row: Option<(Uuid, String, String, String, String, Option<String>, bool, bool)> =
         RunQueryDsl::first(query, &mut conn)
             .await
             .optional()
             .context("Failed to query exchange credentials")?;
 
-    let credential = row.and_then(|(id, tenant_id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
+    let credential = row.and_then(|(id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
         let api_key = decrypt_credential_value(&api_key_enc)?;
         let api_secret = decrypt_credential_value(&api_secret_enc)?;
         let passphrase = passphrase_enc.as_ref().and_then(|p| decrypt_credential_value(p));
 
         Some(ExchangeCredential {
             id,
-            tenant_id,
             exchange,
             label,
             api_key,

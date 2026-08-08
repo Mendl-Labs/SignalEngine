@@ -93,7 +93,10 @@ impl KillSwitch {
         &self,
         reason: KillReason,
         pool: Arc<smartorderrouter::DbPool>,
-        tenant_id: uuid::Uuid,
+        // No tenant concept in the OSS schema; kept in the signature for
+        // call-site compatibility with the private codebase this was forked
+        // from.
+        _tenant_id: uuid::Uuid,
     ) {
         self.trigger(reason);
         let reason_str = format!("{:?}", reason);
@@ -102,7 +105,6 @@ impl KillSwitch {
                 Ok(mut conn) => {
                     if let Err(e) = databaseschema::ops::kill_switch_event_ops::record_trigger(
                         &mut conn,
-                        tenant_id,
                         &reason_str,
                         None,
                     ).await {
@@ -131,7 +133,7 @@ impl KillSwitch {
     pub fn reset_and_persist(
         &self,
         pool: Arc<smartorderrouter::DbPool>,
-        tenant_id: uuid::Uuid,
+        _tenant_id: uuid::Uuid,
         notes: Option<String>,
     ) -> bool {
         let was_triggered = self.reset();
@@ -141,7 +143,6 @@ impl KillSwitch {
                     Ok(mut conn) => {
                         if let Err(e) = databaseschema::ops::kill_switch_event_ops::record_reset(
                             &mut conn,
-                            tenant_id,
                             notes.as_deref(),
                         ).await {
                             log::error!("[KILL-SWITCH] Failed to persist reset event: {}", e);
@@ -162,10 +163,10 @@ impl KillSwitch {
     pub async fn check_startup_state(
         &self,
         pool: &smartorderrouter::DbPool,
-        tenant_id: uuid::Uuid,
+        _tenant_id: uuid::Uuid,
     ) -> Result<bool, String> {
         let mut conn = pool.get().await.map_err(|e| format!("DB connection error: {}", e))?;
-        match databaseschema::ops::kill_switch_event_ops::has_active_trigger(&mut conn, tenant_id).await {
+        match databaseschema::ops::kill_switch_event_ops::has_active_trigger(&mut conn).await {
             Ok(Some(event)) => {
                 log::warn!(
                     "🚨 Kill switch was triggered before shutdown (reason: {}, at: {}). Re-arming.",

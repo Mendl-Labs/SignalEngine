@@ -350,54 +350,6 @@ pub struct DispatcherStats {
     pub normal_queue_size: usize,
 }
 
-/// Legacy signal dispatcher for backward compatibility
-pub struct SignalDispatcher {
-    ultra_dispatcher: UltraFastSignalDispatcher,
-}
-
-impl SignalDispatcher {
-    pub fn new(
-        execution_sender: Sender<Signal>,
-        portfolio_sender: Sender<Signal>,
-        risk_sender: Sender<Signal>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Self {
-            ultra_dispatcher: UltraFastSignalDispatcher::new(
-                execution_sender,
-                portfolio_sender,
-                risk_sender,
-            )?,
-        })
-    }
-
-    /// Start signal processing
-    pub fn start(&self) -> std::thread::JoinHandle<()> {
-        self.ultra_dispatcher.start()
-    }
-
-    /// Submit signal for processing
-    pub fn submit(&self, signal: Signal) -> Result<(), Signal> {
-        self.ultra_dispatcher.submit_signal(signal)
-    }
-
-    /// Submit multiple signals
-    pub fn submit_batch(&self, signals: Vec<Signal>) -> usize {
-        self.ultra_dispatcher.submit_signal_batch(&signals)
-    }
-
-    /// Get dispatcher statistics
-    pub fn get_stats(&self) -> (u64, u64, u64, usize, usize) {
-        let (processed, avg_latency, max_latency) = self.ultra_dispatcher.get_metrics();
-        let (urgent_len, normal_len) = self.ultra_dispatcher.get_queue_stats();
-        (processed, avg_latency, max_latency, urgent_len, normal_len)
-    }
-
-    /// Stop signal processing
-    pub fn stop(&self) {
-        self.ultra_dispatcher.stop();
-    }
-}
-
 /// Zero-copy signal dispatcher using Arc-based signal sharing
 /// 
 /// Eliminates signal copies by sharing Arc<Signal> references.
@@ -685,16 +637,4 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[test]
-    #[ignore = "requires Windows elevation (os error 740)"]
-    fn test_legacy_dispatcher_new() {
-        let (exec_tx, _) = channel::bounded(64);
-        let (port_tx, _) = channel::bounded(64);
-        let (risk_tx, _) = channel::bounded(64);
-        let dispatcher = SignalDispatcher::new(exec_tx, port_tx, risk_tx).unwrap();
-        let (processed, _avg, _max, urgent, normal) = dispatcher.get_stats();
-        assert_eq!(processed, 0);
-        assert_eq!(urgent, 0);
-        assert_eq!(normal, 0);
-    }
 }

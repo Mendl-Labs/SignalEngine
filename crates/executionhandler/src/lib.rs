@@ -2,7 +2,6 @@ pub mod core;
 pub mod exchanges;
 pub mod optimizations;
 pub mod signal;
-pub mod circuit_breaker;
 pub mod circuit_breaker_v2;
 pub mod position_tracker;
 pub mod monitoring;
@@ -55,7 +54,6 @@ pub use core::{
 pub use exchanges::ExchangeFactory;
 pub use signal::{Signal, SignalAction};
 pub use paper_connector::{PaperTradingConnector, PaperTradingConfig};
-pub use circuit_breaker::{CircuitBreaker, ExchangeCircuitBreakerManager};
 pub use position_tracker::{PositionTracker, Position, PositionSide, PortfolioPnL};
 pub use validation::{TradingValidator, VALIDATOR};
 pub use auth::{
@@ -291,7 +289,6 @@ pub struct UltraLowLatencyExecutionHandler {
     default_exchange: Option<String>,
     global_metrics: Arc<core::MetricsCollector>,
     core_assignment: optimizations::CoreAssignment,
-    _circuit_breakers: Arc<RwLock<ExchangeCircuitBreakerManager>>,
     position_tracker: Arc<PositionTracker>,
     performance_monitor: Arc<PerformanceMonitor>,
     execution_database: Option<Arc<dyn DatabaseExecutionPersistence>>,
@@ -334,7 +331,6 @@ impl UltraLowLatencyExecutionHandler {
             default_exchange: None,
             global_metrics: Arc::new(core::MetricsCollector::new()),
             core_assignment,
-            _circuit_breakers: Arc::new(RwLock::new(ExchangeCircuitBreakerManager::new())),
             position_tracker: Arc::new(PositionTracker::new()),
             performance_monitor: Arc::new(PerformanceMonitor::new(MonitoringThresholds::default())),
             execution_database: None,
@@ -570,7 +566,7 @@ impl UltraLowLatencyExecutionHandler {
         pool: &smartorderrouter::DbPool,
         tenant_id: uuid::Uuid,
     ) -> Result<usize, ExecutionError> {
-        let credentials = smartorderrouter::load_exchange_credentials(pool, tenant_id)
+        let credentials = smartorderrouter::load_exchange_credentials(pool)
             .await
             .map_err(|e| ExecutionError::Unknown(format!("Failed to load credentials: {}", e)))?;
         
@@ -628,7 +624,7 @@ impl UltraLowLatencyExecutionHandler {
         exchange: &str,
         live_only: bool,
     ) -> Result<bool, ExecutionError> {
-        let credential = smartorderrouter::load_credentials_for_exchange(pool, tenant_id, exchange, live_only)
+        let credential = smartorderrouter::load_credentials_for_exchange(pool, exchange, live_only)
             .await
             .map_err(|e| ExecutionError::Unknown(format!(
                 "Failed to load credential for tenant={} exchange={}: {}",
@@ -1166,71 +1162,7 @@ impl Default for UltraLowLatencyExecutionHandler {
     }
 }
 
-// For backwards compatibility, provide the old interface
-pub use core::types::KrakenCredentials;
-
 impl UltraLowLatencyExecutionHandler {
-    /// Legacy constructor for backwards compatibility with Kraken-only setup
-    pub fn new_kraken(
-        _exchange: String,
-        credentials: KrakenCredentials,
-        connection_pool_size: Option<usize>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut handler = rt.block_on(Self::new());
-        
-        // Create Kraken config from legacy parameters
-        let _config = ExchangeConfig {
-            name: "Kraken".to_string(),
-            api_key: credentials.api_key,
-            secret_key: credentials.secret_key,
-            passphrase: None,
-            sandbox: false,
-            connection_pool_size: connection_pool_size.unwrap_or(10),
-            timeout_ms: timeout_ms.unwrap_or(5000),
-            rate_limit_per_second: 20,
-            rate_limit_burst: 60,
-            websocket_url: Some("wss://ws.kraken.com".to_string()),
-            rest_api_url: Some("https://api.kraken.com".to_string()),
-            custom_headers: HashMap::new(),
-        };
-        
-        // Note: This is async in practice, but for compatibility we return the handler
-        // In real usage, you'd need to call add_exchange separately
-        handler.default_exchange = Some("Kraken".to_string());
-        handler
-    }
-
-    /// Legacy start method for backwards compatibility
-    pub async fn start(&self) -> Result<(), ExecutionError> {
-        self.initialize_optimizations().await
-    }
-
-    /// Legacy get_metrics method for backwards compatibility  
-    pub fn get_metrics(&self) -> ExecutionMetrics {
-        // Return default metrics for compatibility
-        ExecutionMetrics {
-            exchange: "Legacy".to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Legacy methods for backwards compatibility
-    pub async fn add_execution_callback<F>(&self, _callback: F)
-    where
-        F: Fn(&ExecutionResult) + Send + Sync + 'static,
-    {
-        // Placeholder for backwards compatibility
-    }
-
-    pub async fn add_fill_callback<F>(&self, _callback: F)
-    where
-        F: Fn(&ExecutionFill) + Send + Sync + 'static,
-    {
-        // Placeholder for backwards compatibility  
-    }
-
     pub async fn cancel_order(&self, order_id: &str) -> Result<bool, ExecutionError> {
         if let Some(ref exchange) = self.default_exchange {
             let result = self.cancel_order_on_exchange(order_id, exchange).await?;
@@ -1378,20 +1310,4 @@ mod tests {
         assert_eq!(metrics.max_ns, 500);
     }
 
-    #[test]
-    fn test_legacy_kraken_constructor() {
-        let credentials = KrakenCredentials {
-            api_key: "test_key".to_string(),
-            secret_key: "test_secret".to_string(),
-        };
-
-        let handler = UltraLowLatencyExecutionHandler::new_kraken(
-            "Kraken".to_string(),
-            credentials,
-            Some(5),
-            Some(3000),
-        );
-
-        assert_eq!(handler.default_exchange, Some("Kraken".to_string()));
-    }
 }

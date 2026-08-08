@@ -30,7 +30,7 @@ SignalEngine is the real-time trading execution layer of the TradingPlatform. It
 2. **Loads strategies** from database with optimized parameters from BacktestingEngine
 3. **Generates signals** using SIMD-optimized calculations
 4. **Validates orders** through multiple risk control layers
-5. **Executes trades** on CEX (Kraken) and DEX (Cetus, DeepBook on Sui)
+5. **Executes trades** on 10 CEX/broker presets spanning crypto, equities (Alpaca), and forex (OANDA), plus DEX (Cetus, DeepBook on Sui)
 6. **Tracks positions** with real-time P&L and audit trail
 
 ### Key Characteristics
@@ -42,7 +42,7 @@ SignalEngine is the real-time trading execution layer of the TradingPlatform. It
 | **Architecture** | Lock-free, zero-copy, SIMD-optimized |
 | **Risk Controls** | Kill switch, fat-finger, circuit breakers |
 | **Persistence** | WAL with graceful shutdown |
-| **Exchanges** | Kraken (CEX), Cetus/DeepBook (Sui DEX) |
+| **Exchanges** | 10 CEX/broker presets (crypto, equities, forex) + Cetus/DeepBook (Sui DEX) |
 
 ---
 
@@ -133,15 +133,17 @@ Located in `crates/`:
 | `datahandler/` | MessageBroker subscription, orderbook replication (DashMap) |
 | `strategyloader/` | Database strategy loading from PostgreSQL |
 | `strategyhandler/` | Strategy execution orchestration, signal routing |
-| `signalgenerator/` | SIMD-optimized signal generation |
+| `signalgenerator/` | Shared `MarketData` wire type (used by `datahandler`) |
 | `signaldispatcher/` | Signal routing and batching |
 | `executionhandler/` | Pre-execution risk, CEX/DEX connectors |
 | `portfoliohandler/` | Position tracking, P&L calculation |
+| `portfolio/` | Wallet/balance state shared across handlers |
 | `smartorderrouter/` | Multi-venue execution optimization |
 | `exchangemetricaggregator/` | Exchange performance metrics collection |
 | `orderbook/` | Lock-free orderbook implementation |
 | `config/` | Configuration management |
 | `hostbuilder/` | Dependency injection and service orchestration |
+| `pythonbridge-worker/` | Live/paper strategy execution via an embedded Python interpreter (PyO3), run as an isolated child process per deployment so one strategy's crash/hang can't take down others |
 
 ---
 
@@ -250,18 +252,25 @@ RiskConfig {
 
 ## Exchange Connectors
 
-### CEX: Kraken
+### CEX/Broker: 10 presets via one config-driven connector
 
-Located in `crates/executionhandler/src/kraken/`:
+Handled by the config-driven `GenericConnector` in `crates/executionhandler/src/exchanges/generic/`
+(preset selected via `ExchangePreset::from_name`):
+
+| Preset | Asset class |
+|--------|-------------|
+| Kraken, Coinbase, Binance, Binance US, Bybit, OKX, Gemini, Deribit | Crypto spot/derivatives |
+| Alpaca (paper) | Equities |
+| OANDA (practice) | Forex |
 
 - **REST API** for order submission/cancellation
 - **WebSocket** for execution reports
-- Authenticated endpoints with API key/secret
+- Per-exchange auth method (Kraken/Gemini use HMAC-SHA512; see `generic/auth.rs`)
 - Rate limiting compliance
 
 ### DEX: Sui Network
 
-Located in `crates/executionhandler/src/dex/`:
+Located in `crates/executionhandler/src/exchanges/dex/`:
 
 **Cetus (AMM):**
 - Programmable Transaction Blocks (PTB)
@@ -467,8 +476,8 @@ cargo bench --package signalengine-core
 | `crates/datahandler/src/lib.rs` | MessageBroker subscription |
 | `crates/strategyhandler/src/lib.rs` | Strategy orchestration |
 | `crates/executionhandler/src/lib.rs` | Risk controls, connectors |
-| `crates/executionhandler/src/kraken/` | Kraken CEX connector |
-| `crates/executionhandler/src/dex/` | Sui DEX connectors |
+| `crates/executionhandler/src/exchanges/generic/` | Config-driven CEX connector (Kraken and 7 others) |
+| `crates/executionhandler/src/exchanges/dex/` | Sui DEX connectors |
 
 ---
 
@@ -494,3 +503,9 @@ cargo bench --package signalengine-core
 2. Check gas budget configuration
 3. Review transaction simulation results
 4. Confirm network (mainnet/testnet/devnet)
+
+---
+
+## License
+
+Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2) — see [LICENSE](LICENSE). Free for internal use, non-commercial research/education, and professional services; converts to Apache License 2.0 two years after each version's release.

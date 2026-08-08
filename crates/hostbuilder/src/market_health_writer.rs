@@ -66,18 +66,19 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
             }
         };
 
-        // Collapse to distinct (tenant, exchange, canonical_symbol) —
-        // positions PLUS every symbol of every registered deployment, so
-        // idle (holding) deployments are reported too.
-        let mut tuples: HashSet<(uuid::Uuid, String, String)> = HashSet::new();
+        // Collapse to distinct (exchange, canonical_symbol) — positions PLUS
+        // every symbol of every registered deployment, so idle (holding)
+        // deployments are reported too. No tenant dimension in the OSS
+        // schema's market_data_health table.
+        let mut tuples: HashSet<(String, String)> = HashSet::new();
         for p in &positions {
-            tuples.insert((p.tenant_id, p.exchange.clone(), canon(&p.symbol)));
+            tuples.insert((p.exchange.clone(), canon(&p.symbol)));
         }
         for entry in registry.iter() {
             let m = entry.value();
             for sym in &m.symbols {
                 for exch in &m.venues {
-                    tuples.insert((m.tenant_id, exch.clone(), canon(sym)));
+                    tuples.insert((exch.clone(), canon(sym)));
                 }
             }
         }
@@ -94,16 +95,16 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
         // deployment VENUE ("kraken") or the DATA PROVIDER ("massive" — the
         // consolidated feed publishes payloads with exchange="massive"
         // regardless of requesting venue). Try all four combinations.
-        let mut snaps: std::collections::HashMap<(uuid::Uuid, String, String), datahandler::MarketDataHealthSnapshot> =
+        let mut snaps: std::collections::HashMap<(String, String), datahandler::MarketDataHealthSnapshot> =
             std::collections::HashMap::new();
-        for (tenant_id, exchange, symbol_canon) in &tuples {
+        for (exchange, symbol_canon) in &tuples {
             let slash_form = symbol_canon.replace('-', "/");
             let snap = datahandler::snapshot_market_data_health(&slash_form, exchange)
                 .or_else(|| datahandler::snapshot_market_data_health(symbol_canon, exchange))
                 .or_else(|| datahandler::snapshot_market_data_health(&slash_form, "massive"))
                 .or_else(|| datahandler::snapshot_market_data_health(symbol_canon, "massive"));
             if let Some(s) = snap {
-                snaps.insert((*tenant_id, exchange.clone(), symbol_canon.clone()), s);
+                snaps.insert((exchange.clone(), symbol_canon.clone()), s);
             }
         }
 
@@ -117,7 +118,7 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
                 m.symbols.iter().any(|sym| {
                     m.venues.iter().any(|exch| {
                         snaps
-                            .get(&(m.tenant_id, exch.clone(), canon(sym)))
+                            .get(&(exch.clone(), canon(sym)))
                             .map(|s| {
                                 let newest = s.last_tick_at.max(s.last_orderbook_at);
                                 newest.map_or(false, |t| (now - t).num_seconds() < FRESH_WINDOW_SECS)
@@ -176,14 +177,13 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
         let mut upserted = 0usize;
         let mut missing = 0usize;
 
-        for (tenant_id, exchange, symbol_canon) in &tuples {
-            let snap = match snaps.get(&(*tenant_id, exchange.clone(), symbol_canon.clone())) {
+        for (exchange, symbol_canon) in &tuples {
+            let snap = match snaps.get(&(exchange.clone(), symbol_canon.clone())) {
                 Some(s) => s.clone(),
                 None => { missing += 1; continue; }
             };
 
             let row = UpsertMarketDataHealth {
-                tenant_id: *tenant_id,
                 exchange: exchange.clone(),
                 symbol: symbol_canon.clone(),
                 last_tick_at: snap.last_tick_at,
@@ -195,8 +195,8 @@ async fn run(pool: Arc<DbPool>, registry: PaperDeploymentRegistry) {
             match market_data_health_ops::upsert(&mut conn, &row).await {
                 Ok(_) => upserted += 1,
                 Err(e) => ultra_error!(format!(
-                    "market-health: upsert failed for {}/{}/{}: {}",
-                    tenant_id, exchange, symbol_canon, e
+                    "market-health: upsert failed for {}/{}: {}",
+                    exchange, symbol_canon, e
                 )),
             }
         }

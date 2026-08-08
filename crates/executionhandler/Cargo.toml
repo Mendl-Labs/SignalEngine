@@ -85,7 +85,6 @@ serde_yaml = "0.9"
 tempfile = "3.14"
 
 # Local workspace dependencies (cross-platform)
-signalgenerator = { path = "../signalgenerator" }
 smartorderrouter = { path = "../smartorderrouter" }
 exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 

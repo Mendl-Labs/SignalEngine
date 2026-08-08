@@ -39,7 +39,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::core::{ExchangeConnector, ExecutionError};
-use crate::signal::{Signal, SignalAction};
+use crate::signal::Signal;
 use crate::exchanges::factory::ExchangeFactory;
 use smartorderrouter::{ExchangeCredential, DbPool, load_exchange_credentials};
 
@@ -494,7 +494,7 @@ impl MultiTenantExecutionHandler {
         let pool = self.db_pool.as_ref()
             .ok_or_else(|| ExecutionError::Unknown("Database pool not configured".to_string()))?;
 
-        let credentials = load_exchange_credentials(pool, tenant_id)
+        let credentials = load_exchange_credentials(pool)
             .await
             .map_err(|e| ExecutionError::Unknown(format!("Failed to load credentials: {}", e)))?;
 

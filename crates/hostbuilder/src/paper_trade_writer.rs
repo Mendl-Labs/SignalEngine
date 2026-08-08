@@ -214,7 +214,6 @@ impl PaperTradeWriter {
 
         match paper_fill_ops::record_paper_fill(
             &mut conn,
-            fill.tenant_id,
             fill.deployment_id,
             &fill.exchange,
             &fill.symbol,
