@@ -2,9 +2,10 @@
 //!
 //! `PythonBridgeStrategy` (see `lib.rs`) deliberately isolates every
 //! `(symbol, exchange)` leg behind its OWN worker process, bar accumulator,
-//! and position state -- a real production incident (a shared-state version
-//! caused a ~13.7x mis-sized, wrong-symbol live order) proved this isolation
-//! is load-bearing for ordinary multi-asset portfolios, not an oversight.
+//! and position state -- a past incident with a shared-state version showed
+//! that cross-leg state can leak into order sizing and symbol routing, which
+//! is why this isolation is load-bearing for ordinary multi-asset
+//! portfolios, not an oversight.
 //! A genuine pairs strategy needs the opposite property: BOTH legs' prices
 //! visible to one joint decision, the same relationship
 //! `compute_all_signals_multi_venue` already gives the backtest engine (see
