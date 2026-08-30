@@ -602,6 +602,23 @@ impl UltraLowLatencyExecutionHandler {
         connectors.contains_key(exchange_name)
     }
 
+    /// Start a connector's real-time order-update stream (currently only
+    /// Alpaca does real work here -- see `GenericConnector::subscribe_to_updates`).
+    /// A no-op, not an error, when no connector is registered for
+    /// `exchange_name` yet -- callers that want a live deployment's fills
+    /// confirmed should call this right after `ensure_exchange_for_tenant`
+    /// succeeds for that same exchange.
+    pub async fn subscribe_exchange_updates(
+        &self,
+        exchange_name: &str,
+        callback: Box<dyn Fn(crate::core::types::OrderUpdate) + Send + Sync>,
+    ) {
+        let connectors = self.connectors.read().await;
+        if let Some(connector) = connectors.get(exchange_name) {
+            connector.subscribe_to_updates(callback).await;
+        }
+    }
+
     /// Lazily load (or refresh) a single tenant+exchange credential from the
     /// database and register the resulting connector. Idempotent — calling this
     /// repeatedly always rebuilds the connector with the latest stored creds, so

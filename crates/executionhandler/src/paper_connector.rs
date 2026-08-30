@@ -361,6 +361,11 @@ impl ExchangeConnector for PaperTradingConnector {
                     timestamp: now_ns,
                     exchange_timestamp_ns: Some(now_ns),
                     exchange_sequence: None,
+                    symbol: Some(signal.symbol.clone()),
+                    side: Some(match signal.action {
+                        SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop => "buy".to_string(),
+                        _ => "sell".to_string(),
+                    }),
                 });
             }
         }

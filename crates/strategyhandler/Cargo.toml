@@ -26,7 +26,7 @@ pythonbridge-worker = { path = "../pythonbridge-worker" }
 # shared with BacktestingEngine's research-time cointegration tooling; see
 # that crate's own doc comment ("shared between research-time and, in the
 # future, live-time (SignalEngine) callers") for why this is the intended reuse.
-quant-diagnostics = { path = "../../../BacktestingEngine/quant-diagnostics" }
+quant-diagnostics = { path = "../../../BacktestingCore/quant-diagnostics" }
 # Ultra-low latency logging
 ultra-logger = { workspace = true }
 tracing = "0.1.40"

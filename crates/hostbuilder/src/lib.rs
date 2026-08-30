@@ -1275,6 +1275,12 @@ impl HostedObject {
         // a pod restart when users edit their API keys in the Settings UI.
         #[cfg(feature = "postgres")]
         let deploy_db_pool_for_handler = deploy_db_pool.clone();
+        // For exchanges whose fills don't reliably land within
+        // `check_order_fill`'s short poll window (Alpaca; see its
+        // `subscribe_to_updates`), this is how a WebSocket-confirmed fill
+        // reaches the same trade_history pipeline paper deployments use.
+        #[cfg(feature = "postgres")]
+        let deploy_fill_tx = paper_fill_tx.clone();
         tokio::spawn(async move {
             ultra_logger::ultra_info!("📡 Deployment event handler started");
             
@@ -1590,6 +1596,45 @@ impl HostedObject {
                                         strategy.strategy_name, strategy.instance_id
                                     ));
                                     continue;
+                                }
+
+                                // Start the venue's real-time order-update
+                                // stream (currently only Alpaca does real
+                                // work here -- see
+                                // GenericConnector::subscribe_to_updates).
+                                // A fill confirmed this way is routed
+                                // through the SAME trade_history pipeline
+                                // paper deployments use, via
+                                // `deploy_fill_tx` -- see that channel's
+                                // own doc comment.
+                                if let Some(ref ultra_mgr) = deployment_ultra_mgr.as_ref() {
+                                    let handler = ultra_mgr.execution_handler().read().await;
+                                    let fill_tx = deploy_fill_tx.clone();
+                                    let tenant_id = strategy.tenant_id;
+                                    let deployment_id = strategy.instance_id;
+                                    let fill_exchange_name = exchange_name.clone();
+                                    handler.subscribe_exchange_updates(&exchange_name, Box::new(move |update: executionhandler::core::types::OrderUpdate| {
+                                        let (Some(qty), Some(price)) = (update.filled_quantity, update.fill_price) else { return };
+                                        let (Some(symbol), Some(side)) = (update.symbol.clone(), update.side.clone()) else { return };
+                                        if qty <= 0.0 || price <= 0.0 {
+                                            return;
+                                        }
+                                        if let Some(ref tx) = fill_tx {
+                                            let fill_event = paper_trade_writer::PaperFillEvent {
+                                                tenant_id,
+                                                deployment_id,
+                                                exchange: fill_exchange_name.clone(),
+                                                symbol,
+                                                side: if side.eq_ignore_ascii_case("buy") { "Buy".to_string() } else { "Sell".to_string() },
+                                                quantity: qty,
+                                                price,
+                                                fees: 0.0,
+                                                fill_id: format!("ws_{}_{}", update.order_id, update.timestamp),
+                                                order_id: update.order_id.clone(),
+                                            };
+                                            let _ = tx.try_send(fill_event);
+                                        }
+                                    })).await;
                                 }
                             }
 

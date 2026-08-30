@@ -28,7 +28,7 @@ databaseschema = { path = "../../../databaseschema", optional = true }
 # every restart -- forex backtests already use this same provider as a
 # proxy for Oanda (no historical Oanda candle API exists in this codebase),
 # so this isn't a new/different data source, just the same one reused live.
-dataloader = { path = "../../../BacktestingEngine/dataloader", optional = true }
+dataloader = { path = "../../../BacktestingCore/dataloader", optional = true }
 bigdecimal = { version = "0.4", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = "1.44.1"

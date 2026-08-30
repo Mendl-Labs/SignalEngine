@@ -278,6 +278,16 @@ pub struct OrderUpdate {
     /// Exchange-provided sequence number for ordering
     #[serde(default)]
     pub exchange_sequence: Option<u64>,
+    /// Symbol this update is for, when the source stream echoes it back
+    /// (e.g. Alpaca's trade_updates `data.order.symbol`) -- needed by a
+    /// caller writing a real trade_history row, which has no other way to
+    /// recover it from an out-of-band WebSocket push. `None` for update
+    /// sources that don't carry it.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Order side ("buy"/"sell"), same rationale as `symbol` above.
+    #[serde(default)]
+    pub side: Option<String>,
 }
 
 /// Update type enumeration
