@@ -79,7 +79,7 @@ impl ExchangePreset {
 /// Authentication method used by the exchange
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthMethod {
-    /// HMAC-SHA256 signature (Binance, Bybit, OKX)
+    /// HMAC-SHA256 signature (Binance, Bybit)
     HmacSha256 {
         /// Header name for API key
         api_key_header: String,
@@ -91,6 +91,11 @@ pub enum AuthMethod {
         timestamp_ms: bool,
         /// How to include signature in request (query, header, body)
         signature_location: SignatureLocation,
+        /// Which string-to-sign formula this exchange actually uses.
+        /// Binance's and Bybit's HMAC-SHA256 schemes are NOT
+        /// interchangeable despite both being "HMAC-SHA256 + timestamp" --
+        /// see `HmacSha256Formula`'s own doc comment.
+        formula: HmacSha256Formula,
     },
     /// HMAC-SHA512 signature (Kraken)
     HmacSha512 {
@@ -99,19 +104,44 @@ pub enum AuthMethod {
         /// Whether to include nonce in body
         use_nonce: bool,
     },
-    /// HMAC-SHA256 with passphrase (Coinbase)
+    /// HMAC-SHA256 with passphrase (Coinbase, OKX)
     HmacSha256WithPassphrase {
         api_key_header: String,
         signature_header: String,
         passphrase_header: String,
         timestamp_header: String,
+        /// The timestamp header's required wire format. Coinbase and OKX
+        /// share this signing scheme's *shape* but not its timestamp
+        /// format -- Coinbase wants plain Unix seconds, OKX requires
+        /// ISO-8601 milliseconds (`2020-12-08T09:08:57.715Z`) and rejects
+        /// (or fails signature validation on) anything else.
+        timestamp_format: TimestampFormat,
     },
     /// RSA signature (some exchanges)
     Rsa {
         api_key_header: String,
         signature_header: String,
     },
-    /// Ed25519 signature (Deribit)
+    /// Deribit's HMAC-SHA256 scheme -- verified 2026-08-31 against
+    /// https://docs.deribit.com/articles/authentication: a structured
+    /// `Authorization: deri-hmac-sha256 id=...,ts=...,sig=...,nonce=...`
+    /// header, signature = HMAC-SHA256(secret, "{ts}\n{nonce}\n{METHOD}\n{uri}\n{body}\n"),
+    /// distinct enough from every other scheme here to warrant its own
+    /// variant rather than overloading `HmacSha256`.
+    DeribitHmac,
+    /// Gemini's REST auth -- verified 2026-08-31 against
+    /// https://developer.gemini.com/authentication/api-key: the request
+    /// payload (a JSON object with `request`/`nonce`/business params) is
+    /// base64-encoded into an `X-GEMINI-PAYLOAD` header, signed with
+    /// HMAC-**SHA384** (not SHA512), with an EMPTY request body.
+    GeminiHmac {
+        api_key_header: String,
+        payload_header: String,
+        signature_header: String,
+    },
+    /// Ed25519 signature -- kept for forward compatibility; not backing
+    /// any preset today (Deribit uses `DeribitHmac`'s HMAC scheme, not
+    /// this).
     Ed25519 {
         client_id_param: String,
         signature_param: String,
@@ -136,6 +166,36 @@ pub enum SignatureLocation {
     Header,
     /// Signature in request body
     Body,
+}
+
+/// Which HMAC-SHA256 string-to-sign formula an exchange uses. Verified
+/// 2026-08-31 against each exchange's live docs -- these are NOT
+/// interchangeable even though both are nominally "HMAC-SHA256 with a
+/// timestamp":
+/// - Binance: `HMAC(secret, queryStringOrBody + "&timestamp=" + ts)`,
+///   per https://developers.binance.com/docs/binance-spot-api-docs/rest-api/request-security
+/// - Bybit: `HMAC(secret, ts + api_key + recv_window + queryStringOrBody)`,
+///   per https://bybit-exchange.github.io/docs/v5/guide -- a completely
+///   different concatenation, and it additionally requires an
+///   `X-BAPI-RECV-WINDOW` header that Binance has no equivalent for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HmacSha256Formula {
+    /// Binance/Binance US: `body&timestamp=ts`.
+    Binance,
+    /// Bybit v5: `ts+api_key+recv_window+body`, plus a required
+    /// `X-BAPI-RECV-WINDOW` header carrying the same `recv_window` value
+    /// (milliseconds).
+    Bybit { recv_window_ms: u64 },
+}
+
+/// Wire format for a signed request's timestamp value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TimestampFormat {
+    /// Plain Unix timestamp in seconds, e.g. `"1700000000"` (Coinbase).
+    UnixSeconds,
+    /// ISO-8601 with millisecond precision and a literal `Z` suffix,
+    /// e.g. `"2020-12-08T09:08:57.715Z"` (OKX).
+    Iso8601Millis,
 }
 
 /// Endpoint configuration for an exchange
@@ -364,6 +424,7 @@ fn coinbase_definition() -> ExchangeDefinition {
             signature_header: "CB-ACCESS-SIGN".to_string(),
             passphrase_header: "CB-ACCESS-PASSPHRASE".to_string(),
             timestamp_header: "CB-ACCESS-TIMESTAMP".to_string(),
+            timestamp_format: TimestampFormat::UnixSeconds,
         },
         endpoints: EndpointConfig {
             rest_url: "https://api.coinbase.com".to_string(),
@@ -423,6 +484,7 @@ fn binance_us_definition() -> ExchangeDefinition {
             timestamp_header: "timestamp".to_string(),
             timestamp_ms: true,
             signature_location: SignatureLocation::Query,
+            formula: HmacSha256Formula::Binance,
         },
         endpoints: EndpointConfig {
             rest_url: "https://api.binance.us".to_string(),
@@ -494,6 +556,7 @@ fn bybit_definition() -> ExchangeDefinition {
             timestamp_header: "X-BAPI-TIMESTAMP".to_string(),
             timestamp_ms: true,
             signature_location: SignatureLocation::Header,
+            formula: HmacSha256Formula::Bybit { recv_window_ms: 5000 },
         },
         endpoints: EndpointConfig {
             rest_url: "https://api.bybit.com".to_string(),
@@ -556,6 +619,7 @@ fn okx_definition() -> ExchangeDefinition {
             signature_header: "OK-ACCESS-SIGN".to_string(),
             passphrase_header: "OK-ACCESS-PASSPHRASE".to_string(),
             timestamp_header: "OK-ACCESS-TIMESTAMP".to_string(),
+            timestamp_format: TimestampFormat::Iso8601Millis,
         },
         endpoints: EndpointConfig {
             rest_url: "https://www.okx.com".to_string(),
@@ -613,10 +677,14 @@ fn okx_definition() -> ExchangeDefinition {
 fn gemini_definition() -> ExchangeDefinition {
     ExchangeDefinition {
         name: "Gemini".to_string(),
-        auth_method: AuthMethod::HmacSha512 {
+        // Verified 2026-08-31 against https://developer.gemini.com/authentication/api-key:
+        // HMAC-SHA384 over a base64-encoded JSON payload delivered in the
+        // X-GEMINI-PAYLOAD header, not the HMAC-SHA512-over-body scheme
+        // this used to (incorrectly) share with Kraken.
+        auth_method: AuthMethod::GeminiHmac {
             api_key_header: "X-GEMINI-APIKEY".to_string(),
+            payload_header: "X-GEMINI-PAYLOAD".to_string(),
             signature_header: "X-GEMINI-SIGNATURE".to_string(),
-            use_nonce: true,
         },
         endpoints: EndpointConfig {
             rest_url: "https://api.gemini.com".to_string(),
@@ -670,13 +738,13 @@ fn gemini_definition() -> ExchangeDefinition {
 fn deribit_definition() -> ExchangeDefinition {
     ExchangeDefinition {
         name: "Deribit".to_string(),
-        auth_method: AuthMethod::HmacSha256 {
-            api_key_header: "Authorization".to_string(),
-            signature_header: "sig".to_string(),
-            timestamp_header: "timestamp".to_string(),
-            timestamp_ms: true,
-            signature_location: SignatureLocation::Query,
-        },
+        // Verified 2026-08-31 against https://docs.deribit.com/articles/authentication:
+        // a structured `Authorization: deri-hmac-sha256 id=...,ts=...,sig=...,nonce=...`
+        // header, signed over a request-line-shaped string -- not
+        // interchangeable with the generic HmacSha256 scheme used for
+        // Binance/Bybit, which is why this used to be wrong (a raw hex
+        // signature dropped into a plain "Authorization" header).
+        auth_method: AuthMethod::DeribitHmac,
         endpoints: EndpointConfig {
             rest_url: "https://www.deribit.com".to_string(),
             websocket_url: "wss://www.deribit.com/ws/api/v2".to_string(),

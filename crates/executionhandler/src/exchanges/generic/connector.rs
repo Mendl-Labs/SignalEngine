@@ -95,6 +95,19 @@ impl GenericConnector {
         }
     }
 
+    /// Build a GET query string from `params`. Always `k=v&k=v` form,
+    /// regardless of this exchange's `content_type` -- a GET request has
+    /// no body in practice, so business params always ride the query
+    /// string even for exchanges whose POST bodies are JSON (Bybit, OKX,
+    /// Deribit). Kept separate from `build_request_body` so POST behavior
+    /// (which does depend on `content_type`) is untouched.
+    fn build_query_string(&self, params: &HashMap<String, String>) -> String {
+        params.iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
     /// Substitute path template placeholders (OANDA's `{account_id}` rides in the passphrase credential)
     fn resolve_path(&self, path: &str) -> String {
         if path.contains("{account_id}") {
@@ -188,6 +201,16 @@ impl GenericConnector {
         
         // Exchange-specific additions using trading_mode from config
         match self.preset {
+            ExchangePreset::Binance | ExchangePreset::BinanceUS => {
+                // Without this, Binance's default response type (ACK) omits
+                // status/executedQty/cummulativeQuoteQty entirely, so a
+                // fast market fill can only ever be confirmed via the
+                // separate check_order_fill follow-up GET -- FULL makes
+                // the placement response itself parseable by
+                // parse_fill_status, per
+                // https://developers.binance.com/docs/binance-spot-api-docs/rest-api/trading-endpoints#new-order-trade
+                params.insert("newOrderRespType".to_string(), "FULL".to_string());
+            }
             ExchangePreset::Bybit => {
                 // Bybit requires category from trading_mode
                 params.insert("category".to_string(), self.definition.trading_mode.category.clone());
@@ -222,52 +245,99 @@ impl GenericConnector {
     ) -> Result<Value, ExecutionError> {
         let client = self.http_client.as_ref()
             .ok_or_else(|| ExecutionError::Connection("HTTP client not initialized".to_string()))?;
-        
+
         let auth = self.auth.as_ref()
             .ok_or_else(|| ExecutionError::Authentication("Authentication not initialized".to_string()))?;
 
         let path = &self.resolve_path(path);
 
-        // Build request body
-        let body = self.build_request_body(&params);
-        
-        // Get timestamp
+        // Timestamp must exist before body-building for Kraken: its
+        // nonce (injected below) has to be the exact same value used to
+        // compute the signature, not independently re-derived inside
+        // auth.sign.
         let timestamp = nano_timestamp() as u64 / 1_000_000; // Convert to milliseconds
-        
+
+        // Kraken requires `nonce` as an actual request parameter, not
+        // just an input to the signature -- docs.kraken.com/api/docs/rest-api/add-order.
+        // This was previously missing entirely, so every private Kraken
+        // call was rejected server-side regardless of signature
+        // correctness.
+        let mut params = params;
+        if matches!(self.preset, ExchangePreset::Kraken) {
+            params.entry("nonce".to_string()).or_insert_with(|| timestamp.to_string());
+        }
+
+        let is_get = method.eq_ignore_ascii_case("GET");
+        // GET requests have no body in practice -- business params always
+        // ride the query string as `k=v&k=v`, regardless of this
+        // exchange's POST content_type (Bybit/OKX/Deribit are JSON on
+        // POST but still take GET params as a plain query string).
+        let body = if is_get {
+            self.build_query_string(&params)
+        } else {
+            self.build_request_body(&params)
+        };
+
         // Sign the request
         let auth_headers = auth.sign(method, path, &body, timestamp).await?;
-        
+
         // Build URL
         let base_url = &self.definition.endpoints.rest_url;
         let mut url = format!("{}{}", base_url, path);
-        
-        // Add query params from auth if needed
-        if !auth_headers.query_params.is_empty() {
+
+        if is_get {
+            // Business params (body) and any auth-added query params
+            // (timestamp/signature for Query-location schemes) both
+            // belong in the URL for GET. Previously `body` was silently
+            // dropped here, so any GET call needing business params
+            // (Binance/Bybit/OKX/Deribit order-status checks, and
+            // Deribit's order-placement itself, which is also GET) sent
+            // them nowhere.
+            let mut query_parts = Vec::new();
+            if !body.is_empty() {
+                query_parts.push(body.clone());
+            }
+            if !auth_headers.query_params.is_empty() {
+                let auth_query: String = auth_headers.query_params.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                query_parts.push(auth_query);
+            }
+            if !query_parts.is_empty() {
+                url = format!("{}?{}", url, query_parts.join("&"));
+            }
+        } else if !auth_headers.query_params.is_empty() {
             let query_string: String = auth_headers.query_params.iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect::<Vec<_>>()
                 .join("&");
-            
+
             if body.is_empty() {
                 url = format!("{}?{}", url, query_string);
             } else {
                 url = format!("{}?{}&{}", url, body, query_string);
             }
         }
-        
+
         // Build request
         let content_type = match self.definition.endpoints.content_type {
             ContentType::FormUrlEncoded => "application/x-www-form-urlencoded",
             ContentType::Json => "application/json",
         };
-        
+
+        // Gemini signs the full payload into a header and requires an
+        // empty wire body (Content-Length: 0) -- sending `body` again
+        // would be a protocol violation, not just redundant.
+        let wire_body = if auth_headers.force_empty_body { String::new() } else { body };
+
         let mut request = match method.to_uppercase().as_str() {
             "GET" => client.get(&url),
-            "POST" => client.post(&url).body(body),
+            "POST" => client.post(&url).body(wire_body),
             "DELETE" => client.delete(&url),
             _ => return Err(ExecutionError::InvalidParameter(format!("Unsupported HTTP method: {}", method))),
         };
-        
+
         // Add headers
         request = request.header("Content-Type", content_type);
         for (key, value) in &auth_headers.headers {
@@ -453,16 +523,24 @@ impl GenericConnector {
     /// on ANY exchange -- not just Alpaca -- ever reached `trade_history`.
     /// This follows up the placement call with a real status check.
     ///
-    /// Returns `None` when this preset's response format hasn't been
-    /// verified against the exchange's real API yet -- `execute_order`
-    /// falls back to today's honest "Submitted, unconfirmed" result in that
-    /// case. Silently guessing at an unverified field name risks parsing a
-    /// still-open order as filled (or vice versa), which would corrupt
+    /// Returns `None` when this preset's response can't be confidently
+    /// parsed as a confirmed fill -- `execute_order` falls back to today's
+    /// honest "Submitted, unconfirmed" result in that case. Silently
+    /// guessing at an unverified field name risks parsing a still-open
+    /// order as filled (or vice versa), which would corrupt
     /// `trade_history`/P&L with confidently-wrong data -- worse than
-    /// admitting the fill is unconfirmed. Only extend the match arms below
-    /// once a preset's real response shape has actually been checked
-    /// against its docs (see the Alpaca arm for the verified pattern).
+    /// admitting the fill is unconfirmed. Each arm below cites the doc it
+    /// was verified against (2026-08-31 pass, live-fetched, not recalled
+    /// from memory) -- see the Alpaca arm for the original pattern.
     fn parse_fill_status(&self, response: &Value) -> Option<(ExecutionStatus, f64, f64)> {
+        /// Reads a numeric field regardless of whether this exchange
+        /// encoded it as a JSON number or a quoted string -- most REST
+        /// exchanges here stringify numerics; Deribit's JSON-RPC shape
+        /// uses native numbers.
+        fn num_field(v: &Value) -> Option<f64> {
+            v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }
+
         match self.preset {
             // Verified against https://docs.alpaca.markets/reference/getorderbyorderid
             // (2026-08-30): `status`, `filled_qty`, `filled_avg_price` are the
@@ -488,27 +566,227 @@ impl GenericConnector {
                 };
                 Some((status, filled_qty, avg_price))
             }
-            // Not yet verified against each exchange's real order-status
-            // response -- see this function's own doc comment for why an
-            // unverified guess isn't a safe default here.
-            ExchangePreset::Kraken
-            | ExchangePreset::Coinbase
-            | ExchangePreset::BinanceUS
-            | ExchangePreset::Binance
-            | ExchangePreset::Bybit
-            | ExchangePreset::OKX
-            | ExchangePreset::Gemini
-            | ExchangePreset::Deribit
-            | ExchangePreset::OandaPractice => None,
+            // Verified against https://docs.kraken.com/api/docs/rest-api/get-order-info
+            // (2026-08-31): QueryOrders responds with `result` keyed by
+            // txid, e.g. `{"result":{"<txid>":{"status":...,"vol_exec":...,"price":...}}}`.
+            // Since this connector only ever queries one txid at a time,
+            // take the single entry rather than re-deriving the key (the
+            // response nests it as a map key, not a field we control).
+            // `price` here is the average price of executed trades (per
+            // Kraken's own field description), not the limit price --
+            // that's `descr.price`, deliberately not read here.
+            ExchangePreset::Kraken => {
+                let order = response.get("result")?.as_object()?.values().next()?;
+                let status_str = order.get("status").and_then(|s| s.as_str())?;
+                let filled_qty = order.get("vol_exec").and_then(num_field).unwrap_or(0.0);
+                let avg_price = order.get("price").and_then(num_field).unwrap_or(0.0);
+                let status = match status_str {
+                    "closed" if filled_qty > 0.0 => ExecutionStatus::Filled,
+                    "closed" => ExecutionStatus::Cancelled, // closed with zero fill = expired/cancelled
+                    "canceled" | "expired" => ExecutionStatus::Cancelled,
+                    _ if filled_qty > 0.0 => ExecutionStatus::PartiallyFilled, // "open" with partial exec
+                    _ => ExecutionStatus::Submitted, // "open" / "pending"
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api/orders/get-order
+            // (2026-08-31): `{"order":{"status":"OPEN"|"FILLED"|"CANCELLED"|"EXPIRED"|"FAILED",
+            // "filled_size":"...","average_filled_price":"..."}}`, both numeric fields quoted strings.
+            ExchangePreset::Coinbase => {
+                let order = response.get("order")?;
+                let status_str = order.get("status").and_then(|s| s.as_str())?;
+                let filled_qty = order.get("filled_size").and_then(num_field).unwrap_or(0.0);
+                let avg_price = order.get("average_filled_price").and_then(num_field).unwrap_or(0.0);
+                let status = match status_str {
+                    "FILLED" => ExecutionStatus::Filled,
+                    "CANCELLED" | "EXPIRED" => ExecutionStatus::Cancelled,
+                    "FAILED" => ExecutionStatus::Rejected,
+                    _ if filled_qty > 0.0 => ExecutionStatus::PartiallyFilled, // OPEN with partial fill
+                    _ => ExecutionStatus::Submitted, // OPEN / PENDING
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://developers.binance.com/docs/binance-spot-api-docs/rest-api/trading-endpoints#query-order-user_data
+            // (2026-08-31): `status`, `executedQty` (base asset filled),
+            // `cummulativeQuoteQty` (quote asset spent) -- there is no
+            // direct average-price field, so avg = quote/base when
+            // executedQty > 0. Same shape whether this response came from
+            // the follow-up status GET or an immediate `newOrderRespType=FULL`
+            // placement ack (see `build_order_params`).
+            ExchangePreset::Binance | ExchangePreset::BinanceUS => {
+                let status_str = response.get("status").and_then(|s| s.as_str())?;
+                let filled_qty = response.get("executedQty").and_then(num_field).unwrap_or(0.0);
+                let quote_qty = response.get("cummulativeQuoteQty").and_then(num_field).unwrap_or(0.0);
+                let avg_price = if filled_qty > 0.0 { quote_qty / filled_qty } else { 0.0 };
+                let status = match status_str {
+                    "FILLED" => ExecutionStatus::Filled,
+                    "PARTIALLY_FILLED" => ExecutionStatus::PartiallyFilled,
+                    "CANCELED" | "EXPIRED" | "PENDING_CANCEL" => ExecutionStatus::Cancelled,
+                    "REJECTED" => ExecutionStatus::Rejected,
+                    _ => ExecutionStatus::Submitted, // NEW
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://bybit-exchange.github.io/docs/v5/order/order-list
+            // (2026-08-31): `{"result":{"list":[{"orderStatus":...,"cumExecQty":"...","avgPrice":"..."}]}}`.
+            ExchangePreset::Bybit => {
+                let order = response.get("result")?.get("list")?.as_array()?.first()?;
+                let status_str = order.get("orderStatus").and_then(|s| s.as_str())?;
+                let filled_qty = order.get("cumExecQty").and_then(num_field).unwrap_or(0.0);
+                let avg_price = order.get("avgPrice").and_then(num_field).unwrap_or(0.0);
+                let status = match status_str {
+                    "Filled" => ExecutionStatus::Filled,
+                    "PartiallyFilled" => ExecutionStatus::PartiallyFilled,
+                    "Cancelled" | "Deactivated" => ExecutionStatus::Cancelled,
+                    "Rejected" => ExecutionStatus::Rejected,
+                    _ => ExecutionStatus::Submitted, // New / Created / PartiallyFilledCanceled edge case
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-order-details
+            // (2026-08-31): `{"data":[{"state":...,"accFillSz":"...","avgPx":"..."}]}`.
+            ExchangePreset::OKX => {
+                let order = response.get("data")?.as_array()?.first()?;
+                let status_str = order.get("state").and_then(|s| s.as_str())?;
+                let filled_qty = order.get("accFillSz").and_then(num_field).unwrap_or(0.0);
+                let avg_price = order.get("avgPx").and_then(num_field).unwrap_or(0.0);
+                let status = match status_str {
+                    "filled" => ExecutionStatus::Filled,
+                    "partially_filled" => ExecutionStatus::PartiallyFilled,
+                    "canceled" => ExecutionStatus::Cancelled,
+                    _ => ExecutionStatus::Submitted, // live / partially_canceled edge case, no reject state here
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://docs.gemini.com/rest/orders (2026-08-31):
+            // no single `status` enum -- derived from `is_live`,
+            // `is_cancelled`, `executed_amount`, `remaining_amount`.
+            // Same shape for both the order-creation response
+            // (`/v1/order/new`) and the status response (`/v1/order/status`).
+            ExchangePreset::Gemini => {
+                let is_cancelled = response.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_live = response.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false);
+                let filled_qty = response.get("executed_amount").and_then(num_field).unwrap_or(0.0);
+                let avg_price = response.get("avg_execution_price").and_then(num_field).unwrap_or(0.0);
+                let remaining = response.get("remaining_amount").and_then(num_field).unwrap_or(f64::NAN);
+                let status = if is_cancelled {
+                    ExecutionStatus::Cancelled
+                } else if filled_qty > 0.0 && remaining == 0.0 {
+                    ExecutionStatus::Filled
+                } else if filled_qty > 0.0 {
+                    ExecutionStatus::PartiallyFilled
+                } else if is_live {
+                    ExecutionStatus::Submitted
+                } else {
+                    ExecutionStatus::Rejected
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://docs.deribit.com/#private-get_order_state
+            // (2026-08-31). Two response shapes share this parser:
+            // - order placement (`/private/buy`, `/private/sell`):
+            //   `{"result":{"order":{"order_state":...,"filled_amount":...,"average_price":...}}}`
+            // - status check (`get_order_state`):
+            //   `{"result":{"order_state":...,"filled_amount":...,"average_price":...}}` (no "order" nesting)
+            // `filled_amount`/`average_price` are native JSON numbers here,
+            // not strings (Deribit's JSON-RPC convention, unlike the
+            // REST-conventional exchanges above).
+            ExchangePreset::Deribit => {
+                let result = response.get("result")?;
+                let order = result.get("order").unwrap_or(result);
+                let status_str = order.get("order_state").and_then(|s| s.as_str())?;
+                let filled_qty = order.get("filled_amount").and_then(num_field).unwrap_or(0.0);
+                let avg_price = order.get("average_price").and_then(num_field).unwrap_or(0.0);
+                let status = match status_str {
+                    "filled" => ExecutionStatus::Filled,
+                    "cancelled" => ExecutionStatus::Cancelled,
+                    "rejected" => ExecutionStatus::Rejected,
+                    _ if filled_qty > 0.0 => ExecutionStatus::PartiallyFilled, // "open" with partial fill
+                    _ => ExecutionStatus::Submitted, // "open" / "untriggered"
+                };
+                Some((status, filled_qty, avg_price))
+            }
+            // Verified against https://developer.oanda.com/rest-live-v20/order-df/#OrderFillTransaction
+            // (2026-08-31): a synchronous market-order fill is reported
+            // directly on the ORDER-CREATE response as
+            // `{"orderFillTransaction":{"units":"...","price":"..."}}`
+            // (units is a signed string -- negative for a sell). Only
+            // this shape is handled: the follow-up status-GET's plain
+            // `{"order":{"state":...}}` shape doesn't reliably carry fill
+            // price/quantity fields this codebase has verified, so it's
+            // deliberately left unconfirmed (`None`) rather than guessed --
+            // in practice this rarely matters, since OANDA market orders
+            // (the only order type this connector places, see
+            // `build_oanda_order_params`) fill synchronously and are
+            // already caught by this arm on the placement response itself.
+            ExchangePreset::OandaPractice => {
+                let fill = response.get("orderFillTransaction")?;
+                let filled_qty = fill.get("units").and_then(num_field).unwrap_or(0.0).abs();
+                let avg_price = fill.get("price").and_then(num_field).unwrap_or(0.0);
+                if filled_qty > 0.0 && avg_price > 0.0 {
+                    Some((ExecutionStatus::Filled, filled_qty, avg_price))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Builds the (method, path, params) for this preset's order-status
+    /// check. Each exchange's real status endpoint has a genuinely
+    /// different shape -- some take the order id as a path segment
+    /// (Coinbase, OANDA), some as a query param alongside other required
+    /// fields (Binance needs `symbol`, Bybit needs `category`, OKX needs
+    /// `instId`), and some as a POST body param (Kraken, Gemini). Mirrors
+    /// the per-exchange param-naming already established in
+    /// `cancel_order` for consistency.
+    fn build_status_check_request(&self, order_id: &str, symbol: &str) -> (&'static str, String, HashMap<String, String>) {
+        let base_path = self.definition.endpoints.order_status_path.clone();
+        match self.preset {
+            ExchangePreset::Kraken => {
+                let mut params = HashMap::new();
+                params.insert("txid".to_string(), order_id.to_string());
+                ("POST", base_path, params)
+            }
+            ExchangePreset::Coinbase | ExchangePreset::AlpacaPaper | ExchangePreset::OandaPractice => {
+                ("GET", format!("{}/{}", base_path, order_id), HashMap::new())
+            }
+            ExchangePreset::Binance | ExchangePreset::BinanceUS => {
+                let mut params = HashMap::new();
+                params.insert("symbol".to_string(), symbol.to_string());
+                params.insert("orderId".to_string(), order_id.to_string());
+                ("GET", base_path, params)
+            }
+            ExchangePreset::Bybit => {
+                let mut params = HashMap::new();
+                params.insert("category".to_string(), self.definition.trading_mode.category.clone());
+                params.insert("orderId".to_string(), order_id.to_string());
+                ("GET", base_path, params)
+            }
+            ExchangePreset::OKX => {
+                let mut params = HashMap::new();
+                params.insert("instId".to_string(), symbol.to_string());
+                params.insert("ordId".to_string(), order_id.to_string());
+                ("GET", base_path, params)
+            }
+            ExchangePreset::Gemini => {
+                let mut params = HashMap::new();
+                params.insert("order_id".to_string(), order_id.to_string());
+                ("POST", base_path, params)
+            }
+            ExchangePreset::Deribit => {
+                let mut params = HashMap::new();
+                params.insert("order_id".to_string(), order_id.to_string());
+                ("GET", base_path, params)
+            }
         }
     }
 
     /// Follow up an order placement with a real status check so a fast
     /// (near-instant) fill is actually confirmed and recorded, instead of
-    /// permanently reporting zero fill quantity. Presets without verified
-    /// `parse_fill_status` handling short-circuit to `None` on the first
-    /// attempt (`parse_fill_status` always returns `None` for them) --
-    /// this loop costs them nothing beyond the one no-op iteration.
+    /// permanently reporting zero fill quantity. `symbol` is the
+    /// exchange-formatted instrument (needed by Binance/OKX's status
+    /// endpoints, unused by presets whose status check is order-id-only).
     ///
     /// Alpaca equities orders route through a real brokerage and don't
     /// always fill within the same round-trip as placement (unlike a
@@ -517,17 +795,17 @@ impl GenericConnector {
     /// leaving the order as unconfirmed-but-submitted -- the trade_updates
     /// WebSocket listener (see `subscribe_to_updates`) is the authoritative
     /// source for a fill that lands after this window closes.
-    async fn check_order_fill(&self, order_id: &str) -> Option<(ExecutionStatus, f64, f64)> {
+    async fn check_order_fill(&self, order_id: &str, symbol: &str) -> Option<(ExecutionStatus, f64, f64)> {
         let attempts = match self.preset {
             ExchangePreset::AlpacaPaper => 3,
             _ => 1,
         };
-        let path = format!("{}/{}", self.definition.endpoints.order_status_path, order_id);
+        let (method, path, params) = self.build_status_check_request(order_id, symbol);
         for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
-            match self.execute_request("GET", &path, HashMap::new()).await {
+            match self.execute_request(method, &path, params.clone()).await {
                 Ok(response) => {
                     if let Some(result) = self.parse_fill_status(&response) {
                         if result.0 == ExecutionStatus::Filled || result.0 == ExecutionStatus::PartiallyFilled {
@@ -536,7 +814,7 @@ impl GenericConnector {
                         // Not filled yet on this attempt -- keep polling
                         // (Alpaca) or stop (everyone else, single attempt).
                     } else {
-                        return None; // unverified preset, no point retrying
+                        return None; // unparseable/unverified response shape, no point retrying
                     }
                 }
                 Err(e) => {
@@ -663,8 +941,11 @@ impl ExchangeConnector for GenericConnector {
                     .filter(|(s, _, _)| *s == ExecutionStatus::Filled || *s == ExecutionStatus::PartiallyFilled);
                 let (status, filled_quantity, avg_fill_price) = match immediate_fill {
                     Some(result) => result,
-                    None => self.check_order_fill(&order_id).await
-                        .unwrap_or((ExecutionStatus::Submitted, 0.0, 0.0)),
+                    None => {
+                        let exchange_symbol = self.symbol_converter.to_exchange_format(&signal.symbol);
+                        self.check_order_fill(&order_id, &exchange_symbol).await
+                            .unwrap_or((ExecutionStatus::Submitted, 0.0, 0.0))
+                    }
                 };
 
                 Ok(ExecutionResult {
@@ -1090,13 +1371,301 @@ mod fill_status_tests {
         assert_eq!(status, ExecutionStatus::Rejected);
     }
 
+    // ========== Kraken ==========
+
     #[test]
-    fn unverified_presets_never_guess_a_fill() {
-        // Kraken (and every other not-yet-verified preset) must return
-        // None regardless of response shape -- see parse_fill_status's own
-        // doc comment for why an unverified guess is unsafe here.
-        let resp: Value = serde_json::from_str(r#"{"status": "closed", "vol_exec": "1.5", "price": "100"}"#).unwrap();
+    fn parses_a_real_kraken_closed_order() {
+        // Real shape per https://docs.kraken.com/api/docs/rest-api/get-order-info
+        // -- keyed by txid, single entry for a single-txid query.
+        let resp: Value = serde_json::from_str(r#"{
+            "error": [],
+            "result": {"OABC1-XYZ23-DEF456": {"status": "closed", "vol_exec": "1.5", "price": "50000.0"}}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 1.5);
+        assert_eq!(price, 50000.0);
+    }
+
+    #[test]
+    fn kraken_placement_ack_has_no_fill_fields_and_returns_none() {
+        // AddOrder's own response (no "status"/"vol_exec" anywhere) --
+        // must fall through to None so execute_order correctly falls back
+        // to the follow-up QueryOrders check instead of a phantom fill.
+        let resp: Value = serde_json::from_str(r#"{
+            "error": [],
+            "result": {"descr": {"order": "buy 1.5 XBTUSD"}, "txid": ["OABC1-XYZ23-DEF456"]}
+        }"#).unwrap();
         let conn = GenericConnector::new(ExchangePreset::Kraken);
         assert!(conn.parse_fill_status(&resp).is_none());
+    }
+
+    #[test]
+    fn kraken_canceled_order_is_not_reported_as_filled() {
+        let resp: Value = serde_json::from_str(r#"{
+            "error": [],
+            "result": {"OABC1-XYZ23-DEF456": {"status": "canceled", "vol_exec": "0", "price": "0"}}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let (status, _, _) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Cancelled);
+    }
+
+    // ========== Coinbase ==========
+
+    #[test]
+    fn parses_a_real_coinbase_filled_order() {
+        // https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/rest-api/orders/get-order
+        let resp: Value = serde_json::from_str(r#"{
+            "order": {"order_id": "abc", "status": "FILLED", "filled_size": "0.5", "average_filled_price": "60000.00"}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Coinbase);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 0.5);
+        assert_eq!(price, 60000.0);
+    }
+
+    #[test]
+    fn coinbase_open_order_with_no_fill_is_submitted_not_filled() {
+        let resp: Value = serde_json::from_str(r#"{
+            "order": {"status": "OPEN", "filled_size": "0", "average_filled_price": "0"}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Coinbase);
+        let (status, _, _) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Submitted);
+    }
+
+    // ========== Binance ==========
+
+    #[test]
+    fn parses_a_real_binance_filled_order_deriving_avg_price_from_quote_qty() {
+        // https://developers.binance.com/docs/binance-spot-api-docs/rest-api/trading-endpoints#query-order-user_data
+        // -- no direct avg-price field; avg = cummulativeQuoteQty / executedQty.
+        let resp: Value = serde_json::from_str(r#"{
+            "symbol": "BTCUSDT", "status": "FILLED", "executedQty": "2.0", "cummulativeQuoteQty": "100000.0"
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Binance);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 2.0);
+        assert_eq!(price, 50000.0);
+    }
+
+    #[test]
+    fn binance_us_shares_the_same_parser_as_binance() {
+        let resp: Value = serde_json::from_str(r#"{"status": "PARTIALLY_FILLED", "executedQty": "0.5", "cummulativeQuoteQty": "25000.0"}"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::BinanceUS);
+        let (status, qty, _) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::PartiallyFilled);
+        assert_eq!(qty, 0.5);
+    }
+
+    #[test]
+    fn binance_zero_executed_qty_never_divides_by_zero() {
+        let resp: Value = serde_json::from_str(r#"{"status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Binance);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Submitted);
+        assert_eq!(qty, 0.0);
+        assert_eq!(price, 0.0);
+    }
+
+    // ========== Bybit ==========
+
+    #[test]
+    fn parses_a_real_bybit_filled_order() {
+        // https://bybit-exchange.github.io/docs/v5/order/order-list
+        let resp: Value = serde_json::from_str(r#"{
+            "retCode": 0, "result": {"list": [{"orderId": "x", "orderStatus": "Filled", "cumExecQty": "1.2", "avgPrice": "45000.5"}]}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Bybit);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 1.2);
+        assert_eq!(price, 45000.5);
+    }
+
+    #[test]
+    fn bybit_empty_list_returns_none_not_a_panic() {
+        let resp: Value = serde_json::from_str(r#"{"retCode": 0, "result": {"list": []}}"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Bybit);
+        assert!(conn.parse_fill_status(&resp).is_none());
+    }
+
+    // ========== OKX ==========
+
+    #[test]
+    fn parses_a_real_okx_filled_order() {
+        // https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-order-details
+        let resp: Value = serde_json::from_str(r#"{
+            "code": "0", "data": [{"ordId": "x", "state": "filled", "accFillSz": "0.8", "avgPx": "3000.25"}]
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::OKX);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 0.8);
+        assert_eq!(price, 3000.25);
+    }
+
+    // ========== Gemini ==========
+
+    #[test]
+    fn parses_a_real_gemini_fully_filled_order() {
+        // https://docs.gemini.com/rest/orders -- status derived from
+        // is_live/is_cancelled/executed_amount/remaining_amount, no enum field.
+        let resp: Value = serde_json::from_str(r#"{
+            "is_live": false, "is_cancelled": false,
+            "executed_amount": "2.0", "remaining_amount": "0", "avg_execution_price": "150.25"
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Gemini);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 2.0);
+        assert_eq!(price, 150.25);
+    }
+
+    #[test]
+    fn gemini_partial_fill_still_live() {
+        let resp: Value = serde_json::from_str(r#"{
+            "is_live": true, "is_cancelled": false,
+            "executed_amount": "0.5", "remaining_amount": "1.5", "avg_execution_price": "150.0"
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Gemini);
+        let (status, qty, _) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::PartiallyFilled);
+        assert_eq!(qty, 0.5);
+    }
+
+    #[test]
+    fn gemini_cancelled_order_is_cancelled_even_with_partial_fill() {
+        let resp: Value = serde_json::from_str(r#"{
+            "is_live": false, "is_cancelled": true,
+            "executed_amount": "0.5", "remaining_amount": "1.5", "avg_execution_price": "150.0"
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Gemini);
+        let (status, _, _) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Cancelled);
+    }
+
+    // ========== Deribit ==========
+
+    #[test]
+    fn parses_a_real_deribit_placement_response_with_nested_order() {
+        // https://docs.deribit.com/#private-buy -- placement response
+        // nests the order one level deeper than get_order_state.
+        let resp: Value = serde_json::from_str(r#"{
+            "result": {"order": {"order_id": "x", "order_state": "filled", "filled_amount": 10.0, "average_price": 50000.0}, "trades": []}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Deribit);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 10.0);
+        assert_eq!(price, 50000.0);
+    }
+
+    #[test]
+    fn parses_a_real_deribit_get_order_state_response_without_nesting() {
+        // https://docs.deribit.com/#private-get_order_state
+        let resp: Value = serde_json::from_str(r#"{
+            "result": {"order_id": "x", "order_state": "open", "filled_amount": 3.0, "average_price": 49000.0}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::Deribit);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::PartiallyFilled); // "open" with filled_amount > 0
+        assert_eq!(qty, 3.0);
+        assert_eq!(price, 49000.0);
+    }
+
+    // ========== OANDA ==========
+
+    #[test]
+    fn parses_a_real_oanda_synchronous_market_fill() {
+        // https://developer.oanda.com/rest-live-v20/order-df/#OrderFillTransaction
+        // -- units is a signed string; a sell reports negative units.
+        let resp: Value = serde_json::from_str(r#"{
+            "orderCreateTransaction": {"id": "1"},
+            "orderFillTransaction": {"id": "2", "units": "-100", "price": "1.10523"}
+        }"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::OandaPractice);
+        let (status, qty, price) = conn.parse_fill_status(&resp).unwrap();
+        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(qty, 100.0); // abs() of the signed units
+        assert_eq!(price, 1.10523);
+    }
+
+    #[test]
+    fn oanda_follow_up_status_shape_without_fill_transaction_is_left_unconfirmed() {
+        // The follow-up GET's plain order resource doesn't carry a
+        // verified fill price/qty field -- must not guess.
+        let resp: Value = serde_json::from_str(r#"{"order": {"id": "1", "state": "FILLED"}}"#).unwrap();
+        let conn = GenericConnector::new(ExchangePreset::OandaPractice);
+        assert!(conn.parse_fill_status(&resp).is_none());
+    }
+
+    // ========== build_status_check_request ==========
+
+    #[test]
+    fn kraken_status_check_posts_txid_as_body_param() {
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let (method, path, params) = conn.build_status_check_request("TXID123", "XBTUSD");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/0/private/QueryOrders");
+        assert_eq!(params.get("txid").unwrap(), "TXID123");
+    }
+
+    #[test]
+    fn binance_status_check_needs_symbol_and_order_id_as_query_params() {
+        let conn = GenericConnector::new(ExchangePreset::Binance);
+        let (method, path, params) = conn.build_status_check_request("999", "BTCUSDT");
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/api/v3/order");
+        assert_eq!(params.get("symbol").unwrap(), "BTCUSDT");
+        assert_eq!(params.get("orderId").unwrap(), "999");
+    }
+
+    #[test]
+    fn bybit_status_check_includes_category_from_trading_mode() {
+        let conn = GenericConnector::new(ExchangePreset::Bybit);
+        let (_, _, params) = conn.build_status_check_request("999", "BTCUSDT");
+        assert_eq!(params.get("category").unwrap(), "spot");
+        assert_eq!(params.get("orderId").unwrap(), "999");
+    }
+
+    #[test]
+    fn okx_status_check_uses_inst_id_and_ord_id_field_names() {
+        let conn = GenericConnector::new(ExchangePreset::OKX);
+        let (_, _, params) = conn.build_status_check_request("999", "BTC-USDT");
+        assert_eq!(params.get("instId").unwrap(), "BTC-USDT");
+        assert_eq!(params.get("ordId").unwrap(), "999");
+    }
+
+    #[test]
+    fn coinbase_and_oanda_and_alpaca_embed_order_id_in_the_path() {
+        for preset in [ExchangePreset::Coinbase, ExchangePreset::OandaPractice, ExchangePreset::AlpacaPaper] {
+            let conn = GenericConnector::new(preset);
+            let (method, path, params) = conn.build_status_check_request("ORDID", "SYM");
+            assert_eq!(method, "GET");
+            assert!(path.ends_with("/ORDID"), "preset {:?}: path {} should end with the order id", preset, path);
+            assert!(params.is_empty());
+        }
+    }
+
+    #[test]
+    fn gemini_status_check_posts_order_id_as_body_param() {
+        let conn = GenericConnector::new(ExchangePreset::Gemini);
+        let (method, path, params) = conn.build_status_check_request("999", "btcusd");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/order/status");
+        assert_eq!(params.get("order_id").unwrap(), "999");
+    }
+
+    #[test]
+    fn deribit_status_check_is_get_with_order_id_query_param() {
+        let conn = GenericConnector::new(ExchangePreset::Deribit);
+        let (method, _, params) = conn.build_status_check_request("999", "BTC-PERPETUAL");
+        assert_eq!(method, "GET");
+        assert_eq!(params.get("order_id").unwrap(), "999");
     }
 }

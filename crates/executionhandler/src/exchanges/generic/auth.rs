@@ -8,11 +8,11 @@
 use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512, Digest};
+use sha2::{Sha256, Sha384, Sha512, Digest};
 use std::collections::HashMap;
 
 use crate::core::types::ExecutionError;
-use super::config::{AuthMethod, SignatureLocation};
+use super::config::{AuthMethod, HmacSha256Formula, SignatureLocation, TimestampFormat};
 
 /// Authentication headers result
 #[derive(Debug, Clone)]
@@ -20,6 +20,12 @@ pub struct AuthHeaders {
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
     pub body_params: HashMap<String, String>,
+    /// When true, the actual HTTP request body must be sent empty
+    /// regardless of `body`/`params` — Gemini signs the full payload into
+    /// a header (`X-GEMINI-PAYLOAD`) and requires `Content-Length: 0` on
+    /// the wire; sending the business params again as a literal POST body
+    /// alongside that header is a protocol violation, not just redundant.
+    pub force_empty_body: bool,
 }
 
 impl AuthHeaders {
@@ -28,6 +34,7 @@ impl AuthHeaders {
             headers: HashMap::new(),
             query_params: HashMap::new(),
             body_params: HashMap::new(),
+            force_empty_body: false,
         }
     }
 }
@@ -51,7 +58,13 @@ pub trait AuthStrategy: Send + Sync {
     ) -> Result<AuthHeaders, ExecutionError>;
 }
 
-/// HMAC-SHA256 authentication (Binance, Bybit)
+/// HMAC-SHA256 authentication (Binance, Bybit).
+///
+/// Binance and Bybit are NOT the same formula despite both being nominal
+/// "HMAC-SHA256 + timestamp" schemes -- see `HmacSha256Formula`'s doc
+/// comment. `formula` selects which string-to-sign this instance builds;
+/// getting this wrong produces a signature that silently never validates
+/// server-side (the request is simply rejected, not "wrong but accepted").
 pub struct HmacSha256Auth {
     api_key: String,
     secret_key: String,
@@ -60,6 +73,7 @@ pub struct HmacSha256Auth {
     timestamp_header: String,
     timestamp_ms: bool,
     signature_location: SignatureLocation,
+    formula: HmacSha256Formula,
 }
 
 impl HmacSha256Auth {
@@ -75,6 +89,7 @@ impl HmacSha256Auth {
                 timestamp_header,
                 timestamp_ms,
                 signature_location,
+                formula,
             } => Ok(Self {
                 api_key,
                 secret_key,
@@ -83,13 +98,14 @@ impl HmacSha256Auth {
                 timestamp_header: timestamp_header.clone(),
                 timestamp_ms: *timestamp_ms,
                 signature_location: signature_location.clone(),
+                formula: formula.clone(),
             }),
             _ => Err(ExecutionError::Authentication(
                 "Invalid auth method for HmacSha256Auth".to_string(),
             )),
         }
     }
-    
+
     fn compute_signature(&self, message: &str) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes())
             .expect("HMAC can take key of any size");
@@ -109,42 +125,59 @@ impl AuthStrategy for HmacSha256Auth {
         timestamp: u64,
     ) -> Result<AuthHeaders, ExecutionError> {
         let mut auth = AuthHeaders::new();
-        
+
         // Add API key header
         auth.headers.insert(self.api_key_header.clone(), self.api_key.clone());
-        
+
         // Add timestamp
         let ts_str = if self.timestamp_ms {
             timestamp.to_string()
         } else {
             (timestamp / 1000).to_string()
         };
-        
-        // Build signature message based on exchange
-        // For Binance-style: timestamp + query_string
-        let message = if body.is_empty() {
-            format!("{}={}", self.timestamp_header, ts_str)
-        } else {
-            format!("{}&{}={}", body, self.timestamp_header, ts_str)
-        };
-        
-        let signature = self.compute_signature(&message);
-        
-        match self.signature_location {
-            SignatureLocation::Query => {
-                auth.query_params.insert(self.timestamp_header.clone(), ts_str);
-                auth.query_params.insert(self.signature_header.clone(), signature);
+
+        match &self.formula {
+            HmacSha256Formula::Binance => {
+                // Binance: HMAC(secret, queryStringOrBody & timestamp=ts)
+                // https://developers.binance.com/docs/binance-spot-api-docs/rest-api/request-security
+                let message = if body.is_empty() {
+                    format!("{}={}", self.timestamp_header, ts_str)
+                } else {
+                    format!("{}&{}={}", body, self.timestamp_header, ts_str)
+                };
+                let signature = self.compute_signature(&message);
+
+                match self.signature_location {
+                    SignatureLocation::Query => {
+                        auth.query_params.insert(self.timestamp_header.clone(), ts_str);
+                        auth.query_params.insert(self.signature_header.clone(), signature);
+                    }
+                    SignatureLocation::Header => {
+                        auth.headers.insert(self.timestamp_header.clone(), ts_str);
+                        auth.headers.insert(self.signature_header.clone(), signature);
+                    }
+                    SignatureLocation::Body => {
+                        auth.body_params.insert(self.timestamp_header.clone(), ts_str);
+                        auth.body_params.insert(self.signature_header.clone(), signature);
+                    }
+                }
             }
-            SignatureLocation::Header => {
+            HmacSha256Formula::Bybit { recv_window_ms } => {
+                // Bybit v5: HMAC(secret, timestamp + api_key + recv_window + queryStringOrBody)
+                // https://bybit-exchange.github.io/docs/v5/guide -- a
+                // required X-BAPI-RECV-WINDOW header carries the same
+                // recv_window value used in the signed string.
+                let recv_window = recv_window_ms.to_string();
+                let message = format!("{}{}{}{}", ts_str, self.api_key, recv_window, body);
+                let signature = self.compute_signature(&message);
+
+                // Bybit always signs via headers (X-BAPI-*), never query/body.
                 auth.headers.insert(self.timestamp_header.clone(), ts_str);
+                auth.headers.insert("X-BAPI-RECV-WINDOW".to_string(), recv_window);
                 auth.headers.insert(self.signature_header.clone(), signature);
             }
-            SignatureLocation::Body => {
-                auth.body_params.insert(self.timestamp_header.clone(), ts_str);
-                auth.body_params.insert(self.signature_header.clone(), signature);
-            }
         }
-        
+
         Ok(auth)
     }
 }
@@ -241,6 +274,7 @@ pub struct HmacSha256PassphraseAuth {
     signature_header: String,
     passphrase_header: String,
     timestamp_header: String,
+    timestamp_format: TimestampFormat,
 }
 
 impl HmacSha256PassphraseAuth {
@@ -256,12 +290,13 @@ impl HmacSha256PassphraseAuth {
                 signature_header,
                 passphrase_header,
                 timestamp_header,
+                timestamp_format,
             } => {
                 // Secret is base64 encoded
                 let decoded_secret = base64::engine::general_purpose::STANDARD
                     .decode(&secret_key)
                     .map_err(|e| ExecutionError::Authentication(format!("Invalid secret key: {}", e)))?;
-                
+
                 Ok(Self {
                     api_key,
                     secret_key: decoded_secret,
@@ -270,6 +305,7 @@ impl HmacSha256PassphraseAuth {
                     signature_header: signature_header.clone(),
                     passphrase_header: passphrase_header.clone(),
                     timestamp_header: timestamp_header.clone(),
+                    timestamp_format: timestamp_format.clone(),
                 })
             }
             _ => Err(ExecutionError::Authentication(
@@ -277,17 +313,32 @@ impl HmacSha256PassphraseAuth {
             )),
         }
     }
-    
+
     fn compute_signature(&self, timestamp: &str, method: &str, path: &str, body: &str) -> String {
         // Coinbase/OKX: HMAC-SHA256(timestamp + method + path + body, secret)
         let message = format!("{}{}{}{}", timestamp, method, path, body);
-        
+
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret_key)
             .expect("HMAC can take key of any size");
         mac.update(message.as_bytes());
         let result = mac.finalize();
-        
+
         base64::engine::general_purpose::STANDARD.encode(result.into_bytes())
+    }
+
+    /// Renders `timestamp` (ms since epoch) in this exchange's required
+    /// wire format. Coinbase and OKX share this scheme's shape but not
+    /// its timestamp encoding -- see `TimestampFormat`'s doc comment.
+    fn format_timestamp(&self, timestamp: u64) -> String {
+        match self.timestamp_format {
+            TimestampFormat::UnixSeconds => (timestamp / 1000).to_string(),
+            TimestampFormat::Iso8601Millis => {
+                let millis = timestamp as i64;
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+            }
+        }
     }
 }
 
@@ -301,19 +352,18 @@ impl AuthStrategy for HmacSha256PassphraseAuth {
         timestamp: u64,
     ) -> Result<AuthHeaders, ExecutionError> {
         let mut auth = AuthHeaders::new();
-        
-        // Timestamp as ISO string or seconds
-        let ts_str = (timestamp / 1000).to_string();
-        
+
+        let ts_str = self.format_timestamp(timestamp);
+
         // Compute signature
         let signature = self.compute_signature(&ts_str, method, path, body);
-        
+
         // Add headers
         auth.headers.insert(self.api_key_header.clone(), self.api_key.clone());
         auth.headers.insert(self.signature_header.clone(), signature);
         auth.headers.insert(self.passphrase_header.clone(), self.passphrase.clone());
         auth.headers.insert(self.timestamp_header.clone(), ts_str);
-        
+
         Ok(auth)
     }
 }
@@ -362,6 +412,145 @@ impl AuthStrategy for BearerTokenAuth {
     }
 }
 
+/// Deribit's HMAC-SHA256 scheme — verified 2026-08-31 against
+/// https://docs.deribit.com/articles/authentication:
+///
+/// ```text
+/// Authorization: deri-hmac-sha256 id=<client_id>,ts=<timestamp>,sig=<signature>,nonce=<nonce>
+/// signature = hex(HMAC-SHA256(secret, "{ts}\n{nonce}\n{Data}"))
+/// Data = "{METHOD}\n{uri}\n{RequestBody}\n"
+/// ```
+///
+/// Distinct enough from every other scheme in this file (structured
+/// Authorization header, request-line-shaped signed payload) that it
+/// doesn't fit `HmacSha256Auth`'s generic query/header/body model.
+///
+/// `uri` must be exactly what ends up on the wire, query string included
+/// -- Deribit's presets in this codebase route business params as a GET
+/// query string (see `ExchangeDefinition::endpoints::place_order_method`
+/// for Deribit), so `sign()` reconstructs `path?body` the same way
+/// `GenericConnector::execute_request`'s GET branch builds the final URL,
+/// to keep the signed URI and the actual request URI identical.
+pub struct DeribitAuth {
+    client_id: String,
+    client_secret: String,
+}
+
+impl DeribitAuth {
+    fn compute_signature(&self, message: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.client_secret.as_bytes())
+            .expect("HMAC can take key of any size");
+        mac.update(message.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+}
+
+#[async_trait]
+impl AuthStrategy for DeribitAuth {
+    async fn sign(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        timestamp: u64,
+    ) -> Result<AuthHeaders, ExecutionError> {
+        let mut auth = AuthHeaders::new();
+
+        let ts_str = timestamp.to_string();
+        let nonce = timestamp.to_string();
+        let is_get = method.eq_ignore_ascii_case("GET");
+
+        // For GET (Deribit's convention for both order placement and
+        // status checks here), business params ride the query string, so
+        // the signed URI must include them and RequestBody is empty. For
+        // any future POST usage, params stay in the body instead.
+        let (uri, request_body) = if is_get {
+            let uri = if body.is_empty() { path.to_string() } else { format!("{}?{}", path, body) };
+            (uri, String::new())
+        } else {
+            (path.to_string(), body.to_string())
+        };
+
+        let data = format!("{}\n{}\n{}\n", method.to_uppercase(), uri, request_body);
+        let string_to_sign = format!("{}\n{}\n{}", ts_str, nonce, data);
+        let signature = self.compute_signature(&string_to_sign);
+
+        auth.headers.insert(
+            "Authorization".to_string(),
+            format!("deri-hmac-sha256 id={},ts={},sig={},nonce={}", self.client_id, ts_str, signature, nonce),
+        );
+
+        Ok(auth)
+    }
+}
+
+/// Gemini's REST auth — verified 2026-08-31 against
+/// https://developer.gemini.com/authentication/api-key: the request
+/// payload (a JSON object carrying `request` (the endpoint path),
+/// `nonce`, and any business params) is base64-encoded into an
+/// `X-GEMINI-PAYLOAD` header and signed with HMAC-**SHA384** (not
+/// SHA512, despite Gemini nominally being grouped with Kraken as an
+/// "HMAC-SHA512" exchange elsewhere in this codebase's own doc comments
+/// -- that was wrong). The actual HTTP body must be empty
+/// (`Content-Length: 0`); `AuthHeaders::force_empty_body` signals that to
+/// `execute_request`.
+///
+/// `body` (as passed to `sign()`) is expected to be a flat JSON object
+/// string of business params (e.g. `{"order_id":"123"}`), matching how
+/// `build_request_body` serializes params for Gemini's
+/// `ContentType::Json` -- an empty string is treated as no extra params.
+pub struct GeminiAuth {
+    api_key: String,
+    api_key_header: String,
+    payload_header: String,
+    signature_header: String,
+    secret_key: String,
+}
+
+impl GeminiAuth {
+    fn compute_signature(&self, payload_b64: &str) -> String {
+        let mut mac = Hmac::<Sha384>::new_from_slice(self.secret_key.as_bytes())
+            .expect("HMAC can take key of any size");
+        mac.update(payload_b64.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+}
+
+#[async_trait]
+impl AuthStrategy for GeminiAuth {
+    async fn sign(
+        &self,
+        _method: &str,
+        path: &str,
+        body: &str,
+        timestamp: u64,
+    ) -> Result<AuthHeaders, ExecutionError> {
+        let mut auth = AuthHeaders::new();
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("request".to_string(), serde_json::Value::String(path.to_string()));
+        payload.insert("nonce".to_string(), serde_json::Value::Number(timestamp.into()));
+        if !body.is_empty() {
+            if let Ok(serde_json::Value::Object(business_params)) = serde_json::from_str(body) {
+                for (k, v) in business_params {
+                    payload.insert(k, v);
+                }
+            }
+        }
+
+        let payload_json = serde_json::Value::Object(payload).to_string();
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload_json.as_bytes());
+        let signature = self.compute_signature(&payload_b64);
+
+        auth.headers.insert(self.api_key_header.clone(), self.api_key.clone());
+        auth.headers.insert(self.payload_header.clone(), payload_b64);
+        auth.headers.insert(self.signature_header.clone(), signature);
+        auth.force_empty_body = true;
+
+        Ok(auth)
+    }
+}
+
 /// Factory function to create the appropriate auth strategy
 pub fn create_auth_strategy(
     auth_method: &AuthMethod,
@@ -391,6 +580,19 @@ pub fn create_auth_strategy(
             }))
         }
         AuthMethod::BearerToken => Ok(Box::new(BearerTokenAuth { api_key })),
+        AuthMethod::DeribitHmac => Ok(Box::new(DeribitAuth {
+            client_id: api_key,
+            client_secret: secret_key,
+        })),
+        AuthMethod::GeminiHmac { api_key_header, payload_header, signature_header } => {
+            Ok(Box::new(GeminiAuth {
+                api_key,
+                api_key_header: api_key_header.clone(),
+                payload_header: payload_header.clone(),
+                signature_header: signature_header.clone(),
+                secret_key,
+            }))
+        }
         AuthMethod::Rsa { .. } | AuthMethod::Ed25519 { .. } => {
             Err(ExecutionError::Authentication(
                 "RSA and Ed25519 auth not yet implemented".to_string(),
@@ -402,7 +604,7 @@ pub fn create_auth_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::config::{AuthMethod, SignatureLocation};
+    use super::super::config::{AuthMethod, HmacSha256Formula, SignatureLocation, TimestampFormat};
 
     fn binance_auth_method() -> AuthMethod {
         AuthMethod::HmacSha256 {
@@ -411,6 +613,18 @@ mod tests {
             timestamp_header: "timestamp".to_string(),
             timestamp_ms: true,
             signature_location: SignatureLocation::Query,
+            formula: HmacSha256Formula::Binance,
+        }
+    }
+
+    fn bybit_auth_method() -> AuthMethod {
+        AuthMethod::HmacSha256 {
+            api_key_header: "X-BAPI-API-KEY".to_string(),
+            signature_header: "X-BAPI-SIGN".to_string(),
+            timestamp_header: "X-BAPI-TIMESTAMP".to_string(),
+            timestamp_ms: true,
+            signature_location: SignatureLocation::Header,
+            formula: HmacSha256Formula::Bybit { recv_window_ms: 5000 },
         }
     }
 
@@ -428,6 +642,17 @@ mod tests {
             signature_header: "CB-ACCESS-SIGN".to_string(),
             passphrase_header: "CB-ACCESS-PASSPHRASE".to_string(),
             timestamp_header: "CB-ACCESS-TIMESTAMP".to_string(),
+            timestamp_format: TimestampFormat::UnixSeconds,
+        }
+    }
+
+    fn okx_auth_method() -> AuthMethod {
+        AuthMethod::HmacSha256WithPassphrase {
+            api_key_header: "OK-ACCESS-KEY".to_string(),
+            signature_header: "OK-ACCESS-SIGN".to_string(),
+            passphrase_header: "OK-ACCESS-PASSPHRASE".to_string(),
+            timestamp_header: "OK-ACCESS-TIMESTAMP".to_string(),
+            timestamp_format: TimestampFormat::Iso8601Millis,
         }
     }
 
@@ -439,6 +664,7 @@ mod tests {
         assert!(ah.headers.is_empty());
         assert!(ah.query_params.is_empty());
         assert!(ah.body_params.is_empty());
+        assert!(!ah.force_empty_body);
     }
 
     #[test]
@@ -495,6 +721,67 @@ mod tests {
         assert_eq!(headers.headers.get("X-MBX-APIKEY").unwrap(), "my_api_key");
         assert!(headers.query_params.contains_key("timestamp"));
         assert!(headers.query_params.contains_key("signature"));
+    }
+
+    #[tokio::test]
+    async fn test_hmac_sha256_binance_formula_signs_body_then_timestamp() {
+        // Binance: HMAC(secret, body&timestamp=ts) -- verify the exact
+        // message shape by reproducing it manually and comparing signatures.
+        let auth = HmacSha256Auth::new(
+            "key".to_string(),
+            "secret".to_string(),
+            &binance_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/api/v3/order", "symbol=BTCUSDT&orderId=1", 1700000000000).await.unwrap();
+        let expected = auth.compute_signature("symbol=BTCUSDT&orderId=1&timestamp=1700000000000");
+        assert_eq!(headers.query_params.get("signature").unwrap(), &expected);
+    }
+
+    // ========== HmacSha256Auth (Bybit formula) ==========
+
+    #[tokio::test]
+    async fn test_bybit_formula_signs_via_headers_not_query() {
+        let auth = HmacSha256Auth::new(
+            "bybit_key".to_string(),
+            "bybit_secret".to_string(),
+            &bybit_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/v5/order/realtime", "category=spot&orderId=1", 1700000000000).await.unwrap();
+        // Bybit always signs via headers, regardless of SignatureLocation.
+        assert_eq!(headers.headers.get("X-BAPI-API-KEY").unwrap(), "bybit_key");
+        assert!(headers.headers.contains_key("X-BAPI-SIGN"));
+        assert_eq!(headers.headers.get("X-BAPI-TIMESTAMP").unwrap(), "1700000000000");
+        assert_eq!(headers.headers.get("X-BAPI-RECV-WINDOW").unwrap(), "5000");
+        // Nothing leaks into query params for Bybit.
+        assert!(headers.query_params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bybit_formula_message_is_ts_key_window_body() {
+        // Bybit: HMAC(secret, timestamp+api_key+recv_window+body) --
+        // distinct concatenation order from Binance's `body&timestamp=ts`.
+        let auth = HmacSha256Auth::new(
+            "bybit_key".to_string(),
+            "bybit_secret".to_string(),
+            &bybit_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/v5/order/realtime", "category=spot&orderId=1", 1700000000000).await.unwrap();
+        let expected = auth.compute_signature("1700000000000bybit_key5000category=spot&orderId=1");
+        assert_eq!(headers.headers.get("X-BAPI-SIGN").unwrap(), &expected);
+    }
+
+    #[tokio::test]
+    async fn test_bybit_and_binance_formulas_diverge_on_identical_input() {
+        // Same key/secret/body/timestamp, different formula -- signatures
+        // must NOT match, or one of the two formulas is a no-op.
+        let binance_auth = HmacSha256Auth::new("k".to_string(), "s".to_string(), &binance_auth_method()).unwrap();
+        let bybit_auth = HmacSha256Auth::new("k".to_string(), "s".to_string(), &bybit_auth_method()).unwrap();
+        let binance_headers = binance_auth.sign("GET", "/x", "a=1", 1700000000000).await.unwrap();
+        let bybit_headers = bybit_auth.sign("GET", "/x", "a=1", 1700000000000).await.unwrap();
+        assert_ne!(
+            binance_headers.query_params.get("signature"),
+            bybit_headers.headers.get("X-BAPI-SIGN"),
+        );
     }
 
     // ========== HmacSha512Auth (Kraken) ==========
@@ -595,6 +882,159 @@ mod tests {
         assert!(headers.headers.contains_key("CB-ACCESS-TIMESTAMP"));
     }
 
+    #[tokio::test]
+    async fn test_coinbase_timestamp_is_plain_unix_seconds() {
+        let auth = HmacSha256PassphraseAuth::new(
+            "cb_key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"cb_secret"),
+            "cb_pass".to_string(),
+            &coinbase_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/api/v3/brokerage/orders/historical/1", "", 1700000000000).await.unwrap();
+        assert_eq!(headers.headers.get("CB-ACCESS-TIMESTAMP").unwrap(), "1700000000");
+    }
+
+    #[tokio::test]
+    async fn test_okx_timestamp_is_iso8601_millis_not_unix_seconds() {
+        // Regression: OKX requires ISO-8601 milliseconds
+        // ("2020-12-08T09:08:57.715Z"), not the plain Unix-seconds string
+        // Coinbase uses -- both share HmacSha256PassphraseAuth's shape,
+        // so this format must be selected via `timestamp_format`, not
+        // hardcoded.
+        let auth = HmacSha256PassphraseAuth::new(
+            "okx_key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(b"okx_secret"),
+            "okx_pass".to_string(),
+            &okx_auth_method(),
+        ).unwrap();
+        let headers = auth.sign("GET", "/api/v5/trade/order", "", 1700000000123).await.unwrap();
+        let ts = headers.headers.get("OK-ACCESS-TIMESTAMP").unwrap();
+        assert!(ts.ends_with('Z'), "expected an ISO-8601 Z-suffixed timestamp, got: {}", ts);
+        assert!(ts.contains('T'), "expected an ISO-8601 T separator, got: {}", ts);
+        assert_ne!(ts, "1700000000", "must not fall back to Coinbase's plain-seconds format");
+    }
+
+    #[tokio::test]
+    async fn test_okx_and_coinbase_signatures_diverge_on_identical_input() {
+        // Confirms the timestamp-format fix actually changes the signed
+        // message, not just the displayed header value.
+        let cb_auth = HmacSha256PassphraseAuth::new(
+            "k".to_string(), base64::engine::general_purpose::STANDARD.encode(b"s"), "p".to_string(), &coinbase_auth_method(),
+        ).unwrap();
+        let okx_auth = HmacSha256PassphraseAuth::new(
+            "k".to_string(), base64::engine::general_purpose::STANDARD.encode(b"s"), "p".to_string(), &okx_auth_method(),
+        ).unwrap();
+        let cb_headers = cb_auth.sign("GET", "/x", "", 1700000000000).await.unwrap();
+        let okx_headers = okx_auth.sign("GET", "/x", "", 1700000000000).await.unwrap();
+        assert_ne!(cb_headers.headers.get("CB-ACCESS-SIGN"), okx_headers.headers.get("OK-ACCESS-SIGN"));
+    }
+
+    // ========== DeribitAuth ==========
+
+    #[tokio::test]
+    async fn test_deribit_auth_header_has_structured_format() {
+        let auth = DeribitAuth { client_id: "deribit_id".to_string(), client_secret: "deribit_secret".to_string() };
+        let headers = auth.sign("GET", "/api/v2/private/get_order_state", "order_id=ETH-123", 1700000000000).await.unwrap();
+        let authz = headers.headers.get("Authorization").unwrap();
+        assert!(authz.starts_with("deri-hmac-sha256 id=deribit_id,ts=1700000000000,sig="), "got: {}", authz);
+        assert!(authz.contains(",nonce="));
+    }
+
+    #[tokio::test]
+    async fn test_deribit_get_signs_query_string_as_part_of_uri() {
+        // For GET, business params must be folded into the signed URI
+        // (path?body), matching how the actual request URL gets built --
+        // NOT treated as a separate RequestBody component.
+        let auth = DeribitAuth { client_id: "id".to_string(), client_secret: "secret".to_string() };
+        let with_params = auth.sign("GET", "/api/v2/private/buy", "instrument_name=BTC-PERPETUAL&amount=10", 1700000000000).await.unwrap();
+        let without_params = auth.sign("GET", "/api/v2/private/buy", "", 1700000000000).await.unwrap();
+        assert_ne!(
+            with_params.headers.get("Authorization"),
+            without_params.headers.get("Authorization"),
+            "query params must affect the signature",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deribit_signature_deterministic_for_same_input() {
+        let auth = DeribitAuth { client_id: "id".to_string(), client_secret: "secret".to_string() };
+        let h1 = auth.sign("GET", "/api/v2/private/get_order_state", "order_id=1", 1700000000000).await.unwrap();
+        let h2 = auth.sign("GET", "/api/v2/private/get_order_state", "order_id=1", 1700000000000).await.unwrap();
+        assert_eq!(h1.headers.get("Authorization"), h2.headers.get("Authorization"));
+    }
+
+    // ========== GeminiAuth ==========
+
+    #[tokio::test]
+    async fn test_gemini_auth_forces_empty_body() {
+        let auth = GeminiAuth {
+            api_key: "gemini_key".to_string(),
+            api_key_header: "X-GEMINI-APIKEY".to_string(),
+            payload_header: "X-GEMINI-PAYLOAD".to_string(),
+            signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            secret_key: "gemini_secret".to_string(),
+        };
+        let headers = auth.sign("POST", "/v1/order/status", r#"{"order_id":"123"}"#, 1700000000000).await.unwrap();
+        assert!(headers.force_empty_body, "Gemini requires Content-Length: 0 -- the payload rides in a header, not the body");
+        assert_eq!(headers.headers.get("X-GEMINI-APIKEY").unwrap(), "gemini_key");
+        assert!(headers.headers.contains_key("X-GEMINI-PAYLOAD"));
+        assert!(headers.headers.contains_key("X-GEMINI-SIGNATURE"));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_payload_embeds_request_path_nonce_and_business_params() {
+        let auth = GeminiAuth {
+            api_key: "key".to_string(),
+            api_key_header: "X-GEMINI-APIKEY".to_string(),
+            payload_header: "X-GEMINI-PAYLOAD".to_string(),
+            signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            secret_key: "secret".to_string(),
+        };
+        let headers = auth.sign("POST", "/v1/order/status", r#"{"order_id":"123"}"#, 1700000000000).await.unwrap();
+        let payload_b64 = headers.headers.get("X-GEMINI-PAYLOAD").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(payload_b64).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(payload["request"], "/v1/order/status");
+        assert_eq!(payload["nonce"], 1700000000000_u64);
+        assert_eq!(payload["order_id"], "123");
+    }
+
+    #[tokio::test]
+    async fn test_gemini_signature_is_hex_sha384_over_the_base64_payload() {
+        let auth = GeminiAuth {
+            api_key: "key".to_string(),
+            api_key_header: "X-GEMINI-APIKEY".to_string(),
+            payload_header: "X-GEMINI-PAYLOAD".to_string(),
+            signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            secret_key: "secret".to_string(),
+        };
+        let headers = auth.sign("POST", "/v1/order/status", "", 1700000000000).await.unwrap();
+        let payload_b64 = headers.headers.get("X-GEMINI-PAYLOAD").unwrap();
+        let signature = headers.headers.get("X-GEMINI-SIGNATURE").unwrap();
+        // SHA384 hex digest is 96 hex chars (48 bytes) -- catches an
+        // accidental fall-back to SHA512 (128 hex chars), which was the
+        // original bug.
+        assert_eq!(signature.len(), 96, "expected a SHA384 (96 hex char) digest, got length {}", signature.len());
+        assert_eq!(signature, &auth.compute_signature(payload_b64));
+    }
+
+    #[tokio::test]
+    async fn test_gemini_no_business_params_still_produces_valid_payload() {
+        let auth = GeminiAuth {
+            api_key: "key".to_string(),
+            api_key_header: "X-GEMINI-APIKEY".to_string(),
+            payload_header: "X-GEMINI-PAYLOAD".to_string(),
+            signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            secret_key: "secret".to_string(),
+        };
+        let headers = auth.sign("POST", "/v1/balances", "", 1700000000000).await.unwrap();
+        let payload_b64 = headers.headers.get("X-GEMINI-PAYLOAD").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(payload_b64).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(payload["request"], "/v1/balances");
+        assert!(payload["nonce"].is_number());
+    }
+
     // ========== create_auth_strategy factory ==========
 
     #[test]
@@ -667,5 +1107,42 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_deribit() {
+        let result = create_auth_strategy(&AuthMethod::DeribitHmac, "key".to_string(), "secret".to_string(), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_auth_strategy_gemini() {
+        let result = create_auth_strategy(
+            &AuthMethod::GeminiHmac {
+                api_key_header: "X-GEMINI-APIKEY".to_string(),
+                payload_header: "X-GEMINI-PAYLOAD".to_string(),
+                signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            },
+            "key".to_string(),
+            "secret".to_string(),
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_auth_strategy_gemini_end_to_end() {
+        let strategy = create_auth_strategy(
+            &AuthMethod::GeminiHmac {
+                api_key_header: "X-GEMINI-APIKEY".to_string(),
+                payload_header: "X-GEMINI-PAYLOAD".to_string(),
+                signature_header: "X-GEMINI-SIGNATURE".to_string(),
+            },
+            "gemini_key".to_string(),
+            "gemini_secret".to_string(),
+            None,
+        ).unwrap();
+        let headers = strategy.sign("POST", "/v1/order/status", r#"{"order_id":"1"}"#, 1700000000000).await.unwrap();
+        assert!(headers.force_empty_body);
     }
 }
