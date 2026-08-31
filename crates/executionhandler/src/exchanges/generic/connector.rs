@@ -80,6 +80,63 @@ fn okx_ws_signature(secret_key: &str, timestamp_secs: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
+/// Gemini's WS handshake auth payload+signature -- verified 2026-08-31
+/// against https://docs.gemini.com/websocket/authentication: the same
+/// base64-JSON-payload (`{"request":...,"nonce":...}`) + HMAC-SHA384
+/// scheme as this crate's REST `GeminiAuth` (auth.rs), computed as a
+/// standalone pure function since `GeminiAuth`'s async trait object
+/// can't be moved into `subscribe_to_updates`'s `'static` spawned
+/// reconnect loop, and a fresh nonce is required on every reconnect
+/// attempt anyway (Gemini rejects a replayed nonce).
+fn gemini_ws_auth_headers(secret_key: &str, request_path: &str, nonce: u64) -> (String, String) {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha384;
+    use base64::Engine;
+    let payload = serde_json::json!({"request": request_path, "nonce": nonce});
+    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload.to_string().as_bytes());
+    let mut mac = Hmac::<Sha384>::new_from_slice(secret_key.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(payload_b64.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    (payload_b64, signature)
+}
+
+/// Builds a CDP JWT for Coinbase's WebSocket "user" channel -- verified
+/// 2026-08-31 against
+/// https://docs.cdp.coinbase.com/get-started/authentication/jwt-authentication:
+/// header `{alg, kid, nonce, typ}`, claims `{iss, sub, nbf, exp, aud}`
+/// (the `uri`/`uris` claim used for REST requests is omitted entirely
+/// for WebSocket auth per that doc). ES256 (ECDSA P-256 + SHA-256), raw
+/// r||s signature bytes (not DER), base64url without padding for every
+/// segment -- standard JWS compact serialization.
+///
+/// `secret_key_pem` must be a PKCS8 PEM-encoded EC private key (the
+/// "-----BEGIN EC PRIVATE KEY-----..." string CDP issues for ES256
+/// keys) -- returns `None` if it can't be parsed as one, rather than
+/// panicking or silently producing an unsigned/garbage token.
+fn coinbase_cdp_jwt(api_key: &str, secret_key_pem: &str) -> Option<String> {
+    use p256::ecdsa::{SigningKey, Signature};
+    use p256::ecdsa::signature::Signer;
+    use p256::pkcs8::DecodePrivateKey;
+    use base64::Engine;
+
+    let signing_key = SigningKey::from_pkcs8_pem(secret_key_pem).ok()?;
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let nonce = format!("{:016x}{:016x}", now, nano_timestamp());
+    let header = serde_json::json!({"alg": "ES256", "kid": api_key, "nonce": nonce, "typ": "JWT"});
+    let claims = serde_json::json!({
+        "iss": "cdp", "sub": api_key, "nbf": now, "exp": now + 120, "aud": ["cdp_service"],
+    });
+
+    let b64url = |v: &Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes());
+    let signing_input = format!("{}.{}", b64url(&header), b64url(&claims));
+    let signature: Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    Some(format!("{}.{}", signing_input, sig_b64))
+}
+
 impl GenericConnector {
     /// Create a new generic connector for the specified exchange
     pub fn new(preset: ExchangePreset) -> Self {
@@ -1467,6 +1524,499 @@ impl GenericConnector {
             }
         });
     }
+
+    /// Gemini order events -- verified 2026-08-31 against
+    /// https://docs.gemini.com/websocket/authentication and
+    /// https://developer.gemini.com/websocket/order-events: auth headers
+    /// (X-GEMINI-APIKEY/PAYLOAD/SIGNATURE) are sent on the WebSocket
+    /// HANDSHAKE request itself, not a post-connect message -- the same
+    /// base64-JSON-payload + HMAC-SHA384 scheme as this crate's REST
+    /// GeminiAuth (auth.rs), just delivered as headers instead of a
+    /// signed body. Order push messages share the same shape as the REST
+    /// order-status response (is_live/is_cancelled/executed_amount/
+    /// avg_execution_price), matching parse_fill_status's Gemini arm.
+    async fn spawn_gemini_order_events(&self, callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
+        let Some(config) = self.config.as_ref() else {
+            error!("[{}] subscribe_to_updates called before initialize()", self.definition.name);
+            return;
+        };
+        let api_key = config.api_key.clone();
+        let secret_key = config.secret_key.clone();
+        let exchange_name = self.definition.name.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // A fresh, strictly-increasing nonce is required on every
+                // reconnect (Gemini rejects a replayed nonce), so the auth
+                // headers are rebuilt each time through this loop rather
+                // than computed once outside it.
+                let nonce = (nano_timestamp() / 1_000_000) as u64;
+                let (payload_b64, signature) = gemini_ws_auth_headers(&secret_key, "/v1/order/events", nonce);
+
+                let request = {
+                    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                    use tokio_tungstenite::tungstenite::http::HeaderValue;
+                    let mut req = match "wss://api.gemini.com/v1/order/events".into_client_request() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("[{}] failed to build request: {}, retrying in 3s", exchange_name, e);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                    };
+                    let headers = req.headers_mut();
+                    match (
+                        HeaderValue::from_str(&api_key),
+                        HeaderValue::from_str(&payload_b64),
+                        HeaderValue::from_str(&signature),
+                    ) {
+                        (Ok(k), Ok(p), Ok(s)) => {
+                            headers.insert("X-GEMINI-APIKEY", k);
+                            headers.insert("X-GEMINI-PAYLOAD", p);
+                            headers.insert("X-GEMINI-SIGNATURE", s);
+                        }
+                        _ => {
+                            error!("[{}] failed to build auth headers, retrying in 3s", exchange_name);
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                    }
+                    req
+                };
+
+                match tokio_tungstenite::connect_async(request).await {
+                    Ok((ws_stream, _)) => {
+                        info!("[{}] order events WebSocket connected", exchange_name);
+                        use futures_util::StreamExt;
+                        let (_write, mut read) = ws_stream.split();
+
+                        while let Some(msg) = read.next().await {
+                            let text = match msg {
+                                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    warn!("[{}] order events WebSocket error: {}", exchange_name, e);
+                                    break;
+                                }
+                            };
+                            let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
+                            // Gemini pushes either a single order object or
+                            // an array of them depending on event type;
+                            // handle both without assuming which.
+                            let orders: Vec<&Value> = match &parsed {
+                                Value::Array(items) => items.iter().collect(),
+                                Value::Object(_) => vec![&parsed],
+                                _ => continue,
+                            };
+                            for order in orders {
+                                let is_cancelled = order.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let filled_qty: f64 = order.get("executed_amount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let remaining: f64 = order.get("remaining_amount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+                                let update_type = if is_cancelled {
+                                    UpdateType::Cancellation
+                                } else if filled_qty > 0.0 && remaining == 0.0 {
+                                    UpdateType::CompleteFill
+                                } else if filled_qty > 0.0 {
+                                    UpdateType::PartialFill
+                                } else {
+                                    continue; // still-live with no fill yet -- nothing to record
+                                };
+                                let status = match update_type {
+                                    UpdateType::CompleteFill => ExecutionStatus::Filled,
+                                    UpdateType::PartialFill => ExecutionStatus::PartiallyFilled,
+                                    UpdateType::Cancellation => ExecutionStatus::Cancelled,
+                                    UpdateType::Rejection => ExecutionStatus::Rejected,
+                                    UpdateType::StatusChange => ExecutionStatus::Submitted,
+                                };
+                                let avg_price: f64 = order.get("avg_execution_price").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let order_id = order.get("client_order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let exchange_order_id = order.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let symbol = order.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let side = order.get("side").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                callback(OrderUpdate {
+                                    order_id, exchange_order_id, update_type, status,
+                                    filled_quantity: Some(filled_qty), fill_price: Some(avg_price),
+                                    timestamp: nano_timestamp(), exchange_timestamp_ns: None, exchange_sequence: None,
+                                    symbol, side,
+                                });
+                            }
+                        }
+                        warn!("[{}] order events WebSocket disconnected, reconnecting in 3s", exchange_name);
+                    }
+                    Err(e) => {
+                        error!("[{}] order events WebSocket connect failed: {}, retrying in 3s", exchange_name, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    /// Deribit user orders stream -- verified 2026-08-31 against
+    /// https://docs.deribit.com/#public-auth (client_credentials grant)
+    /// and https://docs.deribit.com/subscriptions/user/userordersinstrument_nameinterval
+    /// (channel shape, field names). Subscribes to
+    /// `user.orders.{kind}.any.raw` using this connector's own configured
+    /// `trading_mode.category` as `kind` -- Deribit's docs confirm a
+    /// per-instrument channel (`user.orders.{instrument_name}.raw`), and
+    /// a currency-scoped variant is documented by direct analogy with the
+    /// sibling `user.trades.(kind).(currency).(interval)` channel, but
+    /// this crate hasn't independently confirmed "any" as a valid
+    /// currency wildcard for ORDERS specifically with the same primary-
+    /// doc confidence as the rest of this function -- flagged here
+    /// rather than silently assumed correct.
+    async fn spawn_deribit_orders_stream(&self, callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
+        let Some(config) = self.config.as_ref() else {
+            error!("[{}] subscribe_to_updates called before initialize()", self.definition.name);
+            return;
+        };
+        let client_id = config.api_key.clone();
+        let client_secret = config.secret_key.clone();
+        let kind = self.definition.trading_mode.category.clone();
+        let exchange_name = self.definition.name.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match tokio_tungstenite::connect_async("wss://www.deribit.com/ws/api/v2").await {
+                    Ok((ws_stream, _)) => {
+                        info!("[{}] user orders WebSocket connected", exchange_name);
+                        use futures_util::{SinkExt, StreamExt};
+                        let (mut write, mut read) = ws_stream.split();
+
+                        let auth_msg = serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "public/auth",
+                            "params": {"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+                        });
+                        if write.send(tokio_tungstenite::tungstenite::Message::Text(auth_msg.to_string())).await.is_err() {
+                            error!("[{}] auth send failed, reconnecting", exchange_name);
+                            continue;
+                        }
+                        // Deribit's response to our auth call arrives as a
+                        // normal message on the same stream; wait for it
+                        // (and the access_token it carries) before
+                        // subscribing.
+                        let access_token = loop {
+                            match read.next().await {
+                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                                    let Ok(parsed) = serde_json::from_str::<Value>(&t) else { continue };
+                                    if let Some(token) = parsed.get("result").and_then(|r| r.get("access_token")).and_then(|v| v.as_str()) {
+                                        break Some(token.to_string());
+                                    }
+                                    if parsed.get("error").is_some() {
+                                        error!("[{}] auth rejected: {}", exchange_name, parsed);
+                                        break None;
+                                    }
+                                }
+                                Some(Ok(_)) => continue,
+                                _ => break None,
+                            }
+                        };
+                        let Some(access_token) = access_token else {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        };
+
+                        let channel = format!("user.orders.{}.any.raw", kind);
+                        let subscribe_msg = serde_json::json!({
+                            "jsonrpc": "2.0", "id": 2, "method": "private/subscribe",
+                            "params": {"channels": [channel], "access_token": access_token},
+                        });
+                        if write.send(tokio_tungstenite::tungstenite::Message::Text(subscribe_msg.to_string())).await.is_err() {
+                            error!("[{}] subscribe send failed, reconnecting", exchange_name);
+                            continue;
+                        }
+
+                        while let Some(msg) = read.next().await {
+                            let text = match msg {
+                                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    warn!("[{}] user orders WebSocket error: {}", exchange_name, e);
+                                    break;
+                                }
+                            };
+                            let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
+                            if parsed.get("method").and_then(|m| m.as_str()) != Some("subscription") {
+                                continue; // subscribe ack, auth response, etc.
+                            }
+                            let Some(order) = parsed.get("params").and_then(|p| p.get("data")) else { continue };
+                            let order_state = order.get("order_state").and_then(|s| s.as_str()).unwrap_or("");
+                            let filled_amount = order.get("filled_amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let update_type = match order_state {
+                                "filled" => UpdateType::CompleteFill,
+                                "cancelled" => UpdateType::Cancellation,
+                                "rejected" => UpdateType::Rejection,
+                                _ if filled_amount > 0.0 => UpdateType::PartialFill,
+                                _ => continue,
+                            };
+                            let status = match update_type {
+                                UpdateType::CompleteFill => ExecutionStatus::Filled,
+                                UpdateType::PartialFill => ExecutionStatus::PartiallyFilled,
+                                UpdateType::Cancellation => ExecutionStatus::Cancelled,
+                                UpdateType::Rejection => ExecutionStatus::Rejected,
+                                UpdateType::StatusChange => ExecutionStatus::Submitted,
+                            };
+                            let order_id = order.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            // "label" is Deribit's client-supplied reference
+                            // (build_order_params sets this to signal.id via
+                            // client_id_field), matching every other
+                            // exchange's OrderUpdate.order_id convention --
+                            // falls back to Deribit's own order_id if a
+                            // label was never set on this order.
+                            let client_order_id = order.get("label").and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| order_id.clone());
+                            let symbol = order.get("instrument_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let side = order.get("direction").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let avg_price = order.get("average_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            callback(OrderUpdate {
+                                order_id: client_order_id, exchange_order_id: order_id, update_type, status,
+                                filled_quantity: Some(filled_amount), fill_price: Some(avg_price),
+                                timestamp: nano_timestamp(), exchange_timestamp_ns: None, exchange_sequence: None,
+                                symbol, side,
+                            });
+                        }
+                        warn!("[{}] user orders WebSocket disconnected, reconnecting in 3s", exchange_name);
+                    }
+                    Err(e) => {
+                        error!("[{}] user orders WebSocket connect failed: {}, retrying in 3s", exchange_name, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    /// OANDA transaction stream -- a chunked HTTP GET, not a WebSocket
+    /// (this is genuinely OANDA's real-time interface for this data, not
+    /// a workaround). Verified 2026-08-31: streaming uses a SEPARATE
+    /// hostname from the REST API (stream-fxpractice.oanda.com vs
+    /// api-fxpractice.oanda.com), the same Bearer-token auth as REST, and
+    /// a response body of newline-delimited JSON transaction objects
+    /// (plus periodic HEARTBEAT lines to ignore). Uses its own HTTP
+    /// client rather than `self.http_client` -- that one is built with a
+    /// finite request timeout appropriate for REST calls, which would
+    /// forcibly kill this intentionally long-lived streaming connection.
+    async fn spawn_oanda_transaction_stream(&self, callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
+        let Some(config) = self.config.as_ref() else {
+            error!("[{}] subscribe_to_updates called before initialize()", self.definition.name);
+            return;
+        };
+        let Ok(streaming_client) = Client::builder().build() else {
+            error!("[{}] failed to build streaming HTTP client", self.definition.name);
+            return;
+        };
+        let api_key = config.api_key.clone();
+        let account_id = config.passphrase.clone().unwrap_or_default();
+        let stream_url = format!(
+            "{}/v3/accounts/{}/transactions/stream",
+            self.definition.endpoints.rest_url.replacen("api-", "stream-", 1),
+            account_id,
+        );
+        let exchange_name = self.definition.name.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match streaming_client.get(&stream_url).header("Authorization", format!("Bearer {}", api_key)).send().await {
+                    Ok(mut response) => {
+                        if !response.status().is_success() {
+                            error!("[{}] transaction stream returned {}, retrying in 3s", exchange_name, response.status());
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            continue;
+                        }
+                        info!("[{}] transaction stream connected", exchange_name);
+                        let mut buf = String::new();
+                        loop {
+                            match response.chunk().await {
+                                Ok(Some(bytes)) => {
+                                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                                    while let Some(newline_pos) = buf.find('\n') {
+                                        let line: String = buf.drain(..=newline_pos).collect();
+                                        let line = line.trim();
+                                        if line.is_empty() { continue; }
+                                        let Ok(parsed) = serde_json::from_str::<Value>(line) else { continue };
+                                        if parsed.get("type").and_then(|t| t.as_str()) != Some("ORDER_FILL") {
+                                            continue; // HEARTBEAT, other transaction types, etc.
+                                        }
+                                        let units: f64 = parsed.get("units").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                        let price: f64 = parsed.get("price").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                        if units == 0.0 || price == 0.0 { continue; }
+                                        let instrument = parsed.get("instrument").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                        let side = Some(if units > 0.0 { "buy".to_string() } else { "sell".to_string() });
+                                        // OANDA doesn't echo back a client-
+                                        // supplied reference the way most
+                                        // other exchanges here do (this
+                                        // connector's build_oanda_order_params
+                                        // never sets clientExtensions) --
+                                        // OANDA's own order id is used for
+                                        // both OrderUpdate fields, so a
+                                        // caller matching this back to a
+                                        // locally-submitted signal needs its
+                                        // own mapping (e.g. from the
+                                        // placement response's transaction id).
+                                        let order_id = parsed.get("orderID").and_then(|v| v.as_str())
+                                            .or_else(|| parsed.get("id").and_then(|v| v.as_str()))
+                                            .unwrap_or("").to_string();
+                                        callback(OrderUpdate {
+                                            order_id: order_id.clone(),
+                                            exchange_order_id: order_id,
+                                            update_type: UpdateType::CompleteFill,
+                                            status: ExecutionStatus::Filled,
+                                            filled_quantity: Some(units.abs()),
+                                            fill_price: Some(price),
+                                            timestamp: nano_timestamp(),
+                                            exchange_timestamp_ns: None,
+                                            exchange_sequence: None,
+                                            symbol: instrument,
+                                            side,
+                                        });
+                                    }
+                                }
+                                Ok(None) => break, // stream ended
+                                Err(e) => {
+                                    warn!("[{}] transaction stream read error: {}", exchange_name, e);
+                                    break;
+                                }
+                            }
+                        }
+                        warn!("[{}] transaction stream disconnected, reconnecting in 3s", exchange_name);
+                    }
+                    Err(e) => {
+                        error!("[{}] transaction stream connect failed: {}, retrying in 3s", exchange_name, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    /// Coinbase Advanced Trade "user" channel -- CDP JWT auth (ES256).
+    /// Verified 2026-08-31 against
+    /// https://docs.cdp.coinbase.com/get-started/authentication/jwt-authentication
+    /// for the JWT header/claims shape. This is a DIFFERENT credential
+    /// type from the legacy HMAC key+secret+passphrase this crate's REST
+    /// auth (auth.rs's HmacSha256WithPassphrase) already uses for
+    /// Coinbase's REST endpoints -- `config.secret_key` must hold a CDP
+    /// API key's PKCS8 PEM-encoded EC private key (the multi-line
+    /// "-----BEGIN EC PRIVATE KEY-----..." string CDP issues) for this to
+    /// work, not the legacy HMAC secret. A tenant using this connector's
+    /// REST order-placement path with a legacy key today would need a
+    /// separate, newer CDP key specifically to also get real-time fill
+    /// confirmation here -- this crate doesn't currently model two
+    /// credential types per exchange connection, so this reinterprets
+    /// the same config field rather than adding a new one. That's a real
+    /// scope gap worth closing later, not a bug in what's implemented.
+    ///
+    /// The exact "user" channel push shape (field names inside
+    /// events[].orders[]) is assumed to mirror the REST Get Order
+    /// response this crate's parse_fill_status already parses for
+    /// Coinbase (status/filled_size/average_filled_price) -- not
+    /// independently confirmed against a live push message the way the
+    /// four higher-confidence exchanges' formats were.
+    async fn spawn_coinbase_user_channel(&self, callback: Box<dyn Fn(OrderUpdate) + Send + Sync>) {
+        let Some(config) = self.config.as_ref() else {
+            error!("[{}] subscribe_to_updates called before initialize()", self.definition.name);
+            return;
+        };
+        let api_key = config.api_key.clone();
+        let secret_key_pem = config.secret_key.clone();
+        let exchange_name = self.definition.name.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let jwt = match coinbase_cdp_jwt(&api_key, &secret_key_pem) {
+                    Some(j) => j,
+                    None => {
+                        error!(
+                            "[{}] failed to build CDP JWT -- secret_key must be a CDP key's PKCS8 PEM private key, not a legacy HMAC secret",
+                            exchange_name
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        continue;
+                    }
+                };
+
+                match tokio_tungstenite::connect_async("wss://advanced-trade-ws.coinbase.com").await {
+                    Ok((ws_stream, _)) => {
+                        info!("[{}] user channel WebSocket connected", exchange_name);
+                        use futures_util::{SinkExt, StreamExt};
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // product_ids omitted -- the "user" channel is
+                        // documented as account-scoped (open orders and
+                        // positions); this connector doesn't know a fixed
+                        // product_id ahead of time since any symbol could
+                        // trade, and omitting the field wasn't
+                        // independently confirmed against a live
+                        // connection to return updates for every product
+                        // rather than none.
+                        let subscribe_msg = serde_json::json!({
+                            "type": "subscribe", "channel": "user", "jwt": jwt,
+                        });
+                        if write.send(tokio_tungstenite::tungstenite::Message::Text(subscribe_msg.to_string())).await.is_err() {
+                            error!("[{}] subscribe send failed, reconnecting", exchange_name);
+                            continue;
+                        }
+
+                        while let Some(msg) = read.next().await {
+                            let text = match msg {
+                                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    warn!("[{}] user channel WebSocket error: {}", exchange_name, e);
+                                    break;
+                                }
+                            };
+                            let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
+                            if parsed.get("channel").and_then(|c| c.as_str()) != Some("user") {
+                                continue; // subscriptions ack, heartbeat, etc.
+                            }
+                            let Some(events) = parsed.get("events").and_then(|e| e.as_array()) else { continue };
+                            for event in events {
+                                let Some(orders) = event.get("orders").and_then(|o| o.as_array()) else { continue };
+                                for order in orders {
+                                    let order_status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                                    let filled_size: f64 = order.get("filled_size").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                    let update_type = match order_status {
+                                        "FILLED" => UpdateType::CompleteFill,
+                                        "CANCELLED" | "EXPIRED" => UpdateType::Cancellation,
+                                        "FAILED" => UpdateType::Rejection,
+                                        _ if filled_size > 0.0 => UpdateType::PartialFill,
+                                        _ => continue,
+                                    };
+                                    let status = match update_type {
+                                        UpdateType::CompleteFill => ExecutionStatus::Filled,
+                                        UpdateType::PartialFill => ExecutionStatus::PartiallyFilled,
+                                        UpdateType::Cancellation => ExecutionStatus::Cancelled,
+                                        UpdateType::Rejection => ExecutionStatus::Rejected,
+                                        UpdateType::StatusChange => ExecutionStatus::Submitted,
+                                    };
+                                    let order_id = order.get("client_order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let exchange_order_id = order.get("order_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let symbol = order.get("product_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let side = order.get("order_side").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                    let avg_price: f64 = order.get("average_filled_price").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                    callback(OrderUpdate {
+                                        order_id, exchange_order_id, update_type, status,
+                                        filled_quantity: Some(filled_size), fill_price: Some(avg_price),
+                                        timestamp: nano_timestamp(), exchange_timestamp_ns: None, exchange_sequence: None,
+                                        symbol, side,
+                                    });
+                                }
+                            }
+                        }
+                        warn!("[{}] user channel WebSocket disconnected, reconnecting in 3s", exchange_name);
+                    }
+                    Err(e) => {
+                        error!("[{}] user channel WebSocket connect failed: {}, retrying in 3s", exchange_name, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
 }
 
 #[async_trait]
@@ -1740,21 +2290,10 @@ impl ExchangeConnector for GenericConnector {
             ExchangePreset::Bybit => self.spawn_bybit_private_stream(callback).await,
             ExchangePreset::OKX => self.spawn_okx_private_stream(callback).await,
             ExchangePreset::Kraken => self.spawn_kraken_executions_stream(callback).await,
-            // Not yet implemented -- same "don't guess" bar as
-            // parse_fill_status's per-exchange REST parsing:
-            // - Coinbase needs a CDP JWT (ES256), a different crypto
-            //   primitive from every HMAC scheme this crate already
-            //   depends on -- not worth adding a new signing dependency
-            //   speculatively.
-            // - OANDA's real-time interface is a chunked HTTP stream, not
-            //   a WebSocket -- a different transport entirely, not a
-            //   variant of this same connect/reconnect loop.
-            // - Gemini and Deribit's WS auth wasn't verified against
-            //   primary docs with the same confidence as the four
-            //   implemented above (secondary-source research only) --
-            //   left unimplemented rather than shipped unverified for
-            //   financial-fill code.
-            ExchangePreset::Coinbase | ExchangePreset::Gemini | ExchangePreset::Deribit | ExchangePreset::OandaPractice => {}
+            ExchangePreset::Gemini => self.spawn_gemini_order_events(callback).await,
+            ExchangePreset::Deribit => self.spawn_deribit_orders_stream(callback).await,
+            ExchangePreset::OandaPractice => self.spawn_oanda_transaction_stream(callback).await,
+            ExchangePreset::Coinbase => self.spawn_coinbase_user_channel(callback).await,
         }
     }
 
@@ -2263,6 +2802,129 @@ mod fill_status_tests {
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
         };
         assert_eq!(okx_ws_signature("my_secret", "1700000010"), expected);
+    }
+
+    // ========== Gemini WS auth ==========
+
+    #[test]
+    fn gemini_ws_auth_headers_payload_embeds_request_path_and_nonce() {
+        use base64::Engine;
+        let (payload_b64, _signature) = gemini_ws_auth_headers("secret", "/v1/order/events", 1700000000000);
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&payload_b64).unwrap();
+        let payload: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(payload["request"], "/v1/order/events");
+        assert_eq!(payload["nonce"], 1700000000000_u64);
+    }
+
+    #[test]
+    fn gemini_ws_auth_headers_signature_is_hex_sha384() {
+        let (_payload, signature) = gemini_ws_auth_headers("secret", "/v1/order/events", 1700000000000);
+        // SHA384 hex digest is 96 hex chars (48 bytes).
+        assert_eq!(signature.len(), 96);
+        assert!(signature.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn gemini_ws_auth_headers_changes_with_nonce() {
+        let (payload1, sig1) = gemini_ws_auth_headers("secret", "/v1/order/events", 1);
+        let (payload2, sig2) = gemini_ws_auth_headers("secret", "/v1/order/events", 2);
+        assert_ne!(payload1, payload2);
+        assert_ne!(sig1, sig2);
+    }
+
+    // ========== Coinbase CDP JWT ==========
+
+    fn generate_test_p256_pem() -> String {
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::EncodePrivateKey;
+        let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+        signing_key.to_pkcs8_pem(Default::default()).unwrap().to_string()
+    }
+
+    #[test]
+    fn coinbase_cdp_jwt_rejects_a_non_pem_secret() {
+        assert!(coinbase_cdp_jwt("my_api_key", "not a pem key").is_none());
+        assert!(coinbase_cdp_jwt("my_api_key", "").is_none());
+    }
+
+    #[test]
+    fn coinbase_cdp_jwt_produces_three_dot_separated_base64url_segments() {
+        let pem = generate_test_p256_pem();
+        let jwt = coinbase_cdp_jwt("organizations/org/apiKeys/key", &pem).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "expected header.claims.signature, got: {}", jwt);
+        use base64::Engine;
+        for part in &parts {
+            assert!(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part).is_ok(), "segment not valid base64url: {}", part);
+        }
+    }
+
+    #[test]
+    fn coinbase_cdp_jwt_header_and_claims_have_the_documented_shape() {
+        use base64::Engine;
+        let pem = generate_test_p256_pem();
+        let jwt = coinbase_cdp_jwt("organizations/org/apiKeys/key", &pem).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let header: Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        let claims: Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["kid"], "organizations/org/apiKeys/key");
+        assert!(header["nonce"].is_string());
+
+        assert_eq!(claims["iss"], "cdp");
+        assert_eq!(claims["sub"], "organizations/org/apiKeys/key");
+        assert_eq!(claims["aud"], serde_json::json!(["cdp_service"]));
+        // No uri/uris claim for WebSocket auth, per CDP's own docs.
+        assert!(claims.get("uri").is_none());
+        assert!(claims.get("uris").is_none());
+        let nbf = claims["nbf"].as_u64().unwrap();
+        let exp = claims["exp"].as_u64().unwrap();
+        assert_eq!(exp - nbf, 120);
+    }
+
+    #[test]
+    fn coinbase_cdp_jwt_signature_verifies_against_the_same_keys_public_half() {
+        // The real correctness test: sign with the private key, verify
+        // with the corresponding public key -- if the signing-input
+        // construction or signature encoding is wrong, this fails even
+        // though the JWT still "looks" well-formed.
+        use p256::ecdsa::{SigningKey, VerifyingKey, Signature};
+        use p256::ecdsa::signature::Verifier;
+        use p256::pkcs8::DecodePrivateKey;
+        use base64::Engine;
+
+        let pem = generate_test_p256_pem();
+        let signing_key = SigningKey::from_pkcs8_pem(&pem).unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
+
+        let jwt = coinbase_cdp_jwt("my_key", &pem).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let signature = Signature::from_slice(&sig_bytes).unwrap();
+
+        assert!(verifying_key.verify(signing_input.as_bytes(), &signature).is_ok());
+    }
+
+    #[test]
+    fn coinbase_cdp_jwt_signature_does_not_verify_against_a_different_keys_public_half() {
+        use p256::ecdsa::{SigningKey, VerifyingKey, Signature};
+        use p256::ecdsa::signature::Verifier;
+        use base64::Engine;
+
+        let pem = generate_test_p256_pem();
+        let other_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let other_verifying_key = VerifyingKey::from(&other_key);
+
+        let jwt = coinbase_cdp_jwt("my_key", &pem).unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let signature = Signature::from_slice(&sig_bytes).unwrap();
+
+        assert!(other_verifying_key.verify(signing_input.as_bytes(), &signature).is_err());
     }
 
     #[test]
