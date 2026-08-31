@@ -128,6 +128,25 @@ pub fn get_coin_type(symbol: &str) -> Option<&'static str> {
     }
 }
 
+/// On-chain decimal places for each coin's raw integer representation --
+/// needed to convert a `balanceChanges`/coin-balance raw amount (always an
+/// integer string on SUI) into a human-readable quantity. SUI-native
+/// tokens use 9 decimals by convention; Wormhole-bridged assets keep
+/// their SOURCE CHAIN's decimal count, not 9 -- USDC/USDT are 6 (as on
+/// Ethereum), WETH is 8. Getting this wrong doesn't error, it silently
+/// misreports fill quantity/balance by orders of magnitude, so this is
+/// deliberately its own explicit table rather than a blanket default.
+pub fn get_decimals(symbol: &str) -> Option<u8> {
+    match symbol.to_uppercase().as_str() {
+        "SUI" => Some(9),
+        "USDC" => Some(6),
+        "USDT" => Some(6),
+        "WETH" => Some(8),
+        "CETUS" => Some(9),
+        _ => None,
+    }
+}
+
 /// Cetus swap function names
 pub mod swap_functions {
     /// Swap from token A to token B

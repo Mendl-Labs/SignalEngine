@@ -139,7 +139,14 @@ impl DexConnector for CetusConnector {
             tx_digest, signal.id, elapsed
         );
         
-        // Query transaction effects to get actual gas used
+        // Query transaction effects: real status, real gas used, and (via
+        // balanceChanges) the actual swap output -- this used to
+        // unconditionally report ExecutionStatus::Filled with
+        // filled_quantity = the REQUESTED amount and price = a fallback
+        // that was never a real price at all, regardless of what actually
+        // happened on-chain. Same class of bug as the CEX fill-confirmation
+        // fix elsewhere in this crate: a REST/RPC ack isn't a fill
+        // confirmation, and neither is "the transaction didn't error."
         let tx_result = wallet.get_transaction(&tx_digest).await?;
         let gas_used = tx_result.get("effects")
             .and_then(|e| e.get("gasUsed"))
@@ -147,22 +154,55 @@ impl DexConnector for CetusConnector {
             .and_then(|c| c.as_str())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(100_000);
-        
-        let price = signal.price.unwrap_or(signal.quantity);
+
+        let succeeded = super::sui_wallet::transaction_succeeded(&tx_result).unwrap_or(false);
+
+        let (status, filled_quantity, avg_fill_price) = if !succeeded {
+            warn!("Cetus swap {} failed on-chain: signal_id={}", tx_digest, signal.id);
+            (ExecutionStatus::Rejected, 0.0, 0.0)
+        } else {
+            let decimals_in = cetus_constants::get_decimals(token_in).unwrap_or(9);
+            let decimals_out = cetus_constants::get_decimals(token_out).unwrap_or(9);
+            let received = cetus_constants::get_coin_type(token_out)
+                .and_then(|ct| super::sui_wallet::extract_balance_change(&tx_result, wallet.address(), ct, decimals_out))
+                .map(f64::abs);
+            let spent = cetus_constants::get_coin_type(token_in)
+                .and_then(|ct| super::sui_wallet::extract_balance_change(&tx_result, wallet.address(), ct, decimals_in))
+                .map(f64::abs);
+            match (received, spent) {
+                (Some(out_amt), Some(in_amt)) if out_amt > 0.0 && in_amt > 0.0 => {
+                    (ExecutionStatus::Filled, out_amt, in_amt / out_amt)
+                }
+                _ => {
+                    // Transaction succeeded on-chain but the real swap
+                    // amounts couldn't be independently verified from
+                    // balanceChanges (unrecognized coin type, or the node
+                    // omitted the field) -- report unconfirmed rather than
+                    // fall back to a guessed quantity/price.
+                    warn!(
+                        "Cetus swap {} succeeded on-chain but balanceChanges couldn't be parsed for {}/{} -- reporting unconfirmed",
+                        tx_digest, token_in, token_out
+                    );
+                    (ExecutionStatus::Submitted, 0.0, 0.0)
+                }
+            }
+        };
+
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        
+        let reject_reason = if status == ExecutionStatus::Rejected { Some("Transaction failed on-chain".to_string()) } else { None };
+
         Ok(DexExecutionResult {
             base: ExecutionResult {
                 order_id: format!("cetus_{}", signal.id),
                 exchange_order_id: Some(tx_digest.clone()),
                 exchange: "Cetus".to_string(),
-                status: ExecutionStatus::Filled,
-                filled_quantity: signal.quantity,
-                remaining_quantity: 0.0,
-                avg_fill_price: price,
-                total_fees: 0.003 * signal.quantity * price, // 0.3% fee
+                status,
+                filled_quantity,
+                remaining_quantity: (signal.quantity - filled_quantity).max(0.0),
+                avg_fill_price,
+                total_fees: 0.003 * filled_quantity * avg_fill_price, // 0.3% fee
                 fills: vec![],
-                reject_reason: None,
+                reject_reason,
                 submitted_at: now_ns,
                 updated_at: now_ns,
                 latency_ns: (elapsed as u64) * 1_000_000, // ms to ns
@@ -181,18 +221,50 @@ impl DexConnector for CetusConnector {
     }
     
     async fn get_quote(&self, token_in: &str, token_out: &str, amount_in: f64) -> Result<DexQuote, ExecutionError> {
-        // TODO: Call Cetus SDK for quote
-        // Query pool reserves and calculate swap output
-        
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-        
+
+        // Was a flat 0.3%-fee-only estimate regardless of trade size vs.
+        // pool depth -- i.e. zero price impact for a $10 trade or a $10M
+        // one. Now derived from the pool's own reserves (real, queried via
+        // query_pool -- falls back to hardcoded defaults only if the RPC
+        // call itself fails, same as query_pool already documented).
+        // Cetus is a concentrated-liquidity AMM (CLMM), not constant-
+        // product, so this constant-product estimate is still an
+        // approximation of the real curve -- closer to reality than
+        // ignoring pool depth entirely, not a precise quote.
+        let pool = self.query_pool(token_in, token_out).await?;
+        let (reserve_in, reserve_out) = if token_in == pool.token_a {
+            (pool.reserve_a, pool.reserve_b)
+        } else {
+            (pool.reserve_b, pool.reserve_a)
+        };
+
+        let fee_multiplier = 1.0 - (pool.fee_rate as f64 / 10_000.0);
+        let amount_in_after_fee = amount_in * fee_multiplier;
+        let expected_amount_out = if reserve_in + amount_in_after_fee > 0.0 {
+            (amount_in_after_fee * reserve_out) / (reserve_in + amount_in_after_fee)
+        } else {
+            amount_in_after_fee
+        };
+
+        let price_impact_bps = if reserve_in > 0.0 && expected_amount_out > 0.0 {
+            let no_impact_out = amount_in_after_fee * (reserve_out / reserve_in);
+            (((no_impact_out - expected_amount_out) / no_impact_out.max(1e-9)) * 10_000.0)
+                .clamp(0.0, u16::MAX as f64) as u32
+        } else {
+            15
+        };
+
+        let slippage_bps = self.config.as_ref().map(|c| c.slippage_bps).unwrap_or(50);
+        let minimum_amount_out = expected_amount_out * (1.0 - slippage_bps as f64 / 10_000.0);
+
         Ok(DexQuote {
             token_in: token_in.to_string(),
             token_out: token_out.to_string(),
             amount_in,
-            expected_amount_out: amount_in * 0.997, // 0.3% fee
-            minimum_amount_out: amount_in * 0.994,  // 0.3% slippage
-            price_impact_bps: 15, // Low impact due to deep liquidity
+            expected_amount_out,
+            minimum_amount_out,
+            price_impact_bps,
             route: vec![token_in.to_string(), token_out.to_string()],
             estimated_gas: 10_000, // MIST
             timestamp_ns: now_ns,
@@ -211,24 +283,35 @@ impl DexConnector for CetusConnector {
     }
     
     async fn check_transaction(&self, tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
-        // TODO: Query SUI for transaction status
         trace!("Checking SUI transaction: {}", tx_hash);
-        
-        // SUI has fast finality - usually confirmed in ~400ms
-        Ok(TransactionStatus::Confirmed(1))
+        let wallet = self.get_wallet()?;
+        let tx_result = wallet.get_transaction(tx_hash).await?;
+        // SUI has fast finality (~400ms) and no multi-confirmation model
+        // like a CEX order book -- a transaction is either confirmed
+        // success/failure, or (rarely, if queried before it landed)
+        // still pending.
+        match super::sui_wallet::transaction_succeeded(&tx_result) {
+            Some(true) => Ok(TransactionStatus::Confirmed(1)),
+            Some(false) => Ok(TransactionStatus::Failed(0)),
+            None => Ok(TransactionStatus::Pending),
+        }
     }
-    
+
     async fn cancel_transaction(&self, _tx_hash: &str) -> Result<(), ExecutionError> {
         // Cannot cancel SUI transactions after submission
         Err(ExecutionError::Validation(
             "Cannot cancel SUI transactions - finality is sub-second".to_string()
         ))
     }
-    
+
     async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError> {
-        // TODO: Query SUI coin balance
         trace!("Getting SUI coin balance: {}", token_address);
-        Ok(1000.0)
+        let wallet = self.get_wallet()?;
+        let coin_type = cetus_constants::get_coin_type(token_address)
+            .ok_or_else(|| ExecutionError::Validation(format!("Unknown coin symbol: {}", token_address)))?;
+        let decimals = cetus_constants::get_decimals(token_address).unwrap_or(9);
+        let raw = wallet.get_coin_balance(coin_type).await?;
+        Ok(raw as f64 / 10f64.powi(decimals as i32))
     }
     
     async fn approve_token(&self, _token_address: &str, _spender: &str, _amount: f64) -> Result<String, ExecutionError> {

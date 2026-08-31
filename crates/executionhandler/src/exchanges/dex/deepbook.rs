@@ -285,7 +285,14 @@ impl DexConnector for DeepBookConnector {
     
     async fn get_quote(&self, token_in: &str, token_out: &str, amount_in: f64) -> Result<DexQuote, ExecutionError> {
         let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-        
+
+        // Still a flat estimate, not derived from real order-book depth --
+        // unlike Cetus (an AMM, where a quote can be derived from pool
+        // reserves already being queried elsewhere in this crate),
+        // DeepBook is a CLOB: a real quote here needs the actual bid/ask
+        // depth from the order book, which this connector doesn't query
+        // anywhere today. Flagged as a known limitation, not silently
+        // left implying real depth was considered.
         Ok(DexQuote {
             token_in: token_in.to_string(),
             token_out: token_out.to_string(),
@@ -312,16 +319,36 @@ impl DexConnector for DeepBookConnector {
         })
     }
     
-    async fn check_transaction(&self, _tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
-        Ok(TransactionStatus::Confirmed(1))
+    async fn check_transaction(&self, tx_hash: &str) -> Result<TransactionStatus, ExecutionError> {
+        // Was unconditionally Confirmed(1) regardless of what actually
+        // happened on-chain -- same class of fabricated-result bug fixed
+        // for Cetus's execute_swap/check_transaction. A DeepBook limit
+        // order placement transaction succeeding on-chain only means the
+        // order was placed into the book, not that it filled (that's a
+        // separate, still-open gap -- this connector has no way to learn
+        // a resting limit order later filled without a real order-status
+        // query against the pool, which isn't implemented here).
+        let wallet = self.get_wallet()?;
+        let tx_result = wallet.get_transaction(tx_hash).await?;
+        match super::sui_wallet::transaction_succeeded(&tx_result) {
+            Some(true) => Ok(TransactionStatus::Confirmed(1)),
+            Some(false) => Ok(TransactionStatus::Failed(0)),
+            None => Ok(TransactionStatus::Pending),
+        }
     }
-    
+
     async fn cancel_transaction(&self, _tx_hash: &str) -> Result<(), ExecutionError> {
         Ok(())
     }
-    
-    async fn get_balance(&self, _token_address: &str) -> Result<f64, ExecutionError> {
-        Ok(1000.0)
+
+    async fn get_balance(&self, token_address: &str) -> Result<f64, ExecutionError> {
+        let wallet = self.get_wallet()?;
+        use super::cetus_constants;
+        let coin_type = cetus_constants::get_coin_type(token_address)
+            .ok_or_else(|| ExecutionError::Validation(format!("Unknown coin symbol: {}", token_address)))?;
+        let decimals = cetus_constants::get_decimals(token_address).unwrap_or(9);
+        let raw = wallet.get_coin_balance(coin_type).await?;
+        Ok(raw as f64 / 10f64.powi(decimals as i32))
     }
     
     async fn approve_token(&self, _token_address: &str, _spender: &str, _amount: f64) -> Result<String, ExecutionError> {

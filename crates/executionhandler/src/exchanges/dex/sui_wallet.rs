@@ -295,6 +295,52 @@ impl SuiWallet {
     }
 }
 
+/// True when a `sui_getTransactionBlock`/`sui_executeTransactionBlock`
+/// response's `effects.status.status` is `"success"`. `None` means that
+/// field wasn't present in the shape expected (e.g. `showEffects` wasn't
+/// requested, or an unexpected RPC response) -- treated as "can't confirm
+/// success or failure" by callers, never silently assumed to be a pass.
+/// Verified 2026-08-31 against Sui's real `sui_getTransactionBlock`
+/// response shape (`effects.status = {"status": "success"|"failure", ...}`).
+pub fn transaction_succeeded(tx_result: &Value) -> Option<bool> {
+    tx_result
+        .get("effects")?
+        .get("status")?
+        .get("status")?
+        .as_str()
+        .map(|s| s == "success")
+}
+
+/// Extracts the real net balance change for `coin_type` belonging to
+/// `owner_address` from a transaction response's `balanceChanges` array
+/// (present when the query/execute call requested `showBalanceChanges`),
+/// converted from the coin's raw on-chain integer amount into human units
+/// via `decimals`. Signed: negative = spent, positive = received.
+/// `None` when no matching entry exists (the tx didn't touch this coin
+/// for this address, or the field is absent) -- callers must not
+/// substitute a guessed amount in that case, the same "don't fabricate a
+/// fill" rule this codebase applies to CEX order-status parsing.
+///
+/// `owner` on a balance-change entry is either a bare address string or
+/// `{"AddressOwner": "0x..."}` depending on RPC version; both are checked.
+pub fn extract_balance_change(tx_result: &Value, owner_address: &str, coin_type: &str, decimals: u8) -> Option<f64> {
+    let changes = tx_result.get("balanceChanges")?.as_array()?;
+    for change in changes {
+        let owner = change.get("owner")?;
+        let owner_matches = owner.as_str() == Some(owner_address)
+            || owner.get("AddressOwner").and_then(|a| a.as_str()) == Some(owner_address);
+        if !owner_matches {
+            continue;
+        }
+        if change.get("coinType").and_then(|c| c.as_str()) != Some(coin_type) {
+            continue;
+        }
+        let raw: i128 = change.get("amount").and_then(|a| a.as_str())?.parse().ok()?;
+        return Some(raw as f64 / 10f64.powi(decimals as i32));
+    }
+    None
+}
+
 /// SUI network configuration
 #[derive(Debug, Clone)]
 pub struct SuiNetworkConfig {
@@ -396,6 +442,69 @@ mod tests {
         let key = SuiWallet::parse_private_key(TEST_KEY_HEX).unwrap();
         let sig: Ed25519Signature = key.sign(b"hello world");
         assert_eq!(sig.to_bytes().len(), 64);
+    }
+
+    // === transaction_succeeded ===
+
+    #[test]
+    fn test_transaction_succeeded_true_on_success_status() {
+        let tx: Value = json!({"effects": {"status": {"status": "success"}}});
+        assert_eq!(transaction_succeeded(&tx), Some(true));
+    }
+
+    #[test]
+    fn test_transaction_succeeded_false_on_failure_status() {
+        let tx: Value = json!({"effects": {"status": {"status": "failure", "error": "InsufficientGas"}}});
+        assert_eq!(transaction_succeeded(&tx), Some(false));
+    }
+
+    #[test]
+    fn test_transaction_succeeded_none_when_effects_missing() {
+        let tx: Value = json!({"digest": "abc"});
+        assert_eq!(transaction_succeeded(&tx), None);
+    }
+
+    // === extract_balance_change ===
+
+    #[test]
+    fn test_extract_balance_change_finds_matching_entry_with_bare_owner() {
+        let tx: Value = json!({
+            "balanceChanges": [
+                {"owner": "0xabc", "coinType": "0x2::sui::SUI", "amount": "-1500000000"},
+                {"owner": "0xabc", "coinType": "0x5d4b...::coin::COIN", "amount": "2500000"}
+            ]
+        });
+        let received = extract_balance_change(&tx, "0xabc", "0x5d4b...::coin::COIN", 6);
+        assert_eq!(received, Some(2.5));
+        let spent = extract_balance_change(&tx, "0xabc", "0x2::sui::SUI", 9);
+        assert_eq!(spent, Some(-1.5));
+    }
+
+    #[test]
+    fn test_extract_balance_change_finds_matching_entry_with_address_owner_object() {
+        let tx: Value = json!({
+            "balanceChanges": [
+                {"owner": {"AddressOwner": "0xabc"}, "coinType": "0x2::sui::SUI", "amount": "1000000000"}
+            ]
+        });
+        assert_eq!(extract_balance_change(&tx, "0xabc", "0x2::sui::SUI", 9), Some(1.0));
+    }
+
+    #[test]
+    fn test_extract_balance_change_none_for_wrong_owner_or_coin_type() {
+        let tx: Value = json!({
+            "balanceChanges": [
+                {"owner": "0xabc", "coinType": "0x2::sui::SUI", "amount": "1000000000"}
+            ]
+        });
+        assert_eq!(extract_balance_change(&tx, "0xdef", "0x2::sui::SUI", 9), None);
+        assert_eq!(extract_balance_change(&tx, "0xabc", "0xother::coin::COIN", 9), None);
+    }
+
+    #[test]
+    fn test_extract_balance_change_none_when_field_missing() {
+        let tx: Value = json!({"digest": "abc"});
+        assert_eq!(extract_balance_change(&tx, "0xabc", "0x2::sui::SUI", 9), None);
     }
 
     #[test]
