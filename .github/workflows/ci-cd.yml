@@ -78,6 +78,16 @@ jobs:
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingEngine
 
+      - name: Checkout BacktestingCore
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingCore
+          # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
+          # quant-diagnostics crates; pin a tag so CI is reproducible.
+          ref: v0.1.49
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingCore
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -230,6 +240,17 @@ jobs:
           path: BacktestingEngine
           fetch-depth: 0
 
+      - name: Checkout BacktestingCore
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingCore
+          # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
+          # quant-diagnostics crates; pin a tag so CI is reproducible.
+          ref: v0.1.49
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingCore
+          fetch-depth: 0
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -253,7 +274,7 @@ jobs:
           set -e
           echo "Building Docker image..."
 
-          REQUIRED_DEPS=("LoggingEngine" "MessageBrokerEngine" "databaseschema" "SimulationEngine" "BacktestingEngine")
+          REQUIRED_DEPS=("LoggingEngine" "MessageBrokerEngine" "databaseschema" "SimulationEngine" "BacktestingEngine" "BacktestingCore")
           for DEP in "${REQUIRED_DEPS[@]}"; do
             if [ -d "$DEP" ]; then
               echo "[OK] Dependency found: $DEP"
