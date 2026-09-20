@@ -11,7 +11,7 @@ const { execSync } = require('child_process');
 const Discovery = require('../discovery');
 
 const APP_LABEL = 'app.kubernetes.io/name=signal-engine-helm';
-const IMAGE_PREFIX = 'ghcr.io/nwagbara-group-llc/signal-engine';
+const IMAGE_PREFIX = 'ghcr.io/mendl-labs/signal-engine';
 
 class SignalEngineE2E {
   constructor(namespace, imageTag, options = {}) {
