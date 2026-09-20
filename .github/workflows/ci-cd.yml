@@ -117,7 +117,8 @@ jobs:
           helm lint k8s/signal-engine-helm -f k8s/signal-engine-helm/values-qa.yaml
           helm lint k8s/signal-engine-helm -f k8s/signal-engine-helm/values-prod.yaml
           for V in values-qa.yaml values-prod.yaml; do
-            helm template signal-engine k8s/signal-engine-helm -f k8s/signal-engine-helm/$V \n              --set image.repository=example/signal-engine --set image.tag=ci > /dev/null
+            helm template signal-engine k8s/signal-engine-helm -f k8s/signal-engine-helm/$V \
+              --set image.repository=example/signal-engine --set image.tag=ci > /dev/null
           done
 
       - name: Check for Skip Tests Flag
