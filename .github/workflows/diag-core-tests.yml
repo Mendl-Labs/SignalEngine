@@ -1,0 +1,58 @@
+# TEMPORARY diagnostic (do not merge): identify which signalengine-core test crashes with SIGSEGV on the CI runner.
+name: Diagnose core test crash (temporary)
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/diag-core-tests.yml']
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with: { path: SignalEngine }
+      - name: Checkout LoggingEngine
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/LoggingEngine, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: LoggingEngine }
+      - name: Checkout MessageBrokerEngine
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/MessageBrokerEngine, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: MessageBrokerEngine }
+      - name: Checkout databaseschema
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/databaseschema, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: databaseschema }
+      - name: Checkout SimulationEngine
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/SimulationEngine, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: SimulationEngine }
+      - name: Checkout BacktestingEngine
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/BacktestingEngine, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: BacktestingEngine }
+      - name: Checkout BacktestingCore
+        uses: actions/checkout@v4
+        with: { repository: Nwagbara-Group-LLC/BacktestingCore, ref: v0.1.49, token: '${{ secrets.PERSONAL_ACCESS_TOKEN }}', path: BacktestingCore }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: 1.90.0 }
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libpq-dev pkg-config python3-dev python3-numpy python3-pandas
+      - name: Run signalengine-core tests repeatedly
+        run: |
+          cd SignalEngine
+          BIN=$(cargo test -p signalengine-core --lib --no-run --message-format=json 2>/dev/null | grep '"executable"' | sed -E 's/.*"executable":"([^"]+)".*/\1/' | grep -E 'signalengine-[0-9a-f]+$' | head -1)
+          echo "binary: $BIN"; uname -m; nproc
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
+          "$BIN" --list 2>/dev/null | grep -c ': test' || true
+          pf=0
+          for i in $(seq 1 60); do
+            out=$("$BIN" 2>&1); rc=$?
+            if [ $rc -ne 0 ]; then pf=$((pf+1)); echo "PARALLEL run $i rc=$rc"; echo "$out" | grep -E "FAILED|panicked|SIG" | head -4; fi
+          done
+          echo "PARALLEL failures: $pf/60"
+          sf=0
+          for i in $(seq 1 40); do
+            "$BIN" --test-threads=1 --nocapture > /tmp/s.log 2>&1; rc=$?
+            if [ $rc -ne 0 ]; then sf=$((sf+1)); echo "SINGLE run $i rc=$rc; last test lines:"; grep -E '^test ' /tmp/s.log | tail -2; fi
+          done
+          echo "SINGLE-THREAD failures: $sf/40"
