@@ -14,6 +14,14 @@ on:
         description: 'Skip tests'
         type: boolean
         default: false
+      deploy_prod:
+        description: 'Deploy to production (manual only; production never deploys automatically)'
+        type: boolean
+        default: false
+      enable_live_credentials:
+        description: 'Also copy the credentials-encryption key so SignalEngine can decrypt user exchange API keys (live trading). Leave off for a paper-only deployment.'
+        type: boolean
+        default: false
 
 concurrency:
   group: signal-engine-${{ github.ref }}
@@ -102,6 +110,16 @@ jobs:
           # strategy code against it (tests/client_integration.rs), which
           # imports numpy/pandas just like a real deployment would.
           sudo apt-get install -y libssl-dev libpq-dev pkg-config python3-dev python3-numpy python3-pandas
+
+      - name: Lint and render the Helm chart
+        run: |
+          cd SignalEngine
+          helm lint k8s/signal-engine-helm -f k8s/signal-engine-helm/values-qa.yaml
+          helm lint k8s/signal-engine-helm -f k8s/signal-engine-helm/values-prod.yaml
+          for V in values-qa.yaml values-prod.yaml; do
+            helm template signal-engine k8s/signal-engine-helm -f k8s/signal-engine-helm/$V \
+              --set image.repository=example/signal-engine --set image.tag=ci > /dev/null
+          done
 
       - name: Check for Skip Tests Flag
         id: check-skip
@@ -324,6 +342,10 @@ jobs:
           echo "Pull: docker pull ${{ env.IMAGE_NAME }}:$SHORT_SHA"
           echo "=========================================="
 
+  # NOTE: QA deploys with the chart's default placeholder command (values-qa.yaml does not clear it), so its
+  # smoke test exercises a placeholder container, not the SignalEngine binary. Making QA meaningful needs an
+  # isolated message broker and database (a QA pod on the production ones could act on real deployments).
+  # Until then production is a manual, explicitly triggered deploy and QA is not a gate that proves the app works.
   deploy-qa:
     name: Deploy to QA & Smoke Test
     runs-on: [self-hosted, linux, x64]
@@ -444,7 +466,7 @@ jobs:
     name: Deploy to Kubernetes (Prod)
     runs-on: [self-hosted, linux, x64]
     needs: deploy-qa
-    if: github.ref == 'refs/heads/main' && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout SignalEngine
@@ -472,90 +494,40 @@ jobs:
           kubectl get nodes
           echo "[OK] Kubernetes connection verified"
 
-      - name: Fetch Secrets from Azure Key Vault
+      - name: Read secrets from the cluster
         env:
-          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
-          AZURE_KEYVAULT_NAME: ${{ secrets.AZURE_KEYVAULT_NAME }}
+          ENABLE_LIVE_CREDENTIALS: ${{ inputs.enable_live_credentials }}
         run: |
           set -euo pipefail
-          echo "Fetching secrets from Azure Key Vault..."
+          # The database (and Massive) settings come from the secrets BacktestingEngine already uses in this
+          # cluster, so SignalEngine talks to the same Postgres. There is no external vault.
+          SRC_NS=backtestingengine
+          get() { kubectl get secret "$1" -n "$SRC_NS" -o "jsonpath={.data.$2}" | base64 -d; }
 
-          if [ -z "${AZURE_CREDENTIALS:-}" ]; then
-            echo "::error::AZURE_CREDENTIALS secret is empty or not set"
-            exit 1
-          fi
-
-          CLIENT_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.clientId')
-          CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS" | jq -r '.clientSecret')
-          TENANT_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.tenantId')
-
-          if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ] || [ -z "$TENANT_ID" ]; then
-            echo "::error::Invalid Azure credentials format"
-            exit 1
-          fi
-          echo "[OK] Azure credentials parsed successfully"
-
-          SUBSCRIPTION_ID=$(echo "$AZURE_CREDENTIALS" | jq -r '.subscriptionId // empty')
-
-          echo "[INFO] Authenticating with Azure..."
-          az login --service-principal \
-            --username "$CLIENT_ID" \
-            --password "$CLIENT_SECRET" \
-            --tenant "$TENANT_ID" \
-            --output none
-          echo "[OK] Successfully authenticated with Azure"
-
-          # Set subscription if provided in credentials
-          if [ -n "${SUBSCRIPTION_ID:-}" ]; then
-            az account set --subscription "$SUBSCRIPTION_ID"
-            echo "[OK] Set subscription to $SUBSCRIPTION_ID"
-          fi
-          echo "[INFO] Active subscription: $(az account show --query '{name:name, id:id}' -o tsv)"
-
-          # Required secrets
-          REQUIRED_SECRETS=(
-            "POSTGRES-HOST" "POSTGRES-PORT" "POSTGRES-USER" "POSTGRES-PASSWORD" "POSTGRES-DB"
-          )
-
-          # Optional secrets
-          OPTIONAL_SECRETS=(
-            "ELASTIC-CLOUD-ENDPOINT" "ELASTIC-CLOUD-USERNAME" "ELASTIC-CLOUD-PASSWORD"
-            "CREDENTIALS-ENCRYPTION-KEY"
-            "MASSIVE-API-KEY"
-          )
-
-          echo "[INFO] Fetching required secrets..."
-          for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
-            ENV_NAME="${SECRET_NAME//-/_}"
-            VALUE=$(az keyvault secret show --vault-name "$AZURE_KEYVAULT_NAME" --name "$SECRET_NAME" --query value -o tsv) || {
-              echo "::error::[FAIL] Failed to fetch required secret $SECRET_NAME from vault $AZURE_KEYVAULT_NAME"
-              exit 1
-            }
-            if [ -z "$VALUE" ]; then
-              echo "::error::[FAIL] Empty value for required secret $SECRET_NAME"
-              exit 1
-            fi
+          for PAIR in "POSTGRES_HOST:database-host" "POSTGRES_PORT:database-port" "POSTGRES_USER:database-username" "POSTGRES_PASSWORD:database-password" "POSTGRES_DB:database-name"; do
+            ENV_NAME="${PAIR%%:*}"; KEY="${PAIR#*:}"
+            VALUE=$(get backtesting-secrets "$KEY") || { echo "::error::could not read $KEY from backtesting-secrets"; exit 1; }
+            [ -n "$VALUE" ] || { echo "::error::empty value for $KEY in backtesting-secrets"; exit 1; }
             echo "::add-mask::$VALUE"
             echo "${ENV_NAME}=${VALUE}" >> "$GITHUB_ENV"
-            echo "[OK] Fetched $SECRET_NAME"
+            echo "[OK] Read $KEY"
           done
 
-          echo "[INFO] Fetching optional secrets..."
-          for SECRET_NAME in "${OPTIONAL_SECRETS[@]}"; do
-            ENV_NAME="${SECRET_NAME//-/_}"
-            VALUE=$(az keyvault secret show --vault-name "$AZURE_KEYVAULT_NAME" --name "$SECRET_NAME" --query value -o tsv 2>/dev/null) || VALUE=""
-            if [ -n "$VALUE" ]; then
-              echo "::add-mask::$VALUE"
-              echo "${ENV_NAME}=${VALUE}" >> "$GITHUB_ENV"
-              echo "[OK] Fetched $SECRET_NAME"
-            else
-              echo "${ENV_NAME}=" >> "$GITHUB_ENV"
-              echo "[SKIP] $SECRET_NAME not found in Key Vault (optional)"
-            fi
-          done
+          MASSIVE=$(get backtesting-secrets MASSIVE_API_KEY 2>/dev/null || true)
+          [ -z "$MASSIVE" ] || echo "::add-mask::$MASSIVE"
+          echo "MASSIVE_API_KEY=${MASSIVE}" >> "$GITHUB_ENV"
 
-          az logout 2>/dev/null || true
-          echo "[OK] All secrets fetched successfully"
+          # Paper-only by default: without this key SignalEngine cannot decrypt users' exchange API keys.
+          if [ "${ENABLE_LIVE_CREDENTIALS:-false}" = "true" ]; then
+            KEYVAL=$(get backtestingengine-credentials-encryption key) || { echo "::error::could not read the credentials-encryption key"; exit 1; }
+            echo "::add-mask::$KEYVAL"
+            echo "CREDENTIALS_ENCRYPTION_KEY=${KEYVAL}" >> "$GITHUB_ENV"
+            echo "[WARN] live credentials ENABLED for this deployment"
+          else
+            echo "CREDENTIALS_ENCRYPTION_KEY=" >> "$GITHUB_ENV"
+            echo "[OK] paper-only: credentials-encryption key NOT copied"
+          fi
+          echo "[OK] Cluster secrets read"
 
       - name: Deploy to Kubernetes
         run: |
