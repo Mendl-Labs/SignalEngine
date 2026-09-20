@@ -47,3 +47,9 @@ panic = "abort"
 lto = "fat"
 debug = false
 overflow-checks = false
+
+# BacktestingCore's dataloader (used by hostbuilder) declares ultra-logger as a git dependency on the private
+# LoggingEngine repository. Resolve it to the sibling checkout that this workspace already uses, so builds need no
+# git credentials (CI and the Docker build have none) and the graph contains a single copy of the logger.
+[patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+ultra-logger = { path = "../LoggingEngine/ultra-logger" }
