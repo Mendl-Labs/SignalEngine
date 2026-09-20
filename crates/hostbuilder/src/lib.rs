@@ -3,6 +3,7 @@ pub mod paper_trade_writer;
 #[cfg(feature = "postgres")]
 pub mod market_health_writer;
 pub mod cross_venue_coordinator;
+pub mod deployment_handles;
 
 use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
 use executionhandler::signal::{Signal as ExecSignal, SignalAction as ExecSignalAction};
@@ -102,6 +103,7 @@ impl SignalEngineUltraOrderManager {
         price: f64,
         strategy_id: u16,
         priority: OrderPriority,
+        origin: Option<OrderOrigin>,
     ) -> Result<OrderResult> {
         let timer = NanoTimer::start();
         let order_id = format!("ultra_{}_{}", strategy_id, nano_timestamp());
@@ -126,7 +128,7 @@ impl SignalEngineUltraOrderManager {
                 OrderPriority::Normal => 0.5,
             },
             timestamp: nano_timestamp() as u64,
-            metadata: std::collections::HashMap::new(),
+            metadata: order_metadata(origin),
         };
         
         // Execute through the handler
@@ -276,6 +278,7 @@ use orderbook::Orderbook;
 use portfolio::CryptoWallet;
 use ultra_logger::{ultra_info, ultra_warn, ultra_error};
 use ultra_signal::hash_symbol;
+use deployment_handles::DEPLOYMENT_HANDLES;
 use lazy_static::lazy_static;
 
 #[cfg(feature = "postgres")]
@@ -284,6 +287,34 @@ use dataloader::{MassiveDataProvider, MarketDataProvider, DataRequest, CandleGra
 // Re-export the global storage from datahandler and portfoliohandler
 pub use datahandler::ORDERBOOKS;
 pub use portfoliohandler::PORTFOLIOS;
+
+/// Which deployment (and tenant) an order belongs to. Carried in the order's metadata so everything downstream of
+/// the signal loop -- connectors, ledgers, guards -- can attribute an order without re-deriving it from the
+/// 16-bit signal handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderOrigin {
+    pub deployment_id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+}
+
+/// Order metadata keys written by [`order_metadata`].
+pub const META_DEPLOYMENT_ID: &str = "deployment_id";
+pub const META_TENANT_ID: &str = "tenant_id";
+
+/// The metadata map for an execution-handler signal: empty when the origin is unknown.
+pub fn order_metadata(origin: Option<OrderOrigin>) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    if let Some(o) = origin {
+        m.insert(META_DEPLOYMENT_ID.to_string(), o.deployment_id.to_string());
+        m.insert(META_TENANT_ID.to_string(), o.tenant_id.to_string());
+    }
+    m
+}
+
+/// The active deployment that owns `handle` (see `deployment_handles`), if any.
+pub fn find_meta_by_handle(registry: &PaperDeploymentRegistry, handle: u16) -> Option<PaperDeploymentMeta> {
+    registry.iter().find(|e| e.value().strategy_id_hash == handle).map(|e| e.value().clone())
+}
 
 /// Metadata for a deployed strategy, shared between the deployment handler
 /// and the signal processing loop.
@@ -1113,9 +1144,7 @@ impl HostedObject {
                     signal_count += 1;
                     
                     // Check if this strategy has a paper deployment — if so, route to paper exchange
-                    let paper_meta = signal_paper_registry.iter()
-                        .find(|e| e.value().strategy_id_hash == signal.strategy_id)
-                        .map(|e| e.value().clone());
+                    let paper_meta = find_meta_by_handle(&signal_paper_registry, signal.strategy_id);
 
                     if signal_count <= 10 {
                         ultra_logger::ultra_info!(format!(
@@ -1168,7 +1197,8 @@ impl HostedObject {
                         signal.quantity,
                         price,
                         signal.strategy_id,
-                        priority
+                        priority,
+                        paper_meta.as_ref().map(|m| OrderOrigin { deployment_id: m.deployment_id, tenant_id: m.tenant_id }),
                     ).await {
                         Ok(result) => {
                             if signal_count <= 10 {
@@ -1318,7 +1348,20 @@ impl HostedObject {
                             continue;
                         }
                         
-                        let strategy_id_hash = (strategy.strategy_id.as_u128() & 0xFFFF) as u16;
+                        // Each ACTIVE deployment gets its own signal handle (was: the low 16 bits of the strategy
+                        // id, which two deployments of one strategy share and any two strategies can collide on).
+                        // The lease releases the handle if this attempt is rejected before it is registered.
+                        let handle_lease = match DEPLOYMENT_HANDLES.lease(strategy.instance_id) {
+                            Ok(lease) => lease,
+                            Err(e) => {
+                                ultra_logger::ultra_error!(format!(
+                                    "Rejected deployment {} ({}): {}.",
+                                    strategy.strategy_name, strategy.instance_id, e
+                                ));
+                                continue;
+                            }
+                        };
+                        let strategy_id_hash = handle_lease.handle();
 
                         // Populate global symbol_hash -> name map so the signal loop
                         // (and any downstream consumers that read SYMBOL_NAMES) can
@@ -1652,6 +1695,7 @@ impl HostedObject {
                                 mode: "live".to_string(),
                                 is_market_making: false,
                             });
+                            handle_lease.commit();
 
                             deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
                                 strategy_id_hash,
@@ -1690,6 +1734,7 @@ impl HostedObject {
                                 mode: "paper".to_string(),
                                 is_market_making: strategyloader::is_market_making_strategy_type(&strategy.strategy_type),
                             });
+                            handle_lease.commit();
 
                             deploy_strategies.insert(strategy.instance_id, DeployedStrategyEntry {
                                 strategy_id_hash,
@@ -1753,6 +1798,7 @@ impl HostedObject {
                         ));
                         deploy_registry.remove(&instance_id);
                         deploy_strategies.remove(&instance_id);
+                        DEPLOYMENT_HANDLES.release(&instance_id);
                     }
                 }
             }
@@ -2114,5 +2160,49 @@ mod tests {
         let venues: Vec<String> = vec![];
         let symbols = vec!["BTC/USD".to_string()];
         assert_eq!(match_deployment_venue(&venues, &symbols, "BTC/USD", "kraken"), None);
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn meta(deployment_id: uuid::Uuid, handle: u16) -> PaperDeploymentMeta {
+        PaperDeploymentMeta {
+            tenant_id: uuid::Uuid::new_v4(),
+            deployment_id,
+            strategy_id_hash: handle,
+            paper_exchange: format!("paper_{deployment_id}"),
+            paper_exchange_2: None,
+            venues: vec!["kraken".to_string()],
+            symbols: vec!["BTC-USD".to_string()],
+            mode: "paper".to_string(),
+            is_market_making: false,
+        }
+    }
+
+    #[test]
+    fn two_deployments_of_one_strategy_route_each_signal_to_its_own_deployment() {
+        // Two deployments of the SAME strategy id. With the old hash they shared one handle and every signal
+        // resolved to whichever registry entry came first.
+        let handles = deployment_handles::HandleAllocator::new();
+        let registry: PaperDeploymentRegistry = Arc::new(DashMap::new());
+        let (d1, d2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (h1, _) = handles.allocate(d1).unwrap();
+        let (h2, _) = handles.allocate(d2).unwrap();
+        registry.insert(d1, meta(d1, h1));
+        registry.insert(d2, meta(d2, h2));
+        assert_eq!(find_meta_by_handle(&registry, h1).unwrap().deployment_id, d1);
+        assert_eq!(find_meta_by_handle(&registry, h2).unwrap().deployment_id, d2);
+        assert!(find_meta_by_handle(&registry, 0).is_none(), "handle 0 is never assigned");
+    }
+
+    #[test]
+    fn an_order_carries_its_deployment_and_tenant() {
+        let origin = OrderOrigin { deployment_id: uuid::Uuid::new_v4(), tenant_id: uuid::Uuid::new_v4() };
+        let m = order_metadata(Some(origin));
+        assert_eq!(m.get(META_DEPLOYMENT_ID).map(String::as_str), Some(origin.deployment_id.to_string().as_str()));
+        assert_eq!(m.get(META_TENANT_ID).map(String::as_str), Some(origin.tenant_id.to_string().as_str()));
+        assert!(order_metadata(None).is_empty(), "an order with no known origin stays unattributed");
     }
 }
