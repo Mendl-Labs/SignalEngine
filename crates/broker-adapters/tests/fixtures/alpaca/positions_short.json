@@ -1,0 +1,16 @@
+[
+  {
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "symbol": "DBC",
+    "exchange": "ARCA",
+    "asset_class": "us_equity",
+    "avg_entry_price": "22.10",
+    "qty": "10",
+    "qty_available": "10",
+    "side": "short",
+    "market_value": "-221.00",
+    "cost_basis": "-221.00",
+    "unrealized_pl": "12.34",
+    "current_price": "22.10"
+  }
+]

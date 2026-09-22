@@ -1,0 +1,89 @@
+{
+  "id": "fx_tsmom_12m",
+  "version": 1,
+  "name": "FX time-series momentum (12-month sign, 7 majors, 10% vol target)",
+  "sources": [
+    "Moskowitz, T., Ooi, Y. H. and Pedersen, L. H., \"Time Series Momentum\", 2012 (rule as stated in stage1-record replication brief, BRIEF_FOR_AGENT.md, Sleeve 2; the original paper trades futures, this is an FX-spot adaptation). Bibliographic details beyond title and year are not in the local files.",
+    "Reference implementation: stage1-record/tool/ticket.py, decide_s2 (independent pandas reimplementation)."
+  ],
+  "rule_text": "Universe: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, NZD/USD (daily closes). At each month-end (the last available trading day of the calendar month): (1) direction: long a pair if its return over the past 12 month-ends (close now divided by the close 12 month-ends earlier, minus 1) is positive, short if negative. (2) raw size = direction / sigma, where sigma = the standard deviation of the last 60 daily returns times the square root of observations per year. (3) sleeve scale: multiply all raw sizes by k so that the sleeve's annualised volatility, estimated over the same 60 days with the same estimator, equals 10%. (4) cap each weight at an absolute value of 3 (a multiple of sleeve equity). Weights are held until the next month-end. A decision uses only data available at the close of the decision day; the position earns returns from the next trading day's close-to-close return onward. Requires 13 month-end closes and at least 70 daily closes before the first signal. Long and short positions; at the published 10% target the gross exposure (sum of absolute weights) is several times sleeve equity and varies from month to month (see requirements.gross_exposure_reference).",
+  "reference_implementation": "stage1-record/tool/ticket.py::decide_s2 (also shadow.py sleeve2). Version pin: none recorded in the local files.",
+  "instruments": ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD"],
+  "requirements": {
+    "needs_shorting": true,
+    "min_leverage_gross": 4.41,
+    "gross_exposure_reference": {
+      "n_month_ends": 121,
+      "first_month_end": "2010-09-30",
+      "last_month_end": "2020-09-30",
+      "mean": 2.69,
+      "median": 2.32,
+      "p90": 4.41,
+      "max": 10.39,
+      "min": 0.92,
+      "source": "C:/Users/ikenn/Projects/product-mandate/evidence/s2_gross_exposure.py (output: s2_gross_exposure_output.txt in the same folder), run 2026-09-21",
+      "note": "RE-DERIVATION, not a published figure: the reference rule (stage1-record/tool/ticket.py::decide_s2) evaluated at each month-end on stage1-record/archive-2026-09-21/replication_ladder/ladder_candles.csv, gross = sum of absolute weights after the rule's own clip at 3. KNOWN DATA GAPS: NZDUSD ends 2020-10-23 and every pair has missing days, so decide_s2 (which drops any date where a pair is missing) has an all-seven-pairs panel of 3413 dates ending 2020-10-12, the last month-end evaluated is 2020-09-30 and 2020-10 to 2020-12 are not covered. The candle file contains weekend bars (563 of the 3413 dates) and the maximum fell on a Sunday (2014-08-31); a weekday-only rerun gave mean 2.69, median 2.31, p90 4.47, max 9.79. The largest single weight seen was 1.87 and the cap of 3 never bound. This supersedes an earlier unsaved rough figure of 'about 6x'."
+    },
+    "needs_portfolio_vol_target": true,
+    "max_abs_weight_per_instrument": 3.0,
+    "cross_asset_rebalance": "needed",
+    "asset_classes": ["fx"],
+    "venues_supported": ["oanda"],
+    "min_history_years": 1.0,
+    "notes": [
+      "min_leverage_gross = 4.41 is a JUDGMENT: the 90th percentile of the re-derived month-end gross exposure (see gross_exposure_reference and its saved script). The mean was 2.69, the median 2.32 and the maximum 10.39, so a mandate that allows 4.41x still clips the target in the few peak months (the eligibility check adds an advisory for that). It replaces the owner's earlier rough 'about 6x' (stage1-record config.json), which was not a stored measurement. The owner should confirm the choice of percentile.",
+      "SHORTING AND LEVERAGE EXIST in the platform: short positions (sell-to-open) and account-level leverage are implemented in the portfolio engine (BacktestingCore/portfoliomanager/src/lib.rs: PositionSide::Short, leverage.max(1.0), margin model; verified 2026-09-21). They are strategy properties checked against the USER'S mandate, not platform blockers.",
+      "REAL PLATFORM GAPS (all three block a faithful run, checked by eligibility): (1) per-instrument position sizes are capped at 1.0 and each asset is sized alone, so weights up to 3 and the joint 10% volatility target cannot be expressed (needs_portfolio_vol_target, max_abs_weight_per_instrument); (2) there is no cross-asset rebalancing (cross_asset_rebalance = needed); (3) OANDA live is not wired (practice only). Also observed in the raw-engine test: an engine job for this 7-pair sleeve did not finish within 600 s (stage-1 SCORECARD Amendment 8). Sources: SCORECARD_PREREGISTRATION.md Amendments 7-8 and results (2026-09-21).",
+      "The evidence for this strategy is WEAK: the independent reimplementation had Sharpe about -0.06 over 2010-2020 (gross), and the scorecard sets no performance band for it. See expected_ranges.",
+      "'12 months' is read as 12 month-ends. Independent agent trials all read it as 252 trading days instead; which one is intended is a specification question. This entry fixes 12 month-ends, matching ticket.py."
+    ]
+  },
+  "rebalance": {
+    "kind": "monthly",
+    "detail": "At month-end close (last available trading day of the calendar month). Holidays are not modelled in the reference implementation; verify against the exchange calendar."
+  },
+  "parameters": {
+    "lookback_month_ends": 12,
+    "direction_rule": "sign of (close now / close 12 month-ends earlier - 1)",
+    "vol_window_days": 60,
+    "vol_annualisation": "sqrt(observations per year, measured from the data)",
+    "weighting": "inverse_volatility (direction / sigma)",
+    "sleeve_vol_target": 0.10,
+    "max_abs_weight": 3.0,
+    "min_month_end_closes_required": 13,
+    "min_daily_closes_required": 70
+  },
+  "expected_ranges": [
+    {
+      "metric": "sharpe",
+      "low": -2.0,
+      "high": 2.0,
+      "role": "integrity_bound",
+      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B and Amendment 1: no performance band for this sleeve, only |Sharpe| <= 2 (a simple monthly trend rule above that is a look-ahead suspect).",
+      "note": "This is an INTEGRITY bound, not an expected performance range: a result outside it means suspect the test, a result inside it says nothing about quality. Independent reimplementation (gross, zero cost, 2010-10-01 to 2020-12-31): Sharpe -0.064, CAGR -1.33%, vol 11.15%, max drawdown -37.52%; the scorecard reads this as consistent with the well-known weak decade for currency trend after 2010 (its reading, not verified). Literature figures are UNVERIFIED (secondary-source summaries): Moskowitz-Ooi-Pedersen composite Sharpe ~1.0 to ~1.28 on 58 futures 1985-2009 (gross, futures, far more diversified, pre-publication; NOT used as a target), Hurst-Ooi-Pedersen average ~0.4 per market after costs on 67 markets 1880-2016. Post-publication decay ~58% (McLean-Pontiff, unverified)."
+    },
+    {
+      "metric": "realised_annual_volatility",
+      "low": 0.07,
+      "high": 0.13,
+      "role": "integrity_bound",
+      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer C and Amendment 1 (volatility-targeting check for this sleeve alone).",
+      "note": "Target is 10%. Independent reimplementation realised 11.15%. Falling inside the band is a pass of the check, not evidence the targeting is accurate: trailing 60-day targeting overshoots when volatility spikes."
+    }
+  ],
+  "failure_regimes": [
+    "2010-2020 in the independent reimplementation: Sharpe -0.064 and max drawdown -37.52%, a weak decade for currency trend (the scorecard's reading).",
+    "Volatility spikes: trailing 60-day volatility targeting lags, so realised volatility overshoots the 10% target (reimplementation 11.15% for this sleeve alone; 14.52% against a 10% target for the combined portfolio).",
+    "Leverage and financing: the rule needs several times gross notional, so margin, financing and stop-out risk dominate small accounts.",
+    "Post-publication decay: published edges tend to shrink (McLean-Pontiff ~58%, UNVERIFIED secondary figure); read any positive result as an upper bound."
+  ],
+  "cost_profile": {
+    "turnover_per_year_estimate": null,
+    "signal_flips_per_year_shadow": 13.4,
+    "note": "Turnover as a fraction of sleeve equity is NOT recorded in the local files, and it is larger than the flip count suggests because weights are re-sized every month as volatility changes. The independent reimplementation counted 137 sign flips over 10.25 years (3194 observations at 311.6 per year), about 13.4 per year across the seven pairs (arithmetic on shadow_summary.json). Financing and rollover on leveraged FX are not modelled by the reference implementation."
+  },
+  "evidence": "reference_only",
+  "last_verified": "2026-09-21",
+  "verification_note": "Rule text transcribed from ticket.py decide_s2 (code and docstring) and cross-read against BRIEF_FOR_AGENT.md on 2026-09-21. An independent reimplementation exists (ticket.py, shadow.py); the platform engine has NOT replicated it: it cannot run this rule faithfully because it has no joint volatility targeting, caps per-instrument sizes at 1.0 and has no cross-asset rebalancing (shorting and leverage themselves DO exist in the platform). Literature figures are UNVERIFIED against the original papers. The gross-exposure figures are a re-derivation (saved script and output under product-mandate/evidence) on data with known gaps (NZDUSD ends 2020-10-23), not a verified measurement, and min_leverage_gross = 4.41 is a judgment. The strategy's own evidence is weak (shadow Sharpe about -0.06 over 2010-2020).",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised volatility falls outside the 7% to 13% integrity band above; (d) realised results over a full evaluation window are persistently worse than the reference replay. The window length and any numeric tolerance for (d) must be set by the owner before go-live; none is assumed here."
+}
