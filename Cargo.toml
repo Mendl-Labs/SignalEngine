@@ -24,6 +24,7 @@ members = [
     "crates/rebalancer-core",
     "crates/rebalancer-risk",
     "crates/rebalancer-run",
+    "crates/rebalancer-store",
 ]
 resolver = "2"
 
