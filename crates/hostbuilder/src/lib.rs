@@ -3,6 +3,7 @@ pub mod paper_trade_writer;
 #[cfg(feature = "postgres")]
 pub mod market_health_writer;
 pub mod cross_venue_coordinator;
+pub mod fill_ledger;
 
 use executionhandler::{UltraLowLatencyExecutionHandler, ExecutionStatus};
 use executionhandler::signal::{Signal as ExecSignal, SignalAction as ExecSignalAction};
