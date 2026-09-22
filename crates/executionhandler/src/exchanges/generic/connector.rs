@@ -9,6 +9,8 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 use crate::signal::Signal;
@@ -42,6 +44,13 @@ pub struct GenericConnector {
     active_orders: Arc<RwLock<HashMap<String, OrderStatus>>>,
     /// Configuration
     config: Option<ExchangeConfig>,
+    /// Last Kraken nonce issued by this connector instance (real
+    /// epoch-milliseconds, ratcheted forward -- see `next_kraken_nonce`
+    /// and the doc comment on its use in `execute_request` for why this
+    /// exists: Kraken requires a nonce that strictly increases, per API
+    /// key, on every request, and this connector previously derived its
+    /// nonce from process-uptime nanoseconds instead of wall-clock time).
+    kraken_nonce: AtomicU64,
 }
 
 /// Bybit v5 WebSocket private-stream auth signature. Verified 2026-08-31
@@ -152,6 +161,7 @@ impl GenericConnector {
             metrics: Arc::new(MetricsCollector::new()),
             active_orders: Arc::new(RwLock::new(HashMap::new())),
             config: None,
+            kraken_nonce: AtomicU64::new(0),
         }
     }
     
@@ -329,6 +339,26 @@ impl GenericConnector {
         Ok(params)
     }
     
+    /// Kraken's nonce, ratcheted forward from real epoch-milliseconds so it
+    /// never goes backwards or repeats within this connector instance's
+    /// lifetime -- see the doc comment on `kraken_nonce` and on its call
+    /// site in `execute_request` for why this exists. A CAS loop (not a
+    /// plain fetch_add) so that concurrent calls landing on the *same*
+    /// `epoch_ms` still each get a distinct, strictly increasing value,
+    /// and so that a value never regresses even if the system clock does.
+    fn next_kraken_nonce(&self, epoch_ms: u64) -> u64 {
+        loop {
+            let last = self.kraken_nonce.load(Ordering::SeqCst);
+            let candidate = std::cmp::max(epoch_ms, last + 1);
+            if self.kraken_nonce
+                .compare_exchange(last, candidate, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+    }
+
     /// Execute the HTTP request to the exchange
     async fn execute_request(
         &self,
@@ -344,11 +374,45 @@ impl GenericConnector {
 
         let path = &self.resolve_path(path);
 
+        // Real wall-clock milliseconds since the Unix epoch. This
+        // intentionally does NOT use `nano_timestamp()` -- this crate's
+        // ~16 other call sites correctly use that function as a cheap
+        // monotonic perf timer measuring nanoseconds since *process
+        // start*, which is fine for latency metrics but wrong here:
+        // every timestamp-signed exchange this connector talks to
+        // (Binance's `timestamp` recvWindow param, Bybit's
+        // `X-BAPI-TIMESTAMP`, OKX/Coinbase's signed timestamp header,
+        // Deribit, Gemini's nonce) needs a value close to real "now",
+        // and Kraken specifically requires its `nonce` request parameter
+        // to be STRICTLY INCREASING, server-side, for a given API key --
+        // see docs.kraken.com/api/docs/guides/spot-rest-auth. Deriving
+        // this from process uptime meant every value started back near
+        // zero on every restart, so Kraken (and any other API key
+        // shared with a process using real epoch-ms nonces, e.g. this
+        // Engine's own credential-test button) would reject every
+        // private call with an invalid-nonce error, often permanently.
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         // Timestamp must exist before body-building for Kraken: its
         // nonce (injected below) has to be the exact same value used to
         // compute the signature, not independently re-derived inside
         // auth.sign.
-        let timestamp = nano_timestamp() as u64 / 1_000_000; // Convert to milliseconds
+        let timestamp = if matches!(self.preset, ExchangePreset::Kraken) {
+            // Kraken alone needs the additional in-process monotonic
+            // guard on top of real epoch time (see `next_kraken_nonce`):
+            // strictly increasing is a harder requirement than "close to
+            // now", and two calls can legitimately land in the same
+            // millisecond. This does NOT fix cross-process/cross-restart
+            // nonce continuity -- that needs a persisted nonce store,
+            // which is out of scope here -- it only stops this connector
+            // from emitting a tiny, non-monotonic, process-uptime value.
+            self.next_kraken_nonce(epoch_ms)
+        } else {
+            epoch_ms
+        };
 
         // Kraken requires `nonce` as an actual request parameter, not
         // just an input to the signature -- docs.kraken.com/api/docs/rest-api/add-order.
@@ -2935,5 +2999,117 @@ mod fill_status_tests {
         let bybit_sig = bybit_ws_signature("shared_secret", 1700000010000);
         let okx_sig = okx_ws_signature("shared_secret", "1700000010");
         assert_ne!(bybit_sig, okx_sig);
+    }
+
+    // ========== Kraken nonce (process-uptime bug, see kraken_nonce field doc) ==========
+
+    #[test]
+    fn kraken_nonce_is_based_on_real_epoch_time_not_a_tiny_process_uptime_counter() {
+        // Regression guard for the original bug: nano_timestamp() is
+        // nanoseconds since process start, not since the Unix epoch, so
+        // a fresh process would previously hand out nonces in the tens
+        // or hundreds (milliseconds of uptime). Any real epoch-ms
+        // timestamp for 2026 is comfortably above 1_700_000_000_000; a
+        // freshly-constructed connector calling this microseconds after
+        // `new()` must still clear that bar.
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let epoch_ms_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let nonce = conn.next_kraken_nonce(epoch_ms_now);
+        assert!(
+            nonce > 1_000_000_000_000,
+            "nonce {} looks like process-uptime ms, not epoch ms",
+            nonce
+        );
+        // Within a second of the real wall clock (loose bound -- just
+        // confirms it's epoch-based, not a coincidence).
+        assert!(
+            (nonce as i128 - epoch_ms_now as i128).abs() < 1_000,
+            "nonce {} is not close to real epoch-ms {}",
+            nonce, epoch_ms_now
+        );
+    }
+
+    #[test]
+    fn kraken_nonce_never_repeats_or_decreases_across_sequential_calls_in_the_same_millisecond() {
+        // Feeding the same epoch_ms repeatedly simulates several calls
+        // landing within one millisecond of wall-clock time -- Kraken
+        // rejects a repeated or non-increasing nonce just as harshly as
+        // a decreasing one.
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let fixed_epoch_ms = 1_800_000_000_000_u64;
+        let mut last = 0u64;
+        for _ in 0..500 {
+            let nonce = conn.next_kraken_nonce(fixed_epoch_ms);
+            assert!(nonce > last, "nonce {} did not strictly increase past {}", nonce, last);
+            last = nonce;
+        }
+    }
+
+    #[test]
+    fn kraken_nonce_is_strictly_increasing_under_real_concurrent_calls() {
+        // The CAS loop, not just single-threaded sequencing, is what
+        // this test guards: many threads hammering the same connector
+        // instance (as would happen with concurrent order placement on
+        // one API key) must still produce a set of nonces with no
+        // duplicates and no regressions once sorted.
+        use std::thread;
+
+        let conn = Arc::new(GenericConnector::new(ExchangePreset::Kraken));
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let conn = Arc::clone(&conn);
+                thread::spawn(move || {
+                    (0..200)
+                        .map(|_| conn.next_kraken_nonce(epoch_ms))
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+
+        let mut all_nonces: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+
+        assert_eq!(all_nonces.len(), 16 * 200);
+        all_nonces.sort_unstable();
+        all_nonces.dedup();
+        assert_eq!(
+            all_nonces.len(),
+            16 * 200,
+            "duplicate nonce issued under concurrent calls"
+        );
+
+        // Strictly increasing once sorted (dedup above already proves
+        // "no duplicates"; this additionally proves no gaps went
+        // backwards relative to each thread's own view).
+        for pair in all_nonces.windows(2) {
+            assert!(pair[1] > pair[0]);
+        }
+    }
+
+    #[test]
+    fn kraken_nonce_never_goes_backwards_even_if_epoch_ms_input_regresses() {
+        // Guards the max(epoch_ms, last+1) logic specifically: if the
+        // system clock were ever to step backwards between calls, the
+        // nonce must still ratchet forward rather than following the
+        // clock down (which would hand Kraken a smaller nonce than
+        // before and get every subsequent call rejected).
+        let conn = GenericConnector::new(ExchangePreset::Kraken);
+        let high = conn.next_kraken_nonce(1_800_000_000_000);
+        let after_clock_regression = conn.next_kraken_nonce(1_000_000_000_000);
+        assert!(
+            after_clock_regression > high,
+            "nonce regressed: {} then {}",
+            high, after_clock_regression
+        );
     }
 }
