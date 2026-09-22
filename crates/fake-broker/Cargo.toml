@@ -1,0 +1,13 @@
+[package]
+name = "fake-broker"
+description = "Stateful, scriptable, in-process fake exchange for the rebalancer's kill drills and journey tests. Speaks Kraken's wire format behind broker-adapters' HttpTransport. No network, no async, no real keys."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+broker-adapters = { path = "../broker-adapters" }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"

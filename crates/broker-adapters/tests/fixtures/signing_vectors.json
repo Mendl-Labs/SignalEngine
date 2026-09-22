@@ -1,0 +1,50 @@
+[
+ {
+  "name": "kraken_docs_example",
+  "secret": "kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+  "path": "/0/private/AddOrder",
+  "body": "nonce=1616492376594&ordertype=limit&pair=XBTUSD&price=37500&type=buy&volume=1.25",
+  "nonce": "1616492376594",
+  "sig": "4/dpxb3iT4tp/ZCVEwSnEsLxx0bqyhLpdfOpc6fn7OR8+UClSV5n9E6aSS8MPtnRfp32bAb0nmbRn6H8ndwLUQ=="
+ },
+ {
+  "name": "balance_ns_nonce",
+  "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+  "path": "/0/private/Balance",
+  "body": "nonce=1758463200123456789",
+  "nonce": "1758463200123456789",
+  "sig": "js4HDwaFoeG4gJ6YRBy9sY1MyEFMJjNqtKxaF0Lg5MjQ+ELexPB204CFEXBk3N5kVg36iEiVuzWY+LkoYOdvaQ=="
+ },
+ {
+  "name": "addorder_userref_validate",
+  "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+  "path": "/0/private/AddOrder",
+  "body": "nonce=1758463200123456790&pair=XBTUSD&type=buy&ordertype=limit&volume=0.00250000&price=61234.5&userref=1234567890&validate=true",
+  "nonce": "1758463200123456790",
+  "sig": "5EaMWlC1abuuHWnKfmeOoxt+jOxTAUi8a1M45DLqojDLDpEo5mpkW3J8ics8z9uLEUwJaSDyRX9CoYVicq5B9A=="
+ },
+ {
+  "name": "cancel_plain_txid_short_secret",
+  "secret": "dW5pdC10ZXN0LXNlY3JldC1ub3QtcmVhbA==",
+  "path": "/0/private/CancelOrder",
+  "body": "nonce=42&txid=OABC12-XYZ23-DEF456",
+  "nonce": "42",
+  "sig": "9bvrpqdQeg2nFjdoOLkyO6Zz7HTf8nH1zjrkybPWPBfu36IH8XzFpGVcgvT87/ztSPKKwwldtfvGpvrB+4eF6Q=="
+ },
+ {
+  "name": "body_with_percent_encoded_chars",
+  "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+  "path": "/0/private/QueryOrders",
+  "body": "nonce=1758463200999999999&txid=OAAAAA-BBBBB-CCCCCC%2COBBBBB-CCCCC-DDDDDD&trades=true&note=a%20b%2Bc",
+  "nonce": "1758463200999999999",
+  "sig": "ukG65lyYsQ143BAEcSzoYSc2SWPlGkaLTE6XS8eSE7T1tZS4Wp4ZwTsUaFwv/2gdfQMRbvz2P8QhSqC+IotaSw=="
+ },
+ {
+  "name": "openorders_userref_max",
+  "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+  "path": "/0/private/OpenOrders",
+  "body": "nonce=9007199254740993&userref=2147483647",
+  "nonce": "9007199254740993",
+  "sig": "R6I1ywuDoWhRbSibTZxNhlPs9IOcnZlJSeStOPojpMnZE9gZ4aHn7ys+LGTbROuYZS2ioUHXOMZA0UAnF0y6+w=="
+ }
+]

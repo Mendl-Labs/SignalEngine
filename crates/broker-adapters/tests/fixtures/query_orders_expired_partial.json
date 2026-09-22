@@ -1,0 +1,1 @@
+{"error":[],"result":{"OEXPI1-AAAAA-BBBBBB":{"refid":null,"userref":__USERREF__,"status":"expired","reason":"Time in force expired","descr":{"pair":"XBTUSD","type":"buy","ordertype":"limit","price":"61000.0"},"vol":"1.00000000","vol_exec":"0.25000000","cost":"15250.0","fee":"24.4","price":"61000.0"}}}

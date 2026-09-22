@@ -1,0 +1,24 @@
+[package]
+name = "rebalancer-run"
+description = "The rebalancer's run pipeline over traits: broker views with per-venue equity definitions, reconciliation, flatten, and (slice C) run_once. Pure and offline: no network, no DB, no async runtime; a Postgres store, real clocks and real brokers plug in behind the traits."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+broker-adapters = { path = "../broker-adapters" }
+mandate-core = { path = "../mandate-core" }
+reference-rules = { path = "../reference-rules" }
+rebalancer-core = { path = "../rebalancer-core" }
+rebalancer-risk = { path = "../rebalancer-risk" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+fake-broker = { path = "../fake-broker" }
+serde_json = "1"
+# The drills play the authenticated-human resume endpoint; this feature is enabled for tests ONLY (a dev-dependency
+# does not enable it in a normal `cargo build -p rebalancer-run`).
+rebalancer-risk = { path = "../rebalancer-risk", features = ["human-endpoint"] }

@@ -17,6 +17,13 @@ members = [
     "crates/signal",
     "crates/signaldispatcher",
     "crates/pythonbridge-worker",
+    "crates/reference-rules",
+    "crates/broker-adapters",
+    "crates/fake-broker",
+    "crates/mandate-core",
+    "crates/rebalancer-core",
+    "crates/rebalancer-risk",
+    "crates/rebalancer-run",
 ]
 resolver = "2"
 
