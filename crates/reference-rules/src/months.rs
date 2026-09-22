@@ -12,6 +12,22 @@ fn same_month(a: NaiveDate, b: NaiveDate) -> bool {
     a.year() == b.year() && a.month() == b.month()
 }
 
+/// Is `date` the last calendar day of its month? Calendar-free in the same sense as the rest of this module (no
+/// holiday table): the same `same_month` test the DATA-driven month-end functions above use, just applied to the
+/// wall-clock calendar instead of to a data panel's bar dates. This is what a SCHEDULER asks (is a rebalance due
+/// today?) before any data exists to check; [`latest_decision_date`] is what the RULE asks once a data panel is in
+/// hand (is the newest bar's month actually complete?). The two can disagree by a few days around a month boundary
+/// when data is late or a holiday shifts the last session -- that disagreement is exactly what the rule's own
+/// month-end and staleness checks (`NotMonthEnd`, `FormingBar`) catch; the scheduler's job is only to decide
+/// whether it is worth asking the rule at all today.
+pub fn is_calendar_month_end(date: NaiveDate) -> bool {
+    match date.succ_opt() {
+        Some(next) => !same_month(date, next),
+        // `NaiveDate::MAX`: there is no next day to compare against, so trivially "no later day this month".
+        None => true,
+    }
+}
+
 /// Indices of the last bar of every calendar month present in `dates` (ascending). The last index is always
 /// included, so the final month is treated as complete: use `completed_month_end_dates` when the data may end
 /// inside a month.

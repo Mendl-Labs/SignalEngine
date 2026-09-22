@@ -391,3 +391,19 @@ fn fingerprint_changes_with_any_bar_and_ignores_insertion_order() {
         data_fingerprint(&Panel::new(vec![shifted, b]).unwrap())
     );
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// is_calendar_month_end: the clock-based scheduling helper, distinct from the data-driven month-end functions above
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn is_calendar_month_end_matches_the_wall_clock_not_any_data() {
+    assert!(is_calendar_month_end(d(2026, 1, 31)));
+    assert!(is_calendar_month_end(d(2026, 2, 28)), "2026 is not a leap year");
+    assert!(is_calendar_month_end(d(2024, 2, 29)), "2024 is a leap year");
+    assert!(is_calendar_month_end(d(2026, 4, 30)));
+    assert!(is_calendar_month_end(d(2026, 12, 31)));
+    assert!(!is_calendar_month_end(d(2026, 1, 30)));
+    assert!(!is_calendar_month_end(d(2026, 3, 1)));
+    assert!(!is_calendar_month_end(d(2026, 6, 15)));
+}
