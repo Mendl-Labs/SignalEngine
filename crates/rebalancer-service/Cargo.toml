@@ -1,0 +1,23 @@
+[package]
+name = "rebalancer-service"
+description = "The rebalancer's multi-account driver-loop binary (WP4.8): ticks every N seconds, reads the database kill flag, enumerates every due tenant-account and calls run_once for each (rebalancer_run::driver::run_all_due), one account's failure never stopping the others."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rebalancer-service"
+path = "src/main.rs"
+
+[dependencies]
+rebalancer-run = { path = "../rebalancer-run" }
+rebalancer-store = { path = "../rebalancer-store" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+uuid = { version = "1" }
+
+# Deliberately NOT tokio at the top level: rebalancer-run's pipeline (and therefore run_all_due) is
+# synchronous end to end ("no async runtime" -- rebalancer-run/src/lib.rs's own module doc); this
+# binary's tick loop is a plain std::thread::sleep loop to match, and rebalancer-store's own stores
+# each carry a small PRIVATE Tokio runtime just to bridge into diesel-async (see
+# rebalancer-store/src/pg.rs). Starting a top-level Tokio runtime here would risk exactly the "cannot
+# start a runtime from within a runtime" panic that private bridge is designed to avoid.
