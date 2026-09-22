@@ -9,6 +9,9 @@
 //! * [`flatten`]: cancel our orders, sell exactly what is held, verify flat.
 //! * [`data`], [`stores`], [`record`]: the data / run-store / notifier / kill-flag traits and the immutable record.
 //! * [`pipeline`] holds `run_once`.
+//! * [`driver`] holds `find_due_runs` / `run_all_due`: the multi-account driver loop (WP4.8) that enumerates every
+//!   due tenant-account and calls `run_once` for each, one process's or one account's failure never stopping the
+//!   others.
 //! * [`testkit`]: in-memory doubles for the traits (a recording notifier, a kill-flag switch, fixture data).
 
 #![forbid(unsafe_code)]
@@ -16,6 +19,7 @@
 pub mod broker;
 pub mod clock;
 pub mod data;
+pub mod driver;
 pub mod flatten;
 pub mod pipeline;
 pub mod recon;

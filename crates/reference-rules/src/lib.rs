@@ -56,6 +56,6 @@ pub use decision::{CryptoDecision, EtfDecision, InstrumentDecision, Signal};
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;
-pub use months::{completed_month_end_dates, latest_decision_date, month_end_dates};
+pub use months::{completed_month_end_dates, is_calendar_month_end, latest_decision_date, month_end_dates};
 pub use options::{GapPolicy, MonthEndMode, Options};
 pub use series::{Panel, PriceSeries};

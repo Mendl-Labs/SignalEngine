@@ -1,0 +1,37 @@
+[package]
+name = "rebalancer-store"
+description = "Postgres implementations of rebalancer-run's/rebalancer-risk's persistence traits (StateStore, RunStore, Notifier, the kill flag) plus a per-account advisory lock, for running the rebalancer as a multi-tenant service (WP4.8)."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+rebalancer-core = { path = "../rebalancer-core" }
+rebalancer-risk = { path = "../rebalancer-risk" }
+rebalancer-run = { path = "../rebalancer-run" }
+broker-adapters = { path = "../broker-adapters" }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde_json = "1"
+thiserror = "2"
+# Matches crates/smartorderrouter's exact versions (its `postgres` feature), so the workspace
+# resolves one copy of diesel/diesel-async/deadpool/bigdecimal, not two.
+diesel = { version = "2.2", features = ["postgres", "uuid", "chrono", "numeric", "64-column-tables", "serde_json"] }
+diesel-async = { version = "0.5", features = ["postgres", "deadpool"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+# diesel-async 0.5.2 depends on futures-util with default-features = false and only ["std", "sink"],
+# which omits "async-await-macro" -- the feature that provides the `try_join!` macro its own
+# `pg::AsyncPgConnection` uses internally. Nothing else in this crate's dependency graph turns that
+# feature back on, so `cargo build -p rebalancer-store` fails with "could not find `try_join` in
+# `futures_util`" without this explicit dependency: Cargo unifies features per resolved package
+# version, so declaring the feature here turns it on for diesel-async's own copy too, without
+# touching diesel-async's manifest.
+futures-util = { version = "0.3", features = ["async-await-macro"] }
+# rebalancer-run's traits are deliberately synchronous ("no async runtime" -- see
+# rebalancer-run/src/lib.rs's own module doc). diesel-async's client is async, so each store
+# here owns a dedicated current-thread Tokio runtime and bridges into it with `block_on` at the
+# trait-method boundary; nothing above this crate needs to know it exists. See src/pg.rs.
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+fake-broker = { path = "../fake-broker" }
