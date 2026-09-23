@@ -17,9 +17,11 @@
 //!   value as the denominator of its percentage limits, so plan and guard agree.
 //!
 //! Instruments the sleeves do not name are left alone (unmanaged), though they still count in the guard's exposure
-//! sums. A pre-existing short is never touched (skipped with a reason).
+//! sums (so the guard can deny an order for exposure the sleeves do not manage, even when the planner's own gross
+//! check on the targets passed). A pre-existing short is never touched (skipped with a reason), unless a signed
+//! sleeve manages that instrument (see the last section).
 //!
-//! # Trade rules
+//! # Trade rules (long-only, the default)
 //! * `delta = target - held * price`. Trades with `|delta| < min_trade_abs`, or `|delta| < min_trade_pct * target`
 //!   (`* current` when the target is zero), are dropped (recorded in `skipped`).
 //! * Sizes are `floor(|delta| / price)` then rounded DOWN by the venue rules. A full exit (target zero) sells the
