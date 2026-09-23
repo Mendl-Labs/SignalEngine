@@ -1,0 +1,50 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "shortOrderCreateTransaction": {
+    "id": "6420",
+    "accountID": "101-001-1234567-001",
+    "userID": 1234567,
+    "batchID": "6420",
+    "requestID": "42",
+    "time": "1758463200.000000000",
+    "type": "MARKET_ORDER",
+    "instrument": "GBP_USD",
+    "units": "5000",
+    "timeInForce": "FOK",
+    "positionFill": "DEFAULT",
+    "reason": "CLIENT_ORDER",
+    "clientExtensions": {
+      "id": "rb1:fl:20260921T150000Z:EURUSD:1:abc",
+      "tag": "mendl-rb"
+    }
+  },
+  "shortOrderFillTransaction": {
+    "id": "6421",
+    "accountID": "101-001-1234567-001",
+    "userID": 1234567,
+    "batchID": "6420",
+    "requestID": "42",
+    "time": "1758463201.250000000",
+    "type": "ORDER_FILL",
+    "orderID": "6420",
+    "clientOrderID": "rb1:fl:20260921T150000Z:EURUSD:1:abc",
+    "instrument": "GBP_USD",
+    "units": "5000",
+    "gainQuoteHomeConversionFactor": "1",
+    "lossQuoteHomeConversionFactor": "1",
+    "price": "1.27020",
+    "fullVWAP": "1.27020",
+    "reason": "MARKET_ORDER",
+    "pl": "0.0000",
+    "financing": "0.0000",
+    "commission": "0.0000",
+    "guaranteedExecutionFee": "0.0000",
+    "accountBalance": "100000.0000",
+    "halfSpreadCost": "0.0500"
+  },
+  "relatedTransactionIDs": [
+    "6420",
+    "6421"
+  ],
+  "lastTransactionID": "6421"
+}

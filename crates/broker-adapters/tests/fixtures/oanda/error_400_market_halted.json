@@ -1,0 +1,10 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "orderRejectTransaction": {
+    "id": "6373",
+    "type": "MARKET_ORDER_REJECT",
+    "rejectReason": "MARKET_HALTED"
+  },
+  "errorCode": "MARKET_HALTED",
+  "errorMessage": "Market is halted"
+}

@@ -1,0 +1,57 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "orders": [
+    {
+      "id": "6390",
+      "createTime": "1758463200.000000000",
+      "state": "PENDING",
+      "type": "LIMIT",
+      "instrument": "EUR_USD",
+      "units": "2000",
+      "timeInForce": "GTC",
+      "positionFill": "DEFAULT",
+      "clientExtensions": {
+        "id": "rb1:run1:EUR/USD:limit",
+        "tag": "mendl-rb"
+      },
+      "price": "1.09500"
+    },
+    {
+      "id": "6395",
+      "createTime": "1758463200.000000000",
+      "state": "PENDING",
+      "type": "STOP_LOSS",
+      "tradeID": "6301",
+      "price": "1.08000",
+      "timeInForce": "GTC",
+      "triggerCondition": "DEFAULT"
+    },
+    {
+      "id": "6396",
+      "createTime": "1758463200.000000000",
+      "state": "PENDING",
+      "type": "LIMIT",
+      "instrument": "GBP_USD",
+      "units": "-3000",
+      "timeInForce": "GTC",
+      "positionFill": "DEFAULT",
+      "price": "1.30000"
+    },
+    {
+      "id": "6397",
+      "createTime": "1758463200.000000000",
+      "state": "PENDING",
+      "type": "LIMIT",
+      "instrument": "USD_JPY",
+      "units": "500",
+      "timeInForce": "GTC",
+      "positionFill": "DEFAULT",
+      "clientExtensions": {
+        "id": "manual-ticket-9",
+        "tag": "mendl-rb"
+      },
+      "price": "148.500"
+    }
+  ],
+  "lastTransactionID": "6400"
+}

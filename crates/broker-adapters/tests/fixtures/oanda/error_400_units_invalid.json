@@ -1,0 +1,20 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "orderRejectTransaction": {
+    "id": "6373",
+    "time": "1758463201.250000000",
+    "type": "MARKET_ORDER_REJECT",
+    "instrument": "EUR_USD",
+    "units": "1000",
+    "rejectReason": "UNITS_INVALID",
+    "clientExtensions": {
+      "id": "rb1:run1:EUR/USD:buy"
+    }
+  },
+  "relatedTransactionIDs": [
+    "6373"
+  ],
+  "lastTransactionID": "6373",
+  "errorCode": "UNITS_INVALID",
+  "errorMessage": "The units specified are invalid"
+}

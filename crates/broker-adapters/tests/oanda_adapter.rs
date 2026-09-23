@@ -1,0 +1,1332 @@
+//! End-to-end OANDA adapter behaviour over hand-authored JSON fixtures and `FakeTransport`.
+//!
+//! PROVENANCE: the fixtures in `tests/fixtures/oanda/` are AUTHORED FROM DOCUMENTATION, not recorded
+//! from a live or practice account (see `gen_fixtures.py`). These tests prove the adapter handles the
+//! shapes we BELIEVE OANDA sends; they cannot prove OANDA sends them (Rung 3).
+
+use broker_adapters::oanda::{
+    CloseOutcome, Environment, InstrumentTable, OandaAdapter, OandaConfig, OandaCredentials, PRACTICE_BASE_URL,
+};
+use broker_adapters::testing::FakeTransport;
+use broker_adapters::transport::{HttpMethod, HttpRequest, HttpResponseDetailed, TransportError};
+use broker_adapters::types::{BalanceKind, BrokerAdapter, OrderKind, OrderRequest, OrderStatus, PlaceOutcome, Side, TimeInForce};
+use broker_adapters::{BrokerError, Dec, ErrorClass};
+use std::sync::{Arc, Mutex};
+
+const TOKEN: &str = "tok-9f3a-unit-test-not-a-real-token";
+const ACCT: &str = "101-001-1234567-001";
+const TAG: &str = "rb1:run1:EUR/USD:buy";
+const SELL_TAG: &str = "rb1:run1:EUR/USD:sell";
+/// `TAG` as it appears in a URL path after `@` (percent-encoded).
+const TAG_PATH: &str = "%40rb1%3Arun1%3AEUR%2FUSD%3Abuy";
+const SELL_TAG_PATH: &str = "%40rb1%3Arun1%3AEUR%2FUSD%3Asell";
+
+macro_rules! fx {
+    ($name:literal) => {
+        include_str!(concat!("fixtures/oanda/", $name))
+    };
+}
+
+fn d(s: &str) -> Dec {
+    Dec::parse(s).unwrap()
+}
+
+// ---------------------------------------------------------------- routing transport
+
+#[derive(Clone)]
+enum Reply {
+    Http(u16, String, Vec<(String, String)>),
+    Err(TransportError),
+}
+
+#[derive(Clone)]
+struct Route {
+    method: HttpMethod,
+    path: String,
+    reply: Reply,
+}
+
+#[derive(Clone, Default)]
+struct Routes(Vec<Route>);
+
+impl Routes {
+    fn on(mut self, method: HttpMethod, path: &str, status: u16, body: &str) -> Self {
+        self.0.push(Route { method, path: path.to_string(), reply: Reply::Http(status, body.to_string(), Vec::new()) });
+        self
+    }
+    fn get(self, path: &str, status: u16, body: &str) -> Self {
+        self.on(HttpMethod::Get, path, status, body)
+    }
+    fn post(self, path: &str, status: u16, body: &str) -> Self {
+        self.on(HttpMethod::Post, path, status, body)
+    }
+    fn put(self, path: &str, status: u16, body: &str) -> Self {
+        self.on(HttpMethod::Put, path, status, body)
+    }
+    fn fail(mut self, method: HttpMethod, path: &str, e: TransportError) -> Self {
+        self.0.push(Route { method, path: path.to_string(), reply: Reply::Err(e) });
+        self
+    }
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        if let Some(Route { reply: Reply::Http(_, _, h), .. }) = self.0.last_mut() {
+            h.push((name.to_string(), value.to_string()));
+        }
+        self
+    }
+    /// First matching route wins, so put the specific one first. An unrouted request is a test bug.
+    fn install(self, t: &FakeTransport) {
+        let routes = Mutex::new(self.0);
+        t.set_handler_detailed(move |req: &HttpRequest| {
+            let path = req.url.strip_prefix(PRACTICE_BASE_URL).unwrap_or_else(|| panic!("request left the practice host: {}", req.url));
+            let routes = routes.lock().unwrap();
+            for r in routes.iter() {
+                if r.method == req.method && r.path == path {
+                    return match &r.reply {
+                        Reply::Http(status, body, headers) => Ok(HttpResponseDetailed { status: *status, body: body.clone(), headers: headers.clone() }),
+                        Reply::Err(e) => Err(e.clone()),
+                    };
+                }
+            }
+            panic!("unrouted request {:?} {path}", req.method)
+        });
+    }
+}
+
+fn p(tail: &str) -> String {
+    format!("/v3/accounts/{ACCT}{tail}")
+}
+
+fn tag_lookup(tag_path: &str) -> String {
+    p(&format!("/orders/{tag_path}"))
+}
+
+fn setup_with(f: impl FnOnce(OandaConfig) -> OandaConfig) -> (OandaAdapter, Arc<FakeTransport>) {
+    let t = Arc::new(FakeTransport::new());
+    let cfg = f(OandaConfig::practice(PRACTICE_BASE_URL).unwrap());
+    let creds = OandaCredentials::new(Environment::Practice, TOKEN, ACCT).unwrap();
+    let a = OandaAdapter::new(cfg, creds, t.clone()).unwrap();
+    a.set_instruments(InstrumentTable::from_instruments_json(fx!("instruments_ok.json")).unwrap());
+    (a, t)
+}
+
+fn setup() -> (OandaAdapter, Arc<FakeTransport>) {
+    setup_with(|c| c)
+}
+
+fn line(r: &HttpRequest) -> String {
+    format!("{:?} {}", r.method, r.url.strip_prefix(PRACTICE_BASE_URL).expect("request went to the practice host"))
+}
+
+fn lines(t: &FakeTransport) -> Vec<String> {
+    t.requests().iter().map(line).collect()
+}
+
+fn count(t: &FakeTransport, method: HttpMethod, path_prefix: &str) -> usize {
+    t.requests().iter().filter(|r| r.method == method && line(r).contains(path_prefix)).count()
+}
+
+fn posts(t: &FakeTransport) -> Vec<HttpRequest> {
+    t.requests().into_iter().filter(|r| r.method == HttpMethod::Post).collect()
+}
+
+fn body_json(r: &HttpRequest) -> serde_json::Value {
+    serde_json::from_str(r.body.as_ref().expect("request has a body")).unwrap()
+}
+
+fn buy_req() -> OrderRequest {
+    OrderRequest::market(TAG, "EUR/USD", Side::Buy, d("1000"))
+}
+
+fn sell_req() -> OrderRequest {
+    OrderRequest::market(SELL_TAG, "EUR/USD", Side::Sell, d("1000"))
+}
+
+/// Routes for a placement whose POST answers `(status, body)`: account fine, tag not found.
+fn place_routes(tag_path: &str, post_status: u16, post_body: &str) -> Routes {
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(tag_path), 404, fx!("error_404_order.json"))
+        .post(&p("/orders"), post_status, post_body)
+}
+
+fn place(post_status: u16, post_body: &str) -> (Result<PlaceOutcome, BrokerError>, Arc<FakeTransport>) {
+    let (a, t) = setup();
+    place_routes(TAG_PATH, post_status, post_body).install(&t);
+    (a.place_order(&buy_req()), t)
+}
+
+fn expect_rejected(out: Result<PlaceOutcome, BrokerError>) -> Vec<broker_adapters::ExchangeError> {
+    match out.unwrap() {
+        PlaceOutcome::Rejected { errors, .. } => errors,
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+fn expect_unknown(out: Result<PlaceOutcome, BrokerError>) -> String {
+    match out.unwrap() {
+        PlaceOutcome::UnknownOutcome { reason, .. } => reason,
+        other => panic!("expected UnknownOutcome, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------- fixture hygiene
+
+#[test]
+fn every_json_fixture_is_labelled_as_authored_from_documentation() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/oanda");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The deliberately truncated / non-JSON fixtures cannot carry a label.
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let label = v["_fixture_provenance"].as_str().unwrap_or_else(|| panic!("{path:?} has no provenance label"));
+        assert_eq!(label, "authored from documentation, not recorded from a live account", "{path:?}");
+        checked += 1;
+    }
+    assert!(checked > 60, "checked only {checked} fixtures");
+}
+
+// ---------------------------------------------------------------- reads: account, instruments, positions
+
+#[test]
+fn account_summary_is_parsed_exactly_and_the_request_is_well_formed() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, fx!("account_summary_ok.json")).install(&t);
+    let s = a.get_account_summary().unwrap();
+    assert_eq!(s.id, ACCT);
+    assert_eq!(s.currency, "USD");
+    assert_eq!(s.balance, d("100000.0000"));
+    assert_eq!(s.nav, d("100250.5000"));
+    assert_eq!(s.unrealized_pl, d("250.5000"));
+    assert_eq!(s.margin_used, d("1100.0000"));
+    assert_eq!(s.margin_available, d("99150.5000"));
+    assert_eq!(s.position_value, Some(d("55000.0000")));
+    assert_eq!(s.margin_closeout_percent, Some(d("0.00549")));
+    assert!(!s.hedging_enabled);
+    assert_eq!(s.open_position_count, Some(2));
+    assert!(a.check_account(&s).is_ok());
+
+    let reqs = t.requests();
+    assert_eq!(lines(&t), [format!("Get {}", p("/summary"))]);
+    assert_eq!(reqs[0].header("Authorization"), Some(format!("Bearer {TOKEN}").as_str()));
+    assert_eq!(reqs[0].header("Accept"), Some("application/json"));
+    assert_eq!(reqs[0].header("Accept-Datetime-Format"), Some("UNIX"));
+    assert!(reqs[0].body.is_none());
+}
+
+#[test]
+fn hedging_accounts_and_the_wrong_account_are_refused() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_hedging.json"))
+        .install(&t);
+    match a.verify_account() {
+        Err(BrokerError::AccountBlocked(m)) => assert!(m.contains("hedgingEnabled"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, fx!("account_summary_other_account.json")).install(&t);
+    match a.verify_account() {
+        Err(BrokerError::Credentials(m)) => assert!(m.contains("101-001-7654321-001") && m.contains(ACCT), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_summary_missing_a_safety_field_or_truncated_fails_closed() {
+    for (name, body) in [
+        ("missing NAV", fx!("account_summary_missing_nav.json")),
+        ("missing hedgingEnabled", fx!("account_summary_missing_hedging_flag.json")),
+        ("truncated JSON", fx!("account_summary_truncated.json")),
+        ("empty object", "{}"),
+        ("not JSON", "<html>"),
+    ] {
+        let (a, t) = setup();
+        Routes::default().get(&p("/summary"), 200, body).install(&t);
+        assert!(matches!(a.get_account_summary(), Err(BrokerError::Malformed(_))), "{name}");
+    }
+}
+
+#[test]
+fn instruments_load_from_the_broker_list_and_one_bad_row_fails_the_table() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/instruments"), 200, fx!("instruments_ok.json")).install(&t);
+    assert_eq!(a.refresh_instruments().unwrap(), 6);
+    let i = a.instrument("eur/usd").unwrap();
+    assert_eq!((i.display_precision, i.trade_units_precision), (5, 0));
+    assert_eq!((i.minimum_trade_size, i.maximum_order_units, i.margin_rate), (d("1"), d("100000000"), d("0.02")));
+    assert_eq!(a.instrument("USD_JPY").unwrap().display_precision, 3);
+    assert_eq!(a.instrument("DE30_EUR").unwrap().trade_units_precision, 1);
+    assert_eq!(a.instruments().len(), 6);
+
+    for body in [fx!("instruments_malformed_row.json"), fx!("instruments_bad_min.json")] {
+        let (a, t) = setup();
+        Routes::default().get(&p("/instruments"), 200, body).install(&t);
+        let before = a.instruments().len();
+        assert!(matches!(a.refresh_instruments(), Err(BrokerError::Malformed(_))));
+        assert_eq!(a.instruments().len(), before, "a failed refresh leaves the old table alone");
+    }
+}
+
+#[test]
+fn positions_carry_signed_units_for_long_and_short() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/openPositions"), 200, fx!("open_positions_ok.json")).install(&t);
+    let pos = a.get_open_positions().unwrap();
+    assert_eq!(pos.len(), 2);
+    // sorted by instrument
+    assert_eq!(pos[0].instrument, "EUR_USD");
+    assert_eq!((pos[0].long_units, pos[0].short_units, pos[0].net_units()), (d("10000"), d("0"), d("10000")));
+    assert_eq!(pos[0].long_average_price, Some(d("1.10000")));
+    assert_eq!(pos[0].unrealized_pl, d("290.5000"));
+    assert_eq!(pos[1].instrument, "GBP_USD");
+    assert_eq!((pos[1].long_units, pos[1].short_units, pos[1].net_units()), (d("0"), d("-5000"), d("-5000")));
+    assert_eq!(pos[1].short_average_price, Some(d("1.27000")));
+    assert!(!pos[0].is_hedged() && !pos[1].is_hedged());
+    assert_eq!(pos[1].unrealized_pl, d("-40.0000"));
+
+    Routes::default().get(&p("/openPositions"), 200, fx!("open_positions_empty.json")).install(&t);
+    assert!(a.get_open_positions().unwrap().is_empty());
+    Routes::default().get(&p("/openPositions"), 200, fx!("open_positions_hedged.json")).install(&t);
+    assert!(a.get_open_positions().unwrap()[0].is_hedged());
+    Routes::default().get(&p("/openPositions"), 200, fx!("open_positions_bad_sign.json")).install(&t);
+    assert!(matches!(a.get_open_positions(), Err(BrokerError::Malformed(m)) if m.contains("negative")));
+}
+
+#[test]
+fn single_position_reads_and_a_404_means_no_position() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/positions/EUR_USD"), 200, fx!("position_single_long.json"))
+        .get(&p("/positions/GBP_USD"), 200, fx!("position_single_short.json"))
+        .get(&p("/positions/AUD_USD"), 404, fx!("error_404_account.json"))
+        .install(&t);
+    assert_eq!(a.get_position("EUR/USD").unwrap().unwrap().net_units(), d("10000"));
+    assert_eq!(a.get_position("gbp_usd").unwrap().unwrap().net_units(), d("-5000"));
+    assert!(a.get_position("AUD_USD").unwrap().is_none());
+    assert!(matches!(a.get_position("nonsense"), Err(BrokerError::UnknownSymbol(_))));
+    // asking for one instrument and receiving another is refused
+    Routes::default().get(&p("/positions/GBP_USD"), 200, fx!("position_single_long.json")).install(&t);
+    assert!(matches!(a.get_position("GBP_USD"), Err(BrokerError::Malformed(_))));
+}
+
+#[test]
+fn balances_are_currency_balance_plus_net_units_by_canonical_symbol() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&p("/openPositions"), 200, fx!("open_positions_ok.json"))
+        .install(&t);
+    let b = a.get_balances().unwrap();
+    assert_eq!(b.spot("USD"), d("100000.0000"));
+    assert_eq!(b.spot("EUR/USD"), d("10000"));
+    assert_eq!(b.spot("GBP/USD"), d("-5000"), "a short is a negative quantity");
+    assert!(b.entries.iter().all(|e| e.kind == BalanceKind::Spot));
+    assert_eq!(a.broker_name(), "oanda");
+}
+
+#[test]
+fn balances_refuse_a_hedging_account_and_a_hedged_position() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, fx!("account_summary_hedging.json")).install(&t);
+    assert!(matches!(a.get_balances(), Err(BrokerError::AccountBlocked(_))));
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&p("/openPositions"), 200, fx!("open_positions_hedged.json"))
+        .install(&t);
+    assert!(matches!(a.get_balances(), Err(BrokerError::Unsupported(_))));
+}
+
+// ---------------------------------------------------------------- pricing / quote
+
+#[test]
+fn quote_is_top_of_book_and_last_is_the_exact_mid() {
+    let (a, t) = setup();
+    let pricing_path = p("/pricing?instruments=EUR_USD&includeHomeConversions=true");
+    Routes::default().get(&pricing_path, 200, fx!("pricing_ok.json")).install(&t);
+    let q = a.get_quote("EUR/USD").unwrap();
+    assert_eq!((q.symbol.as_str(), q.bid, q.ask, q.last), ("EUR/USD", d("1.10048"), d("1.10052"), d("1.10050")));
+    assert_eq!(lines(&t), [format!("Get {pricing_path}")]);
+}
+
+#[test]
+fn pricing_with_several_instruments_parses_prices_and_home_conversions() {
+    let (a, t) = setup();
+    let path = p("/pricing?instruments=EUR_USD%2CGBP_USD%2CUSD_JPY&includeHomeConversions=true");
+    Routes::default().get(&path, 200, fx!("pricing_ok.json")).install(&t);
+    let pr = a.get_pricing(&["eur/usd", "GBP_USD", "USDJPY"]).unwrap();
+    assert_eq!(pr.prices.len(), 3);
+    assert_eq!(pr.price("USD_JPY").unwrap().mid(), Some(d("148.505")));
+    assert_eq!(pr.conversion("JPY").unwrap().position_value, d("0.006736"));
+    assert_eq!(pr.conversion("usd").unwrap().position_value, d("1.0"));
+    assert!(pr.price("AUD_USD").is_none() && pr.conversion("CHF").is_none());
+    assert!(matches!(a.get_pricing(&[]), Err(BrokerError::InvalidRequest(_))));
+}
+
+#[test]
+fn a_closed_crossed_or_missing_quote_is_refused() {
+    let path = p("/pricing?instruments=EUR_USD&includeHomeConversions=true");
+    let (a, t) = setup();
+    Routes::default().get(&path, 200, fx!("pricing_closed.json")).install(&t);
+    assert!(matches!(a.get_quote("EUR_USD"), Err(BrokerError::PairNotTradable { .. })));
+    Routes::default().get(&path, 200, fx!("pricing_crossed.json")).install(&t);
+    assert!(matches!(a.get_quote("EUR_USD"), Err(BrokerError::Malformed(m)) if m.contains("crossed")));
+    Routes::default().get(&path, 200, fx!("pricing_missing_instrument.json")).install(&t);
+    assert!(matches!(a.get_quote("EUR_USD"), Err(BrokerError::Malformed(_))));
+}
+
+// ---------------------------------------------------------------- reads: orders
+
+#[test]
+fn pending_orders_report_ours_and_foreign_and_unit_less_orders() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/pendingOrders"), 200, fx!("pending_orders_ok.json")).install(&t);
+    let o = a.open_orders().unwrap();
+    assert_eq!(o.len(), 4);
+    let ours = &o[0];
+    assert_eq!(ours.broker_order_id, "6390");
+    assert_eq!(ours.tag.as_deref(), Some("rb1:run1:EUR/USD:limit"));
+    assert_eq!(ours.symbol, "EUR/USD");
+    assert_eq!(ours.side, Some(Side::Buy));
+    assert_eq!(ours.status, OrderStatus::Open);
+    assert_eq!(ours.quantity, d("2000"));
+    assert_eq!(ours.executed_quantity, Dec::ZERO);
+    assert!(matches!(ours.kind, Some(OrderKind::Limit { price }) if price == d("1.09500")));
+    assert_eq!(ours.avg_price, None);
+    // a linked stop-loss has no units and no instrument
+    let sl = &o[1];
+    assert_eq!((sl.quantity, sl.side, sl.kind, sl.tag.clone()), (Dec::ZERO, None, None, None));
+    assert_eq!(sl.raw_status, "PENDING/STOP_LOSS");
+    // foreign: no client id / a foreign client id (no prefix filter configured -> reported verbatim)
+    assert_eq!(o[2].tag, None);
+    assert_eq!(o[2].side, Some(Side::Sell));
+    assert_eq!(o[3].tag.as_deref(), Some("manual-ticket-9"));
+    assert_eq!(o[3].symbol, "USD/JPY");
+}
+
+#[test]
+fn own_tag_prefix_hides_the_tag_of_foreign_orders() {
+    let (a, t) = setup_with(|c| c.with_own_tag_prefix("rb1:").unwrap());
+    Routes::default().get(&p("/pendingOrders"), 200, fx!("pending_orders_ok.json")).install(&t);
+    let o = a.open_orders().unwrap();
+    assert_eq!(o[0].tag.as_deref(), Some("rb1:run1:EUR/USD:limit"));
+    assert_eq!(o[3].tag, None, "manual-ticket-9 is foreign");
+    Routes::default().get(&p("/pendingOrders"), 200, fx!("pending_orders_empty.json")).install(&t);
+    assert!(a.open_orders().unwrap().is_empty());
+}
+
+#[test]
+fn a_filled_market_order_is_completed_from_its_fill_transaction() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy_commission.json"))
+        .install(&t);
+    let r = a.get_order("6372").unwrap();
+    assert_eq!(r.status, OrderStatus::Filled);
+    assert_eq!(r.raw_status, "FILLED");
+    assert_eq!((r.quantity, r.executed_quantity), (d("1000"), d("1000")));
+    assert_eq!(r.avg_price, Some(d("1.10052")));
+    assert_eq!(r.fee, Some(d("0.5000")));
+    assert_eq!(r.cost, None, "OANDA reports no cost figure and none is invented");
+    assert_eq!(r.side, Some(Side::Buy));
+    assert!(matches!(r.kind, Some(OrderKind::Market)));
+    assert_eq!(r.tag.as_deref(), Some(TAG));
+    assert_eq!(r.symbol, "EUR/USD");
+    assert_eq!(r.userref, None);
+    assert!(r.open_time.is_some() && r.close_time.is_some());
+    assert_eq!(lines(&t), [format!("Get {}", p("/orders/6372")), format!("Get {}", p("/transactions/6373"))]);
+}
+
+#[test]
+fn a_filled_sell_reports_the_magnitude_and_the_sell_side() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6382"), 200, fx!("order_filled_market_sell.json"))
+        .get(&p("/transactions/6383"), 200, fx!("txn_fill_sell.json"))
+        .install(&t);
+    let r = a.get_order("6382").unwrap();
+    assert_eq!((r.side, r.quantity, r.executed_quantity, r.avg_price), (Some(Side::Sell), d("1000"), d("1000"), Some(d("1.09948"))));
+    assert_eq!(r.status, OrderStatus::Filled);
+}
+
+#[test]
+fn a_partial_fill_keeps_the_executed_quantity() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_partial.json"))
+        .get(&p("/transactions/6374"), 200, fx!("txn_fill_partial.json"))
+        .install(&t);
+    let r = a.get_order("6372").unwrap();
+    assert_eq!(r.status, OrderStatus::PartiallyFilledThenCanceled);
+    assert!(r.status.has_fills() && r.status.is_terminal());
+    assert_eq!((r.quantity, r.executed_quantity), (d("1000"), d("400")));
+}
+
+#[test]
+fn contradictory_fills_fail_closed() {
+    // overfill: the rebalancer's flatten halts on this exact phrase
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_overfill.json"))
+        .get(&p("/transactions/6375"), 200, fx!("txn_fill_overfill.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("overfill anomaly")));
+    // a fill that belongs to another order
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_wrong_txn_order.json"))
+        .get(&p("/transactions/6376"), 200, fx!("txn_fill_wrong_order.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("belongs to order")));
+    // a fill in the opposite direction
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_sign_flip.json"))
+        .get(&p("/transactions/6377"), 200, fx!("txn_fill_sign_flip.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("opposite sign")));
+    // FILLED but no filling transaction named
+    Routes::default().get(&p("/orders/6372"), 200, fx!("order_filled_no_txn_id.json")).install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("fillingTransactionID")));
+    // a fill transaction without a price
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_no_price.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(_))));
+    // the transaction is not a fill at all
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_cancel_client_request.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("ORDER_FILL")));
+    // an unknown order state
+    Routes::default().get(&p("/orders/6372"), 200, fx!("order_unknown_state.json")).install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Malformed(m)) if m.contains("REPLACED")));
+}
+
+#[test]
+fn a_failure_to_read_the_fill_is_an_error_not_a_report_without_a_fill() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 500, fx!("error_500.json"))
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Http(500))));
+    Routes::default()
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .fail(HttpMethod::Get, &p("/transactions/6373"), TransportError::Timeout)
+        .install(&t);
+    assert!(matches!(a.get_order("6372"), Err(BrokerError::Transport(TransportError::Timeout))));
+}
+
+#[test]
+fn cancelled_orders_carry_the_cancel_reason_from_the_cancelling_transaction() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/6390"), 200, fx!("order_cancelled_client_request.json"))
+        .get(&p("/transactions/6391"), 200, fx!("txn_cancel_client_request.json"))
+        .install(&t);
+    let r = a.get_order("6390").unwrap();
+    assert_eq!((r.status, r.reason.as_deref(), r.executed_quantity), (OrderStatus::Canceled, Some("CLIENT_REQUEST"), Dec::ZERO));
+    assert_eq!(r.avg_price, None);
+
+    Routes::default()
+        .get(&p("/orders/6390"), 200, fx!("order_cancelled_expired.json"))
+        .get(&p("/transactions/6392"), 200, fx!("txn_cancel_expired.json"))
+        .install(&t);
+    let r = a.get_order("6390").unwrap();
+    assert_eq!((r.status, r.reason.as_deref()), (OrderStatus::Expired, Some("TIME_IN_FORCE_EXPIRED")));
+
+    // No cancelling transaction named: still cancelled, reason unknown.
+    Routes::default().get(&p("/orders/6390"), 200, fx!("order_cancelled_no_txn.json")).install(&t);
+    let r = a.get_order("6390").unwrap();
+    assert_eq!((r.status, r.reason), (OrderStatus::Canceled, None));
+
+    // The cancelling transaction cannot be read: reason unknown, order still cancelled with nothing executed.
+    Routes::default()
+        .get(&p("/orders/6390"), 200, fx!("order_cancelled_client_request.json"))
+        .get(&p("/transactions/6391"), 500, fx!("error_500.json"))
+        .install(&t);
+    let r = a.get_order("6390").unwrap();
+    assert_eq!((r.status, r.reason, r.executed_quantity), (OrderStatus::Canceled, None, Dec::ZERO));
+}
+
+#[test]
+fn a_pending_limit_order_is_open_with_its_price() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/orders/6390"), 200, fx!("order_pending_limit.json")).install(&t);
+    let r = a.get_order("6390").unwrap();
+    assert_eq!(r.status, OrderStatus::Open);
+    assert!(!r.status.is_terminal());
+    assert!(matches!(r.kind, Some(OrderKind::Limit { price }) if price == d("1.09500")));
+    assert_eq!(lines(&t).len(), 1, "no transaction is fetched for a live order");
+}
+
+#[test]
+fn asking_for_one_order_and_receiving_another_is_refused() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/orders/9999"), 200, fx!("order_pending_limit.json")).install(&t);
+    assert!(matches!(a.get_order("9999"), Err(BrokerError::Malformed(m)) if m.contains("asked for order 9999")));
+}
+
+#[test]
+fn order_ids_that_could_escape_the_path_are_refused_before_sending() {
+    let (a, t) = setup();
+    let too_long = "1".repeat(65);
+    for bad in ["", "6390/../x", "6390?x=1", "63 90", "6390#", "%40tag", too_long.as_str()] {
+        assert!(matches!(a.get_order(bad), Err(BrokerError::InvalidRequest(_))), "{bad:?}");
+        assert!(matches!(a.cancel_order(bad), Err(BrokerError::InvalidRequest(_))), "{bad:?}");
+        assert!(matches!(a.cancel_and_settle(bad), Err(BrokerError::InvalidRequest(_))), "{bad:?}");
+    }
+    assert_eq!(t.request_count(), 0);
+}
+
+// ---------------------------------------------------------------- placement: request
+
+#[test]
+fn a_market_buy_sends_summary_then_tag_lookup_then_exactly_one_post() {
+    let (out, t) = place(201, fx!("create_market_buy_filled.json"));
+    match out.unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, sent, warnings, description } => {
+            assert_eq!(broker_order_id, "6372");
+            assert_eq!((sent.broker_pair.as_str(), sent.side, sent.quantity, sent.price, sent.userref), ("EUR_USD", Side::Buy, d("1000"), None, 0));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(description.as_deref(), Some("buy 1000 EUR_USD market FOK"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(lines(&t), [format!("Get {}", p("/summary")), format!("Get {}", tag_lookup(TAG_PATH)), format!("Post {}", p("/orders"))]);
+    let post = &posts(&t)[0];
+    assert_eq!(post.header("Content-Type"), Some("application/json"));
+    assert_eq!(post.header("Authorization"), Some(format!("Bearer {TOKEN}").as_str()));
+    let body = body_json(post);
+    let expected: serde_json::Value = serde_json::from_str(
+        r#"{"order":{"type":"MARKET","instrument":"EUR_USD","units":"1000","timeInForce":"FOK","positionFill":"DEFAULT",
+            "clientExtensions":{"id":"rb1:run1:EUR/USD:buy","tag":"mendl-rb"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(body, expected);
+}
+
+#[test]
+fn a_market_sell_sends_negative_units_and_the_fill_is_matched_to_it() {
+    let (a, t) = setup();
+    place_routes(SELL_TAG_PATH, 201, fx!("create_market_sell_filled.json")).install(&t);
+    let out = a.place_order(&sell_req()).unwrap();
+    assert!(matches!(out, PlaceOutcome::Accepted { ref broker_order_id, ref sent, .. } if broker_order_id == "6382" && sent.side == Side::Sell && sent.quantity == d("1000")));
+    let body = body_json(&posts(&t)[0]);
+    assert_eq!(body["order"]["units"], "-1000");
+    assert_eq!(body["order"]["clientExtensions"]["id"], SELL_TAG);
+}
+
+#[test]
+fn the_reference_price_never_turns_a_market_order_into_a_limit_order() {
+    // Regression for the legacy connector's defect: a priced market signal became LIMIT/GTC.
+    let (a, t) = setup();
+    place_routes(TAG_PATH, 201, fx!("create_market_buy_filled.json")).install(&t);
+    let mut req = buy_req();
+    req.reference_price = Some(d("1.10050"));
+    a.place_order(&req).unwrap();
+    let body = body_json(&posts(&t)[0]);
+    assert_eq!(body["order"]["type"], "MARKET");
+    assert_eq!(body["order"]["timeInForce"], "FOK");
+    assert!(body["order"].get("price").is_none(), "{body}");
+    assert!(!posts(&t)[0].body.as_ref().unwrap().contains("LIMIT"));
+}
+
+#[test]
+fn a_limit_order_goes_out_as_limit_gtc_with_a_rounded_price() {
+    let (a, t) = setup();
+    place_routes("%40rb1%3Arun1%3AEUR%2FUSD%3Alimit", 201, fx!("create_limit_pending.json")).install(&t);
+    let req = OrderRequest::limit("rb1:run1:EUR/USD:limit", "EUR/USD", Side::Buy, d("2000"), d("1.095004"));
+    match a.place_order(&req).unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, sent, warnings, description } => {
+            assert_eq!(broker_order_id, "6390");
+            assert_eq!(sent.price, Some(d("1.09500")));
+            assert!(warnings.is_empty());
+            assert_eq!(description.as_deref(), Some("buy 2000 EUR_USD limit GTC"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let body = body_json(&posts(&t)[0]);
+    assert_eq!((body["order"]["type"].as_str(), body["order"]["price"].as_str(), body["order"]["timeInForce"].as_str()), (Some("LIMIT"), Some("1.09500"), Some("GTC")));
+}
+
+#[test]
+fn local_refusals_send_nothing_at_all() {
+    let (a, t) = setup();
+    let cases: Vec<(OrderRequest, &str)> = vec![
+        (OrderRequest::market(TAG, "AUD_CAD", Side::Buy, d("1000")), "unknown instrument"),
+        (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("0.5")), "rounds to zero"),
+        (OrderRequest::market("", "EUR_USD", Side::Buy, d("1000")), "empty tag"),
+        (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("0")), "zero quantity"),
+        (OrderRequest::market(TAG, "nonsense", Side::Buy, d("1000")), "bad name"),
+        ({
+            let mut r = buy_req();
+            r.time_in_force = Some(TimeInForce::Gtc);
+            r
+        }, "GTC market"),
+        ({
+            let mut r = buy_req();
+            r.validate_only = true;
+            r
+        }, "validate_only"),
+        ({
+            let mut r = buy_req();
+            r.post_only = true;
+            r
+        }, "post_only"),
+        (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("999999999999")), "above max"),
+    ];
+    for (req, why) in cases {
+        assert!(a.place_order(&req).is_err(), "{why}");
+    }
+    assert_eq!(t.request_count(), 0, "a locally refused order must not reach the transport");
+}
+
+#[test]
+fn an_adapter_with_an_empty_instrument_table_cannot_trade_anything() {
+    let t = Arc::new(FakeTransport::new());
+    let a = OandaAdapter::new(
+        OandaConfig::practice(PRACTICE_BASE_URL).unwrap(),
+        OandaCredentials::new(Environment::Practice, TOKEN, ACCT).unwrap(),
+        t.clone(),
+    )
+    .unwrap();
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::UnknownSymbol(_))));
+    assert_eq!(t.request_count(), 0);
+}
+
+#[test]
+fn own_tag_prefix_is_enforced_at_placement() {
+    let (a, t) = setup_with(|c| c.with_own_tag_prefix("rb1:").unwrap());
+    let req = OrderRequest::market("someone-else:1", "EUR_USD", Side::Buy, d("1000"));
+    assert!(matches!(a.place_order(&req), Err(BrokerError::InvalidRequest(_))));
+    assert_eq!(t.request_count(), 0);
+}
+
+#[test]
+fn reduce_only_goes_out_as_position_fill_reduce_only() {
+    let (a, t) = setup();
+    place_routes(SELL_TAG_PATH, 201, fx!("create_market_sell_filled.json")).install(&t);
+    let mut req = sell_req();
+    req.reduce_only = true;
+    a.place_order(&req).unwrap();
+    assert_eq!(body_json(&posts(&t)[0])["order"]["positionFill"], "REDUCE_ONLY");
+}
+
+// ---------------------------------------------------------------- placement: outcomes
+
+#[test]
+fn a_partial_fill_is_accepted_with_a_warning_naming_the_shortfall() {
+    let (out, _) = place(201, fx!("create_market_partial_fill.json"));
+    match out.unwrap() {
+        PlaceOutcome::Accepted { warnings, .. } => assert_eq!(warnings, ["filled 400 of 1000 units"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_order_cancelled_at_creation_is_a_definite_rejection_with_its_reason() {
+    for (fixture, reason, class) in [
+        (fx!("create_market_cancelled_margin.json"), "INSUFFICIENT_MARGIN", ErrorClass::InsufficientFunds),
+        (fx!("create_market_cancelled_liquidity.json"), "INSUFFICIENT_LIQUIDITY", ErrorClass::OrderRejected),
+        (fx!("create_market_cancelled_halted.json"), "MARKET_HALTED", ErrorClass::OrderRejected),
+    ] {
+        let (out, t) = place(201, fixture);
+        let errs = expect_rejected(out);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].code.contains(reason) && errs[0].code.starts_with("oanda:201"), "{}", errs[0].code);
+        assert_eq!(errs[0].class, class, "{reason}");
+        assert_eq!(posts(&t).len(), 1);
+    }
+}
+
+#[test]
+fn a_400_with_a_reject_transaction_is_a_definite_rejection() {
+    for (fixture, reason, class) in [
+        (fx!("error_400_units_invalid.json"), "UNITS_INVALID", ErrorClass::InvalidArguments),
+        (fx!("error_400_insufficient_margin.json"), "INSUFFICIENT_MARGIN", ErrorClass::InsufficientFunds),
+        (fx!("error_400_market_halted.json"), "MARKET_HALTED", ErrorClass::OrderRejected),
+        (fx!("error_400_plain.json"), "Invalid value", ErrorClass::InvalidArguments),
+    ] {
+        let (out, t) = place(400, fixture);
+        let errs = expect_rejected(out);
+        assert!(errs[0].code.contains(reason) && errs[0].code.starts_with("oanda:400"), "{}", errs[0].code);
+        assert_eq!(errs[0].class, class, "{reason}");
+        assert_eq!(posts(&t).len(), 1, "exactly one POST, never a retry");
+    }
+}
+
+#[test]
+fn auth_failures_are_definite_rejections_of_class_auth() {
+    for (status, body) in [(401, fx!("error_401.json")), (403, fx!("error_403.json"))] {
+        let (out, _) = place(status, body);
+        let errs = expect_rejected(out);
+        assert_eq!(errs[0].class, ErrorClass::Auth);
+        assert!(errs[0].code.starts_with(&format!("oanda:{status}")));
+    }
+}
+
+#[test]
+fn rate_limiting_means_not_sent_and_reports_retry_after() {
+    let (a, t) = setup();
+    place_routes(TAG_PATH, 429, fx!("error_429.json")).with_header("Retry-After", "7").install(&t);
+    match a.place_order(&buy_req()) {
+        Err(BrokerError::RateLimited { retry_after_secs: Some(7), .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(posts(&t).len(), 1);
+}
+
+#[test]
+fn server_errors_timeouts_and_ambiguous_answers_are_unknown_outcomes_and_never_retried() {
+    // 5xx and a non-2xx oddity
+    for (status, body) in [(500, fx!("error_500.json")), (503, fx!("error_503_html.txt")), (502, ""), (404, fx!("error_404_account.json")), (418, "teapot")] {
+        let (out, t) = place(status, body);
+        let reason = expect_unknown(out);
+        assert!(reason.contains(&status.to_string()), "{reason}");
+        assert_eq!(posts(&t).len(), 1, "HTTP {status}: a placement is never blindly retried");
+    }
+    // transport failures after the request may have left
+    for e in [TransportError::Timeout, TransportError::Io("connection reset".into())] {
+        let (a, t) = setup();
+        Routes::default()
+            .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+            .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
+            .fail(HttpMethod::Post, &p("/orders"), e.clone())
+            .install(&t);
+        let reason = expect_unknown(a.place_order(&buy_req()));
+        assert!(!reason.is_empty());
+        assert_eq!(posts(&t).len(), 1, "{e:?}");
+    }
+    // a connect failure means the request never left: Err, nothing to look up
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
+        .fail(HttpMethod::Post, &p("/orders"), TransportError::ConnectFailed("refused".into()))
+        .install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Transport(TransportError::ConnectFailed(_)))));
+}
+
+#[test]
+fn a_success_that_cannot_be_trusted_is_an_unknown_outcome() {
+    for (why, body) in [
+        ("truncated JSON", fx!("create_json_but_truncated.json")),
+        ("not JSON", "OK"),
+        ("no create transaction", fx!("create_no_create_txn.json")),
+        ("client id of someone else", fx!("create_wrong_client_id.json")),
+        ("fill of another order", fx!("create_fill_wrong_order.json")),
+        ("fill in the wrong direction", fx!("create_fill_wrong_direction.json")),
+        ("cancel of another order", fx!("create_cancel_wrong_order.json")),
+        ("empty object", "{}"),
+    ] {
+        let (out, t) = place(201, body);
+        let reason = expect_unknown(out);
+        assert!(!reason.is_empty(), "{why}");
+        assert_eq!(posts(&t).len(), 1, "{why}");
+    }
+}
+
+#[test]
+fn a_market_order_with_neither_fill_nor_cancel_is_accepted_with_a_poll_warning() {
+    let (out, _) = place(201, fx!("create_market_no_fill_no_cancel.json"));
+    match out.unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, warnings, .. } => {
+            assert_eq!(broker_order_id, "6372");
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("poll get_order"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_http_200_is_read_like_a_201() {
+    let (out, _) = place(200, fx!("create_market_buy_filled.json"));
+    assert!(matches!(out.unwrap(), PlaceOutcome::Accepted { .. }));
+}
+
+// ---------------------------------------------------------------- placement: pre-checks
+
+#[test]
+fn account_trouble_before_the_post_means_nothing_was_sent() {
+    // summary: 500
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 500, fx!("error_500.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Preflight(m)) if m.contains("500")));
+    assert!(posts(&t).is_empty());
+    // summary: timeout (must not surface as a bare Transport(Timeout) that looks like an unknown outcome)
+    let (a, t) = setup();
+    Routes::default().fail(HttpMethod::Get, &p("/summary"), TransportError::Timeout).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Preflight(_))));
+    assert!(posts(&t).is_empty());
+    // summary: 401 -> an auth error, still nothing sent
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 401, fx!("error_401.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Exchange(e)) if e[0].class == ErrorClass::Auth));
+    assert!(posts(&t).is_empty());
+    // hedging account
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, fx!("account_summary_hedging.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::AccountBlocked(_))));
+    assert!(posts(&t).is_empty());
+    // the wrong account answered
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, fx!("account_summary_other_account.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Credentials(_))));
+    assert!(posts(&t).is_empty());
+    // garbage summary
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 200, "{}").install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Preflight(_))));
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_tag_lookup_that_cannot_be_completed_means_nothing_is_sent() {
+    for (why, routes) in [
+        ("500", Routes::default().get(&tag_lookup(TAG_PATH), 500, fx!("error_500.json"))),
+        ("timeout", Routes::default().fail(HttpMethod::Get, &tag_lookup(TAG_PATH), TransportError::Timeout)),
+        ("401", Routes::default().get(&tag_lookup(TAG_PATH), 401, fx!("error_401.json"))),
+        ("malformed order", Routes::default().get(&tag_lookup(TAG_PATH), 200, "{\"order\": 5}")),
+    ] {
+        let (a, t) = setup();
+        let routes = Routes(
+            [Routes::default().get(&p("/summary"), 200, fx!("account_summary_ok.json")).0, routes.0].concat(),
+        )
+        .post(&p("/orders"), 201, fx!("create_market_buy_filled.json"));
+        routes.install(&t);
+        match a.place_order(&buy_req()) {
+            Err(BrokerError::Preflight(m)) => assert!(m.contains("nothing was sent"), "{why}: {m}"),
+            other => panic!("{why}: {other:?}"),
+        }
+        assert!(posts(&t).is_empty(), "{why}: a tag we could not check must not be sent");
+    }
+}
+
+// ---------------------------------------------------------------- idempotency
+
+#[test]
+fn placing_again_with_the_same_tag_adopts_the_existing_filled_order_and_sends_nothing() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    match a.place_order(&buy_req()).unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, warnings, description, sent } => {
+            assert_eq!(broker_order_id, "6372");
+            assert_eq!(sent.quantity, d("1000"));
+            assert!(warnings[0].contains("already existed"), "{warnings:?}");
+            assert!(description.unwrap().contains("adopted"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(posts(&t).is_empty(), "restart idempotency: nothing may be sent twice");
+}
+
+#[test]
+fn an_existing_pending_order_with_the_tag_is_adopted_too() {
+    let (a, t) = setup();
+    let tag = "rb1:run1:EUR/USD:limit";
+    let path = "%40rb1%3Arun1%3AEUR%2FUSD%3Alimit";
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(path), 200, fx!("order_pending_limit.json"))
+        .install(&t);
+    let req = OrderRequest::limit(tag, "EUR/USD", Side::Buy, d("2000"), d("1.095"));
+    assert!(matches!(a.place_order(&req).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_tag_that_belongs_to_a_dead_order_is_refused_not_resent() {
+    let (a, t) = setup();
+    let path = "%40rb1%3Arun1%3AEUR%2FUSD%3Alimit";
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(path), 200, fx!("order_cancelled_client_request.json"))
+        .get(&p("/transactions/6391"), 200, fx!("txn_cancel_client_request.json"))
+        .install(&t);
+    let req = OrderRequest::limit("rb1:run1:EUR/USD:limit", "EUR/USD", Side::Buy, d("2000"), d("1.095"));
+    let errs = expect_rejected(a.place_order(&req));
+    assert!(errs[0].code.contains("use a new tag") && errs[0].code.contains("6390"), "{}", errs[0].code);
+    assert_eq!(errs[0].class, ErrorClass::OrderRejected);
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_tag_that_belongs_to_a_different_order_is_refused() {
+    // same tag, but the existing order is for another quantity
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    let req = OrderRequest::market(TAG, "EUR/USD", Side::Buy, d("2500"));
+    let errs = expect_rejected(a.place_order(&req));
+    assert!(errs[0].code.contains("differs from this request"), "{}", errs[0].code);
+    assert_eq!(errs[0].class, ErrorClass::InvalidArguments);
+    assert!(posts(&t).is_empty());
+    // and a different side
+    let req = OrderRequest::market(TAG, "EUR/USD", Side::Sell, d("1000"));
+    let errs = expect_rejected(a.place_order(&req));
+    assert!(errs[0].code.contains("differs"), "{}", errs[0].code);
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn unknown_outcome_then_lookup_by_tag_finds_the_order_and_a_second_place_does_not_resend() {
+    let (a, t) = setup();
+    // 1. the POST times out
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
+        .fail(HttpMethod::Post, &p("/orders"), TransportError::Timeout)
+        .install(&t);
+    let reason = expect_unknown(a.place_order(&buy_req()));
+    assert!(reason.contains("timed out"));
+    assert_eq!(posts(&t).len(), 1);
+    // 2. the order did land: the tag lookup finds it
+    Routes::default()
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    let found = a.find_orders_by_tag(TAG).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].broker_order_id.as_str(), found[0].status, found[0].tag.as_deref()), ("6372", OrderStatus::Filled, Some(TAG)));
+    // 3. placing again with the same tag (a restarted run) sends nothing
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    assert!(matches!(a.place_order(&buy_req()).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert_eq!(posts(&t).len(), 1, "still exactly one POST in total");
+}
+
+#[test]
+fn lookup_by_tag_returns_nothing_on_404_and_the_tag_round_trips_through_the_url() {
+    let (a, t) = setup();
+    Routes::default().get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json")).install(&t);
+    assert!(a.find_orders_by_tag(TAG).unwrap().is_empty());
+    // The `@` and every reserved character of the tag are percent-encoded in the path.
+    let url = &t.requests()[0].url;
+    assert!(url.ends_with(&format!("/orders/{TAG_PATH}")), "{url}");
+    assert!(!url.contains('@') && !url[PRACTICE_BASE_URL.len()..].contains(':'));
+    // the tag decodes back to the id we sent in clientExtensions.id
+    let decoded = TAG_PATH.replace("%40", "@").replace("%3A", ":").replace("%2F", "/");
+    assert_eq!(decoded, format!("@{TAG}"));
+}
+
+#[test]
+fn a_lookup_that_returns_someone_elses_order_is_refused() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_other_client_id.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::Malformed(m)) if m.contains("does not carry")));
+    // and unusable tags are refused before sending
+    let too_long = "x".repeat(129);
+    for bad in ["", too_long.as_str(), "caf\u{e9}"] {
+        assert!(matches!(a.find_orders_by_tag(bad), Err(BrokerError::InvalidRequest(_))));
+    }
+}
+
+// ---------------------------------------------------------------- cancel
+
+#[test]
+fn cancel_puts_to_the_cancel_endpoint_and_reports_a_synchronous_cancel() {
+    let (a, t) = setup();
+    Routes::default().put(&p("/orders/6390/cancel"), 200, fx!("cancel_ok.json")).install(&t);
+    let out = a.cancel_order("6390").unwrap();
+    assert_eq!((out.canceled_count, out.pending), (1, false));
+    assert_eq!(lines(&t), [format!("Put {}", p("/orders/6390/cancel"))]);
+    assert!(t.requests()[0].body.is_none());
+    assert_eq!(t.requests()[0].header("Authorization"), Some(format!("Bearer {TOKEN}").as_str()));
+}
+
+#[test]
+fn cancel_errors_are_classified() {
+    let (a, t) = setup();
+    Routes::default().put(&p("/orders/6390/cancel"), 404, fx!("cancel_reject_404.json")).install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::NotFound(_))));
+    Routes::default().put(&p("/orders/6390/cancel"), 401, fx!("error_401.json")).install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Exchange(e)) if e[0].class == ErrorClass::Auth));
+    Routes::default().put(&p("/orders/6390/cancel"), 429, fx!("error_429.json")).with_header("Retry-After", "3").install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::RateLimited { retry_after_secs: Some(3), .. })));
+    Routes::default().put(&p("/orders/6390/cancel"), 503, fx!("error_503_html.txt")).install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Http(503))));
+    Routes::default().put(&p("/orders/6390/cancel"), 200, fx!("cancel_no_txn.json")).install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Malformed(_))));
+    Routes::default().fail(HttpMethod::Put, &p("/orders/6390/cancel"), TransportError::Timeout).install(&t);
+    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Transport(TransportError::Timeout))));
+}
+
+#[test]
+fn cancel_and_settle_returns_the_order_as_it_ended() {
+    let (a, t) = setup();
+    Routes::default()
+        .put(&p("/orders/6390/cancel"), 200, fx!("cancel_ok.json"))
+        .get(&p("/orders/6390"), 200, fx!("order_cancelled_client_request.json"))
+        .get(&p("/transactions/6391"), 200, fx!("txn_cancel_client_request.json"))
+        .install(&t);
+    let (out, report) = a.cancel_and_settle("6390").unwrap();
+    assert_eq!((out.canceled_count, out.pending, report.status), (1, false, OrderStatus::Canceled));
+}
+
+#[test]
+fn cancel_of_an_order_that_already_filled_reports_the_fill_with_a_zero_cancel_count() {
+    let (a, t) = setup();
+    Routes::default()
+        .put(&p("/orders/6372/cancel"), 404, fx!("cancel_reject_404.json"))
+        .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    let (out, report) = a.cancel_and_settle("6372").unwrap();
+    assert_eq!((out.canceled_count, out.pending), (0, false));
+    assert_eq!((report.status, report.executed_quantity), (OrderStatus::Filled, d("1000")));
+}
+
+#[test]
+fn cancel_of_an_unknown_order_is_target_not_found() {
+    let (a, t) = setup();
+    Routes::default()
+        .put(&p("/orders/9999/cancel"), 404, fx!("cancel_reject_404.json"))
+        .get(&p("/orders/9999"), 404, fx!("error_404_order.json"))
+        .install(&t);
+    assert!(matches!(a.cancel_and_settle("9999"), Err(BrokerError::CancelTargetNotFound(id)) if id == "9999"));
+    // any other failure is passed through, not swallowed
+    Routes::default().put(&p("/orders/9999/cancel"), 500, fx!("error_500.json")).install(&t);
+    assert!(matches!(a.cancel_and_settle("9999"), Err(BrokerError::Http(500))));
+}
+
+// ---------------------------------------------------------------- close / flatten one instrument
+
+const CLOSE_TAG: &str = "rb1:fl:20260921T150000Z:EURUSD:1:abc";
+const CLOSE_TAG_PATH: &str = "%40rb1%3Afl%3A20260921T150000Z%3AEURUSD%3A1%3Aabc";
+
+fn close_routes(pos_fixture: &str, put_status: u16, put_body: &str, instrument: &str) -> Routes {
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&p(&format!("/positions/{instrument}")), 200, pos_fixture)
+        .put(&p(&format!("/positions/{instrument}/close")), put_status, put_body)
+}
+
+fn puts(t: &FakeTransport) -> Vec<HttpRequest> {
+    t.requests().into_iter().filter(|r| r.method == HttpMethod::Put).collect()
+}
+
+#[test]
+fn closing_a_long_position_sends_long_units_all_with_the_tag() {
+    let (a, t) = setup();
+    close_routes(fx!("position_single_long.json"), 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
+    match a.close_position("EUR/USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::Closed { broker_order_id, fill } => {
+            assert_eq!(broker_order_id, "6410");
+            assert_eq!((fill.units, fill.price, fill.pl), (d("-10000"), d("1.10148"), Some(d("481.0000"))));
+        }
+        other => panic!("{other:?}"),
+    }
+    let put = &puts(&t)[0];
+    let expected: serde_json::Value = serde_json::from_str(
+        r#"{"longUnits":"ALL","longClientExtensions":{"id":"rb1:fl:20260921T150000Z:EURUSD:1:abc","tag":"mendl-rb"}}"#,
+    )
+    .unwrap();
+    assert_eq!(body_json(put), expected);
+    assert!(line(put).ends_with("/positions/EUR_USD/close"));
+}
+
+#[test]
+fn closing_a_short_position_sends_short_units_all() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&p("/positions/GBP_USD"), 200, fx!("position_single_short.json"))
+        .put(&p("/positions/GBP_USD/close"), 200, fx!("close_short_ok.json"))
+        .install(&t);
+    match a.close_position("GBP_USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::Closed { fill, .. } => assert_eq!(fill.units, d("5000")),
+        other => panic!("{other:?}"),
+    }
+    let body = body_json(&puts(&t)[0]);
+    assert_eq!(body["shortUnits"], "ALL");
+    assert!(body.get("longUnits").is_none());
+    assert_eq!(body["shortClientExtensions"]["id"], CLOSE_TAG);
+}
+
+#[test]
+fn nothing_to_close_sends_no_put() {
+    for pos in [fx!("position_single_flat.json")] {
+        let (a, t) = setup();
+        close_routes(pos, 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
+        assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
+        assert!(puts(&t).is_empty());
+    }
+    // a 404 on the position read also means no position
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&p("/positions/EUR_USD"), 404, fx!("error_404_account.json"))
+        .install(&t);
+    assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
+    assert!(puts(&t).is_empty());
+}
+
+#[test]
+fn closing_twice_with_the_same_tag_adopts_the_first_close() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 200, fx!("order_filled_close.json"))
+        .get(&p("/transactions/6411"), 200, fx!("txn_fill_close.json"))
+        .install(&t);
+    match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::AlreadyDone { report } => assert_eq!(report.broker_order_id, "6410"),
+        other => panic!("{other:?}"),
+    }
+    assert!(puts(&t).is_empty(), "no second close is sent");
+}
+
+#[test]
+fn a_hedged_position_is_refused_without_sending_a_close() {
+    let (a, t) = setup();
+    close_routes(fx!("position_single_hedged.json"), 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::Unsupported(_))));
+    assert!(puts(&t).is_empty());
+}
+
+#[test]
+fn close_outcomes_are_parsed_into_rejected_and_unknown() {
+    // a 400 with a reject transaction under the long/short prefix
+    let (a, t) = setup();
+    close_routes(fx!("position_single_long.json"), 400, fx!("close_rejected_400.json"), "EUR_USD").install(&t);
+    match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::Rejected { errors } => {
+            assert!(errors[0].code.contains("MARKET_HALTED") && errors[0].code.starts_with("oanda:400"), "{}", errors[0].code);
+        }
+        other => panic!("{other:?}"),
+    }
+    // cancelled at creation
+    let (a, t) = setup();
+    close_routes(fx!("position_single_long.json"), 200, fx!("close_cancelled.json"), "EUR_USD").install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::Rejected { errors } if errors[0].code.contains("MARKET_HALTED")));
+    // untrustworthy successes and server trouble
+    for (why, status, body) in [
+        ("other tag", 200, fx!("close_wrong_tag.json")),
+        ("no transactions", 200, fx!("close_no_transactions.json")),
+        ("not JSON", 200, "OK"),
+        ("500", 500, fx!("error_500.json")),
+        ("503", 503, fx!("error_503_html.txt")),
+        ("404 on close", 404, fx!("error_404_account.json")),
+    ] {
+        let (a, t) = setup();
+        close_routes(fx!("position_single_long.json"), status, body, "EUR_USD").install(&t);
+        assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::UnknownOutcome { .. }), "{why}");
+        assert_eq!(puts(&t).len(), 1, "{why}: never retried");
+    }
+    // a timeout on the PUT
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&p("/positions/EUR_USD"), 200, fx!("position_single_long.json"))
+        .fail(HttpMethod::Put, &p("/positions/EUR_USD/close"), TransportError::Timeout)
+        .install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::UnknownOutcome { .. }));
+    // rate limit: not sent
+    let (a, t) = setup();
+    close_routes(fx!("position_single_long.json"), 429, fx!("error_429.json"), "EUR_USD").install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::RateLimited { .. })));
+}
+
+#[test]
+fn a_close_whose_tag_lookup_fails_sends_nothing() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&tag_lookup(CLOSE_TAG_PATH), 500, fx!("error_500.json"))
+        .install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::Preflight(_))));
+    assert!(puts(&t).is_empty());
+    assert_eq!(count(&t, HttpMethod::Get, "/positions/"), 0);
+}
+
+// ---------------------------------------------------------------- HTTP error shapes on reads
+
+#[test]
+fn read_errors_map_status_codes_to_typed_errors() {
+    let (a, t) = setup();
+    let path = p("/summary");
+    for (status, body, check) in [
+        (401, fx!("error_401.json"), 0),
+        (403, fx!("error_403.json"), 0),
+        (404, fx!("error_404_account.json"), 1),
+        (429, fx!("error_429.json"), 2),
+        (500, fx!("error_500.json"), 3),
+        (503, fx!("error_503_html.txt"), 3),
+        (418, "teapot", 3),
+    ] {
+        Routes::default().get(&path, status, body).install(&t);
+        let e = a.get_account_summary().unwrap_err();
+        match check {
+            0 => assert!(matches!(&e, BrokerError::Exchange(v) if v[0].class == ErrorClass::Auth && v[0].code.starts_with(&format!("oanda:{status}"))), "{status}: {e:?}"),
+            1 => assert!(matches!(e, BrokerError::NotFound(_)), "{status}"),
+            2 => assert!(matches!(e, BrokerError::RateLimited { retry_after_secs: None, .. }), "{status}"),
+            _ => assert!(matches!(e, BrokerError::Http(s) if s == status), "{status}: {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_gateway_page_is_never_echoed_into_an_error() {
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 503, fx!("error_503_html.txt")).install(&t);
+    let e = a.get_account_summary().unwrap_err();
+    assert!(!format!("{e} {e:?}").contains("secret-gateway-page"));
+    let (out, _) = place(400, fx!("error_503_html.txt"));
+    let errs = expect_rejected(out);
+    assert!(!errs[0].code.contains("secret-gateway-page"), "{}", errs[0].code);
+}
+
+// ---------------------------------------------------------------- secrets in errors
+
+#[test]
+fn a_server_that_echoes_the_token_does_not_leak_it_into_our_errors() {
+    let echo = format!(r#"{{"errorCode":"BAD_AUTH","errorMessage":"rejected header Authorization: Bearer {TOKEN}"}}"#);
+    // read path
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 401, &echo).install(&t);
+    let e = a.get_account_summary().unwrap_err();
+    let shown = format!("{e} {e:?}");
+    assert!(!shown.contains(TOKEN) && shown.contains("<redacted>"), "{shown}");
+    // placement path (401 => Rejected with the scrubbed text)
+    let (out, _) = place(401, &echo);
+    let errs = expect_rejected(out);
+    assert!(!errs[0].code.contains(TOKEN), "{}", errs[0].code);
+    // 400 echo
+    let echo400 = format!(r#"{{"errorMessage":"invalid header {TOKEN}"}}"#);
+    let (out, _) = place(400, &echo400);
+    let errs = expect_rejected(out);
+    assert!(!errs[0].code.contains(TOKEN), "{}", errs[0].code);
+    // rate limit message
+    let (a, t) = setup();
+    Routes::default().get(&p("/summary"), 429, &echo400).install(&t);
+    let e = a.get_account_summary().unwrap_err();
+    assert!(!format!("{e} {e:?}").contains(TOKEN));
+    // and the adapter's own Debug
+    let (a, _) = setup();
+    assert!(!format!("{a:?}").contains(TOKEN));
+}

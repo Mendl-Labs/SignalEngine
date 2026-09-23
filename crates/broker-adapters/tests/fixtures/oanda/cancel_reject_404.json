@@ -1,0 +1,12 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "orderCancelRejectTransaction": {
+    "id": "6392",
+    "type": "ORDER_CANCEL_REJECT",
+    "orderID": "6390",
+    "rejectReason": "ORDER_DOESNT_EXIST"
+  },
+  "lastTransactionID": "6392",
+  "errorCode": "ORDER_DOESNT_EXIST",
+  "errorMessage": "The Order specified does not exist"
+}
