@@ -23,6 +23,13 @@
 //!   position on the account, including holdings the mandate does not cover, so unrelated holdings in a shared
 //!   account consume the allocation's headroom (fail closed).
 //!
+//! * **Signed plans (opt-in).** `PreTradeGuard::check` is unchanged and knows only the caller's `uses_margin` flag.
+//!   `PreTradeGuard::check_margin` adds what a short or levered book needs: it derives margin use from the account
+//!   itself (`margin_use`: an order that is not a pure reduction and leaves the instrument short, or gross above the
+//!   broker's equity, or negative cash), denies it `LEVERAGE_FORBIDDEN` when the mandate's `leverage_max_gross` is 1,
+//!   and tests funding against the broker's buying power (`MarginContext`) instead of cash. Shorting stays governed
+//!   by `universe.shorting` (`SHORTING_FORBIDDEN`), and every cap above still applies.
+//!
 //! The guard does not mutate anything. The planner simulates its own sequence of orders (see `planner`).
 
 use broker_adapters::{Dec, Side};

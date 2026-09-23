@@ -52,8 +52,10 @@
 //!   buy that covers a short); one that moves away is an INCREASE. Reductions are ordered first, increases second,
 //!   each by (venue, symbol): risk is taken off before it is added, on any book.
 //! * A trade that CROSSES zero is always two orders, never one: a close leg (reduction, sized to exactly the held
-//!   quantity) and an open leg (increase, sized to `|target|`). See [`client_tag`] for their tags. The open leg is
-//!   only attempted when the close leg was accepted; if the venue refuses the open leg the account is left flat.
+//!   quantity) and an open leg (increase, sized to `|target|` plus whatever the venue's rounding left of the old
+//!   position, so the final position never exceeds the target). See [`client_tag`] for their tags. The open leg
+//!   is only attempted when the close leg was accepted; if the venue refuses the open leg the account is left flat
+//!   (on a whole-share venue: holding only the dust the close leg could not sell).
 //! * A held short is no longer skipped (`ShortPositionHeld` remains for long-only instruments).
 //! * Increases are limited by the caller's `buying_power` (the broker's own number), not by cash: see
 //!   [`PlanConfig::buying_power`]. Without it (a plan that needs no margin) the plain cash rule above applies.
@@ -678,7 +680,13 @@ impl OrderPlanner {
                 vec![(Leg::Whole, side, wished, reduction)]
             };
             let mut pending: Vec<Candidate<'_>> = Vec::new();
+            // What the close leg leaves behind when the venue rounds it down (dust on a whole-share venue).
+            let mut residual = Dec::ZERO;
             for (leg, side, wished, reducing) in legs {
+                // The open leg has to cover that residual as well, or the book would end short of the target by it:
+                // it is sized `|target| / price + residual`, still rounded DOWN, so the final position can never be
+                // larger than the target.
+                let wished = if leg == Leg::Open { add(wished, residual)? } else { wished };
                 let qty = match rules.round_quantity(&m.symbol, side, wished, price.price) {
                     Ok(q) => q,
                     Err(refusal) => {
@@ -693,6 +701,9 @@ impl OrderPlanner {
                 };
                 if qty > wished {
                     return Err(PlanError::VenueRoundedUp { symbol: m.symbol.clone(), wished, returned: qty });
+                }
+                if leg == Leg::Close {
+                    residual = sub(wished, qty)?;
                 }
                 pending.push(Candidate { m, side, qty, price, reducing, leg });
             }
