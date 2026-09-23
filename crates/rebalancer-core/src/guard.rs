@@ -213,6 +213,16 @@ impl DayCounters {
     pub const ZERO: DayCounters = DayCounters { orders_today: 0, turnover_today: Dec::ZERO };
 }
 
+/// Margin awareness for a SIGNED (short and/or levered) plan. `PreTradeGuard::check` knows nothing of it and is
+/// unchanged; only [`PreTradeGuard::check_margin`] takes one. See that function for what it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarginContext {
+    /// What is left, before THIS order, of the broker-reported buying power: the total notional of
+    /// exposure-INCREASING orders (buys that add long, sells that add short) the broker would still accept. `None`:
+    /// the caller has no such figure, so any order that would use margin is denied.
+    pub buying_power_left: Option<Dec>,
+}
+
 pub struct PreTradeGuard;
 
 fn deny(reasons: &mut Vec<Denial>, code: DenialCode, message: impl Into<String>) {
@@ -263,11 +273,65 @@ fn after_state(account: &AccountView, order: &ProposedOrder, notional: Dec, clas
     })
 }
 
+/// Would this order put the account on margin? True only for an order that is not a pure reduction and that leaves
+/// the account (a) short in this instrument, or (b) with gross exposure above the broker's equity (levered), or
+/// (c) with negative cash (borrowing). A reduction (a sell up to the long held, a buy up to the short held) is never
+/// margin use: it can only shrink what margin is used. `price` must be the order's usable price.
+///
+/// Pure and exact. The planner sets `ProposedOrder::uses_margin` from this same function and the guard derives it
+/// again itself in [`PreTradeGuard::check_margin`], so a caller that forgets the flag cannot lever an account.
+pub fn margin_use(account: &AccountView, order: &ProposedOrder, price: Dec) -> Result<bool, MathError> {
+    let pos_qty = account.position(&order.symbol).map_or(Dec::ZERO, |p| p.quantity);
+    let (signed_qty, reducing) = match order.side {
+        Side::Sell => (neg(order.quantity)?, pos_qty.is_positive() && order.quantity <= pos_qty),
+        Side::Buy => (order.quantity, pos_qty.is_negative() && order.quantity <= neg(pos_qty)?),
+    };
+    if reducing {
+        return Ok(false);
+    }
+    let notional = mul(order.quantity, price)?;
+    let class = order.asset_class.trim().to_lowercase();
+    let after = after_state(account, order, notional, &class)?;
+    let short_after = add(pos_qty, signed_qty)?.is_negative();
+    Ok(short_after || after.gross > account.equity || after.cash.is_negative())
+}
+
+/// The part of a non-reducing order that ADDS exposure (an order that flips through zero closes first, and only the
+/// remainder adds). Exact.
+fn increasing_notional(account: &AccountView, order: &ProposedOrder, price: Dec) -> Result<Dec, MathError> {
+    let pos_qty = account.position(&order.symbol).map_or(Dec::ZERO, |p| p.quantity);
+    let closing = match order.side {
+        Side::Sell if pos_qty.is_positive() => std::cmp::min(order.quantity, pos_qty),
+        Side::Buy if pos_qty.is_negative() => std::cmp::min(order.quantity, neg(pos_qty)?),
+        _ => Dec::ZERO,
+    };
+    mul(sub(order.quantity, closing)?, price)
+}
+
 impl PreTradeGuard {
     /// Check one proposed order. Pure: no clock (the account view carries `now`), no I/O, no mutation.
     pub fn check(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters) -> Verdict {
+        Self::run(policy, account, order, day, None)
+    }
+
+    /// [`check`](Self::check) for an order of a SIGNED plan (shorts and/or gross above 1x). Every check of `check`
+    /// still applies unchanged (universe, shorting permission, per-position / class / gross / net caps, order and
+    /// turnover limits), plus:
+    /// * the guard derives margin use itself ([`margin_use`]); an order that uses margin (flagged by the caller OR
+    ///   derived) is denied `LEVERAGE_FORBIDDEN` unless the mandate's `leverage_max_gross` is above 1;
+    /// * the funding test of a non-reducing order changes from "cash after the order stays above the reserve" to
+    ///   "buying power left after the order stays above the reserve" when `buying_power_left` is given, because on a
+    ///   margin book cash is not what limits an order (short proceeds are collateral, not spendable) and the
+    ///   broker's own buying-power figure is. The shortfall is reported as `CASH_RESERVE`;
+    /// * with no buying power supplied, an order that uses margin is denied `CASH_RESERVE` (nothing to verify it
+    ///   against), and every other order keeps the plain cash test.
+    pub fn check_margin(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: &MarginContext) -> Verdict {
+        Self::run(policy, account, order, day, Some(margin))
+    }
+
+    fn run(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: Option<&MarginContext>) -> Verdict {
         let mut reasons = Vec::new();
-        if let Err(e) = check_inner(policy, account, order, day, &mut reasons) {
+        if let Err(e) = check_inner(policy, account, order, day, margin, &mut reasons) {
             deny(&mut reasons, DenialCode::ArithmeticOverflow, e.to_string());
         }
         Verdict { allow: reasons.is_empty(), reasons }
@@ -279,6 +343,7 @@ fn check_inner(
     account: &AccountView,
     order: &ProposedOrder,
     day: &DayCounters,
+    margin: Option<&MarginContext>,
     reasons: &mut Vec<Denial>,
 ) -> Result<(), MathError> {
     // --- 1. Is there a usable mandate at all?
@@ -355,7 +420,12 @@ fn check_inner(
     if order.is_derivative && !limits.derivatives {
         deny(reasons, DenialCode::DerivativesForbidden, "derivatives are not allowed by the mandate");
     }
-    if order.uses_margin && limits.leverage_max_gross <= one() {
+    // With a margin context the guard derives margin use from the account itself; without one, only the caller's flag.
+    let derived_margin = match (margin, price) {
+        (Some(_), Some(p)) => margin_use(account, order, p)?,
+        _ => false,
+    };
+    if (order.uses_margin || derived_margin) && limits.leverage_max_gross <= one() {
         deny(reasons, DenialCode::LeverageForbidden, "the order uses margin and the mandate allows no leverage");
     }
 
@@ -427,12 +497,30 @@ fn check_inner(
 
     if !reducing {
         let reserve = policy.reserve_amount(equity)?;
-        if after.cash < reserve {
-            deny(
-                reasons,
-                DenialCode::CashReserve,
-                format!("cash would be {} after the order; the required reserve is {reserve}", after.cash),
-            );
+        match margin.map(|m| m.buying_power_left) {
+            Some(Some(bp)) => {
+                let increase = increasing_notional(account, order, price)?;
+                let left = sub(sub(bp, increase)?, order.est_fee)?;
+                if left < reserve {
+                    deny(
+                        reasons,
+                        DenialCode::CashReserve,
+                        format!("buying power would be {left} after the order (increasing {increase}, fee {}); the required reserve is {reserve}", order.est_fee),
+                    );
+                }
+            }
+            Some(None) if order.uses_margin || derived_margin => {
+                deny(reasons, DenialCode::CashReserve, "the order needs margin and no buying power figure was supplied to check it against");
+            }
+            _ => {
+                if after.cash < reserve {
+                    deny(
+                        reasons,
+                        DenialCode::CashReserve,
+                        format!("cash would be {} after the order; the required reserve is {reserve}", after.cash),
+                    );
+                }
+            }
         }
     }
     Ok(())
