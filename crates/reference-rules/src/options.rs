@@ -28,7 +28,7 @@ pub enum GapPolicy {
     MaxMissingDays(u32),
 }
 
-/// When is a date accepted as the month-end decision date (ETF trend only)?
+/// When is a date accepted as the month-end decision date (ETF trend and FX momentum; crypto trend ignores it)?
 ///
 /// In both modes the decision date must be a bar of every instrument and the LAST bar of its calendar month in
 /// the panel (a later bar of the same month refuses with `NotMonthEnd`). Bars after the decision date, if any,
@@ -53,7 +53,7 @@ pub struct Options {
     pub as_of: Option<NaiveDate>,
     pub max_stale_days: i64,
     pub gap_policy: GapPolicy,
-    /// ETF trend only; ignored by the crypto rule.
+    /// ETF trend and FX momentum; ignored by the crypto rule.
     pub month_end_mode: MonthEndMode,
     /// Refuse (`PanelDoesNotEndOnDecisionDate`) when any instrument has a bar after the decision date.
     pub require_panel_end_on_decision_date: bool,
@@ -78,6 +78,18 @@ impl Options {
             month_end_mode: mode,
             ..Self::etf_live(NaiveDate::MIN)
         }
+    }
+
+    /// FX momentum on live data: same staleness and month-end tolerances as the ETF rule (weekday FX bars;
+    /// a next-month bar must exist). The gap policy is applied to the JOINT calendar of the seven pairs.
+    pub fn fx_live(as_of: NaiveDate) -> Self {
+        Self::etf_live(as_of)
+    }
+
+    /// FX momentum replayed over history (no as_of checks); strict gap policy on the joint calendar. Pass
+    /// `gap_policy = GapPolicy::Unchecked` on the result to replay a data set that itself has holes.
+    pub fn fx_replay(mode: MonthEndMode) -> Self {
+        Self::etf_replay(mode)
     }
 
     /// Crypto trend on live data: newest bar = yesterday, panel must end on the decision date.

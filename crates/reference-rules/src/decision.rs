@@ -70,3 +70,57 @@ macro_rules! sleeve_helpers {
 }
 sleeve_helpers!(EtfDecision);
 sleeve_helpers!(CryptoDecision);
+
+/// Decision for one FX pair in the time-series-momentum sleeve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FxInstrumentDecision {
+    pub symbol: String,
+    /// The decision-date close (informational).
+    pub close: f64,
+    /// `sign(month-end close now / month-end close 12 month-ends earlier - 1)`: +1, -1 or 0 (0 => weight 0).
+    pub sign: i8,
+    /// 60-day sample standard deviation of daily returns times `sqrt(ppy)` (the reference's `sigma`).
+    pub sigma: f64,
+    /// SIGNED fraction of the SLEEVE's equity: negative = short, magnitude may exceed 1 (leverage), capped at
+    /// `FX_WEIGHT_CAP` in absolute value.
+    pub weight: f64,
+    /// True when the cap was applied (`|vol_scale * sign / sigma| > FX_WEIGHT_CAP`).
+    pub clipped: bool,
+}
+
+/// FX time-series-momentum decision at a month-end. `instruments` follow `FX_SYMBOLS` order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FxTsmomDecision {
+    pub decision_date: NaiveDate,
+    /// The explicit history window start the caller passed: bars dated before it were ignored. It determines
+    /// `ppy` and therefore every weight (see the crate docs, "FX momentum: the ppy window").
+    pub history_start: NaiveDate,
+    /// First date of the joint calendar (all seven pairs have a bar) inside the window.
+    pub first_joint_date: NaiveDate,
+    /// Number of joint-calendar bars from `first_joint_date` to `decision_date` (the reference's `len(c)`).
+    pub joint_bars: usize,
+    /// Dates inside the window on which at least one pair, but not all seven, had a bar: silently dropped by the
+    /// reference's joint `dropna`, dropped here too but REPORTED so the caller can apply its own limit.
+    pub dropped_bars: usize,
+    /// Observations per year: `(joint_bars - 1) / ((decision_date - first_joint_date).days / 365.25)`.
+    pub ppy: f64,
+    /// Joint volatility scale `k = 0.10 / (sleeve daily-return std * sqrt(ppy))`, before the cap.
+    pub vol_scale: f64,
+    /// The 13 month-ends of the joint calendar (oldest first, last = `decision_date`).
+    pub month_end_dates: Vec<NaiveDate>,
+    pub instruments: Vec<FxInstrumentDecision>,
+}
+
+impl FxTsmomDecision {
+    pub fn get(&self, symbol: &str) -> Option<&FxInstrumentDecision> {
+        self.instruments.iter().find(|i| i.symbol == symbol)
+    }
+    /// Sum of |weight| (gross exposure as a multiple of sleeve equity).
+    pub fn gross_weight(&self) -> f64 {
+        self.instruments.iter().map(|i| i.weight.abs()).sum()
+    }
+    /// Sum of signed weights.
+    pub fn net_weight(&self) -> f64 {
+        self.instruments.iter().map(|i| i.weight).sum()
+    }
+}
