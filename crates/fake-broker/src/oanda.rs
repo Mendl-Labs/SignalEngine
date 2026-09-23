@@ -17,7 +17,10 @@
 //!   HTTP 400, nothing open at all is HTTP 404, both `CLOSEOUT_POSITION_DOESNT_EXIST` with a reject transaction;
 //! * an unknown instrument is HTTP 400 `oanda::rest::core::InvalidParameterException` with NO reject transaction;
 //! * a client id longer than 128 characters is refused with `CLIENT_ORDER_ID_INVALID`;
-//! * `maximumPositionSize` is reported as `"0"` (no cap) unless the test sets one.
+//! * `maximumPositionSize` is reported as `"0"` (no cap) unless the test sets one;
+//! * an instrument that has EVER been traded is still answered by `GET /positions/<inst>` once it is flat, as HTTP 200 with
+//!   `long.units` and `short.units` of `"0"`; one never traded is 404 `NO_SUCH_POSITION`; `GET /positions` lists the flat
+//!   previously-traded entries too, `GET /openPositions` only the non-flat ones.
 //!
 //! Everything else is a model written from documentation: a green run proves the adapter agrees with THIS model, and
 //! reason strings the fake invents (marked below) are not OANDA's. Unmeasured behaviours are switchable so the adapter can
@@ -165,6 +168,8 @@ struct Account {
     balance: Dec,
     hedging: bool,
     positions: BTreeMap<String, Position>,
+    /// Instruments that have had a position at some point (a flat one is still reported, with zero units).
+    ever_traded: std::collections::BTreeSet<String>,
     /// Sum of external position adjustments per instrument (for the invariant check).
     external_units: BTreeMap<String, Dec>,
     /// Sum of external balance adjustments (for the invariant check).
@@ -298,6 +303,7 @@ impl FakeOandaBuilder {
                 balance: self.balance,
                 hedging: false,
                 positions: BTreeMap::new(),
+                ever_traded: std::collections::BTreeSet::new(),
                 external_units: BTreeMap::new(),
                 external_cash: Dec::ZERO,
                 initial_balance: self.balance,
@@ -654,6 +660,7 @@ impl OandaWorld {
                 }
             }
         };
+        self.account.ever_traded.insert(inst.to_string());
         match new_pos {
             Some(p) => {
                 self.account.positions.insert(inst.to_string(), p);
@@ -875,6 +882,13 @@ impl OandaWorld {
         })
     }
 
+    /// MEASURED: an instrument that was traded before and is flat now is still a position record, with zero units.
+    fn flat_position_json(&self, inst: &str) -> Value {
+        let side = json!({"units": "0", "pl": "0.0000", "resettablePL": "0.0000", "financing": "0.0000", "unrealizedPL": "0.0000"});
+        json!({"instrument": inst, "long": side, "short": side, "pl": "0.0000", "resettablePL": "0.0000", "financing": "0.0000",
+               "commission": "0.0000", "unrealizedPL": "0.0000"})
+    }
+
     fn position_json(&self, inst: &str, p: &Position) -> Value {
         let upl = Self::fmt4(self.unrealized_usd(inst, p));
         let side = |units: Dec, avg: Option<Dec>| {
@@ -952,9 +966,17 @@ fn dispatch(w: &mut OandaWorld, now: u64, req: &HttpRequest, path: &str, query: 
             let rows: Vec<Value> = w.account.positions.iter().map(|(i, p)| w.position_json(i, p)).collect();
             (200, json!({"positions": rows, "lastTransactionID": (w.next_id - 1).to_string()}).to_string())
         }
+        (Verb::Get, ["positions"]) => {
+            let mut rows: Vec<Value> = w.account.positions.iter().map(|(i, p)| w.position_json(i, p)).collect();
+            rows.extend(w.account.ever_traded.iter().filter(|i| !w.account.positions.contains_key(*i)).map(|i| w.flat_position_json(i)));
+            (200, json!({"positions": rows, "lastTransactionID": w.last_id().to_string()}).to_string())
+        }
         (Verb::Get, ["positions", inst]) => match w.account.positions.get(*inst) {
             Some(p) => (200, json!({"position": w.position_json(inst, p), "lastTransactionID": (w.next_id - 1).to_string()}).to_string()),
-            None => (404, err_body("The Position specified does not exist")),
+            None if w.account.ever_traded.contains(*inst) => {
+                (200, json!({"position": w.flat_position_json(inst), "lastTransactionID": w.last_id().to_string()}).to_string())
+            }
+            None => (404, json!({"lastTransactionID": w.last_id().to_string(), "errorMessage": "No position exists for the specified instrument", "errorCode": "NO_SUCH_POSITION"}).to_string()),
         },
         (Verb::Get, ["pendingOrders"]) => {
             let rows: Vec<Value> = w.orders.iter().filter(|o| o.state == OrderState::Pending).map(|o| w.order_json(o)).collect();
@@ -1445,6 +1467,7 @@ impl OandaHandle {
         let (u, p) = (dec(units), dec(avg_price));
         self.control(format!("set_position {inst} {u} @ {p}"), |w, _| {
             let before = w.account.positions.get(inst).map(|x| x.units).unwrap_or(Dec::ZERO);
+            w.account.ever_traded.insert(inst.to_string());
             let ext = w.account.external_units.entry(inst.to_string()).or_insert(Dec::ZERO);
             *ext = add(*ext, sub(u, before));
             if u.is_zero() {

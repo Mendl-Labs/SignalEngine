@@ -22,7 +22,10 @@ What they establish (see `product-mandate/VENUE_FACTS.md`, "MEASURED on the prac
 | `reject_bad_instrument` | unknown instrument: HTTP 400 `oanda::rest::core::InvalidParameterException`, NO reject transaction |
 | `transactions_sinceid`, `transactions_list` | the transaction stream after a checkpoint, and the paged listing (page URLs, not transactions) |
 | `list_orders_all` | an empty order list |
+| `oanda_smoke__account_summary`, `oanda_smoke__instruments`, `oanda_smoke__pricing_home_conversions` | the account summary (with `lastTransactionID`), two instrument rows (`maximumPositionSize` "0", `tags` as objects) and a price with home conversions, recorded while the smoke test ran |
+| `oanda_smoke__position_flat_previously_traded`, `oanda_smoke__position_never_traded_404`, `oanda_smoke__positions_all_with_flat_entries`, `oanda_smoke__open_positions_empty` | an instrument traded before and flat now is HTTP 200 with both sides at "0"; a never-traded one is 404 `NO_SUCH_POSITION`; `GET /positions` lists flat entries, `GET /openPositions` does not |
 
-Not recorded (still authored from documentation, see `../README.md`): the account summary, instruments, pricing, open
-positions and position bodies, `GET /orders/<numeric id>` of a finished order, `GET /transactions/<id>`, cancel-at-creation
-bodies, 401/403/429/5xx bodies, and whether a close echoes `longClientExtensions`.
+Not recorded (still authored from documentation, see `../README.md`): open positions and single positions that are actually
+HELD (long, short, hedged), `GET /orders/<numeric id>` of a finished order, `GET /transactions/<id>`, cancel-at-creation bodies,
+401/403/429/5xx bodies, and whether a close echoes `longClientExtensions`. Files named `oanda_211402__*` are the first recording
+session, `oanda_smoke__*` the second.

@@ -41,6 +41,13 @@ macro_rules! fx {
     };
 }
 
+/// A RECORDED response from the second session (summary, instruments, pricing, positions; taken while the smoke test ran).
+macro_rules! sfx {
+    ($name:literal) => {
+        include_str!(concat!("fixtures/oanda/real/oanda_smoke__", $name, ".json"))
+    };
+}
+
 /// A RECORDED response (real practice account, 2026-09-23).
 macro_rules! rfx {
     ($name:literal) => {
@@ -235,6 +242,12 @@ fn with_client_id(body: &str, tag: &str) -> String {
         }
     }
     v.to_string()
+}
+
+/// DERIVED from the recorded flat position (`GET /positions/EUR_USD` after EUR_USD was traded and closed: HTTP 200, both sides
+/// at "0"): the same body for another instrument.
+fn flat_position_body(inst: &str) -> String {
+    sfx!("position_flat_previously_traded").replace("\"instrument\":\"EUR_USD\"", &format!("\"instrument\":\"{inst}\""))
 }
 
 /// AUTHORED (unmeasured shape): a single-position body.
@@ -434,7 +447,7 @@ fn single_position_reads_and_a_404_means_no_position() {
     Routes::default()
         .get(&p("/positions/EUR_USD"), 200, fx!("position_single_long.json"))
         .get(&p("/positions/GBP_USD"), 200, fx!("position_single_short.json"))
-        .get(&p("/positions/AUD_USD"), 404, fx!("error_404_account.json"))
+        .get(&p("/positions/AUD_USD"), 404, sfx!("position_never_traded_404"))
         .install(&t);
     assert_eq!(a.get_position("EUR/USD").unwrap().unwrap().net_units(), d("10000"));
     assert_eq!(a.get_position("gbp_usd").unwrap().unwrap().net_units(), d("-5000"));
@@ -1568,7 +1581,7 @@ fn a_positive_maximum_position_size_refuses_an_order_that_would_exceed_it_and_ne
     assert_cap_refused(try_order(&a, &t, Side::Sell, "9500"), "flip past the cap on the other side");
     assert_sent(try_order(&a, &t, Side::Sell, "9000"), "flip to exactly -5000");
     // a 404 on the position read means flat
-    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 404, fx!("error_404_account.json")).install(&t);
+    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 404, sfx!("position_never_traded_404")).install(&t);
     assert_sent(try_order(&a, &t, Side::Buy, "5000"), "from flat to the cap");
     assert_cap_refused(try_order(&a, &t, Side::Buy, "5001"), "from flat past the cap");
     assert_eq!(a.tag_checkpoint("never-used"), None);
@@ -1817,7 +1830,7 @@ fn nothing_to_close_sends_no_put() {
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
         .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
-        .get(&p("/positions/EUR_USD"), 404, fx!("error_404_account.json"))
+        .get(&p("/positions/EUR_USD"), 404, sfx!("position_never_traded_404"))
         .install(&t);
     assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
     assert!(puts(&t).is_empty());
@@ -1857,7 +1870,7 @@ fn a_closeout_that_the_broker_says_does_not_exist_is_settled_by_re_reading_the_p
     for (status, body) in [(404u16, rfx!("close_nothing")), (400, rfx!("close_wrong_side"))] {
         // the position is gone on the re-read: already flat
         let (a, t) = setup();
-        close_routes_seq("USD_JPY", &[(200, position_body("USD_JPY", "0", "-3")), (404, fx!("error_404_account.json").to_string())], status, body).install(&t);
+        close_routes_seq("USD_JPY", &[(200, position_body("USD_JPY", "0", "-3")), (200, flat_position_body("USD_JPY"))], status, body).install(&t);
         match a.close_position("USD_JPY", CLOSE_TAG).unwrap() {
             CloseOutcome::AlreadyFlat { detail } => assert!(detail.contains("no position to close"), "{detail}"),
             other => panic!("{status}: {other:?}"),
@@ -1942,7 +1955,7 @@ fn a_close_whose_answer_is_lost_is_settled_from_the_stream_or_from_the_position(
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
         .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
-        .get_seq(&p("/positions/EUR_USD"), &[(200, long_open.clone()), (404, fx!("error_404_account.json").to_string())])
+        .get_seq(&p("/positions/EUR_USD"), &[(200, long_open.clone()), (200, flat_position_body("EUR_USD"))])
         .fail(HttpMethod::Put, &p("/positions/EUR_USD/close"), TransportError::Timeout)
         .get(&scan_path(LAST), 200, &page(LAST, LAST + 2, &[]))
         .install(&t);
@@ -2036,4 +2049,81 @@ fn a_server_that_echoes_the_token_does_not_leak_it_into_our_errors() {
     // and the adapter's own Debug
     let (a, _) = setup();
     assert!(!format!("{a:?}").contains(TOKEN));
+}
+
+// ---------------------------------------------------------------- flat is not held (MEASURED 2026-09-23)
+//
+// GET /positions/<i> for an instrument traded before and flat now is HTTP 200 with both sides at "0"; for one never traded it is
+// 404 NO_SUCH_POSITION. Both mean "nothing held". Only a 404 that is NOT NO_SUCH_POSITION is an error.
+
+#[test]
+fn get_position_maps_flat_and_never_traded_to_none_and_a_held_position_to_some() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/positions/EUR_USD"), 200, sfx!("position_flat_previously_traded"))
+        .get(&p("/positions/GBP_JPY"), 404, sfx!("position_never_traded_404"))
+        .get(&p("/positions/GBP_USD"), 200, fx!("position_single_short.json"))
+        .get(&p("/positions/USD_JPY"), 404, fx!("error_404_account.json"))
+        .install(&t);
+    assert!(a.get_position("EUR_USD").unwrap().is_none(), "RECORDED: flat but previously traded is 200 with zero units: NOT held");
+    assert!(a.get_position("GBP_JPY").unwrap().is_none(), "RECORDED: never traded is 404 NO_SUCH_POSITION");
+    assert_eq!(a.get_position("GBP_USD").unwrap().unwrap().net_units(), d("-5000"));
+    // a 404 that is not NO_SUCH_POSITION (an unknown account) is never read as "flat"
+    assert!(matches!(a.get_position("USD_JPY"), Err(BrokerError::NotFound(_))));
+}
+
+#[test]
+fn flat_entries_of_the_recorded_all_positions_list_are_no_balances() {
+    // DERIVED: the recorded summary with the placeholder account id replaced by the test account's, and the recorded
+    // GET /positions body (two flat previously-traded entries) served where the adapter reads open positions.
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, &sfx!("account_summary").replace("ACCOUNT_ID", ACCT))
+        .get(&p("/openPositions"), 200, sfx!("positions_all_with_flat_entries"))
+        .install(&t);
+    let b = a.get_balances().unwrap();
+    assert_eq!(b.entries.len(), 1, "USD only: a flat entry is not a spot balance of 0 EUR/USD");
+    assert_eq!(b.spot("USD"), d("99999.9917"));
+    assert_eq!(b.spot("EUR/USD"), Dec::ZERO);
+}
+
+#[test]
+fn close_position_on_a_flat_previously_traded_instrument_is_nothing_to_close_and_sends_no_put() {
+    let (a, t) = setup();
+    close_routes("EUR_USD", sfx!("position_flat_previously_traded"), 200, rfx!("close_long_only")).install(&t);
+    assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
+    assert!(puts(&t).is_empty(), "the flat record must not be mistaken for a position to close");
+    assert_eq!(a.tag_checkpoint(CLOSE_TAG), None);
+}
+
+#[test]
+fn a_flat_previously_traded_instrument_does_not_block_a_new_order_even_with_a_position_cap() {
+    let (a, t) = cap_adapter(Some("5000"));
+    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 200, sfx!("position_flat_previously_traded")).install(&t);
+    assert_sent(try_order(&a, &t, Side::Buy, "5000"), "from a flat previously-traded instrument up to the cap");
+    assert_cap_refused(try_order(&a, &t, Side::Buy, "5001"), "past the cap from flat");
+}
+
+// ---------------------------------------------------------------- reads over the RECORDED summary, instruments and pricing
+
+#[test]
+fn the_recorded_summary_instruments_and_pricing_drive_the_adapter_reads() {
+    // DERIVED only in the account id (sanitised to ACCOUNT_ID in the recording): everything else is the real body.
+    let (a, t) = setup();
+    let summary = sfx!("account_summary").replace("ACCOUNT_ID", ACCT);
+    Routes::default()
+        .get(&p("/summary"), 200, &summary)
+        .get(&p("/instruments"), 200, sfx!("instruments"))
+        .get(&p("/pricing?instruments=EUR_USD&includeHomeConversions=true"), 200, sfx!("pricing_home_conversions"))
+        .get(&p("/openPositions"), 200, sfx!("open_positions_empty"))
+        .install(&t);
+    let s = a.verify_account().unwrap();
+    assert_eq!((s.nav, s.balance, s.last_transaction_id.as_deref()), (d("99999.9917"), d("99999.9917"), Some("54")));
+    assert_eq!(a.refresh_instruments().unwrap(), 2);
+    assert_eq!(a.instrument("EUR/USD").unwrap().maximum_position_size, None);
+    let q = a.get_quote("EUR/USD").unwrap();
+    assert_eq!((q.bid, q.ask, q.last), (d("1.13841"), d("1.13860"), d("1.138505")));
+    let b = a.get_balances().unwrap();
+    assert_eq!((b.entries.len(), b.spot("USD")), (1, d("99999.9917")));
+    assert!(a.get_open_positions().unwrap().is_empty());
 }

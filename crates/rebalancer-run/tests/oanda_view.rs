@@ -6,7 +6,7 @@ mod common;
 
 use broker_adapters::oanda::parse::{parse_account_summary, parse_open_positions, parse_pricing};
 use broker_adapters::oanda::{AccountSummary, OandaPosition, Pricing};
-use broker_adapters::Dec;
+use broker_adapters::{BrokerAdapter, Dec};
 use common::*;
 use fake_broker::oanda_rig::OandaRig;
 use rebalancer_run::broker::{Broker, OandaBroker, SnapshotError};
@@ -262,4 +262,32 @@ fn snapshot_failures_are_typed() {
     rig.handle.inject_fault(Fault::http(503).on_path(&rig.handle.path("/pricing")));
     assert!(matches!(OandaBroker::fx(&rig.adapter).snapshot(t0()), Err(SnapshotError::Broker(BrokerError::Http(503)))));
     assert_eq!(SnapshotError::View(ViewError::AccountBlocked("x".into())).code(), "VIEW_ACCOUNT_BLOCKED");
+}
+
+// ---------------------------------------------------------------- flat previously-traded entries (RECORDED, 2026-09-23)
+
+#[test]
+fn a_flat_previously_traded_position_record_is_not_a_holding_in_the_snapshot() {
+    // RECORDED: GET /positions/EUR_USD for an instrument traded before and flat now is a record with both sides at zero
+    // units; the recorded summary and pricing are used too. The record is handed to the snapshot as-is (a consumer that
+    // fed it every entry of GET /positions would do the same).
+    use broker_adapters::oanda::parse::parse_single_position;
+    let flat = parse_single_position(include_str!("../../broker-adapters/tests/fixtures/oanda/real/oanda_smoke__position_flat_previously_traded.json")).unwrap();
+    assert!(flat.is_flat());
+    let acct = parse_account_summary(include_str!("../../broker-adapters/tests/fixtures/oanda/real/oanda_smoke__account_summary.json")).unwrap();
+    let pr = parse_pricing(include_str!("../../broker-adapters/tests/fixtures/oanda/real/oanda_smoke__pricing_home_conversions.json")).unwrap();
+    let s = snap(&acct, &[flat], &pr).unwrap();
+    assert!(s.snapshot.holdings.is_empty() && s.snapshot.unvalued.is_empty(), "a flat record is neither a holding nor an unvalued one");
+    assert_eq!(s.snapshot.cash, Dec::parse("99999.9917").unwrap());
+    assert_eq!(s.snapshot.derived_equity, s.snapshot.equity);
+}
+
+#[test]
+fn the_broker_snapshot_after_a_position_was_opened_and_closed_has_no_holdings() {
+    let rig = OandaRig::new();
+    rig.adapter.place_order(&broker_adapters::OrderRequest::market("v:in", "EUR/USD", broker_adapters::Side::Buy, Dec::parse("500").unwrap())).unwrap();
+    rig.adapter.close_position("EUR_USD", "v:out").unwrap();
+    let b = OandaBroker::fx(&rig.adapter);
+    let s = b.snapshot_with_margin(t0()).unwrap();
+    assert!(s.snapshot.holdings.is_empty() && s.snapshot.unvalued.is_empty());
 }

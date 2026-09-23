@@ -706,3 +706,56 @@ fn reduce_only_orders_never_open_or_grow_a_position() {
     assert_eq!(rig.handle.position_units("EUR_USD"), d("400"));
     assert_eq!(rig.handle.orders().last().unwrap().position_fill, "REDUCE_ONLY");
 }
+
+// ---------------------------------------------------------------- a flat previously-traded instrument is not held
+
+#[test]
+fn a_flat_previously_traded_instrument_is_not_held_and_closing_it_sends_nothing() {
+    // MEASURED: the exchange keeps answering 200 with zero units for an instrument that was traded and is flat again.
+    let rig = OandaRig::new();
+    rig.adapter.place_order(&buy("t:in", "700")).unwrap();
+    assert!(matches!(rig.adapter.close_position("EUR_USD", "t:out").unwrap(), CloseOutcome::Closed { .. }));
+    assert_eq!(rig.handle.position_units("EUR_USD"), Dec::ZERO);
+    // the raw exchange reports a position record with zero units ...
+    let (s, b) = raw_get(&rig, "/positions/EUR_USD");
+    assert_eq!((s, b["position"]["long"]["units"].as_str()), (200, Some("0")));
+    // ... and the adapter says: nothing held
+    assert!(rig.adapter.get_position("EUR_USD").unwrap().is_none());
+    assert!(rig.adapter.get_open_positions().unwrap().is_empty());
+    let bal = rig.adapter.get_balances().unwrap();
+    assert_eq!(bal.spot("EUR/USD"), Dec::ZERO);
+    assert_eq!(bal.entries.len(), 1);
+    // closing it is "nothing to close" and no PUT is sent
+    let puts_before = rig.handle.applied(HttpMethod::Put, "/close").len();
+    assert_eq!(rig.adapter.close_position("EUR_USD", "t:out-again").unwrap(), CloseOutcome::NothingToClose);
+    assert_eq!(rig.handle.applied(HttpMethod::Put, "/close").len(), puts_before);
+    // a never-traded instrument behaves the same way (404 NO_SUCH_POSITION -> None)
+    assert!(rig.adapter.get_position("AUD_USD").unwrap().is_none());
+    assert_eq!(rig.adapter.close_position("AUD_USD", "t:aud").unwrap(), CloseOutcome::NothingToClose);
+}
+
+#[test]
+fn a_new_order_on_a_flat_previously_traded_instrument_is_not_blocked_by_a_position_cap() {
+    use fake_broker::oanda::{FakeOandaBuilder, InstrumentSpec};
+    let fake = FakeOandaBuilder::new()
+        .balance("100000")
+        .instrument(InstrumentSpec::fx("EUR_USD", 5).with_max_position("5000"), "1.10048", "1.10052")
+        .build();
+    let rig = OandaRig::with_fake(fake, |c| c);
+    rig.adapter.place_order(&buy("cap:1", "5000")).unwrap();
+    assert!(matches!(rig.adapter.close_position("EUR_USD", "cap:close").unwrap(), CloseOutcome::Closed { .. }));
+    // flat again (record with zero units): the cap check reads net 0, so the full cap is available again
+    rig.adapter.place_order(&buy("cap:2", "5000")).unwrap();
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("5000"));
+    assert!(matches!(rig.adapter.place_order(&buy("cap:3", "1")), Err(BrokerError::InvalidRequest(_))));
+}
+
+#[test]
+fn a_close_whose_answer_is_lost_on_a_position_that_is_flat_afterwards_is_already_flat_not_held() {
+    let rig = OandaRig::new();
+    rig.handle.set_echo_close_client_ids(false);
+    rig.adapter.place_order(&buy("t:l", "300")).unwrap();
+    rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/positions/EUR_USD/close")));
+    // the re-read after the ambiguous answer sees a 200 record with zero units: that must be read as flat
+    assert!(matches!(rig.adapter.close_position("EUR_USD", "t:c").unwrap(), CloseOutcome::AlreadyFlat { .. }));
+}

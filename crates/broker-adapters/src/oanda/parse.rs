@@ -9,8 +9,9 @@
 //! `tests/fixtures/oanda/real/`): the order-create response (market fill, resting limit, short sale), the pending-order
 //! lookup and its 404, cancel and cancel-again, position close (long, short, one-sided, nothing open), the reject
 //! shapes, the unknown-instrument `InvalidParameterException`, and `transactions/sinceid`. Everything else here
-//! (account summary, instruments, pricing, open positions, order resources of FILLED/CANCELLED orders read by numeric
-//! id, `GET /transactions/{id}`, cancel-at-creation bodies, 401/403/429/5xx bodies) is still FROM-MEMORY-OF-DOCS and is
+//! (the account summary, instruments, pricing and flat/never-traded positions were recorded in a second session; still authored:
+//! held positions, order resources of FILLED/CANCELLED orders read by numeric
+//! id, `GET /transactions/{id}`, held-position bodies, cancel-at-creation bodies, 401/403/429/5xx bodies) is still FROM-MEMORY-OF-DOCS and is
 //! exercised only by hand-authored fixtures (labelled as such; see `tests/fixtures/oanda/README.md`).
 //! The legacy connector's parse of `orderCreateTransaction.id` / `orderFillTransaction.{id, units, price}` is
 //! VERIFIED-FROM-REPO-CODE and now also matches the recordings.
@@ -152,6 +153,13 @@ impl OandaPosition {
         self.long_units.checked_add(self.short_units).unwrap_or(self.long_units)
     }
 
+    /// Both sides at zero units. MEASURED on a practice account: an instrument that was traded before and is flat now is
+    /// still returned by `GET /positions/<i>` (HTTP 200) and listed by `GET /positions`, with `long.units` and
+    /// `short.units` of `"0"` (and non-zero `pl`). A flat record is NOT a held position.
+    pub fn is_flat(&self) -> bool {
+        self.long_units.is_zero() && self.short_units.is_zero()
+    }
+
     /// Both sides non-zero: only possible on a hedging account.
     pub fn is_hedged(&self) -> bool {
         self.long_units.is_positive() && self.short_units.is_negative()
@@ -183,8 +191,9 @@ fn parse_position_value(v: &Value) -> Result<OandaPosition, BrokerError> {
     })
 }
 
-/// Parse `GET /v3/accounts/{id}/openPositions`: `{"positions": [...]}`. Rows with zero units on
-/// both sides are dropped (OANDA should not send them).
+/// Parse `GET /v3/accounts/{id}/openPositions` or `GET /v3/accounts/{id}/positions`: `{"positions": [...]}`. Rows with
+/// zero units on both sides are dropped: `openPositions` never sends them, but `positions` (all) lists every instrument
+/// ever traded, flat ones included (MEASURED), and a flat row is not a holding.
 pub fn parse_open_positions(body: &str) -> Result<Vec<OandaPosition>, BrokerError> {
     let v = json_of(body, "open positions")?;
     let arr = v.get("positions").and_then(Value::as_array).ok_or_else(|| BrokerError::Malformed("open positions has no `positions` array".into()))?;
@@ -199,7 +208,8 @@ pub fn parse_open_positions(body: &str) -> Result<Vec<OandaPosition>, BrokerErro
     Ok(out)
 }
 
-/// Parse `GET /v3/accounts/{id}/positions/{instrument}`: `{"position": {...}}`.
+/// Parse `GET /v3/accounts/{id}/positions/{instrument}`: `{"position": {...}}`. The result may be FLAT (both sides zero,
+/// see [`OandaPosition::is_flat`]): callers that ask "is anything held" must check that.
 pub fn parse_single_position(body: &str) -> Result<OandaPosition, BrokerError> {
     let v = json_of(body, "position")?;
     let p = v.get("position").ok_or_else(|| BrokerError::Malformed("position response has no `position`".into()))?;
@@ -848,7 +858,7 @@ pub fn classify_reject_reason(reason: &str) -> Option<ErrorClass> {
     Some(match reason {
         "UNITS_LIMIT_EXCEEDED" | "UNITS_INVALID" | "UNITS_PRECISION_EXCEEDED" | "UNITS_MINIMUM_NOT_MET" | "TIME_IN_FORCE_INVALID"
         | "CLIENT_ORDER_ID_INVALID" | "PRICE_PRECISION_EXCEEDED" | "INSTRUMENT_INVALID" | INVALID_PARAMETER_EXCEPTION => ErrorClass::InvalidArguments,
-        "ORDER_DOESNT_EXIST" | "NO_SUCH_ORDER" | "CLOSEOUT_POSITION_DOESNT_EXIST" => ErrorClass::UnknownOrder,
+        "ORDER_DOESNT_EXIST" | "NO_SUCH_ORDER" | "NO_SUCH_POSITION" | "CLOSEOUT_POSITION_DOESNT_EXIST" => ErrorClass::UnknownOrder,
         _ => return None,
     })
 }

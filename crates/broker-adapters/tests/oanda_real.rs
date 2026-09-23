@@ -1,4 +1,6 @@
-//! Parse tests over RECORDED responses from an OANDA practice account (2026-09-23, account and user ids removed).
+//! Parse tests over RECORDED responses from an OANDA practice account (2026-09-23, account and user ids removed). Two
+//! recording sessions: `oanda_211402__*` (orders, cancels, closes, rejects, the transaction stream) and `oanda_smoke__*`
+//! (summary, instruments, pricing, positions, taken while the smoke test ran).
 //!
 //! PROVENANCE: the files in `tests/fixtures/oanda/real/` are real, not authored (see the README there). The HTTP status of a
 //! response is not stored in the file, so it is stated in [`RECORDED`], from the recording notes in
@@ -9,6 +11,7 @@ use broker_adapters::oanda::parse::{
     self, classify_http_failure, parse_cancel_response, parse_order_resource, parse_order_resources, parse_order_transactions,
     parse_transactions_page, HttpFailure, INVALID_PARAMETER_EXCEPTION,
 };
+use broker_adapters::oanda::{InstrumentTable, PriceQuote};
 use broker_adapters::{Dec, ErrorClass};
 use serde_json::Value;
 
@@ -42,6 +45,16 @@ enum Shape {
     OrderList,
     /// `GET /transactions`: paged listing (page URLs).
     TxnListing,
+    /// `GET /summary`.
+    Summary,
+    /// `GET /instruments`.
+    Instruments,
+    /// `GET /pricing?includeHomeConversions=true`.
+    Pricing,
+    /// `GET /positions` or `GET /openPositions`.
+    PositionList,
+    /// `GET /positions/<instrument>` (200).
+    SinglePosition,
 }
 
 /// (file stem after `oanda_211402__`, HTTP status, shape).
@@ -68,10 +81,20 @@ const RECORDED: &[(&str, u16, Shape)] = &[
     ("transactions_sinceid", 200, Shape::Sinceid),
     ("transactions_list", 200, Shape::TxnListing),
     ("list_orders_all", 200, Shape::OrderList),
+    // second session (smoke test run)
+    ("position_flat_previously_traded", 200, Shape::SinglePosition),
+    ("position_never_traded_404", 404, Shape::Error),
+    ("positions_all_with_flat_entries", 200, Shape::PositionList),
+    ("open_positions_empty", 200, Shape::PositionList),
+    ("account_summary", 200, Shape::Summary),
+    ("instruments", 200, Shape::Instruments),
+    ("pricing_home_conversions", 200, Shape::Pricing),
 ];
 
 fn body_of(stem: &str) -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/oanda/real/oanda_211402__{stem}.json"));
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/oanda/real");
+    let first = dir.join(format!("oanda_211402__{stem}.json"));
+    let path = if first.exists() { first } else { dir.join(format!("oanda_smoke__{stem}.json")) };
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
 }
 
@@ -89,7 +112,7 @@ fn every_recorded_fixture_still_parses_and_every_file_is_listed() {
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.ends_with(".json"))
-        .map(|n| n.trim_start_matches("oanda_211402__").trim_end_matches(".json").to_string())
+        .map(|n| n.trim_start_matches("oanda_211402__").trim_start_matches("oanda_smoke__").trim_end_matches(".json").to_string())
         .collect();
     on_disk.sort();
     let mut listed: Vec<String> = RECORDED.iter().map(|(s, _, _)| s.to_string()).collect();
@@ -130,6 +153,21 @@ fn every_recorded_fixture_still_parses_and_every_file_is_listed() {
             Shape::TxnListing => {
                 let v = json(stem);
                 assert!(v["pages"].is_array() && v["lastTransactionID"].is_string(), "{stem}");
+            }
+            Shape::Summary => {
+                parse::parse_account_summary(&body).unwrap_or_else(|e| panic!("{stem}: {e}"));
+            }
+            Shape::Instruments => {
+                InstrumentTable::from_instruments_json(&body).unwrap_or_else(|e| panic!("{stem}: {e}"));
+            }
+            Shape::Pricing => {
+                parse::parse_pricing(&body).unwrap_or_else(|e| panic!("{stem}: {e}"));
+            }
+            Shape::PositionList => {
+                parse::parse_open_positions(&body).unwrap_or_else(|e| panic!("{stem}: {e}"));
+            }
+            Shape::SinglePosition => {
+                parse::parse_single_position(&body).unwrap_or_else(|e| panic!("{stem}: {e}"));
             }
         }
     }
@@ -303,4 +341,78 @@ fn a_paged_listing_returns_page_urls_not_transactions() {
     assert!(v["pages"][0].as_str().unwrap().contains("/transactions/idrange?"), "{v}");
     assert!(v.get("transactions").is_none(), "the listing has no transactions: the adapter cannot use it directly");
     let _ = parse::parse_order_resources(rfx!("list_orders_all")).unwrap();
+}
+
+// ---------------------------------------------------------------- second session: positions, summary, instruments, pricing
+
+#[test]
+fn a_flat_previously_traded_instrument_is_a_200_with_zero_units_and_is_flat_not_held() {
+    // MEASURED: GET /positions/EUR_USD after EUR_USD was traded and closed is HTTP 200 with both sides at "0" and a non-zero pl.
+    let p = parse::parse_single_position(&body_of("position_flat_previously_traded")).unwrap();
+    assert_eq!((p.instrument.as_str(), p.long_units, p.short_units, p.net_units()), ("EUR_USD", d("0"), d("0"), d("0")));
+    assert!(p.is_flat() && !p.is_hedged());
+    assert_eq!(p.unrealized_pl, d("0.0000"));
+    assert!(p.margin_used.is_none() && p.long_average_price.is_none(), "a flat record carries no margin or average price");
+}
+
+#[test]
+fn a_never_traded_instrument_is_a_404_no_such_position() {
+    let f = classify_http_failure(404, &body_of("position_never_traded_404"), None, &[]);
+    match f {
+        HttpFailure::NotFound { api } => assert_eq!(api.code.as_deref(), Some("NO_SUCH_POSITION")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_all_positions_list_carries_flat_entries_that_are_not_holdings() {
+    // MEASURED: GET /positions lists USD_JPY and EUR_USD, both flat; GET /openPositions is empty.
+    let raw: Value = serde_json::from_str(&body_of("positions_all_with_flat_entries")).unwrap();
+    let rows = raw["positions"].as_array().unwrap();
+    let units: Vec<(&str, &str, &str)> =
+        rows.iter().map(|r| (r["instrument"].as_str().unwrap(), r["long"]["units"].as_str().unwrap(), r["short"]["units"].as_str().unwrap())).collect();
+    assert_eq!(units, [("USD_JPY", "0", "0"), ("EUR_USD", "0", "0")]);
+    assert!(parse::parse_open_positions(&body_of("positions_all_with_flat_entries")).unwrap().is_empty(), "flat entries are dropped");
+    assert!(parse::parse_open_positions(&body_of("open_positions_empty")).unwrap().is_empty());
+}
+
+#[test]
+fn the_real_account_summary_parses_with_the_fields_the_adapter_depends_on() {
+    // First REAL summary. Assumed shape held: top-level and account.lastTransactionID, NAV, hedgingEnabled, marginAvailable.
+    let s = parse::parse_account_summary(&body_of("account_summary")).unwrap();
+    assert_eq!((s.id.as_str(), s.currency.as_str(), s.hedging_enabled), ("ACCOUNT_ID", "USD", false));
+    assert_eq!((s.balance, s.nav, s.unrealized_pl, s.margin_used, s.margin_available), (d("99999.9917"), d("99999.9917"), d("0"), d("0"), d("99999.9917")));
+    assert_eq!((s.position_value, s.margin_closeout_percent, s.margin_rate), (Some(d("0")), Some(d("0")), Some(d("0.02"))));
+    assert_eq!((s.open_trade_count, s.open_position_count, s.pending_order_count), (Some(0), Some(0), Some(0)));
+    assert_eq!(s.last_transaction_id.as_deref(), Some("54"), "the idempotency checkpoint");
+    // MEASURED: the summary has no positionAggregationMode key
+    assert!(!body_of("account_summary").contains("positionAggregationMode"));
+}
+
+#[test]
+fn the_real_instruments_parse_and_maximum_position_size_zero_means_no_cap() {
+    let t = InstrumentTable::from_instruments_json(&body_of("instruments")).unwrap();
+    assert_eq!(t.len(), 2);
+    let e = t.lookup("EUR_USD").unwrap();
+    assert_eq!((e.display_precision, e.trade_units_precision, e.minimum_trade_size, e.maximum_order_units, e.margin_rate), (5, 0, d("1"), d("100000000"), d("0.02")));
+    assert_eq!(e.maximum_position_size, None, "the recorded \"0\" is NO cap");
+    let j = t.lookup("USD_JPY").unwrap();
+    assert_eq!((j.display_precision, j.margin_rate, j.maximum_position_size), (3, d("0.05"), None));
+    // the recorded rows carry `tags` as objects, `financing` and trailing-stop distances: all ignored without complaint
+    assert!(body_of("instruments").contains("\"tags\":[{\"type\""));
+}
+
+#[test]
+fn the_real_pricing_parses_with_home_conversions_and_numeric_liquidity() {
+    let p = parse::parse_pricing(&body_of("pricing_home_conversions")).unwrap();
+    let q: &PriceQuote = p.price("EUR_USD").unwrap();
+    assert!(q.tradeable);
+    assert_eq!(q.status.as_deref(), Some("tradeable"));
+    assert_eq!((q.bid, q.ask, q.closeout_bid, q.closeout_ask), (Some(d("1.13841")), Some(d("1.13860")), Some(d("1.13832")), Some(d("1.13870"))));
+    assert_eq!(q.mid(), Some(d("1.138505")));
+    assert_eq!(p.conversion("EUR").unwrap().position_value, d("1.1385"));
+    assert_eq!(p.conversion("EUR").unwrap().account_gain, Some(d("1.127115")));
+    assert_eq!(p.conversion("USD").unwrap().position_value, d("1"));
+    // times are RFC 3339 here (no Accept-Datetime-Format was sent): informational only, so absent rather than an error
+    assert!(q.time.is_none());
 }

@@ -26,9 +26,17 @@
 //!    `CLIENT_ORDER_ID_INVALID`). An unknown instrument is HTTP 400 `oanda::rest::core::InvalidParameterException`
 //!    with NO reject transaction. A cancel of a missing order is 404 `ORDER_DOESNT_EXIST`.
 //! 7. `maximumPositionSize` is the string `"0"` on every instrument checked: no cap, never a zero limit.
+//! 8. An instrument that was traded before and is flat now is still answered by `GET /positions/<i>` as HTTP 200 with
+//!    `long.units` and `short.units` of `"0"` (and a non-zero `pl`); a never-traded one is 404 `NO_SUCH_POSITION`;
+//!    `GET /positions` lists the flat entries and `GET /openPositions` does not. `get_position` therefore returns `None`
+//!    for "flat OR never traded", and every consumer treats a zero-unit record as flat. (Found by the first real run of the
+//!    smoke test: the adapter had reported a flat instrument as held.)
+//! 9. The account summary, the instrument rows and a price with home conversions were recorded too (second session) and the
+//!    parsers were confirmed against them: no discrepancy beyond richer bodies (`tags` are objects, `financing` details, RFC 3339
+//!    times, numeric `liquidity`).
 //!
-//! Still FROM-MEMORY-OF-DOCS (not measured; covered only by authored fixtures): the account summary, instruments,
-//! open positions and pricing bodies, `GET /orders/<numeric id>` for FILLED / CANCELLED orders, `GET /transactions/<id>`,
+//! Still FROM-MEMORY-OF-DOCS (not measured; covered only by authored fixtures): positions that are actually HELD (long,
+//! short, hedged), `GET /orders/<numeric id>` for FILLED / CANCELLED orders, `GET /transactions/<id>`,
 //! the cancel-at-creation bodies (`INSUFFICIENT_MARGIN`, `MARKET_HALTED`), 401/403/429/5xx bodies, whether a position
 //! close echoes `longClientExtensions` onto its transactions, `Retry-After`, weekend / halted-market behaviour, and
 //! anything about the LIVE host. VERIFIED-FROM-REPO-CODE (legacy SignalEngine connector): bearer auth, the practice
@@ -394,7 +402,10 @@ impl OandaAdapter {
         parse::parse_open_positions(&self.read(HttpMethod::Get, &self.acct_path("/openPositions"))?.body)
     }
 
-    /// `GET /positions/{instrument}`; `Ok(None)` when OANDA answers 404 (no such position).
+    /// `GET /positions/{instrument}`. `Ok(None)` means FLAT OR NEVER TRADED: OANDA answers 404 `NO_SUCH_POSITION` for an
+    /// instrument never traded, but HTTP 200 with `long.units` = `short.units` = `"0"` for one traded before and flat now
+    /// (both MEASURED); the second is mapped to `None` too, so `Some` is always a position that is actually held. Any
+    /// other 404 (an unknown account, an unrecognised body) is an error, never "flat".
     pub fn get_position(&self, symbol: &str) -> Result<Option<OandaPosition>, BrokerError> {
         let inst = normalize_instrument(symbol)?;
         match self.call(HttpMethod::Get, &self.acct_path(&format!("/positions/{}", enc(&inst))), None) {
@@ -403,9 +414,9 @@ impl OandaAdapter {
                 if p.instrument != inst {
                     return Err(BrokerError::Malformed(format!("asked for position {inst} but received {}", p.instrument)));
                 }
-                Ok(Some(p))
+                Ok(if p.is_flat() { None } else { Some(p) })
             }
-            Err(CallError::Failure(HttpFailure::NotFound { .. })) => Ok(None),
+            Err(CallError::Failure(HttpFailure::NotFound { api })) if api.code.as_deref() == Some("NO_SUCH_POSITION") => Ok(None),
             Err(e) => Err(self.read_error(e)),
         }
     }
@@ -780,9 +791,6 @@ impl OandaAdapter {
             Ok(None) => Ok(CloseOutcome::AlreadyFlat {
                 detail: format!("{inst}: the broker says there is no position to close and a re-read shows none; no transaction with the tag explains it"),
             }),
-            Ok(Some(p)) if p.long_units.is_zero() && p.short_units.is_zero() => Ok(CloseOutcome::AlreadyFlat {
-                detail: format!("{inst}: the broker says there is no position to close and a re-read shows it flat"),
-            }),
             Ok(Some(p)) => Ok(CloseOutcome::UnknownOutcome {
                 reason: format!("the broker says there is nothing to close in {inst} but the position still shows {} units {marker}", p.net_units()),
             }),
@@ -804,9 +812,6 @@ impl OandaAdapter {
         match self.get_position(inst) {
             Ok(None) => Ok(CloseOutcome::AlreadyFlat {
                 detail: format!("{inst}: the close answer was lost ({why}) and the position is now flat; the transaction stream shows no close carrying the tag (the broker may not echo it on closeouts), so who closed it is unverified"),
-            }),
-            Ok(Some(p)) if p.long_units.is_zero() && p.short_units.is_zero() => Ok(CloseOutcome::AlreadyFlat {
-                detail: format!("{inst}: the close answer was lost ({why}) and the position is now flat"),
             }),
             Ok(Some(_)) => Ok(CloseOutcome::UnknownOutcome { reason: format!("{why}; the position is still open and no transaction carries the tag {marker}") }),
             Err(e) => Ok(CloseOutcome::UnknownOutcome { reason: format!("{why}; the position could not be re-read ({e}) {marker}") }),
@@ -932,7 +937,7 @@ impl BrokerAdapter for OandaAdapter {
         let s = self.verify_account()?;
         let positions = self.get_open_positions()?;
         let mut entries = vec![BalanceEntry { raw_asset: s.currency.clone(), asset: s.currency.clone(), amount: s.balance, kind: BalanceKind::Spot }];
-        for p in &positions {
+        for p in positions.iter().filter(|p| !p.is_flat()) {
             if p.is_hedged() {
                 return Err(BrokerError::Unsupported(format!("{}: hedged position", p.instrument)));
             }

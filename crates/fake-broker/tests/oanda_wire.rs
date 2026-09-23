@@ -477,3 +477,40 @@ fn builder_refuses_an_instrument_without_a_usd_leg() {
     });
     assert!(r.is_err());
 }
+
+#[test]
+fn a_flat_previously_traded_instrument_is_a_200_with_zero_units_a_never_traded_one_a_404() {
+    // MEASURED on a practice account: GET /positions/EUR_USD after EUR_USD was traded and is flat again is HTTP 200 with
+    // both sides at "0"; GET /positions/GBP_JPY for a never-traded instrument is 404 NO_SUCH_POSITION. GET /positions lists
+    // the flat previously-traded entries, GET /openPositions only the non-flat ones.
+    let (_f, t, h) = setup();
+    let (s, b) = send(&*t, req(HttpMethod::Get, &acct("/positions/EUR_USD"), None));
+    assert_eq!((s, b["errorCode"].as_str()), (404, Some("NO_SUCH_POSITION")), "not traded yet");
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("100", "o"))));
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("50", "p"))));
+    let (s, b) = send(&*t, req(HttpMethod::Get, &acct("/positions/EUR_USD"), None));
+    assert_eq!((s, b["position"]["long"]["units"].as_str()), (200, Some("150")));
+    send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "ALL", "shortUnits": "NONE"}))));
+    assert_eq!(h.position_units("EUR_USD"), Dec::ZERO);
+    let (s, b) = send(&*t, req(HttpMethod::Get, &acct("/positions/EUR_USD"), None));
+    assert_eq!(s, 200, "flat but previously traded");
+    assert_eq!((b["position"]["long"]["units"].as_str(), b["position"]["short"]["units"].as_str()), (Some("0"), Some("0")));
+    assert_eq!(b["position"]["instrument"], "EUR_USD");
+    let (s, b) = send(&*t, req(HttpMethod::Get, &acct("/positions/GBP_JPY"), None));
+    assert_eq!((s, b["errorCode"].as_str()), (404, Some("NO_SUCH_POSITION")));
+    // a second instrument that is open, and one that was traded and closed
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(json!({"order": {"type": "MARKET", "instrument": "GBP_USD", "units": "-30", "timeInForce": "FOK",
+        "positionFill": "DEFAULT", "clientExtensions": {"id": "g"}}}))));
+    let (_, all) = send(&*t, req(HttpMethod::Get, &acct("/positions"), None));
+    let rows: Vec<(String, String, String)> = all["positions"].as_array().unwrap().iter()
+        .map(|r| (r["instrument"].as_str().unwrap().to_string(), r["long"]["units"].as_str().unwrap().to_string(), r["short"]["units"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(rows, [("GBP_USD".to_string(), "0".to_string(), "-30".to_string()), ("EUR_USD".to_string(), "0".to_string(), "0".to_string())]);
+    let (_, open) = send(&*t, req(HttpMethod::Get, &acct("/openPositions"), None));
+    let open: Vec<&str> = open["positions"].as_array().unwrap().iter().map(|r| r["instrument"].as_str().unwrap()).collect();
+    assert_eq!(open, ["GBP_USD"], "openPositions never lists a flat entry");
+    // and closing the flat one is what the recording shows: 404 CLOSEOUT_POSITION_DOESNT_EXIST
+    let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "ALL", "shortUnits": "NONE"}))));
+    assert_eq!((s, b["errorCode"].as_str()), (404, Some("CLOSEOUT_POSITION_DOESNT_EXIST")));
+    h.assert_invariants();
+}
