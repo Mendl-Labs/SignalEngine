@@ -41,7 +41,28 @@ use uuid::Uuid;
 use crate::core::{ExchangeConnector, ExecutionError};
 use crate::signal::Signal;
 use crate::exchanges::factory::ExchangeFactory;
-use smartorderrouter::{ExchangeCredential, DbPool, load_exchange_credentials};
+use smartorderrouter::{ExchangeCredential, CredentialProvider, resolve_all_credentials};
+
+/// Builds an exchange connector from an already-resolved credential.
+///
+/// Exists so tests can observe which credential a tenant's connector was built
+/// from; production uses [`DefaultConnectorBuilder`].
+#[async_trait::async_trait]
+pub trait ConnectorBuilder: Send + Sync {
+    async fn build(&self, credential: &ExchangeCredential)
+        -> Result<Box<dyn ExchangeConnector>, ExecutionError>;
+}
+
+/// Builds real exchange connectors via [`ExchangeFactory`].
+pub struct DefaultConnectorBuilder;
+
+#[async_trait::async_trait]
+impl ConnectorBuilder for DefaultConnectorBuilder {
+    async fn build(&self, credential: &ExchangeCredential)
+        -> Result<Box<dyn ExchangeConnector>, ExecutionError> {
+        ExchangeFactory::create_connector_from_credential(credential).await
+    }
+}
 
 // ============================================================================
 // Subscription Tier (aligned with BacktestingEngine/databaseschema)
@@ -265,6 +286,15 @@ impl TenantContext {
 
     /// Add an exchange connector from a credential
     pub async fn add_exchange(&mut self, credential: &ExchangeCredential) -> Result<(), ExecutionError> {
+        self.add_exchange_with(credential, &DefaultConnectorBuilder).await
+    }
+
+    /// Like [`Self::add_exchange`] with an explicit connector builder.
+    pub async fn add_exchange_with(
+        &mut self,
+        credential: &ExchangeCredential,
+        builder: &dyn ConnectorBuilder,
+    ) -> Result<(), ExecutionError> {
         if self.connectors.len() >= self.tier.max_exchanges() {
             return Err(ExecutionError::Validation(format!(
                 "Exchange limit reached for {} tier: {} max",
@@ -272,7 +302,7 @@ impl TenantContext {
             )));
         }
 
-        let connector = ExchangeFactory::create_connector_from_credential(credential).await?;
+        let connector = builder.build(credential).await?;
         self.connectors.insert(credential.exchange.clone(), connector);
         
         log::info!(
@@ -444,8 +474,12 @@ pub struct MultiTenantExecutionHandler {
     tenants: Arc<RwLock<HashMap<Uuid, TenantContext>>>,
     /// Fair scheduler for order processing
     scheduler: Arc<FairScheduler>,
-    /// Database pool for loading credentials
-    db_pool: Option<Arc<DbPool>>,
+    /// Source of per-tenant credentials. The SaaS provider is implemented
+    /// outside the public repo (against the private, tenant-scoped schema);
+    /// nothing here reads credentials without a tenant id.
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    /// How connectors are built from resolved credentials.
+    connector_builder: Arc<dyn ConnectorBuilder>,
     /// Background task shutdown signal
     shutdown: AtomicBool,
     /// Total orders processed
@@ -460,18 +494,25 @@ impl MultiTenantExecutionHandler {
         Self {
             tenants: Arc::new(RwLock::new(HashMap::new())),
             scheduler: Arc::new(FairScheduler::new()),
-            db_pool: None,
+            credential_provider: None,
+            connector_builder: Arc::new(DefaultConnectorBuilder),
             shutdown: AtomicBool::new(false),
             total_orders_processed: AtomicU64::new(0),
             total_orders_rejected: AtomicU64::new(0),
         }
     }
 
-    /// Create with database pool for loading credentials
-    pub fn with_db_pool(pool: Arc<DbPool>) -> Self {
+    /// Create with the credential provider that resolves each tenant's keys.
+    pub fn with_credential_provider(provider: Arc<dyn CredentialProvider>) -> Self {
         let mut handler = Self::new();
-        handler.db_pool = Some(pool);
+        handler.credential_provider = Some(provider);
         handler
+    }
+
+    /// Replace how connectors are built from credentials (tests).
+    pub fn with_connector_builder(mut self, builder: Arc<dyn ConnectorBuilder>) -> Self {
+        self.connector_builder = builder;
+        self
     }
 
     /// Register a new tenant
@@ -489,14 +530,18 @@ impl MultiTenantExecutionHandler {
         Ok(())
     }
 
-    /// Load tenant credentials from database and initialize connectors
+    /// Load THIS tenant's credentials through the credential provider and
+    /// initialize its connectors. Fails closed: no provider, unregistered
+    /// tenant or any provider error means nothing is loaded.
     pub async fn load_tenant_credentials(&self, tenant_id: Uuid) -> Result<usize, ExecutionError> {
-        let pool = self.db_pool.as_ref()
-            .ok_or_else(|| ExecutionError::Unknown("Database pool not configured".to_string()))?;
+        let provider = self.credential_provider.as_ref()
+            .ok_or_else(|| ExecutionError::Unknown("Credential provider not configured".to_string()))?;
 
-        let credentials = load_exchange_credentials(pool)
+        let credentials = resolve_all_credentials(provider.as_ref(), tenant_id)
             .await
-            .map_err(|e| ExecutionError::Unknown(format!("Failed to load credentials: {}", e)))?;
+            .map_err(|e| ExecutionError::Unknown(format!(
+                "Failed to load credentials for tenant {}: {}", tenant_id, e
+            )))?;
 
         let mut tenants = self.tenants.write().await;
         let context = tenants.get_mut(&tenant_id)
@@ -504,7 +549,7 @@ impl MultiTenantExecutionHandler {
 
         let mut loaded = 0;
         for credential in &credentials {
-            match context.add_exchange(credential).await {
+            match context.add_exchange_with(credential, self.connector_builder.as_ref()).await {
                 Ok(_) => loaded += 1,
                 Err(e) => {
                     log::error!(

@@ -525,6 +525,13 @@ pub struct HostedObject {
     strategy_manager: Option<StrategyManager>,
     // Phase 2: Ultra-fast order management (853x faster)
     ultra_order_manager: Option<Arc<SignalEngineUltraOrderManager>>,
+    /// Where exchange credentials come from. The caller passes this in (the
+    /// multi-tenant SaaS provider lives outside this public repo). When left
+    /// unset, a `postgres` build falls back to the public-schema
+    /// `SingleTenantDbProvider` bound to the `TENANT_ID` env var -- serving
+    /// that ONE tenant only -- and with no `TENANT_ID` there is no provider
+    /// at all, so no exchange credential is ever loaded (fail closed).
+    credential_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
 }
 
 impl HostedObject {
@@ -539,8 +546,37 @@ impl HostedObject {
             signal_rx: Some(signal_rx),
             strategy_manager: None,
             ultra_order_manager: None, // Will be initialized during run()
+            credential_provider: None,
         }
     }
+
+    /// Inject the tenant-scoped credential provider (see the field docs).
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn smartorderrouter::CredentialProvider>,
+    ) -> Self {
+        self.credential_provider = Some(provider);
+        self
+    }
+}
+
+/// The credential provider to use: the injected one, else (self-hosted
+/// single-tenant fallback) the public-schema provider bound to `TENANT_ID`.
+/// `None` means no credential can be resolved for any tenant.
+#[cfg(feature = "postgres")]
+fn effective_credential_provider(
+    injected: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
+    pool: Option<&Arc<smartorderrouter::DbPool>>,
+) -> Option<Arc<dyn smartorderrouter::CredentialProvider>> {
+    if injected.is_some() {
+        return injected;
+    }
+    let pool = pool?;
+    let tenant_id = std::env::var("TENANT_ID").ok().and_then(|s| uuid::Uuid::parse_str(&s).ok())?;
+    Some(Arc::new(smartorderrouter::SingleTenantDbProvider::self_hosted_single_tenant_only(
+        Arc::clone(pool),
+        tenant_id,
+    )))
 }
 
 impl Default for HostedObject {
@@ -561,11 +597,15 @@ impl HostedObject {
             signal_rx: Some(signal_rx),
             strategy_manager: None,
             ultra_order_manager: None, // Will be initialized during run()
+            credential_provider: None,
         }
     }
 
     /// Create handlers from configuration
-    async fn create_handlers() -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler, Config), Box<dyn Error>> {
+    async fn create_handlers(
+        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
+        injected_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
+    ) -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler, Config), Box<dyn Error>> {
         // Load environment variables
         dotenv().ok();
         
@@ -598,12 +638,23 @@ impl HostedObject {
                 if let Ok(tenant_id) = uuid::Uuid::parse_str(&tenant_id_str) {
                     match smartorderrouter::database::create_pool(&database_url).await {
                         Ok(pool) => {
-                            match execution_handler.initialize_from_database(&pool, tenant_id).await {
-                                Ok(count) => {
-                                    ultra_info!(format!("✅ Loaded {} exchange(s) from database credentials", count));
+                            // Credentials come from the injected provider; the
+                            // fallback is the single-tenant public-schema
+                            // provider bound to THIS process's TENANT_ID.
+                            let pool = Arc::new(pool);
+                            match effective_credential_provider(injected_provider.clone(), Some(&pool)) {
+                                Some(provider) => {
+                                    match execution_handler.initialize_from_provider(provider.as_ref(), tenant_id).await {
+                                        Ok(count) => {
+                                            ultra_info!(format!("✅ Loaded {} exchange(s) from tenant credentials", count));
+                                        }
+                                        Err(e) => {
+                                            ultra_warn!(format!("⚠️ Failed to load tenant credentials: {:?}", e));
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    ultra_warn!(format!("⚠️ Failed to load database credentials: {:?}", e));
+                                None => {
+                                    ultra_warn!("⚠️ No credential provider available; no exchange credentials loaded");
                                 }
                             }
                         }
@@ -754,7 +805,7 @@ impl HostedObject {
         }
         
         // Create handlers (exchanges are loaded from YAML config inside create_handlers)
-        let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers().await?;
+        let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers(self.credential_provider.clone()).await?;
 
         // Capture the market-data receiver BEFORE the datahandler is moved into
         // its blocking task — this is the channel `process_trade()` writes to
@@ -1276,6 +1327,12 @@ impl HostedObject {
         // a pod restart when users edit their API keys in the Settings UI.
         #[cfg(feature = "postgres")]
         let deploy_db_pool_for_handler = deploy_db_pool.clone();
+        // Tenant-scoped credential provider for the Deploy handler (injected, or
+        // the single-tenant fallback bound to TENANT_ID). A deploy event for any
+        // tenant the provider does not serve is rejected below (fail closed).
+        #[cfg(feature = "postgres")]
+        let deploy_credential_provider =
+            effective_credential_provider(self.credential_provider.clone(), deploy_db_pool.as_ref());
         // For exchanges whose fills don't reliably land within
         // `check_order_fill`'s short poll window (Alpaca; see its
         // `subscribe_to_updates`), this is how a WebSocket-confirmed fill
@@ -1542,8 +1599,8 @@ impl HostedObject {
                             // reject the whole deployment (fail-closed).
                             #[cfg(feature = "postgres")]
                             {
-                                if let (Some(ref ultra_mgr), Some(ref pool)) =
-                                    (deployment_ultra_mgr.as_ref(), deploy_db_pool_for_handler.as_ref())
+                                if let (Some(ref ultra_mgr), Some(ref provider)) =
+                                    (deployment_ultra_mgr.as_ref(), deploy_credential_provider.as_ref())
                                 {
                                     let mut rejected = false;
                                     for venue in &venues {
@@ -1551,35 +1608,27 @@ impl HostedObject {
                                         // live_only=true: a live deployment must
                                         // never bind to a testnet/sandbox key.
                                         match handler
-                                            .ensure_exchange_for_tenant(pool, strategy.tenant_id, venue, true)
+                                            .ensure_exchange_for_tenant(provider.as_ref(), strategy.tenant_id, venue, true)
                                             .await
                                         {
-                                            Ok(true) => {
+                                            Ok(()) => {
                                                 ultra_logger::ultra_info!(format!(
                                                     "🔑 Loaded {} credential for tenant {} (deployment {})",
                                                     venue, strategy.tenant_id, strategy.instance_id
                                                 ));
                                             }
-                                            Ok(false) => {
+                                            Err(e) => {
+                                                // Fail closed: no usable non-testnet credential for
+                                                // THIS tenant (or provider/tenant mismatch, or the
+                                                // connector belongs to another tenant).
                                                 ultra_logger::ultra_error!(format!(
-                                                    "❌ Rejected live deployment {} ({}): no enabled \
-                                                     non-testnet credential for exchange '{}' on tenant {}. \
-                                                     Add production API keys via the Settings UI and re-publish.",
+                                                    "❌ Rejected live deployment {} ({}): no usable credential \
+                                                     for exchange '{}' on tenant {}: {:?}. Add production API \
+                                                     keys via the Settings UI and re-publish.",
                                                     strategy.strategy_name,
                                                     strategy.instance_id,
                                                     venue,
                                                     strategy.tenant_id,
-                                                ));
-                                                rejected = true;
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                ultra_logger::ultra_error!(format!(
-                                                    "❌ Rejected live deployment {} ({}): credential load \
-                                                     failed for exchange '{}': {:?}",
-                                                    strategy.strategy_name,
-                                                    strategy.instance_id,
-                                                    venue,
                                                     e,
                                                 ));
                                                 rejected = true;
@@ -1592,8 +1641,8 @@ impl HostedObject {
                                     }
                                 } else {
                                     ultra_logger::ultra_error!(format!(
-                                        "❌ Rejected live deployment {} ({}): no DB pool or order \
-                                         manager available — cannot verify exchange credential.",
+                                        "❌ Rejected live deployment {} ({}): no credential provider or order \
+                                         manager available — cannot resolve a tenant-scoped exchange credential.",
                                         strategy.strategy_name, strategy.instance_id
                                     ));
                                     continue;
@@ -1971,6 +2020,7 @@ impl HostedObjectTrait for HostedObject {
 /// Builder pattern for HostedObject
 pub struct HostedObjectBuilder {
     config_path: Option<String>,
+    credential_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
 }
 
 impl HostedObjectBuilder {
@@ -1978,6 +2028,7 @@ impl HostedObjectBuilder {
     pub fn new() -> Self {
         Self {
             config_path: None,
+            credential_provider: None,
         }
     }
 
@@ -1993,7 +2044,17 @@ impl HostedObjectBuilder {
         if let Some(path) = self.config_path {
             obj.config_path = Some(path);
         }
+        obj.credential_provider = self.credential_provider;
         Ok(obj)
+    }
+
+    /// Inject the tenant-scoped credential provider.
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn smartorderrouter::CredentialProvider>,
+    ) -> Self {
+        self.credential_provider = Some(provider);
+        self
     }
 }
 
