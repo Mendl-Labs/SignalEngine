@@ -48,8 +48,16 @@
 //! * the planner refuses the whole plan ([`PlanError::GrossAboveCap`]) when the sum of `|target|` exceeds
 //!   `max_gross * capital_base`, and ([`PlanError::BuyingPowerRequired`]) when the targets need margin (any short,
 //!   or gross above the broker's equity) and the caller gave no `buying_power`. Whether shorting and leverage are
-//!   PERMITTED is the guard's call, not the planner's: those orders are denied with `SHORTING_FORBIDDEN` /
-//!   `LEVERAGE_FORBIDDEN` and recorded in `denied`.
+//!   PERMITTED is the guard's call, not the planner's, and it is decided from these facts (see
+//!   [`PreTradeGuard::check_signed`]): a short is denied `SHORTING_FORBIDDEN` when the mandate has `shorting: false`
+//!   OR the venue facts for that instrument ([`crate::venue::InstrumentRules`], carried by the
+//!   [`VenueRuleBook`](crate::venue::VenueRuleBook)) forbid it, are absent (unknown: fail closed, nothing is assumed
+//!   allowed) or need a locate that was not supplied. Leverage is denied `LEVERAGE_FORBIDDEN` only when the projected
+//!   GROSS exceeds `min(mandate leverage_max_gross, mandate max_gross, the instrument's venue max_leverage)` times
+//!   the capital base; a short by itself is not leverage, so a long/short book within 1x gross needs no leverage
+//!   allowance. An order that would take a position above the venue's `max_position_units` is denied `MAX_POSITION`
+//!   (never clipped). Denied orders are recorded in `denied`. The planner's own gross check on the targets
+//!   ([`PlanError::GrossAboveCap`]) stays the mandate's cap; the venue's per-instrument limits bind in the guard.
 //! * `delta = target - held * price` is signed. A trade that moves toward zero is a REDUCTION (a sell of a long, a
 //!   buy that covers a short); one that moves away is an INCREASE. Reductions are ordered first, increases second,
 //!   each by (venue, symbol): risk is taken off before it is added, on any book.
@@ -61,8 +69,11 @@
 //! * A held short is no longer skipped (`ShortPositionHeld` remains for long-only instruments).
 //! * Increases are limited by the caller's `buying_power` (the broker's own number), not by cash: see
 //!   [`PlanConfig::buying_power`]. Without it (a plan that needs no margin) the plain cash rule above applies.
-//! * Each order carries `uses_margin`, derived from the account state by [`crate::guard::margin_use`], and the
-//!   guard is called through [`PreTradeGuard::check_margin`].
+//! * Each order carries `uses_margin`, derived from the account state by [`crate::guard::margin_use`] as
+//!   informational data (it denies nothing by itself), and the guard is called through
+//!   [`PreTradeGuard::check_signed`] with the rule book's instrument facts.
+//! * A signed plan's inputs digest also covers the venue facts of every managed instrument (a long-only plan's
+//!   digest is unchanged, and never consults them).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -780,7 +791,14 @@ impl OrderPlanner {
             let verdict = if signed_plan {
                 // Margin use is DATA derived from the simulated account, not a constant.
                 proposed.uses_margin = margin_use(sim, &proposed, c.price.price)?;
-                PreTradeGuard::check_margin(policy, sim, &proposed, day, &MarginContext { buying_power_left: bp_left })
+                PreTradeGuard::check_signed(
+                    policy,
+                    sim,
+                    &proposed,
+                    day,
+                    &MarginContext { buying_power_left: bp_left },
+                    venue_rules.instrument_rules(),
+                )
             } else {
                 PreTradeGuard::check(policy, sim, &proposed, day)
             };
@@ -984,6 +1002,9 @@ fn digest_inputs(
             lines.push(format!("signed|{id}|{}", dtxt(*max)));
         }
         lines.push(format!("buying_power|{}", cfg.buying_power.map_or("-".to_string(), dtxt)));
+        for m in managed.values() {
+            lines.push(format!("instrument_rule|{}|{}|{}", m.venue, m.symbol, venue_rules.instrument_rules().fingerprint(&m.venue, &m.symbol)));
+        }
     }
     for m in managed.values() {
         if let Some(r) = venue_rules.get(&m.venue) {

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use mandate_core::mandate::MandateBody;
 use rebalancer_core::guard::{AccountView, DayCounters, Position, PricePoint, ProposedOrder};
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus, Policy};
+use rebalancer_core::venue::{InstrumentRules, InstrumentVenueRule};
 use rebalancer_core::Dec;
 use serde_json::Value;
 
@@ -51,6 +52,20 @@ pub fn venue_and_class(symbol: &str) -> (&'static str, &'static str) {
         "BTC/USD" | "ETH/USD" => ("kraken", "crypto_spot"),
         _ => ("alpaca", "us_etf"),
     }
+}
+
+/// Venue facts under which every instrument the signed tests use may be sold short (Alpaca ETFs and Kraken spot
+/// margin pairs). The signed guard denies a short in an instrument it has no rule for, so a test that wants shorts
+/// to be allowed must say so with data, as a real caller would read it from the broker.
+pub fn shortable_everywhere() -> InstrumentRules {
+    let mut r = InstrumentRules::new();
+    for s in ["SPY", "EFA", "IEF", "DBC", "VNQ", "QQQ"] {
+        r = r.with_rule("alpaca", s, InstrumentVenueRule::shortable());
+    }
+    for s in ["BTC/USD", "ETH/USD"] {
+        r = r.with_rule("kraken", s, InstrumentVenueRule::shortable());
+    }
+    r
 }
 
 pub fn pos(symbol: &str, qty: &str, mv: &str) -> Position {

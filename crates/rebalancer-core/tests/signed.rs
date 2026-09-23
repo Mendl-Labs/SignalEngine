@@ -101,7 +101,7 @@ impl Env {
     fn plan(&self, targets: &[SleeveTarget], account: &AccountView, policy: &Policy, cfg: &PlanConfig) -> Result<OrderPlan, PlanError> {
         let kraken = KrakenRules { pairs: &self.pairs };
         let alpaca = AlpacaRules { assets: &self.assets, options: &self.opts };
-        let book = VenueRuleBook::new().with("kraken", &kraken).with("alpaca", &alpaca);
+        let book = VenueRuleBook::new().with("kraken", &kraken).with("alpaca", &alpaca).with_instrument_rules(shortable_everywhere());
         OrderPlanner::plan(targets, account, &prices(), &book, policy, cfg)
     }
 
@@ -236,8 +236,9 @@ fn shorting_off_in_the_mandate_denies_the_short_with_the_existing_code() {
 }
 
 #[test]
-fn no_leverage_in_the_mandate_denies_a_short_as_margin_use() {
-    // leverage 1x: a short (margin) is refused even though shorting is permitted. The long is unaffected.
+fn a_short_within_the_gross_cap_is_not_leverage_even_at_one_x() {
+    // leverage 1x, shorting permitted, gross 4000 of 20000: a short by itself is not leverage (VENUE_FACTS.md), so both
+    // legs go. (Before venue rules, the short was denied LEVERAGE_FORBIDDEN as "margin use".)
     let pol = signed_policy(|m| {
         m["universe"]["leverage_max_gross"] = json!(1.0);
         m["exposure"]["max_gross"] = json!(1.0);
@@ -245,9 +246,11 @@ fn no_leverage_in_the_mandate_denies_a_short_as_margin_use() {
         m["exposure"]["max_position"] = json!(1.0);
     });
     let plan = Env::new().ok(&ls(&[("SPY", "0.1"), ("EFA", "-0.1")]), &acct("20000", vec![]), &pol, &cfg());
-    assert_eq!(denial_codes(&plan), vec![DenialCode::LeverageForbidden], "{:#?}", plan.denied);
-    assert_eq!(plan.denied[0].order.symbol, "EFA");
-    assert_eq!(brief(&plan), vec![("SPY".to_string(), Side::Buy, "4".to_string())]);
+    assert!(plan.denied.is_empty(), "{:#?}", plan.denied);
+    assert_eq!(
+        brief(&plan),
+        vec![("EFA".to_string(), Side::Sell, "25".to_string()), ("SPY".to_string(), Side::Buy, "4".to_string())]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -486,7 +489,7 @@ fn ctx(bp: Option<&str>) -> MarginContext {
 }
 
 fn cm(p: &Policy, a: &AccountView, o: &ProposedOrder, bp: Option<&str>) -> rebalancer_core::guard::Verdict {
-    PreTradeGuard::check_margin(p, a, o, &day0(), &ctx(bp))
+    PreTradeGuard::check_signed(p, a, o, &day0(), &ctx(bp), &shortable_everywhere())
 }
 
 #[test]
@@ -496,14 +499,14 @@ fn the_guard_derives_margin_use_itself_even_when_the_caller_says_false() {
     let short = sell("EFA", "25", "80"); // uses_margin: false as built
     // The plain check is unchanged: it does not derive anything.
     assert!(PreTradeGuard::check(&p, &flat, &short, &day0()).allow);
-    // With a margin context the short is margin use and the mandate has no leverage.
+    // With a margin context the short is margin use (data), but gross stays within the 1x cap: not leverage.
     let v = cm(&p, &flat, &short, Some("50000"));
-    assert_eq!(v.codes(), vec![DenialCode::LeverageForbidden], "{:?}", v.reasons);
-    // The caller's own flag still works through both entry points.
+    assert!(v.allow, "{:?}", v.reasons);
+    // The caller's own flag still denies through the plain entry point; the signed one tests gross instead.
     let mut flagged = buy("SPY", "1", "500");
     flagged.uses_margin = true;
     assert!(PreTradeGuard::check(&p, &flat, &flagged, &day0()).has(DenialCode::LeverageForbidden));
-    assert!(cm(&p, &flat, &flagged, Some("50000")).has(DenialCode::LeverageForbidden));
+    assert!(!cm(&p, &flat, &flagged, Some("50000")).has(DenialCode::LeverageForbidden));
     // A levered long: equity 20000, holds SPY 36 (18000), cash 2000; buying 26 EFA (2080) takes gross to 20080.
     let held = acct("2000", vec![pos("SPY", "36", "18000")]);
     assert_eq!(margin_use(&held, &buy("EFA", "26", "80"), d("80")), Ok(true));

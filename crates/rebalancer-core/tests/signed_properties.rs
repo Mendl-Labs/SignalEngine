@@ -210,7 +210,7 @@ fn run_with(
 ) -> Result<OrderPlan, PlanError> {
     let k = KrakenRules { pairs: &env.pairs };
     let a = AlpacaRules { assets: &env.assets, options: &env.opts };
-    let book = VenueRuleBook::new().with("kraken", &k).with("alpaca", &a);
+    let book = VenueRuleBook::new().with("kraken", &k).with("alpaca", &a).with_instrument_rules(shortable_everywhere());
     OrderPlanner::plan(targets, account, prices, &book, policy, cfg)
 }
 
