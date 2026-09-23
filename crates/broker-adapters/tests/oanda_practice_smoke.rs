@@ -19,7 +19,7 @@
 //!   tries to close the position again if the test panics half way.
 //!
 //! WHAT IT DOES: read-only summary / instruments / pricing / open positions / pending orders; then a 1-unit EUR_USD market
-//! buy with a unique tag; verifies the transaction scan finds it by tag (and that `GET /orders/@tag` does NOT, as measured);
+//! buy with a unique tag; verifies the transaction scan finds it by tag (it reports, but does not assert, whether `GET /orders/@tag` finds it: that answered 404 once and 200 later);
 //! closes it with the one-sided close; verifies the account is flat again. It also places a far-away 1-unit LIMIT buy,
 //! finds it by the pending lookup and cancels it.
 //!
@@ -137,7 +137,10 @@ fn oanda_practice_smoke() {
     let (cancelled, report) = adapter.cancel_and_settle(&limit_id).expect("cancel: THE FIRST REAL PUT WITH NO BODY through reqwest");
     println!("smoke: limit order {limit_id} cancelled ({} cancelled, now {:?})", cancelled.canceled_count, report.status);
     assert_eq!(report.status, OrderStatus::Canceled);
-    assert!(adapter.get_pending_order_by_tag(&limit_tag).expect("pending lookup after cancel").is_none(), "MEASURED: a cancelled order is not found by client id");
+    // OBSERVED, NOT ASSERTED: whether OANDA answers a client-id lookup for a CANCELLED order was 404 in one run (2026-09-23 21:14Z)
+    // and 200 in later runs (22:30Z and after), so lookup by client id is not a reliable signal either way. The transaction scan below is.
+    let after_cancel = adapter.get_pending_order_by_tag(&limit_tag).expect("lookup after cancel");
+    println!("smoke: client-id lookup of the CANCELLED order: {}", if after_cancel.is_some() { "found" } else { "not found" });
     assert_eq!(adapter.find_orders_by_tag(&limit_tag).expect("scan lookup").len(), 1, "but the transaction stream still knows it");
 
     // ---- a 1-unit market buy, found by the transaction scan
@@ -158,7 +161,9 @@ fn oanda_practice_smoke() {
     assert_eq!(scan.orders.len(), 1, "the transaction scan finds the order by its tag");
     assert_eq!(scan.orders[0].order_id, buy_id);
     assert_eq!(scan.orders[0].fills.len(), 1, "with its fill");
-    assert!(adapter.get_pending_order_by_tag(&buy_tag).expect("pending lookup").is_none(), "MEASURED: a filled market order is NOT found by client id");
+    // OBSERVED, NOT ASSERTED (see above): a client-id lookup of a FILLED market order answered 404 once and 200 later.
+    let by_id = adapter.get_pending_order_by_tag(&buy_tag).expect("lookup");
+    println!("smoke: client-id lookup of the FILLED order: {}", if by_id.is_some() { "found" } else { "not found" });
     let found = adapter.find_orders_by_tag(&buy_tag).expect("lookup by tag");
     assert_eq!(found.len(), 1);
     assert_eq!((found[0].status, found[0].executed_quantity), (OrderStatus::Filled, Dec::parse("1").unwrap()));
