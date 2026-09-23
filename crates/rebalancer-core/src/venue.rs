@@ -1,9 +1,10 @@
 //! Venue size rules for the planner, taken from the broker adapters and NOT re-stated here.
 //!
-//! The planner asks a [`VenueRules`] to turn a wanted quantity into one the venue will accept. The two provided
+//! The planner asks a [`VenueRules`] to turn a wanted quantity into one the venue will accept. The provided
 //! implementations call the adapters' own `prepare_order` (Kraken: lot decimals, `ordermin`, `costmin`, pair
-//! status; Alpaca: fractionable vs whole shares, minimum order size, minimum notional, tradable status), with a
-//! market-order probe request. Two consequences worth knowing:
+//! status; Alpaca: fractionable vs whole shares, minimum order size, minimum notional, tradable status; OANDA:
+//! `tradeUnitsPrecision`, `minimumTradeSize`, `maximumOrderUnits`), with a market-order probe request. Two
+//! consequences worth knowing:
 //! * no venue constant lives in this crate, and a change to an adapter table or rule changes the plan with it;
 //! * a quantity the planner emits is one the adapter's `prepare_order` accepts unchanged, so the order the plan
 //!   proposes is the order that will be sent (the adapter rounds down again; that is a no-op on a rounded value).
@@ -15,6 +16,7 @@ use std::collections::BTreeMap;
 use broker_adapters::alpaca::{self, AssetTable};
 use broker_adapters::kraken::order::{prepare_order as kraken_prepare, PrepareOptions as KrakenPrepareOptions};
 use broker_adapters::kraken::pairs::PairTable;
+use broker_adapters::oanda;
 use broker_adapters::{BrokerError, Dec, OrderRequest, Side};
 
 /// Why a quantity could not be turned into a sendable order size.
@@ -105,7 +107,32 @@ impl VenueRules for AlpacaRules<'_> {
     }
 }
 
-/// The venue rule sets a plan may use, keyed by lower-case venue name (`"kraken"`, `"alpaca"`).
+/// OANDA FX rules from an [`InstrumentTable`](oanda::InstrumentTable) (the broker's own instrument list: unit
+/// precision, minimum trade size, maximum order units) and the adapter's [`oanda::PrepareOptions`]. Added after the
+/// Kraken and Alpaca rules and independent of them. Unlike Kraken/Alpaca there is NO minimum notional at OANDA, so
+/// the reference `price` argument is ignored; the returned quantity is a MAGNITUDE (the side gives the sign).
+/// A table with no row for the instrument (nothing is built in) is `UnknownInstrument`, never a guess.
+pub struct OandaRules<'a> {
+    pub instruments: &'a oanda::InstrumentTable,
+    pub options: &'a oanda::PrepareOptions,
+}
+
+impl VenueRules for OandaRules<'_> {
+    fn round_quantity(&self, symbol: &str, side: Side, quantity: Dec, _price: Dec) -> Result<Dec, SizeRefusal> {
+        let info = self.instruments.lookup(symbol).ok_or_else(|| SizeRefusal::UnknownInstrument(symbol.to_string()))?;
+        let prefix = self.options.own_tag_prefix.clone().unwrap_or_default();
+        let req = OrderRequest::market(&format!("{prefix}size-probe"), symbol, side, quantity);
+        oanda::order::prepare_order(&req, info, self.options).map(|p| p.quantity).map_err(|e| map_error(symbol, e))
+    }
+
+    fn fingerprint(&self, symbol: &str) -> String {
+        // Canonical spelling, so `EUR/USD` and `EUR_USD` give the same plan digest.
+        let canonical = oanda::canonical_symbol(symbol).unwrap_or_else(|_| symbol.to_string());
+        format!("oanda:{canonical}:{:?}", self.instruments.lookup(symbol))
+    }
+}
+
+/// The venue rule sets a plan may use, keyed by lower-case venue name (`"kraken"`, `"alpaca"`, `"oanda"`).
 #[derive(Default)]
 pub struct VenueRuleBook<'a> {
     by_venue: BTreeMap<String, &'a dyn VenueRules>,

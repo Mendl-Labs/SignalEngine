@@ -14,14 +14,33 @@
 //!   margin is in use and reconciliation halts), holdings are `GET /v2/positions` with the broker's own signed
 //!   `market_value`. A blocked or inactive account is refused outright.
 //!
-//! In both cases `derived_equity` = `cash + sum(holdings market value)` is OUR arithmetic over the broker's own
-//! numbers, kept only as a cross-check of the broker's equity figure (reads happen at slightly different instants,
-//! so reconciliation allows a percentage tolerance). The risk overlay never uses it: risk uses the broker's `equity`.
+//! * **OANDA** (`oanda_snapshot`, NEVER exercised against a real OANDA account): a MARGIN account, so the spot
+//!   equation `equity = cash + sum(holdings)` does not hold and is not faked. `equity` is the broker-reported `NAV`;
+//!   `cash` is the broker-reported realised `balance` (NOT free cash: margin is a separate figure, carried in
+//!   [`MarginInfo`] next to the snapshot in [`OandaSnapshot`], never invented); holdings are the open positions
+//!   with SIGNED NET units (long positive, short negative, `long.units + short.units`). A holding's `market_value`
+//!   is the signed NOTIONAL in the account currency, our arithmetic over broker numbers: `units * mid * factor`,
+//!   where `mid` is the mid of the instrument's `pricing` bid/ask (a closed market has no liquidity: then the mid of
+//!   the broker's own `closeoutBid`/`closeoutAsk`, so positions stay visible over a weekend) and `factor` converts the instrument's quote
+//!   currency into the account currency (1 when they are the same, otherwise the `positionValue` factor of the
+//!   pricing response's `homeConversions`). No price or no conversion means the position is listed in `unvalued`
+//!   (reconciliation halts on it), never valued at a guess. `derived_equity` is `balance + sum(position
+//!   unrealizedPL)`, all broker numbers (OANDA documents `NAV = balance + unrealizedPL`), so it cross-checks the NAV
+//!   and does NOT include notional. A hedging account, or a position with both long and short units, is refused.
+//!   Consumers built for spot (reconciliation's expected-cash model, the guard's cash test, the planner) still
+//!   assume that a trade moves cash by its cost; on a margin account it does not, so they are NOT yet correct for
+//!   FX: that is the leverage/signed-weight work (B3), not done here.
+//!
+//! In every case `derived_equity` is OUR arithmetic over the broker's own numbers, kept only as a cross-check of the
+//! broker's equity figure (reads happen at slightly different instants, so reconciliation allows a percentage
+//! tolerance). The risk overlay never uses it: risk uses the broker's `equity`.
 
 use std::collections::BTreeMap;
 
 use broker_adapters::alpaca::{AccountInfo, PositionInfo};
 use broker_adapters::kraken::parse::TradeBalance;
+use broker_adapters::oanda::instrument::{canonical_symbol, quote_currency};
+use broker_adapters::oanda::{AccountSummary, OandaPosition, Pricing};
 use broker_adapters::{Balances, BalanceKind, Dec, OrderReport};
 use chrono::{DateTime, Utc};
 use rebalancer_core::dec_math::{add, mul};
@@ -246,4 +265,119 @@ pub fn alpaca_snapshot(
         taken_at: now,
         derived_equity: derived,
     })
+}
+
+/// The margin figures of an OANDA account exactly as the broker reported them (nothing derived). Kept beside the
+/// [`BrokerSnapshot`] because the snapshot has no place for margin and the venue-neutral consumers do not use it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarginInfo {
+    /// Account (home) currency, upper-case.
+    pub currency: String,
+    /// Net asset value.
+    pub nav: Dec,
+    /// Realised balance.
+    pub balance: Dec,
+    /// Unrealised P&L of the open positions, account currency.
+    pub unrealized_pl: Dec,
+    pub margin_used: Dec,
+    pub margin_available: Dec,
+    /// Total position value the broker reports (`positionValue`), when present.
+    pub position_value: Option<Dec>,
+    /// `marginCloseoutPercent` (a fraction: 0.5 means closeout at 50 percent margin used), when present.
+    pub margin_closeout_percent: Option<Dec>,
+    pub margin_rate: Option<Dec>,
+    pub open_position_count: Option<u32>,
+    pub pending_order_count: Option<u32>,
+}
+
+/// An OANDA reading: the venue-neutral snapshot plus the broker's margin figures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OandaSnapshot {
+    pub snapshot: BrokerSnapshot,
+    pub margin: MarginInfo,
+}
+
+/// Inputs of the OANDA builder: three raw reads plus pricing for the instruments held.
+pub struct OandaViewInput<'a> {
+    pub account: &'a AccountSummary,
+    pub positions: &'a [OandaPosition],
+    pub open_orders: Vec<OrderReport>,
+    /// Prices (and home conversions) for every held instrument. Missing entries make that holding `unvalued`.
+    pub pricing: &'a Pricing,
+    /// Asset class stamped on every holding (`fx_spot`).
+    pub asset_class: &'a str,
+}
+
+/// Build a snapshot from OANDA's account summary, open positions, pending orders and pricing (see the module docs for
+/// the definitions). Refuses a hedging account and any hedged position; signed net units keep the direction.
+pub fn oanda_snapshot(input: &OandaViewInput<'_>, now: DateTime<Utc>) -> Result<OandaSnapshot, ViewError> {
+    let a = input.account;
+    if a.hedging_enabled {
+        return Err(ViewError::AccountBlocked("hedgingEnabled=true: only netting accounts are supported".into()));
+    }
+    let ccy = a.currency.trim().to_uppercase();
+    let mut holdings = Vec::new();
+    let mut unvalued = Vec::new();
+    let mut derived = a.balance;
+    for p in input.positions {
+        if p.is_hedged() {
+            return Err(ViewError::AccountBlocked(format!("{}: long and short units are both open (hedged position)", p.instrument)));
+        }
+        let net = p.net_units();
+        if net.is_zero() {
+            continue;
+        }
+        derived = add(derived, p.unrealized_pl).map_err(|_| overflow("summing position P&L"))?;
+        let symbol = canonical_symbol(&p.instrument).map_err(|e| ViewError::AccountBlocked(format!("{}: {e}", p.instrument)))?;
+        let mark = input.pricing.price(&p.instrument).and_then(|q| q.valuation_mid());
+        let factor = match quote_currency(&p.instrument) {
+            Some(q) if q.eq_ignore_ascii_case(&ccy) => Some(Dec::from_i64(1)),
+            Some(q) => input.pricing.conversion(q).map(|c| c.position_value),
+            None => None,
+        };
+        match (mark, factor) {
+            (Some(mark), Some(factor)) => {
+                let notional = mul(net, mark).and_then(|v| mul(v, factor)).map_err(|_| overflow("valuing a position"))?;
+                holdings.push(Holding { symbol, asset_class: input.asset_class.to_string(), quantity: net, mark: Some(mark), market_value: notional });
+            }
+            (None, _) => unvalued.push(UnvaluedHolding {
+                asset: symbol.clone(),
+                quantity: net,
+                reason: format!("no usable price for {symbol} (missing, one-sided, crossed)"),
+            }),
+            (_, None) => unvalued.push(UnvaluedHolding {
+                asset: symbol.clone(),
+                quantity: net,
+                reason: format!("no conversion from the quote currency of {symbol} to {ccy}"),
+            }),
+        }
+    }
+    holdings.sort_by(|x, y| x.symbol.cmp(&y.symbol));
+    unvalued.sort_by(|x, y| x.asset.cmp(&y.asset));
+    let snapshot = BrokerSnapshot {
+        venue: "oanda".to_string(),
+        ccy: ccy.clone(),
+        equity: a.nav,
+        cash: a.balance,
+        holdings,
+        unvalued,
+        open_orders: input.open_orders.clone(),
+        excluded_balances: Vec::new(),
+        taken_at: now,
+        derived_equity: derived,
+    };
+    let margin = MarginInfo {
+        currency: ccy,
+        nav: a.nav,
+        balance: a.balance,
+        unrealized_pl: a.unrealized_pl,
+        margin_used: a.margin_used,
+        margin_available: a.margin_available,
+        position_value: a.position_value,
+        margin_closeout_percent: a.margin_closeout_percent,
+        margin_rate: a.margin_rate,
+        open_position_count: a.open_position_count,
+        pending_order_count: a.pending_order_count,
+    };
+    Ok(OandaSnapshot { snapshot, margin })
 }
