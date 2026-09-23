@@ -268,3 +268,18 @@ fn a_recorded_request_debug_redacts_the_authorization_header() {
     let dbg = format!("{req:?}");
     assert!(!dbg.contains(TOKEN) && dbg.contains("<redacted>"), "{dbg}");
 }
+
+// ---------------------------------------------------------------- tag-scan options
+
+#[test]
+fn the_restart_scan_window_defaults_to_400_is_bounded_and_strict_mode_is_off_by_default() {
+    use broker_adapters::oanda::DEFAULT_RESTART_SCAN_WINDOW;
+    let c = OandaConfig::practice(PRACTICE_BASE_URL).unwrap();
+    assert_eq!((c.restart_scan_window(), DEFAULT_RESTART_SCAN_WINDOW, c.strict_unseen_tags()), (400, 400, false));
+    assert_eq!(c.clone().with_restart_scan_window(10).unwrap().restart_scan_window(), 10);
+    assert_eq!(c.clone().with_restart_scan_window(100_000).unwrap().restart_scan_window(), 100_000);
+    for bad in [0, 9, 100_001, u64::MAX] {
+        assert!(matches!(c.clone().with_restart_scan_window(bad), Err(BrokerError::Config(_))), "{bad}");
+    }
+    assert!(c.with_strict_unseen_tags(true).strict_unseen_tags());
+}

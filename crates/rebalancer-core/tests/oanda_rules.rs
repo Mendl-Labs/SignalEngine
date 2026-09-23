@@ -18,6 +18,7 @@ fn row(name: &str, units_dp: u32, min: &str, max: &str) -> InstrumentInfo {
         minimum_trade_size: d(min),
         maximum_order_units: d(max),
         margin_rate: d("0.02"),
+        maximum_position_size: None,
     }
 }
 

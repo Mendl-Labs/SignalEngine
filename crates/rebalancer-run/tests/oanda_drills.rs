@@ -172,14 +172,17 @@ fn a_closed_market_is_an_alert_not_a_hang_and_a_later_flatten_with_the_same_key_
 // ---------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn a_sell_whose_answer_is_lost_is_adopted_by_tag_and_sold_exactly_once() {
+fn a_sell_whose_answer_is_lost_is_found_in_the_transaction_stream_and_sold_exactly_once() {
+    // The adapter itself resolves the lost answer (it scans the stream from its checkpoint and finds the fill), so flatten
+    // sees an ordinary accepted order rather than an unknown outcome to look up.
     let env = OEnv::new();
     env.hold("EUR_USD", "6000");
     env.rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&env.rig.handle.path("/orders")));
     let r = flat(&env);
     assert_eq!(r.verdict, FlattenVerdict::Flat, "{}", r.summary());
     assert_eq!(r.orders.len(), 1);
-    assert!(r.orders[0].adopted_by_tag, "the order was found by its tag, not resent");
+    assert_eq!(r.orders[0].outcome, FlattenOutcome::Filled);
+    assert_eq!(r.orders[0].executed_quantity, d("6000"));
     assert_eq!(env.sells_applied(), 1, "exactly one sell reached the exchange");
     assert_eq!(env.units("EUR_USD"), Dec::ZERO, "and the account did not go short");
     env.rig.handle.assert_invariants();

@@ -2,7 +2,7 @@
 //! force, position fill, the idempotency key, and the "a market order stays a market order" rule.
 
 use broker_adapters::oanda::instrument::{canonical_symbol, normalize_instrument, quote_currency};
-use broker_adapters::oanda::order::{prepare_order, validate_client_id, PrepareOptions};
+use broker_adapters::oanda::order::{check_position_cap, prepare_order, validate_client_id, PrepareOptions};
 use broker_adapters::oanda::{InstrumentInfo, InstrumentTable};
 use broker_adapters::{BrokerError, Dec, OrderKind, OrderRequest, Side, TimeInForce};
 use serde_json::Value;
@@ -22,6 +22,7 @@ fn info(name: &str, disp: u32, units: u32, min: &str, max: &str) -> InstrumentIn
         minimum_trade_size: d(min),
         maximum_order_units: d(max),
         margin_rate: d("0.02"),
+        maximum_position_size: None,
     }
 }
 
@@ -289,4 +290,46 @@ fn bad_tags_are_refused() {
     assert!(matches!(validate_client_id("other:x", Some("rb1:")), Err(BrokerError::InvalidRequest(_))));
     let opts = PrepareOptions { own_tag_prefix: Some("rb1:".into()), ..PrepareOptions::default() };
     assert!(prepare_order(&OrderRequest::market("other:x", "EUR_USD", Side::Buy, d("1000")), &eurusd(), &opts).is_err());
+}
+
+// ---------------------------------------------------------------- maximumPositionSize
+
+fn capped(cap: &str) -> InstrumentInfo {
+    InstrumentInfo { maximum_position_size: Some(d(cap)), ..eurusd() }
+}
+
+#[test]
+fn maximum_position_size_parses_zero_and_absent_as_no_cap_and_a_positive_value_as_the_cap() {
+    // MEASURED on a practice account: "0" on every instrument, meaning no cap.
+    let row = |cap: Option<&str>| {
+        let mut r = serde_json::json!({"name": "EUR_USD", "type": "CURRENCY", "displayPrecision": 5, "tradeUnitsPrecision": 0,
+            "minimumTradeSize": "1", "maximumOrderUnits": "100000000", "marginRate": "0.02"});
+        if let Some(c) = cap {
+            r["maximumPositionSize"] = serde_json::json!(c);
+        }
+        serde_json::json!({"instruments": [r]}).to_string()
+    };
+    let cap_of = |cap: Option<&str>| InstrumentTable::from_instruments_json(&row(cap)).unwrap().lookup("EUR_USD").unwrap().maximum_position_size;
+    assert_eq!(cap_of(Some("0")), None, "a zero cap is NOT a limit of zero units");
+    assert_eq!(cap_of(Some("0.0")), None);
+    assert_eq!(cap_of(None), None, "absent = no cap");
+    assert_eq!(cap_of(Some("25000")), Some(d("25000")));
+}
+
+#[test]
+fn a_zero_or_absent_cap_never_refuses_and_a_positive_one_refuses_instead_of_truncating() {
+    let none = eurusd();
+    assert!(check_position_cap(&none, d("0"), d("99999999")).is_ok(), "no cap: nothing to check");
+    let c = capped("5000");
+    assert!(check_position_cap(&c, d("0"), d("5000")).is_ok(), "exactly the cap is allowed");
+    assert!(matches!(check_position_cap(&c, d("0"), d("5001")), Err(BrokerError::InvalidRequest(m)) if m.contains("maximumPositionSize") && m.contains("refusing to truncate")));
+    assert!(check_position_cap(&c, d("-4000"), d("-1000")).is_ok());
+    assert!(check_position_cap(&c, d("-4000"), d("-1001")).is_err(), "a short is capped too");
+    // net arithmetic: long 4000 sold 9000 is -5000 (allowed), 9001 is -5001 (refused)
+    assert!(check_position_cap(&c, d("4000"), d("-9000")).is_ok());
+    assert!(check_position_cap(&c, d("4000"), d("-9001")).is_err());
+    // a reduction is always allowed, even from over the cap; growing it is not
+    assert!(check_position_cap(&c, d("6000"), d("-1")).is_ok());
+    assert!(check_position_cap(&c, d("6000"), d("1")).is_err());
+    assert!(check_position_cap(&c, d("6000"), d("-12000")).is_err(), "reducing through zero to -6000 grows the short side beyond the cap");
 }

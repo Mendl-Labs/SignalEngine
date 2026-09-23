@@ -85,6 +85,10 @@ pub struct InstrumentInfo {
     pub maximum_order_units: Dec,
     /// `marginRate` (0.02 = 2 percent = 50:1).
     pub margin_rate: Dec,
+    /// `maximumPositionSize`: `None` = no cap. MEASURED on a practice account (2026-09-23): the string `"0"` on every
+    /// instrument checked, which means NO CAP, never a zero limit. Absent or `"0"` parses to `None`; only a positive
+    /// value is a cap. Enforced (by refusing, never truncating) in `OandaAdapter::place_order`.
+    pub maximum_position_size: Option<Dec>,
 }
 
 impl InstrumentInfo {
@@ -106,6 +110,7 @@ impl InstrumentInfo {
             minimum_trade_size: req_dec(v, "minimumTradeSize")?,
             maximum_order_units: req_dec(v, "maximumOrderUnits")?,
             margin_rate: req_dec(v, "marginRate")?,
+            maximum_position_size: parse_position_cap(v, &name)?,
             kind: opt_str(v, "type").unwrap_or_default(),
             name,
         };
@@ -116,6 +121,17 @@ impl InstrumentInfo {
             return Err(BrokerError::Malformed(format!("instrument {}: maximumOrderUnits is not positive", info.name)));
         }
         Ok(info)
+    }
+}
+
+/// `maximumPositionSize`: absent, `null` or zero mean NO CAP (measured: OANDA reports `"0"` for "no cap"); a positive
+/// value is the cap; a negative or non-numeric value is a malformed row (fail closed).
+fn parse_position_cap(v: &Value, name: &str) -> Result<Option<Dec>, BrokerError> {
+    match crate::oanda::parse::opt_dec(v, "maximumPositionSize")? {
+        None => Ok(None),
+        Some(d) if d.is_zero() => Ok(None),
+        Some(d) if d.is_positive() => Ok(Some(d)),
+        Some(_) => Err(BrokerError::Malformed(format!("instrument {name}: maximumPositionSize is negative"))),
     }
 }
 

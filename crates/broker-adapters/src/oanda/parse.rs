@@ -5,11 +5,15 @@
 //! unparseable is `Malformed`, never a silent zero. OANDA sends amounts, units and prices as
 //! decimal STRINGS; they are parsed to `Dec` exactly (JSON numbers are accepted too).
 //!
-//! Every response shape here is FROM-MEMORY-OF-DOCS unless a comment says otherwise. The single
-//! shape confirmed by repository code is the legacy connector's parse of the order-create response:
-//! `orderCreateTransaction.id`, `orderFillTransaction.{id, units, price}` with `units` a signed
-//! string, and the error body `{"errorCode", "errorMessage"}` (VERIFIED-FROM-REPO-CODE). All
-//! fixtures used against this parser are hand-authored from documentation, not recorded.
+//! PROVENANCE. Shapes MEASURED on an OANDA practice account on 2026-09-23 (recorded, sanitised responses under
+//! `tests/fixtures/oanda/real/`): the order-create response (market fill, resting limit, short sale), the pending-order
+//! lookup and its 404, cancel and cancel-again, position close (long, short, one-sided, nothing open), the reject
+//! shapes, the unknown-instrument `InvalidParameterException`, and `transactions/sinceid`. Everything else here
+//! (account summary, instruments, pricing, open positions, order resources of FILLED/CANCELLED orders read by numeric
+//! id, `GET /transactions/{id}`, cancel-at-creation bodies, 401/403/429/5xx bodies) is still FROM-MEMORY-OF-DOCS and is
+//! exercised only by hand-authored fixtures (labelled as such; see `tests/fixtures/oanda/README.md`).
+//! The legacy connector's parse of `orderCreateTransaction.id` / `orderFillTransaction.{id, units, price}` is
+//! VERIFIED-FROM-REPO-CODE and now also matches the recordings.
 
 use crate::decimal::Dec;
 use crate::error::{BrokerError, ErrorClass, ExchangeError};
@@ -121,7 +125,7 @@ pub fn parse_account_summary(body: &str) -> Result<AccountSummary, BrokerError> 
         open_position_count: opt_u32(a, "openPositionCount"),
         pending_order_count: opt_u32(a, "pendingOrderCount"),
         hedging_enabled: req_bool(a, "hedgingEnabled")?,
-        last_transaction_id: opt_str(&root, "lastTransactionID"),
+        last_transaction_id: opt_str(&root, "lastTransactionID").or_else(|| opt_str(a, "lastTransactionID")),
     })
 }
 
@@ -361,9 +365,12 @@ pub struct RejectInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateInfo {
     pub id: String,
+    /// The transaction type, verbatim (`MARKET_ORDER`, `LIMIT_ORDER`, ...).
     pub kind: String,
     pub instrument: Option<String>,
     pub units: Option<Dec>,
+    pub price: Option<Dec>,
+    pub time_in_force: Option<String>,
     pub client_id: Option<String>,
 }
 
@@ -371,7 +378,7 @@ pub fn client_id_of(v: &Value) -> Option<String> {
     v.get("clientExtensions").and_then(|c| opt_str(c, "id"))
 }
 
-fn parse_fill(v: &Value) -> Result<FillInfo, BrokerError> {
+pub(crate) fn parse_fill(v: &Value) -> Result<FillInfo, BrokerError> {
     Ok(FillInfo {
         id: req_str(v, "id")?.to_string(),
         order_id: req_str(v, "orderID")?.to_string(),
@@ -387,7 +394,7 @@ fn parse_fill(v: &Value) -> Result<FillInfo, BrokerError> {
     })
 }
 
-fn parse_cancel(v: &Value) -> Result<CancelInfo, BrokerError> {
+pub(crate) fn parse_cancel(v: &Value) -> Result<CancelInfo, BrokerError> {
     Ok(CancelInfo {
         id: req_str(v, "id")?.to_string(),
         order_id: req_str(v, "orderID")?.to_string(),
@@ -397,7 +404,7 @@ fn parse_cancel(v: &Value) -> Result<CancelInfo, BrokerError> {
     })
 }
 
-fn parse_reject(v: &Value) -> RejectInfo {
+pub(crate) fn parse_reject(v: &Value) -> RejectInfo {
     RejectInfo {
         id: opt_str(v, "id"),
         reason: opt_str(v, "rejectReason").unwrap_or_else(|| "UNSPECIFIED".to_string()),
@@ -405,12 +412,14 @@ fn parse_reject(v: &Value) -> RejectInfo {
     }
 }
 
-fn parse_create(v: &Value) -> Result<CreateInfo, BrokerError> {
+pub(crate) fn parse_create(v: &Value) -> Result<CreateInfo, BrokerError> {
     Ok(CreateInfo {
         id: req_str(v, "id")?.to_string(),
         kind: opt_str(v, "type").unwrap_or_default(),
         instrument: opt_str(v, "instrument").map(|i| normalize_instrument(&i)).transpose()?,
         units: opt_dec(v, "units")?,
+        price: opt_dec(v, "price")?,
+        time_in_force: opt_str(v, "timeInForce"),
         client_id: client_id_of(v),
     })
 }
@@ -477,6 +486,98 @@ pub fn parse_cancel_response(body: &str) -> Result<CancelInfo, BrokerError> {
     let root = json_of(body, "cancel")?;
     let t = root.get("orderCancelTransaction").ok_or_else(|| BrokerError::Malformed("cancel response has no `orderCancelTransaction`".into()))?;
     parse_cancel(t)
+}
+
+// ---------------------------------------------------------------- transaction stream (sinceid)
+
+/// One transaction of a `GET /transactions/sinceid` page, with the two fields the tag scan needs pulled out.
+///
+/// MEASURED (practice account, 2026-09-23): a `MARKET_ORDER` transaction carries the client id as
+/// `clientExtensions.id`; its `ORDER_FILL` (and `ORDER_CANCEL`, `ORDER_CANCEL_REJECT`) carry it as the top-level
+/// `clientOrderID`. Reject transactions echo `clientExtensions` when the request carried them (NOT yet measured with a
+/// client id present).
+#[derive(Debug, Clone)]
+pub struct TxnRecord {
+    /// Numeric transaction id (OANDA ids are integers, increasing within an account).
+    pub id: u64,
+    pub id_text: String,
+    /// `MARKET_ORDER`, `ORDER_FILL`, `ORDER_CANCEL`, `MARKET_ORDER_REJECT`, ...
+    pub kind: String,
+    /// `orderID` (fills, cancels).
+    pub order_id: Option<String>,
+    /// `clientOrderID`, else `clientExtensions.id`.
+    pub client_id: Option<String>,
+    pub raw: Value,
+}
+
+/// A `sinceid` response: the transactions with id greater than `after_id`, and the account's last transaction id.
+#[derive(Debug, Clone)]
+pub struct TxnPage {
+    pub after_id: u64,
+    pub records: Vec<TxnRecord>,
+    pub last_transaction_id: u64,
+}
+
+impl TxnPage {
+    /// `Ok` when the page provably holds EVERY transaction in `(after_id, last_transaction_id]`: it starts at
+    /// `after_id + 1`, ends at `last_transaction_id`, and an empty page is only consistent with
+    /// `last_transaction_id == after_id`. Anything else (a page the server truncated, gaps, ids out of range, a page
+    /// that ends before the account's last id) is `Err(reason)`: the absence of a tag in it proves nothing.
+    /// Relies on OANDA transaction ids being consecutive within an account, which the recorded practice-account
+    /// stream showed (30, 31, 32, ... including reject transactions); if that ever fails the result is a refusal to
+    /// prove (safe), never a false "not found".
+    pub fn completeness(&self) -> Result<(), String> {
+        let (first, last) = match (self.records.first(), self.records.last()) {
+            (Some(f), Some(l)) => (f.id, l.id),
+            _ => {
+                return if self.last_transaction_id == self.after_id {
+                    Ok(())
+                } else {
+                    Err(format!("empty page after id {} but the account's last transaction id is {}", self.after_id, self.last_transaction_id))
+                }
+            }
+        };
+        if first != self.after_id + 1 {
+            return Err(format!("page starts at id {first}, not {}", self.after_id + 1));
+        }
+        if last != self.last_transaction_id {
+            return Err(format!("page ends at id {last} but the account's last transaction id is {}", self.last_transaction_id));
+        }
+        for w in self.records.windows(2) {
+            if w[1].id != w[0].id + 1 {
+                return Err(format!("gap between transaction {} and {}", w[0].id, w[1].id));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse `GET /transactions/sinceid?id=<after_id>`: `{"transactions": [...], "lastTransactionID": "..."}`.
+pub fn parse_transactions_page(body: &str, after_id: u64) -> Result<TxnPage, BrokerError> {
+    let root = json_of(body, "transactions")?;
+    let arr = root
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BrokerError::Malformed("transactions response has no `transactions` array".into()))?;
+    let last_text = req_str(&root, "lastTransactionID")?;
+    let last_transaction_id = last_text.parse::<u64>().map_err(|_| BrokerError::Malformed(format!("lastTransactionID {last_text:?} is not numeric")))?;
+    let mut records = Vec::with_capacity(arr.len());
+    for t in arr {
+        let id_text = req_str(t, "id")?.to_string();
+        let id = id_text.parse::<u64>().map_err(|_| BrokerError::Malformed(format!("transaction id {id_text:?} is not numeric")))?;
+        if id <= after_id {
+            return Err(BrokerError::Malformed(format!("transaction {id} is not after the requested id {after_id}")));
+        }
+        records.push(TxnRecord {
+            id,
+            id_text,
+            kind: req_str(t, "type")?.to_string(),
+            order_id: opt_str(t, "orderID"),
+            client_id: opt_str(t, "clientOrderID").or_else(|| client_id_of(t)),
+            raw: t.clone(),
+        });
+    }
+    Ok(TxnPage { after_id, records, last_transaction_id })
 }
 
 // ---------------------------------------------------------------- order resources
@@ -738,8 +839,29 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| t.contains(n))
 }
 
+/// Class of a reject reason / error code, from the values MEASURED on a practice account (2026-09-23):
+/// `UNITS_LIMIT_EXCEEDED`, `UNITS_INVALID`, `TIME_IN_FORCE_INVALID`, `UNITS_PRECISION_EXCEEDED` and
+/// `CLIENT_ORDER_ID_INVALID` (HTTP 400 with a `MARKET_ORDER_REJECT` whose `rejectReason` equals the `errorCode`), and
+/// the unknown-instrument shape (HTTP 400, `errorCode` `oanda::rest::core::InvalidParameterException`, NO reject
+/// transaction). `None` for a value this table does not know (the caller falls back to keyword matching).
+pub fn classify_reject_reason(reason: &str) -> Option<ErrorClass> {
+    Some(match reason {
+        "UNITS_LIMIT_EXCEEDED" | "UNITS_INVALID" | "UNITS_PRECISION_EXCEEDED" | "UNITS_MINIMUM_NOT_MET" | "TIME_IN_FORCE_INVALID"
+        | "CLIENT_ORDER_ID_INVALID" | "PRICE_PRECISION_EXCEEDED" | "INSTRUMENT_INVALID" | INVALID_PARAMETER_EXCEPTION => ErrorClass::InvalidArguments,
+        "ORDER_DOESNT_EXIST" | "NO_SUCH_ORDER" | "CLOSEOUT_POSITION_DOESNT_EXIST" => ErrorClass::UnknownOrder,
+        _ => return None,
+    })
+}
+
+/// The `errorCode` OANDA answers with (HTTP 400, no reject transaction) for a request whose parameter it cannot parse,
+/// for example an unknown instrument name. MEASURED 2026-09-23.
+pub const INVALID_PARAMETER_EXCEPTION: &str = "oanda::rest::core::InvalidParameterException";
+
 /// Class of a definite rejection from its reason / code / message.
 pub fn classify_rejection(api: &ApiError) -> ErrorClass {
+    if let Some(class) = api.reject_reason.as_deref().and_then(classify_reject_reason).or_else(|| api.code.as_deref().and_then(classify_reject_reason)) {
+        return class;
+    }
     let hay = format!(
         "{} {} {}",
         api.reject_reason.as_deref().unwrap_or(""),

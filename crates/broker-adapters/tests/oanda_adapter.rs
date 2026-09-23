@@ -1,8 +1,13 @@
-//! End-to-end OANDA adapter behaviour over hand-authored JSON fixtures and `FakeTransport`.
+//! End-to-end OANDA adapter behaviour over JSON fixtures and `FakeTransport`.
 //!
-//! PROVENANCE: the fixtures in `tests/fixtures/oanda/` are AUTHORED FROM DOCUMENTATION, not recorded
-//! from a live or practice account (see `gen_fixtures.py`). These tests prove the adapter handles the
-//! shapes we BELIEVE OANDA sends; they cannot prove OANDA sends them (Rung 3).
+//! PROVENANCE, two kinds of fixture (see `tests/fixtures/oanda/README.md`):
+//! * `rfx!(..)` = RECORDED from an OANDA practice account on 2026-09-23 (`tests/fixtures/oanda/real/`, account and user ids
+//!   removed). Where a test says DERIVED it starts from a recording and adds one field, and says which.
+//! * `fx!(..)` = AUTHORED FROM DOCUMENTATION for shapes that have NOT been measured (account summary, instruments, positions,
+//!   pricing, finished orders read by numeric id, cancel-at-creation, generic error bodies). These tests prove the adapter
+//!   handles the shapes we BELIEVE OANDA sends; they cannot prove OANDA sends them.
+//!
+//! Every adapter is built with a recent-transaction window of `WINDOW` ids so a scan page is small and easy to state.
 
 use broker_adapters::oanda::{
     CloseOutcome, Environment, InstrumentTable, OandaAdapter, OandaConfig, OandaCredentials, PRACTICE_BASE_URL,
@@ -11,6 +16,8 @@ use broker_adapters::testing::FakeTransport;
 use broker_adapters::transport::{HttpMethod, HttpRequest, HttpResponseDetailed, TransportError};
 use broker_adapters::types::{BalanceKind, BrokerAdapter, OrderKind, OrderRequest, OrderStatus, PlaceOutcome, Side, TimeInForce};
 use broker_adapters::{BrokerError, Dec, ErrorClass};
+use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 const TOKEN: &str = "tok-9f3a-unit-test-not-a-real-token";
@@ -19,11 +26,25 @@ const TAG: &str = "rb1:run1:EUR/USD:buy";
 const SELL_TAG: &str = "rb1:run1:EUR/USD:sell";
 /// `TAG` as it appears in a URL path after `@` (percent-encoded).
 const TAG_PATH: &str = "%40rb1%3Arun1%3AEUR%2FUSD%3Abuy";
-const SELL_TAG_PATH: &str = "%40rb1%3Arun1%3AEUR%2FUSD%3Asell";
+/// Client ids of the RECORDED responses.
+const R_TAG: &str = "lookup-filled-20260923T211402Z";
+const R_LIMIT_TAG: &str = "limit-20260923T211402Z";
+const R_SCAN_TAG: &str = "txscan-20260923T211519Z";
+/// The recent-transaction window every test adapter scans (production default: 400).
+const WINDOW: u64 = 10;
+/// `lastTransactionID` of `account_summary_ok.json`.
+const LAST: u64 = 6400;
 
 macro_rules! fx {
     ($name:literal) => {
         include_str!(concat!("fixtures/oanda/", $name))
+    };
+}
+
+/// A RECORDED response (real practice account, 2026-09-23).
+macro_rules! rfx {
+    ($name:literal) => {
+        include_str!(concat!("fixtures/oanda/real/oanda_211402__", $name, ".json"))
     };
 }
 
@@ -37,6 +58,8 @@ fn d(s: &str) -> Dec {
 enum Reply {
     Http(u16, String, Vec<(String, String)>),
     Err(TransportError),
+    /// Answers in order; the last answer repeats.
+    Seq(Arc<Mutex<VecDeque<(u16, String)>>>),
 }
 
 #[derive(Clone)]
@@ -63,6 +86,11 @@ impl Routes {
     fn put(self, path: &str, status: u16, body: &str) -> Self {
         self.on(HttpMethod::Put, path, status, body)
     }
+    fn get_seq(mut self, path: &str, seq: &[(u16, String)]) -> Self {
+        let q: VecDeque<(u16, String)> = seq.iter().cloned().collect();
+        self.0.push(Route { method: HttpMethod::Get, path: path.to_string(), reply: Reply::Seq(Arc::new(Mutex::new(q))) });
+        self
+    }
     fn fail(mut self, method: HttpMethod, path: &str, e: TransportError) -> Self {
         self.0.push(Route { method, path: path.to_string(), reply: Reply::Err(e) });
         self
@@ -84,6 +112,11 @@ impl Routes {
                     return match &r.reply {
                         Reply::Http(status, body, headers) => Ok(HttpResponseDetailed { status: *status, body: body.clone(), headers: headers.clone() }),
                         Reply::Err(e) => Err(e.clone()),
+                        Reply::Seq(q) => {
+                            let mut q = q.lock().unwrap();
+                            let (status, body) = if q.len() > 1 { q.pop_front().unwrap() } else { q.front().unwrap().clone() };
+                            Ok(HttpResponseDetailed { status, body, headers: Vec::new() })
+                        }
                     };
                 }
             }
@@ -102,7 +135,7 @@ fn tag_lookup(tag_path: &str) -> String {
 
 fn setup_with(f: impl FnOnce(OandaConfig) -> OandaConfig) -> (OandaAdapter, Arc<FakeTransport>) {
     let t = Arc::new(FakeTransport::new());
-    let cfg = f(OandaConfig::practice(PRACTICE_BASE_URL).unwrap());
+    let cfg = f(OandaConfig::practice(PRACTICE_BASE_URL).unwrap().with_restart_scan_window(WINDOW).unwrap());
     let creds = OandaCredentials::new(Environment::Practice, TOKEN, ACCT).unwrap();
     let a = OandaAdapter::new(cfg, creds, t.clone()).unwrap();
     a.set_instruments(InstrumentTable::from_instruments_json(fx!("instruments_ok.json")).unwrap());
@@ -137,21 +170,119 @@ fn buy_req() -> OrderRequest {
     OrderRequest::market(TAG, "EUR/USD", Side::Buy, d("1000"))
 }
 
-fn sell_req() -> OrderRequest {
-    OrderRequest::market(SELL_TAG, "EUR/USD", Side::Sell, d("1000"))
+
+/// `%40<tag>` with the tag percent-encoded like the adapter does (RFC 3986 unreserved characters stay).
+fn pending_lookup(tag: &str) -> String {
+    let mut out = String::from("%40");
+    for b in tag.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    p(&format!("/orders/{out}"))
 }
 
-/// Routes for a placement whose POST answers `(status, body)`: account fine, tag not found.
-fn place_routes(tag_path: &str, post_status: u16, post_body: &str) -> Routes {
+/// `GET /transactions/sinceid?id=<after>`.
+fn scan_path(after: u64) -> String {
+    p(&format!("/transactions/sinceid?id={after}"))
+}
+
+/// A COMPLETE sinceid page for ids `after+1 ..= last`: the given records where their ids match, an unrelated
+/// `DAILY_FINANCING` transaction (no client id) everywhere else.
+fn page(after: u64, last: u64, records: &[Value]) -> String {
+    let mut out = Vec::new();
+    for id in after + 1..=last {
+        let want = id.to_string();
+        match records.iter().find(|r| r["id"].as_str() == Some(want.as_str())) {
+            Some(r) => out.push(r.clone()),
+            None => out.push(json!({"id": want, "type": "DAILY_FINANCING", "financing": "0.0000"})),
+        }
+    }
+    json!({"transactions": out, "lastTransactionID": last.to_string()}).to_string()
+}
+
+/// The authored account summary with another `lastTransactionID`.
+fn summary_with_last(last: u64) -> String {
+    let mut v: Value = serde_json::from_str(fx!("account_summary_ok.json")).unwrap();
+    v["lastTransactionID"] = json!(last.to_string());
+    v["account"]["lastTransactionID"] = json!(last.to_string());
+    v.to_string()
+}
+
+fn real_json(body: &str) -> Value {
+    serde_json::from_str(body).unwrap()
+}
+
+/// The two transactions of the RECORDED `transactions_sinceid` page (ids 51 and 52, tag `R_SCAN_TAG`).
+fn real_txns() -> Vec<Value> {
+    real_json(rfx!("transactions_sinceid"))["transactions"].as_array().unwrap().clone()
+}
+
+/// DERIVED from a recording: add the client id where OANDA puts it (`clientExtensions.id` on the create transaction,
+/// `clientOrderID` on the fill) to a body that was recorded without one.
+fn with_client_id(body: &str, tag: &str) -> String {
+    let mut v: Value = serde_json::from_str(body).unwrap();
+    for key in ["orderCreateTransaction", "longOrderCreateTransaction", "shortOrderCreateTransaction"] {
+        if let Some(t) = v.get_mut(key) {
+            t["clientExtensions"] = json!({"id": tag});
+        }
+    }
+    for key in ["orderFillTransaction", "longOrderFillTransaction", "shortOrderFillTransaction"] {
+        if let Some(t) = v.get_mut(key) {
+            t["clientOrderID"] = json!(tag);
+        }
+    }
+    v.to_string()
+}
+
+/// AUTHORED (unmeasured shape): a single-position body.
+fn position_body(inst: &str, long: &str, short: &str) -> String {
+    let side = |u: &str| {
+        if u == "0" {
+            json!({"units": "0", "pl": "0.0000", "unrealizedPL": "0.0000"})
+        } else {
+            json!({"units": u, "averagePrice": "1.00000", "pl": "0.0000", "unrealizedPL": "0.0000"})
+        }
+    };
+    json!({"position": {"instrument": inst, "pl": "0.0000", "unrealizedPL": "0.0000", "marginUsed": "1.0000", "long": side(long), "short": side(short)},
+           "lastTransactionID": LAST.to_string()})
+    .to_string()
+}
+
+/// AUTHORED: an EUR_USD-only instrument table with an optional `maximumPositionSize`.
+fn table_with_cap(cap: Option<&str>) -> InstrumentTable {
+    let mut row = json!({"name": "EUR_USD", "type": "CURRENCY", "displayName": "EUR/USD", "pipLocation": -4, "displayPrecision": 5,
+        "tradeUnitsPrecision": 0, "minimumTradeSize": "1", "maximumOrderUnits": "100000000", "marginRate": "0.02"});
+    if let Some(c) = cap {
+        row["maximumPositionSize"] = json!(c);
+    }
+    InstrumentTable::from_instruments_json(&json!({"instruments": [row]}).to_string()).unwrap()
+}
+
+/// Routes for a placement whose POST answers `(status, body)`: account fine (checkpoint `LAST`), the recent-window scan
+/// finds nothing, and the follow-up scan since the checkpoint (only used after an ambiguous answer) finds nothing.
+fn place_routes(post_status: u16, post_body: &str) -> Routes {
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(tag_path), 404, fx!("error_404_order.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
         .post(&p("/orders"), post_status, post_body)
+}
+
+/// Like [`place_routes`] but the POST fails in the transport.
+fn place_routes_with_post_error(e: TransportError) -> Routes {
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
+        .fail(HttpMethod::Post, &p("/orders"), e)
 }
 
 fn place(post_status: u16, post_body: &str) -> (Result<PlaceOutcome, BrokerError>, Arc<FakeTransport>) {
     let (a, t) = setup();
-    place_routes(TAG_PATH, post_status, post_body).install(&t);
+    place_routes(post_status, post_body).install(&t);
     (a.place_order(&buy_req()), t)
 }
 
@@ -588,38 +719,51 @@ fn order_ids_that_could_escape_the_path_are_refused_before_sending() {
 // ---------------------------------------------------------------- placement: request
 
 #[test]
-fn a_market_buy_sends_summary_then_tag_lookup_then_exactly_one_post() {
-    let (out, t) = place(201, fx!("create_market_buy_filled.json"));
-    match out.unwrap() {
+fn a_market_buy_reads_the_summary_scans_the_recent_window_then_sends_exactly_one_post() {
+    // The response is the RECORDED real one (place_filled); the checkpoint is the summary's lastTransactionID.
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(29))
+        .get(&scan_path(29 - WINDOW), 200, &page(29 - WINDOW, 29, &[]))
+        .post(&p("/orders"), 201, rfx!("place_filled"))
+        .install(&t);
+    match a.place_order(&OrderRequest::market(R_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap() {
         PlaceOutcome::Accepted { broker_order_id, sent, warnings, description } => {
-            assert_eq!(broker_order_id, "6372");
-            assert_eq!((sent.broker_pair.as_str(), sent.side, sent.quantity, sent.price, sent.userref), ("EUR_USD", Side::Buy, d("1000"), None, 0));
+            assert_eq!(broker_order_id, "30");
+            assert_eq!((sent.broker_pair.as_str(), sent.side, sent.quantity, sent.price, sent.userref), ("EUR_USD", Side::Buy, d("1"), None, 0));
             assert!(warnings.is_empty(), "{warnings:?}");
-            assert_eq!(description.as_deref(), Some("buy 1000 EUR_USD market FOK"));
+            assert_eq!(description.as_deref(), Some("buy 1 EUR_USD market FOK"));
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(lines(&t), [format!("Get {}", p("/summary")), format!("Get {}", tag_lookup(TAG_PATH)), format!("Post {}", p("/orders"))]);
+    assert_eq!(lines(&t), [format!("Get {}", p("/summary")), format!("Get {}", scan_path(29 - WINDOW)), format!("Post {}", p("/orders"))]);
     let post = &posts(&t)[0];
     assert_eq!(post.header("Content-Type"), Some("application/json"));
     assert_eq!(post.header("Authorization"), Some(format!("Bearer {TOKEN}").as_str()));
-    let body = body_json(post);
-    let expected: serde_json::Value = serde_json::from_str(
-        r#"{"order":{"type":"MARKET","instrument":"EUR_USD","units":"1000","timeInForce":"FOK","positionFill":"DEFAULT",
-            "clientExtensions":{"id":"rb1:run1:EUR/USD:buy","tag":"mendl-rb"}}}"#,
+    let expected: Value = serde_json::from_str(
+        r#"{"order":{"type":"MARKET","instrument":"EUR_USD","units":"1","timeInForce":"FOK","positionFill":"DEFAULT",
+            "clientExtensions":{"id":"lookup-filled-20260923T211402Z","tag":"mendl-rb"}}}"#,
     )
     .unwrap();
-    assert_eq!(body, expected);
+    assert_eq!(body_json(post), expected);
+    assert_eq!(a.tag_checkpoint(R_TAG), Some(29), "the checkpoint of the first attempt stays registered");
 }
 
 #[test]
-fn a_market_sell_sends_negative_units_and_the_fill_is_matched_to_it() {
+fn a_market_sell_sends_negative_units_and_the_recorded_short_fill_is_matched_to_it() {
+    // DERIVED from the recorded sell_short: the recording sent no client id, so one is added to the create and fill exactly
+    // where OANDA puts it in place_filled (clientExtensions.id / clientOrderID).
     let (a, t) = setup();
-    place_routes(SELL_TAG_PATH, 201, fx!("create_market_sell_filled.json")).install(&t);
-    let out = a.place_order(&sell_req()).unwrap();
-    assert!(matches!(out, PlaceOutcome::Accepted { ref broker_order_id, ref sent, .. } if broker_order_id == "6382" && sent.side == Side::Sell && sent.quantity == d("1000")));
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(40))
+        .get(&scan_path(40 - WINDOW), 200, &page(40 - WINDOW, 40, &[]))
+        .post(&p("/orders"), 201, &with_client_id(rfx!("sell_short"), SELL_TAG))
+        .install(&t);
+    let out = a.place_order(&OrderRequest::market(SELL_TAG, "USD/JPY", Side::Sell, d("3"))).unwrap();
+    assert!(matches!(out, PlaceOutcome::Accepted { ref broker_order_id, ref sent, .. } if broker_order_id == "41" && sent.side == Side::Sell && sent.quantity == d("3")), "{out:?}");
     let body = body_json(&posts(&t)[0]);
-    assert_eq!(body["order"]["units"], "-1000");
+    assert_eq!(body["order"]["units"], "-3");
+    assert_eq!(body["order"]["instrument"], "USD_JPY");
     assert_eq!(body["order"]["clientExtensions"]["id"], SELL_TAG);
 }
 
@@ -627,8 +771,8 @@ fn a_market_sell_sends_negative_units_and_the_fill_is_matched_to_it() {
 fn the_reference_price_never_turns_a_market_order_into_a_limit_order() {
     // Regression for the legacy connector's defect: a priced market signal became LIMIT/GTC.
     let (a, t) = setup();
-    place_routes(TAG_PATH, 201, fx!("create_market_buy_filled.json")).install(&t);
-    let mut req = buy_req();
+    place_routes(201, rfx!("place_filled")).install(&t);
+    let mut req = OrderRequest::market(R_TAG, "EUR/USD", Side::Buy, d("1"));
     req.reference_price = Some(d("1.10050"));
     a.place_order(&req).unwrap();
     let body = body_json(&posts(&t)[0]);
@@ -639,37 +783,56 @@ fn the_reference_price_never_turns_a_market_order_into_a_limit_order() {
 }
 
 #[test]
-fn a_limit_order_goes_out_as_limit_gtc_with_a_rounded_price() {
+fn a_limit_order_looks_for_a_pending_order_first_then_goes_out_as_limit_gtc_with_a_rounded_price() {
+    // RECORDED: place_limit (create only), get_by_client_id_missing (404 NO_SUCH_ORDER on the pending lookup).
     let (a, t) = setup();
-    place_routes("%40rb1%3Arun1%3AEUR%2FUSD%3Alimit", 201, fx!("create_limit_pending.json")).install(&t);
-    let req = OrderRequest::limit("rb1:run1:EUR/USD:limit", "EUR/USD", Side::Buy, d("2000"), d("1.095004"));
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(33))
+        .get(&pending_lookup(R_LIMIT_TAG), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(33 - WINDOW), 200, &page(33 - WINDOW, 33, &[]))
+        .post(&p("/orders"), 201, rfx!("place_limit"))
+        .install(&t);
+    let req = OrderRequest::limit(R_LIMIT_TAG, "EUR/USD", Side::Buy, d("1"), d("0.500004"));
     match a.place_order(&req).unwrap() {
         PlaceOutcome::Accepted { broker_order_id, sent, warnings, description } => {
-            assert_eq!(broker_order_id, "6390");
-            assert_eq!(sent.price, Some(d("1.09500")));
-            assert!(warnings.is_empty());
-            assert_eq!(description.as_deref(), Some("buy 2000 EUR_USD limit GTC"));
+            assert_eq!(broker_order_id, "34");
+            assert_eq!(sent.price, Some(d("0.50000")));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(description.as_deref(), Some("buy 1 EUR_USD limit GTC"));
         }
         other => panic!("{other:?}"),
     }
     let body = body_json(&posts(&t)[0]);
-    assert_eq!((body["order"]["type"].as_str(), body["order"]["price"].as_str(), body["order"]["timeInForce"].as_str()), (Some("LIMIT"), Some("1.09500"), Some("GTC")));
+    assert_eq!((body["order"]["type"].as_str(), body["order"]["price"].as_str(), body["order"]["timeInForce"].as_str()), (Some("LIMIT"), Some("0.50000"), Some("GTC")));
+    // the pending lookup is for LIMIT orders only: a market order never asks for @tag
+    assert_eq!(count(&t, HttpMethod::Get, "/orders/"), 1);
+}
+
+#[test]
+fn a_market_order_never_asks_for_a_pending_order_by_tag() {
+    let (a, t) = setup();
+    place_routes(201, rfx!("place_filled")).install(&t);
+    a.place_order(&OrderRequest::market(R_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap();
+    assert_eq!(count(&t, HttpMethod::Get, "/orders/"), 0, "OANDA finds only PENDING orders by client id, so it is pointless for FOK market orders");
 }
 
 #[test]
 fn local_refusals_send_nothing_at_all() {
     let (a, t) = setup();
+    let too_long = "t".repeat(129);
     let cases: Vec<(OrderRequest, &str)> = vec![
         (OrderRequest::market(TAG, "AUD_CAD", Side::Buy, d("1000")), "unknown instrument"),
         (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("0.5")), "rounds to zero"),
         (OrderRequest::market("", "EUR_USD", Side::Buy, d("1000")), "empty tag"),
+        (OrderRequest::market(&too_long, "EUR_USD", Side::Buy, d("1000")), "a 129 character client id (OANDA: CLIENT_ORDER_ID_INVALID)"),
+        (OrderRequest::market("caf\u{e9}", "EUR_USD", Side::Buy, d("1000")), "non-ASCII client id (stricter than OANDA, which accepted it)"),
         (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("0")), "zero quantity"),
         (OrderRequest::market(TAG, "nonsense", Side::Buy, d("1000")), "bad name"),
         ({
             let mut r = buy_req();
             r.time_in_force = Some(TimeInForce::Gtc);
             r
-        }, "GTC market"),
+        }, "GTC market (OANDA: TIME_IN_FORCE_INVALID)"),
         ({
             let mut r = buy_req();
             r.validate_only = true;
@@ -680,12 +843,21 @@ fn local_refusals_send_nothing_at_all() {
             r.post_only = true;
             r
         }, "post_only"),
-        (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("999999999999")), "above max"),
+        (OrderRequest::market(TAG, "EUR_USD", Side::Buy, d("999999999999")), "above max (OANDA: UNITS_LIMIT_EXCEEDED)"),
     ];
     for (req, why) in cases {
         assert!(a.place_order(&req).is_err(), "{why}");
     }
     assert_eq!(t.request_count(), 0, "a locally refused order must not reach the transport");
+}
+
+#[test]
+fn a_client_id_of_128_characters_with_the_measured_punctuation_is_accepted_locally() {
+    let (a, _t) = setup();
+    let id = format!("{}{}", "rb1:a.b-c_d/e f", "x".repeat(128 - 15));
+    assert_eq!(id.len(), 128);
+    let prepared = a.prepare(&OrderRequest::market(&id, "EUR_USD", Side::Buy, d("1"))).unwrap();
+    assert_eq!(prepared.client_id, id, "never truncated or hashed");
 }
 
 #[test]
@@ -712,8 +884,8 @@ fn own_tag_prefix_is_enforced_at_placement() {
 #[test]
 fn reduce_only_goes_out_as_position_fill_reduce_only() {
     let (a, t) = setup();
-    place_routes(SELL_TAG_PATH, 201, fx!("create_market_sell_filled.json")).install(&t);
-    let mut req = sell_req();
+    place_routes(201, &with_client_id(rfx!("sell_short"), SELL_TAG)).install(&t);
+    let mut req = OrderRequest::market(SELL_TAG, "USD_JPY", Side::Sell, d("3"));
     req.reduce_only = true;
     a.place_order(&req).unwrap();
     assert_eq!(body_json(&posts(&t)[0])["order"]["positionFill"], "REDUCE_ONLY");
@@ -732,6 +904,7 @@ fn a_partial_fill_is_accepted_with_a_warning_naming_the_shortfall() {
 
 #[test]
 fn an_order_cancelled_at_creation_is_a_definite_rejection_with_its_reason() {
+    // AUTHORED bodies: the cancel-at-creation shape is not recorded.
     for (fixture, reason, class) in [
         (fx!("create_market_cancelled_margin.json"), "INSUFFICIENT_MARGIN", ErrorClass::InsufficientFunds),
         (fx!("create_market_cancelled_liquidity.json"), "INSUFFICIENT_LIQUIDITY", ErrorClass::OrderRejected),
@@ -747,9 +920,53 @@ fn an_order_cancelled_at_creation_is_a_definite_rejection_with_its_reason() {
 }
 
 #[test]
-fn a_400_with_a_reject_transaction_is_a_definite_rejection() {
+fn the_measured_reject_reasons_map_to_the_right_class_and_never_retry() {
+    // RECORDED bodies: HTTP 400, orderRejectTransaction, rejectReason == errorCode.
+    for (fixture, reason) in [
+        (rfx!("reject_too_big"), "UNITS_LIMIT_EXCEEDED"),
+        (rfx!("reject_zero"), "UNITS_INVALID"),
+        (rfx!("reject_market_gtc"), "TIME_IN_FORCE_INVALID"),
+        (rfx!("reject_fractional"), "UNITS_PRECISION_EXCEEDED"),
+    ] {
+        let (out, t) = place(400, fixture);
+        let errs = expect_rejected(out);
+        assert!(errs[0].code.starts_with(&format!("oanda:400 {reason}:")), "{}", errs[0].code);
+        assert_eq!(errs[0].class, ErrorClass::InvalidArguments, "{reason}");
+        assert_eq!(posts(&t).len(), 1, "exactly one POST, never a retry");
+        assert_eq!(follow_up_scans(&t), 0, "a refusal is definitive: no follow-up scan");
+    }
+}
+
+/// Number of follow-up scans (`sinceid` from the checkpoint LAST) a test transport saw.
+fn follow_up_scans(t: &FakeTransport) -> usize {
+    t.requests().iter().filter(|r| r.url.ends_with(&scan_path(LAST))).count()
+}
+
+#[test]
+fn an_unknown_instrument_is_a_definite_invalid_arguments_rejection_without_a_reject_transaction() {
+    // RECORDED: HTTP 400 oanda::rest::core::InvalidParameterException, no reject transaction.
+    let (out, t) = place(400, rfx!("reject_bad_instrument"));
+    let errs = expect_rejected(out);
+    assert!(errs[0].code.starts_with("oanda:400 oanda::rest::core::InvalidParameterException:"), "{}", errs[0].code);
+    assert!(errs[0].code.contains("order.instrument"));
+    assert_eq!(errs[0].class, ErrorClass::InvalidArguments);
+    assert_eq!(posts(&t).len(), 1);
+}
+
+#[test]
+fn a_definitive_refusal_leaves_the_tag_unused_so_the_same_tag_can_be_sent_again() {
+    let (a, t) = setup();
+    place_routes(400, rfx!("reject_zero")).install(&t);
+    expect_rejected(a.place_order(&buy_req()));
+    assert_eq!(a.tag_checkpoint(TAG), None, "a refusal created nothing: no checkpoint is kept");
+    place_routes(201, fx!("create_market_buy_filled.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert_eq!(posts(&t).len(), 2);
+}
+
+#[test]
+fn a_400_with_authored_reject_bodies_is_a_definite_rejection() {
     for (fixture, reason, class) in [
-        (fx!("error_400_units_invalid.json"), "UNITS_INVALID", ErrorClass::InvalidArguments),
         (fx!("error_400_insufficient_margin.json"), "INSUFFICIENT_MARGIN", ErrorClass::InsufficientFunds),
         (fx!("error_400_market_halted.json"), "MARKET_HALTED", ErrorClass::OrderRejected),
         (fx!("error_400_plain.json"), "Invalid value", ErrorClass::InvalidArguments),
@@ -775,43 +992,48 @@ fn auth_failures_are_definite_rejections_of_class_auth() {
 #[test]
 fn rate_limiting_means_not_sent_and_reports_retry_after() {
     let (a, t) = setup();
-    place_routes(TAG_PATH, 429, fx!("error_429.json")).with_header("Retry-After", "7").install(&t);
+    place_routes(429, fx!("error_429.json")).with_header("Retry-After", "7").install(&t);
     match a.place_order(&buy_req()) {
         Err(BrokerError::RateLimited { retry_after_secs: Some(7), .. }) => {}
         other => panic!("{other:?}"),
     }
     assert_eq!(posts(&t).len(), 1);
+    assert_eq!(a.tag_checkpoint(TAG), None, "a 429 was refused before processing: nothing to look for later");
 }
 
 #[test]
-fn server_errors_timeouts_and_ambiguous_answers_are_unknown_outcomes_and_never_retried() {
-    // 5xx and a non-2xx oddity
+fn server_errors_timeouts_and_ambiguous_answers_are_unknown_outcomes_never_retried_and_carry_the_checkpoint() {
+    // 5xx and a non-2xx oddity: the follow-up scan (empty here) finds nothing, so the outcome stays unknown.
     for (status, body) in [(500, fx!("error_500.json")), (503, fx!("error_503_html.txt")), (502, ""), (404, fx!("error_404_account.json")), (418, "teapot")] {
         let (out, t) = place(status, body);
         let reason = expect_unknown(out);
         assert!(reason.contains(&status.to_string()), "{reason}");
+        assert!(reason.contains(&format!("[oanda-tag-checkpoint={LAST}]")), "a later lookup needs the checkpoint: {reason}");
         assert_eq!(posts(&t).len(), 1, "HTTP {status}: a placement is never blindly retried");
+        assert_eq!(follow_up_scans(&t), 1, "HTTP {status}: one follow-up scan since the checkpoint");
     }
     // transport failures after the request may have left
     for e in [TransportError::Timeout, TransportError::Io("connection reset".into())] {
         let (a, t) = setup();
         Routes::default()
             .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-            .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
+            .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
             .fail(HttpMethod::Post, &p("/orders"), e.clone())
+            .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
             .install(&t);
         let reason = expect_unknown(a.place_order(&buy_req()));
         assert!(!reason.is_empty());
         assert_eq!(posts(&t).len(), 1, "{e:?}");
     }
-    // a connect failure means the request never left: Err, nothing to look up
+    // a connect failure means the request never left: Err, nothing to look up, and the tag is not registered
     let (a, t) = setup();
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
         .fail(HttpMethod::Post, &p("/orders"), TransportError::ConnectFailed("refused".into()))
         .install(&t);
     assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Transport(TransportError::ConnectFailed(_)))));
+    assert_eq!(a.tag_checkpoint(TAG), None);
 }
 
 #[test]
@@ -889,168 +1111,549 @@ fn account_trouble_before_the_post_means_nothing_was_sent() {
 }
 
 #[test]
-fn a_tag_lookup_that_cannot_be_completed_means_nothing_is_sent() {
+fn a_summary_without_a_last_transaction_id_cannot_give_a_checkpoint_so_nothing_is_sent() {
+    let (a, t) = setup();
+    let mut v: Value = serde_json::from_str(fx!("account_summary_ok.json")).unwrap();
+    v.as_object_mut().unwrap().remove("lastTransactionID");
+    v["account"].as_object_mut().unwrap().remove("lastTransactionID");
+    Routes::default().get(&p("/summary"), 200, &v.to_string()).post(&p("/orders"), 201, rfx!("place_filled")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Preflight(m)) if m.contains("lastTransactionID")));
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_tag_scan_that_cannot_be_completed_means_nothing_is_sent() {
+    let ok_summary = |routes: Routes| Routes([Routes::default().get(&p("/summary"), 200, fx!("account_summary_ok.json")).0, routes.0].concat());
+    let scan = scan_path(LAST - WINDOW);
+    let short_page = {
+        // a page that stops short of the account's last id (a server that truncates)
+        let mut v: Value = serde_json::from_str(&page(LAST - WINDOW, LAST, &[])).unwrap();
+        v["transactions"].as_array_mut().unwrap().truncate(4);
+        v.to_string()
+    };
     for (why, routes) in [
-        ("500", Routes::default().get(&tag_lookup(TAG_PATH), 500, fx!("error_500.json"))),
-        ("timeout", Routes::default().fail(HttpMethod::Get, &tag_lookup(TAG_PATH), TransportError::Timeout)),
-        ("401", Routes::default().get(&tag_lookup(TAG_PATH), 401, fx!("error_401.json"))),
-        ("malformed order", Routes::default().get(&tag_lookup(TAG_PATH), 200, "{\"order\": 5}")),
+        ("500", Routes::default().get(&scan, 500, fx!("error_500.json"))),
+        ("timeout", Routes::default().fail(HttpMethod::Get, &scan, TransportError::Timeout)),
+        ("401", Routes::default().get(&scan, 401, fx!("error_401.json"))),
+        ("not a page", Routes::default().get(&scan, 200, "{\"transactions\": 5}")),
+        ("a page cut short by the server", Routes::default().get(&scan, 200, &short_page)),
+        ("a page that starts too late", Routes::default().get(&scan, 200, &page(LAST - WINDOW + 2, LAST, &[]))),
     ] {
         let (a, t) = setup();
-        let routes = Routes(
-            [Routes::default().get(&p("/summary"), 200, fx!("account_summary_ok.json")).0, routes.0].concat(),
-        )
-        .post(&p("/orders"), 201, fx!("create_market_buy_filled.json"));
-        routes.install(&t);
+        ok_summary(routes).post(&p("/orders"), 201, fx!("create_market_buy_filled.json")).install(&t);
         match a.place_order(&buy_req()) {
             Err(BrokerError::Preflight(m)) => assert!(m.contains("nothing was sent"), "{why}: {m}"),
             other => panic!("{why}: {other:?}"),
         }
         assert!(posts(&t).is_empty(), "{why}: a tag we could not check must not be sent");
+        assert_eq!(a.tag_checkpoint(TAG), None, "{why}");
     }
 }
 
-// ---------------------------------------------------------------- idempotency
+#[test]
+fn a_limit_order_whose_pending_lookup_cannot_be_completed_sends_nothing() {
+    for (why, routes) in [
+        ("500", Routes::default().get(&pending_lookup(R_LIMIT_TAG), 500, fx!("error_500.json"))),
+        ("timeout", Routes::default().fail(HttpMethod::Get, &pending_lookup(R_LIMIT_TAG), TransportError::Timeout)),
+        ("401", Routes::default().get(&pending_lookup(R_LIMIT_TAG), 401, fx!("error_401.json"))),
+        ("malformed order", Routes::default().get(&pending_lookup(R_LIMIT_TAG), 200, "{\"order\": 5}")),
+        // a 404 that is NOT NO_SUCH_ORDER (an unknown account) must not be read as "no such order"
+        ("404 of another kind", Routes::default().get(&pending_lookup(R_LIMIT_TAG), 404, fx!("error_404_account.json"))),
+    ] {
+        let (a, t) = setup();
+        Routes([Routes::default().get(&p("/summary"), 200, fx!("account_summary_ok.json")).0, routes.0].concat())
+            .post(&p("/orders"), 201, rfx!("place_limit"))
+            .install(&t);
+        let req = OrderRequest::limit(R_LIMIT_TAG, "EUR/USD", Side::Buy, d("1"), d("0.5"));
+        match a.place_order(&req) {
+            Err(BrokerError::Preflight(m)) => assert!(m.contains("nothing was sent"), "{why}: {m}"),
+            other => panic!("{why}: {other:?}"),
+        }
+        assert!(posts(&t).is_empty(), "{why}");
+    }
+}
+
+// ---------------------------------------------------------------- idempotency: the transaction-stream protocol
 
 #[test]
-fn placing_again_with_the_same_tag_adopts_the_existing_filled_order_and_sends_nothing() {
+fn a_lost_response_is_found_in_the_transaction_stream_and_the_order_is_not_placed_again() {
+    // RECORDED: transactions_sinceid is exactly what OANDA returned after checkpoint 50 (a MARKET_ORDER and its ORDER_FILL,
+    // both carrying the tag).
     let (a, t) = setup();
     Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
-        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .get(&p("/summary"), 200, &summary_with_last(50))
+        .get(&scan_path(50 - WINDOW), 200, &page(50 - WINDOW, 50, &[]))
+        .fail(HttpMethod::Post, &p("/orders"), TransportError::Timeout)
+        .get(&scan_path(50), 200, rfx!("transactions_sinceid"))
         .install(&t);
-    match a.place_order(&buy_req()).unwrap() {
-        PlaceOutcome::Accepted { broker_order_id, warnings, description, sent } => {
-            assert_eq!(broker_order_id, "6372");
-            assert_eq!(sent.quantity, d("1000"));
+    let out = a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap();
+    match out {
+        PlaceOutcome::Accepted { broker_order_id, warnings, .. } => {
+            assert_eq!(broker_order_id, "51");
+            assert!(warnings.is_empty(), "the order was found after THIS call's own POST: {warnings:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(posts(&t).len(), 1);
+    // a careless second call with the same tag: the scan since the checkpoint finds it again; nothing is sent
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(52))
+        .get(&scan_path(50), 200, rfx!("transactions_sinceid"))
+        .install(&t);
+    match a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, warnings, .. } => {
+            assert_eq!(broker_order_id, "51");
             assert!(warnings[0].contains("already existed"), "{warnings:?}");
-            assert!(description.unwrap().contains("adopted"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(posts(&t).len(), 1, "still exactly one POST in total");
+}
+
+#[test]
+fn a_lost_request_is_replaced_exactly_once_only_after_a_scan_since_the_first_checkpoint_found_nothing() {
+    let (a, t) = setup();
+    // attempt 1: the POST times out; the follow-up scan (since 6400) finds nothing
+    place_routes_with_post_error(TransportError::Timeout).install(&t);
+    let reason = expect_unknown(a.place_order(&buy_req()));
+    assert!(reason.ends_with(&format!("[oanda-tag-checkpoint={LAST}]")), "{reason}");
+    assert_eq!(posts(&t).len(), 1);
+    assert_eq!(a.tag_checkpoint(TAG), Some(LAST));
+    // attempt 2 (the caller retries with the SAME tag): the account has moved on, but the scan still starts at the FIRST
+    // checkpoint, finds nothing, and only then is the order sent again
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(LAST + 5))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST + 5, &[]))
+        .post(&p("/orders"), 201, fx!("create_market_buy_filled.json"))
+        .install(&t);
+    assert!(matches!(a.place_order(&buy_req()).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert_eq!(posts(&t).len(), 2, "exactly one POST for each of the two attempts");
+    let l = lines(&t);
+    let scan_at = l.iter().rposition(|x| x.contains(&format!("sinceid?id={LAST}"))).expect("a scan since the first checkpoint");
+    let post_at = l.iter().rposition(|x| x.starts_with("Post ")).expect("the second POST");
+    assert!(scan_at < post_at, "the scan comes BEFORE the re-send: {l:?}");
+    assert_eq!(a.tag_checkpoint(TAG), Some(LAST), "the checkpoint never moves forward");
+}
+
+#[test]
+fn nothing_is_replaced_when_the_scan_since_the_checkpoint_cannot_prove_absence() {
+    for (why, scan_reply) in [
+        ("500", (500u16, fx!("error_500.json").to_string())),
+        // the server says the account is at 6410 but returns nothing: an incomplete page proves nothing
+        ("an empty page for a moved account", (200, json!({"transactions": [], "lastTransactionID": (LAST + 10).to_string()}).to_string())),
+    ] {
+        let (a, t) = setup();
+        place_routes_with_post_error(TransportError::Timeout).install(&t);
+        expect_unknown(a.place_order(&buy_req()));
+        Routes::default()
+            .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+            .get(&scan_path(LAST), scan_reply.0, &scan_reply.1)
+            .post(&p("/orders"), 201, fx!("create_market_buy_filled.json"))
+            .install(&t);
+        let reason = expect_unknown(a.place_order(&buy_req()));
+        assert!(reason.contains("earlier attempt") && reason.contains(&format!("[oanda-tag-checkpoint={LAST}]")), "{why}: {reason}");
+        assert_eq!(posts(&t).len(), 1, "{why}: no second POST without a provable scan");
+    }
+}
+
+#[test]
+fn a_duplicate_tag_in_the_stream_is_an_alert_not_an_adoption() {
+    // RECORDED: place_filled (orders 30/31) and duplicate_post (orders 32/33) carry the SAME client id. OANDA does not stop
+    // the second fill, so if the stream shows two orders for one tag a human must look.
+    let mut recs: Vec<Value> = Vec::new();
+    for (body, key, fkey) in [(rfx!("place_filled"), "orderCreateTransaction", "orderFillTransaction"), (rfx!("duplicate_post"), "orderCreateTransaction", "orderFillTransaction")] {
+        let v: Value = serde_json::from_str(body).unwrap();
+        recs.push(v[key].clone());
+        recs.push(v[fkey].clone());
+    }
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(33))
+        .get(&scan_path(33 - WINDOW), 200, &page(33 - WINDOW, 33, &recs))
+        .post(&p("/orders"), 201, rfx!("place_filled"))
+        .install(&t);
+    let reason = expect_unknown(a.place_order(&OrderRequest::market(R_TAG, "EUR/USD", Side::Buy, d("1"))));
+    assert!(reason.contains("DUPLICATE_TAG") && reason.contains("30") && reason.contains("32"), "{reason}");
+    assert!(posts(&t).is_empty());
+    // and the lookup reports BOTH orders
+    Routes::default()
+        .get(&pending_lookup(R_TAG), 404, rfx!("get_by_client_id_filled"))
+        .get(&p("/summary"), 200, &summary_with_last(33))
+        .get(&scan_path(33 - WINDOW), 200, &page(33 - WINDOW, 33, &recs))
+        .install(&t);
+    let found = a.find_orders_by_tag(R_TAG).unwrap();
+    let ids: Vec<&str> = found.iter().map(|r| r.broker_order_id.as_str()).collect();
+    assert_eq!(ids, ["30", "32"]);
+    assert!(found.iter().all(|r| r.status == OrderStatus::Filled && r.executed_quantity == d("1")));
+}
+
+#[test]
+fn restart_with_no_checkpoint_finds_an_earlier_fill_in_the_recent_window_and_sends_nothing() {
+    // A brand-new adapter (no attempts registered), the tag was filled recently: it is found in the last WINDOW ids.
+    let (a, t) = setup();
+    let recs: Vec<Value> = real_txns();
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(52))
+        .get(&scan_path(52 - WINDOW), 200, &page(52 - WINDOW, 52, &recs))
+        .install(&t);
+    match a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, warnings, description, .. } => {
+            assert_eq!(broker_order_id, "51");
+            assert!(warnings[0].contains("already existed"), "{warnings:?}");
+            assert!(description.unwrap().contains("buy 1 EUR_USD"));
         }
         other => panic!("{other:?}"),
     }
     assert!(posts(&t).is_empty(), "restart idempotency: nothing may be sent twice");
+    assert_eq!(a.tag_checkpoint(R_SCAN_TAG), None, "nothing was sent, so no checkpoint was taken");
 }
 
 #[test]
-fn an_existing_pending_order_with_the_tag_is_adopted_too() {
-    let (a, t) = setup();
-    let tag = "rb1:run1:EUR/USD:limit";
-    let path = "%40rb1%3Arun1%3AEUR%2FUSD%3Alimit";
-    Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(path), 200, fx!("order_pending_limit.json"))
-        .install(&t);
-    let req = OrderRequest::limit(tag, "EUR/USD", Side::Buy, d("2000"), d("1.095"));
-    assert!(matches!(a.place_order(&req).unwrap(), PlaceOutcome::Accepted { .. }));
-    assert!(posts(&t).is_empty());
-}
-
-#[test]
-fn a_tag_that_belongs_to_a_dead_order_is_refused_not_resent() {
-    let (a, t) = setup();
-    let path = "%40rb1%3Arun1%3AEUR%2FUSD%3Alimit";
-    Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(path), 200, fx!("order_cancelled_client_request.json"))
-        .get(&p("/transactions/6391"), 200, fx!("txn_cancel_client_request.json"))
-        .install(&t);
-    let req = OrderRequest::limit("rb1:run1:EUR/USD:limit", "EUR/USD", Side::Buy, d("2000"), d("1.095"));
-    let errs = expect_rejected(a.place_order(&req));
-    assert!(errs[0].code.contains("use a new tag") && errs[0].code.contains("6390"), "{}", errs[0].code);
-    assert_eq!(errs[0].class, ErrorClass::OrderRejected);
-    assert!(posts(&t).is_empty());
-}
-
-#[test]
-fn a_tag_that_belongs_to_a_different_order_is_refused() {
-    // same tag, but the existing order is for another quantity
+fn a_tag_that_belongs_to_a_different_order_is_refused_not_adopted() {
     let (a, t) = setup();
     Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
-        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .get(&p("/summary"), 200, &summary_with_last(52))
+        .get(&scan_path(52 - WINDOW), 200, &page(52 - WINDOW, 52, &real_txns()))
         .install(&t);
-    let req = OrderRequest::market(TAG, "EUR/USD", Side::Buy, d("2500"));
-    let errs = expect_rejected(a.place_order(&req));
-    assert!(errs[0].code.contains("differs from this request"), "{}", errs[0].code);
+    // same tag, other quantity
+    let errs = expect_rejected(a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Buy, d("2"))));
+    assert!(errs[0].code.contains("differs from this request") && errs[0].code.contains("51"), "{}", errs[0].code);
     assert_eq!(errs[0].class, ErrorClass::InvalidArguments);
-    assert!(posts(&t).is_empty());
-    // and a different side
-    let req = OrderRequest::market(TAG, "EUR/USD", Side::Sell, d("1000"));
-    let errs = expect_rejected(a.place_order(&req));
+    // other side
+    let errs = expect_rejected(a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Sell, d("1"))));
     assert!(errs[0].code.contains("differs"), "{}", errs[0].code);
     assert!(posts(&t).is_empty());
 }
 
 #[test]
-fn unknown_outcome_then_lookup_by_tag_finds_the_order_and_a_second_place_does_not_resend() {
+fn a_tag_whose_order_was_cancelled_is_refused_with_use_a_new_tag() {
+    // RECORDED transactions: place_limit's LIMIT_ORDER (34) and cancel_by_client_id's ORDER_CANCEL (35), same client id.
+    let create = real_json(rfx!("place_limit"))["orderCreateTransaction"].clone();
+    let cancel = real_json(rfx!("cancel_by_client_id"))["orderCancelTransaction"].clone();
     let (a, t) = setup();
-    // 1. the POST times out
     Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json"))
-        .fail(HttpMethod::Post, &p("/orders"), TransportError::Timeout)
+        .get(&p("/summary"), 200, &summary_with_last(35))
+        .get(&pending_lookup(R_LIMIT_TAG), 404, rfx!("get_limit_cancelled"))
+        .get(&scan_path(35 - WINDOW), 200, &page(35 - WINDOW, 35, &[create, cancel]))
         .install(&t);
+    let req = OrderRequest::limit(R_LIMIT_TAG, "EUR/USD", Side::Buy, d("1"), d("0.5"));
+    let errs = expect_rejected(a.place_order(&req));
+    assert!(errs[0].code.contains("use a new tag") && errs[0].code.contains("34") && errs[0].code.contains("CLIENT_REQUEST"), "{}", errs[0].code);
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_resting_limit_order_with_the_tag_is_adopted_through_the_pending_lookup_even_when_it_is_older_than_the_window() {
+    // RECORDED: get_limit_pending (order 34, PENDING). The scan window would not reach it; the pending lookup does.
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(5000))
+        .get(&pending_lookup(R_LIMIT_TAG), 200, rfx!("get_limit_pending"))
+        .install(&t);
+    let req = OrderRequest::limit(R_LIMIT_TAG, "EUR/USD", Side::Buy, d("1"), d("0.5"));
+    match a.place_order(&req).unwrap() {
+        PlaceOutcome::Accepted { broker_order_id, warnings, .. } => {
+            assert_eq!(broker_order_id, "34");
+            assert!(warnings[0].contains("already existed"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(posts(&t).is_empty());
+    // a resting order for a different request is refused
+    let req = OrderRequest::limit(R_LIMIT_TAG, "EUR/USD", Side::Buy, d("9"), d("0.5"));
+    assert!(expect_rejected(a.place_order(&req))[0].code.contains("differs"));
+}
+
+#[test]
+fn a_seeded_checkpoint_gives_exact_coverage_after_a_restart() {
+    // The caller persisted the checkpoint (from the UnknownOutcome reason / tag_checkpoint) and restores it.
+    let (a, t) = setup();
+    a.seed_tag_checkpoint(R_SCAN_TAG, 50);
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(52))
+        .get(&scan_path(50), 200, rfx!("transactions_sinceid"))
+        .install(&t);
+    assert!(matches!(a.place_order(&OrderRequest::market(R_SCAN_TAG, "EUR/USD", Side::Buy, d("1"))).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert!(posts(&t).is_empty());
+    // seeding never moves a checkpoint forward
+    a.seed_tag_checkpoint(R_SCAN_TAG, 80);
+    assert_eq!(a.tag_checkpoint(R_SCAN_TAG), Some(50));
+    a.seed_tag_checkpoint(R_SCAN_TAG, 40);
+    assert_eq!(a.tag_checkpoint(R_SCAN_TAG), Some(40));
+}
+
+#[test]
+fn a_window_that_reaches_the_start_of_the_account_is_a_proof_and_a_shorter_one_is_not() {
+    // account at 6: window 10 reaches back to the creation transaction -> full history
+    let (a, t) = setup_with(|c| c.with_strict_unseen_tags(true));
+    Routes::default()
+        .get(&p("/summary"), 200, &summary_with_last(6))
+        .get(&scan_path(1), 200, &page(1, 6, &[]))
+        .post(&p("/orders"), 201, fx!("create_market_buy_filled.json"))
+        .install(&t);
+    assert!(matches!(a.place_order(&buy_req()).unwrap(), PlaceOutcome::Accepted { .. }), "strict mode still sends when the whole history was scanned");
+    // account at 6400: only the recent window was scanned -> strict mode refuses to call the tag unused
+    let (a, t) = setup_with(|c| c.with_strict_unseen_tags(true));
+    place_routes(201, fx!("create_market_buy_filled.json")).install(&t);
     let reason = expect_unknown(a.place_order(&buy_req()));
-    assert!(reason.contains("timed out"));
-    assert_eq!(posts(&t).len(), 1);
-    // 2. the order did land: the tag lookup finds it
+    assert!(reason.contains("strict mode") && reason.contains("nothing was sent"), "{reason}");
+    assert!(posts(&t).is_empty());
+    // the same lookup by tag is inconclusive, not "not found"
     Routes::default()
-        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
-        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
-        .install(&t);
-    let found = a.find_orders_by_tag(TAG).unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!((found[0].broker_order_id.as_str(), found[0].status, found[0].tag.as_deref()), ("6372", OrderStatus::Filled, Some(TAG)));
-    // 3. placing again with the same tag (a restarted run) sends nothing
-    Routes::default()
+        .get(&pending_lookup(TAG), 404, rfx!("get_by_client_id_missing"))
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(TAG_PATH), 200, fx!("order_filled_market.json"))
-        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
         .install(&t);
-    assert!(matches!(a.place_order(&buy_req()).unwrap(), PlaceOutcome::Accepted { .. }));
-    assert_eq!(posts(&t).len(), 1, "still exactly one POST in total");
-}
-
-#[test]
-fn lookup_by_tag_returns_nothing_on_404_and_the_tag_round_trips_through_the_url() {
-    let (a, t) = setup();
-    Routes::default().get(&tag_lookup(TAG_PATH), 404, fx!("error_404_order.json")).install(&t);
-    assert!(a.find_orders_by_tag(TAG).unwrap().is_empty());
-    // The `@` and every reserved character of the tag are percent-encoded in the path.
-    let url = &t.requests()[0].url;
-    assert!(url.ends_with(&format!("/orders/{TAG_PATH}")), "{url}");
-    assert!(!url.contains('@') && !url[PRACTICE_BASE_URL.len()..].contains(':'));
-    // the tag decodes back to the id we sent in clientExtensions.id
-    let decoded = TAG_PATH.replace("%40", "@").replace("%3A", ":").replace("%2F", "/");
-    assert_eq!(decoded, format!("@{TAG}"));
-}
-
-#[test]
-fn a_lookup_that_returns_someone_elses_order_is_refused() {
+    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::LookupInconclusive(_))));
+    // strict mode off (the default): the same scan is "not found in the recent window"
     let (a, t) = setup();
     Routes::default()
-        .get(&tag_lookup(TAG_PATH), 200, fx!("order_other_client_id.json"))
-        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .get(&pending_lookup(TAG), 404, rfx!("get_by_client_id_missing"))
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
         .install(&t);
-    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::Malformed(m)) if m.contains("does not carry")));
-    // and unusable tags are refused before sending
+    assert!(a.find_orders_by_tag(TAG).unwrap().is_empty());
+}
+
+#[test]
+fn lookup_by_tag_scans_since_the_checkpoint_when_this_process_sent_the_tag_and_needs_no_summary() {
+    let (a, t) = setup();
+    place_routes_with_post_error(TransportError::Timeout).install(&t);
+    expect_unknown(a.place_order(&buy_req()));
+    Routes::default()
+        .get(&pending_lookup(TAG), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST + 3, &[]))
+        .install(&t);
+    assert!(a.find_orders_by_tag(TAG).unwrap().is_empty(), "provably nothing since the first attempt's checkpoint");
+    let tail: Vec<String> = lines(&t).into_iter().rev().take(2).collect();
+    assert!(tail.iter().all(|l| !l.contains("/summary")), "{tail:?}");
+}
+
+#[test]
+fn lookup_by_tag_reports_what_the_scan_found_and_what_is_resting() {
+    // filled market order found in the recent window (RECORDED transactions)
+    let (a, t) = setup();
+    Routes::default()
+        .get(&pending_lookup(R_SCAN_TAG), 404, rfx!("get_by_client_id_filled"))
+        .get(&p("/summary"), 200, &summary_with_last(52))
+        .get(&scan_path(52 - WINDOW), 200, &page(52 - WINDOW, 52, &real_txns()))
+        .install(&t);
+    let found = a.find_orders_by_tag(R_SCAN_TAG).unwrap();
+    assert_eq!(found.len(), 1);
+    let r = &found[0];
+    assert_eq!((r.broker_order_id.as_str(), r.status, r.tag.as_deref(), r.side), ("51", OrderStatus::Filled, Some(R_SCAN_TAG), Some(Side::Buy)));
+    assert_eq!((r.quantity, r.executed_quantity, r.avg_price), (d("1"), d("1"), Some(d("1.13846"))));
+    assert!(matches!(r.kind, Some(OrderKind::Market)));
+
+    // a resting limit order (RECORDED get_limit_pending) is found by the pending lookup even though the scan sees nothing
+    let (a, t) = setup();
+    Routes::default()
+        .get(&pending_lookup(R_LIMIT_TAG), 200, rfx!("get_limit_pending"))
+        .get(&p("/summary"), 200, &summary_with_last(5000))
+        .get(&scan_path(5000 - WINDOW), 200, &page(5000 - WINDOW, 5000, &[]))
+        .install(&t);
+    let found = a.find_orders_by_tag(R_LIMIT_TAG).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].broker_order_id.as_str(), found[0].status), ("34", OrderStatus::Open));
+    // ... and even when the history cannot be read
+    Routes::default()
+        .get(&pending_lookup(R_LIMIT_TAG), 200, rfx!("get_limit_pending"))
+        .get(&p("/summary"), 200, &summary_with_last(5000))
+        .get(&scan_path(5000 - WINDOW), 200, fx!("error_500.json"))
+        .install(&t);
+    assert_eq!(a.find_orders_by_tag(R_LIMIT_TAG).unwrap().len(), 1);
+}
+
+#[test]
+fn lookup_by_tag_is_inconclusive_never_empty_when_the_scan_is_incomplete_and_passes_other_errors_through() {
+    let (a, t) = setup();
+    let mut cut: Value = serde_json::from_str(&page(LAST - WINDOW, LAST, &[])).unwrap();
+    cut["transactions"].as_array_mut().unwrap().truncate(3);
+    Routes::default()
+        .get(&pending_lookup(TAG), 404, rfx!("get_by_client_id_missing"))
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &cut.to_string())
+        .install(&t);
+    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::LookupInconclusive(m)) if m.contains("incomplete")));
+    // a pending lookup that fails is an error, not "no order"
+    Routes::default().get(&pending_lookup(TAG), 500, fx!("error_500.json")).install(&t);
+    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::Http(500))));
+    Routes::default().get(&pending_lookup(TAG), 401, fx!("error_401.json")).install(&t);
+    assert!(matches!(a.find_orders_by_tag(TAG), Err(BrokerError::Exchange(e)) if e[0].class == ErrorClass::Auth));
+    // an unusable tag is refused before anything is sent
+    let before = t.request_count();
     let too_long = "x".repeat(129);
     for bad in ["", too_long.as_str(), "caf\u{e9}"] {
         assert!(matches!(a.find_orders_by_tag(bad), Err(BrokerError::InvalidRequest(_))));
     }
+    assert_eq!(t.request_count(), before);
 }
 
+#[test]
+fn the_pending_lookup_percent_encodes_the_at_sign_and_reserved_characters() {
+    let (a, t) = setup();
+    Routes::default().get(&tag_lookup(TAG_PATH), 404, rfx!("get_by_client_id_missing")).install(&t);
+    assert!(a.get_pending_order_by_tag(TAG).unwrap().is_none());
+    let url = &t.requests()[0].url;
+    assert!(url.ends_with(&format!("/orders/{TAG_PATH}")), "{url}");
+    assert!(!url.contains('@') && !url[PRACTICE_BASE_URL.len()..].contains(':'));
+    let decoded = TAG_PATH.replace("%40", "@").replace("%3A", ":").replace("%2F", "/");
+    assert_eq!(decoded, format!("@{TAG}"));
+    // a lookup that returns someone else's order is refused
+    Routes::default()
+        .get(&tag_lookup(TAG_PATH), 200, fx!("order_other_client_id.json"))
+        .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
+        .install(&t);
+    assert!(matches!(a.get_pending_order_by_tag(TAG), Err(BrokerError::Malformed(m)) if m.contains("does not carry")));
+}
+
+// ---------------------------------------------------------------- maximumPositionSize
+
+fn cap_adapter(cap: Option<&str>) -> (OandaAdapter, Arc<FakeTransport>) {
+    let (a, t) = setup();
+    a.set_instruments(table_with_cap(cap));
+    (a, t)
+}
+
+fn cap_routes(net_long: &str, net_short: &str) -> Routes {
+    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 200, &position_body("EUR_USD", net_long, net_short))
+}
+
+/// Send one order and say whether the POST left. `Err(InvalidRequest)` naming maximumPositionSize is the cap refusal.
+fn try_order(a: &OandaAdapter, t: &FakeTransport, side: Side, units: &str) -> (Result<PlaceOutcome, BrokerError>, bool) {
+    let before = posts(t).len();
+    let out = a.place_order(&OrderRequest::market(TAG, "EUR_USD", side, d(units)));
+    (out, posts(t).len() > before)
+}
+
+fn assert_cap_refused(r: (Result<PlaceOutcome, BrokerError>, bool), what: &str) {
+    match r {
+        (Err(BrokerError::InvalidRequest(m)), false) => assert!(m.contains("maximumPositionSize") && m.contains("refusing to truncate"), "{what}: {m}"),
+        other => panic!("{what}: expected the cap refusal and no POST, got {other:?}"),
+    }
+}
+
+fn assert_sent(r: (Result<PlaceOutcome, BrokerError>, bool), what: &str) {
+    assert!(r.1, "{what}: the POST should have left, got {:?}", r.0);
+    assert!(!matches!(r.0, Err(BrokerError::InvalidRequest(_))), "{what}: {:?}", r.0);
+}
+
+#[test]
+fn maximum_position_size_zero_or_absent_means_no_cap_and_the_position_is_not_even_read() {
+    for cap in [Some("0"), Some("0.0"), None] {
+        let (a, t) = cap_adapter(cap);
+        assert_eq!(a.instrument("EUR_USD").unwrap().maximum_position_size, None, "{cap:?}: zero / absent parse to NO cap, never a zero limit");
+        cap_routes("1000000000", "0").install(&t);
+        let (out, posted) = try_order(&a, &t, Side::Buy, "99999999");
+        assert!(matches!(out.unwrap(), PlaceOutcome::Accepted { .. }), "{cap:?}");
+        assert!(posted);
+        assert_eq!(count(&t, HttpMethod::Get, "/positions/"), 0, "{cap:?}: no cap, so no extra read");
+    }
+}
+
+#[test]
+fn a_positive_maximum_position_size_refuses_an_order_that_would_exceed_it_and_never_truncates() {
+    let (a, t) = cap_adapter(Some("5000"));
+    assert_eq!(a.instrument("EUR_USD").unwrap().maximum_position_size, Some(d("5000")));
+    // long 4000: buying 1000 reaches exactly the cap (allowed), buying 1001 does not
+    cap_routes("4000", "0").install(&t);
+    assert_sent(try_order(&a, &t, Side::Buy, "1000"), "buy to exactly the cap");
+    assert_cap_refused(try_order(&a, &t, Side::Buy, "1001"), "buy past the cap");
+    // short side: net -4500, selling 500 reaches -5000 (allowed), 501 crosses -5001
+    cap_routes("0", "-4500").install(&t);
+    assert_sent(try_order(&a, &t, Side::Sell, "500"), "sell to exactly the cap");
+    assert_cap_refused(try_order(&a, &t, Side::Sell, "501"), "sell past the cap");
+    // flipping through zero counts the resulting net: long 4000, sell 9500 -> net -5500
+    cap_routes("4000", "0").install(&t);
+    assert_cap_refused(try_order(&a, &t, Side::Sell, "9500"), "flip past the cap on the other side");
+    assert_sent(try_order(&a, &t, Side::Sell, "9000"), "flip to exactly -5000");
+    // a 404 on the position read means flat
+    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 404, fx!("error_404_account.json")).install(&t);
+    assert_sent(try_order(&a, &t, Side::Buy, "5000"), "from flat to the cap");
+    assert_cap_refused(try_order(&a, &t, Side::Buy, "5001"), "from flat past the cap");
+    assert_eq!(a.tag_checkpoint("never-used"), None);
+}
+
+#[test]
+fn reducing_a_position_that_is_already_over_the_cap_is_allowed() {
+    let (a, t) = cap_adapter(Some("5000"));
+    cap_routes("6000", "0").install(&t);
+    assert_sent(try_order(&a, &t, Side::Sell, "500"), "a reduction from an over-cap position");
+    assert_cap_refused(try_order(&a, &t, Side::Buy, "1"), "growing an over-cap position");
+}
+
+#[test]
+fn a_position_read_failure_with_a_cap_means_nothing_is_sent() {
+    let (a, t) = cap_adapter(Some("5000"));
+    place_routes(201, fx!("create_market_buy_filled.json")).get(&p("/positions/EUR_USD"), 500, fx!("error_500.json")).install(&t);
+    assert!(matches!(a.place_order(&buy_req()), Err(BrokerError::Preflight(m)) if m.contains("nothing was sent")));
+    assert!(posts(&t).is_empty());
+}
+
+#[test]
+fn a_negative_or_garbage_maximum_position_size_fails_the_instrument_table() {
+    for bad in ["-5", "lots"] {
+        let row = json!({"name":"EUR_USD","type":"CURRENCY","displayPrecision":5,"tradeUnitsPrecision":0,"minimumTradeSize":"1",
+            "maximumOrderUnits":"100000000","marginRate":"0.02","maximumPositionSize": bad});
+        assert!(matches!(InstrumentTable::from_instruments_json(&json!({"instruments":[row]}).to_string()), Err(BrokerError::Malformed(_))), "{bad}");
+    }
+}
+
+// ---------------------------------------------------------------- get_order: the transaction-stream fallback
+
+#[test]
+fn get_order_rebuilds_a_finished_order_from_the_stream_when_the_broker_will_not_serve_it_by_id() {
+    // RECORDED transactions of the cancelled limit order: 34 LIMIT_ORDER, 35 ORDER_CANCEL (CLIENT_REQUEST), 36 ORDER_CANCEL_REJECT.
+    let create = real_json(rfx!("place_limit"))["orderCreateTransaction"].clone();
+    let cancel = real_json(rfx!("cancel_by_client_id"))["orderCancelTransaction"].clone();
+    let cancel_reject = real_json(rfx!("cancel_again"))["orderCancelRejectTransaction"].clone();
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/34"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(33), 200, &page(33, 36, &[create, cancel, cancel_reject]))
+        .install(&t);
+    let r = a.get_order("34").unwrap();
+    assert_eq!((r.status, r.reason.as_deref(), r.executed_quantity, r.tag.as_deref()), (OrderStatus::Canceled, Some("CLIENT_REQUEST"), Dec::ZERO, Some(R_LIMIT_TAG)));
+    assert!(matches!(r.kind, Some(OrderKind::Limit { price }) if price == d("0.50000")));
+
+    // and a filled market order (RECORDED place_filled): the fill comes from the same page
+    let v = real_json(rfx!("place_filled"));
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/30"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(29), 200, &page(29, 31, &[v["orderCreateTransaction"].clone(), v["orderFillTransaction"].clone()]))
+        .install(&t);
+    let r = a.get_order("30").unwrap();
+    assert_eq!((r.status, r.executed_quantity, r.avg_price), (OrderStatus::Filled, d("1"), Some(d("1.13835"))));
+
+    // an id that is in no page is NotFound (so cancel_and_settle can say CancelTargetNotFound)
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/orders/999"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(998), 200, &page(998, 998, &[]))
+        .install(&t);
+    assert!(matches!(a.get_order("999"), Err(BrokerError::NotFound(_))));
+    // an incomplete stream is never read as a finished order
+    let (a, t) = setup();
+    let mut cut: Value = serde_json::from_str(&page(33, 36, &[])).unwrap();
+    cut["transactions"].as_array_mut().unwrap().truncate(1);
+    Routes::default()
+        .get(&p("/orders/34"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(33), 200, &cut.to_string())
+        .install(&t);
+    // the first record of the cut page is a filler, not the order, so it is "not found", not a wrong report
+    assert!(a.get_order("34").is_err());
+}
 // ---------------------------------------------------------------- cancel
 
 #[test]
 fn cancel_puts_to_the_cancel_endpoint_and_reports_a_synchronous_cancel() {
+    // RECORDED 200 body (cancel_by_client_id): orderCancelTransaction, reason CLIENT_REQUEST.
     let (a, t) = setup();
-    Routes::default().put(&p("/orders/6390/cancel"), 200, fx!("cancel_ok.json")).install(&t);
-    let out = a.cancel_order("6390").unwrap();
+    Routes::default().put(&p("/orders/34/cancel"), 200, rfx!("cancel_by_client_id")).install(&t);
+    let out = a.cancel_order("34").unwrap();
     assert_eq!((out.canceled_count, out.pending), (1, false));
-    assert_eq!(lines(&t), [format!("Put {}", p("/orders/6390/cancel"))]);
+    assert_eq!(lines(&t), [format!("Put {}", p("/orders/34/cancel"))]);
     assert!(t.requests()[0].body.is_none());
     assert_eq!(t.requests()[0].header("Authorization"), Some(format!("Bearer {TOKEN}").as_str()));
 }
@@ -1058,18 +1661,19 @@ fn cancel_puts_to_the_cancel_endpoint_and_reports_a_synchronous_cancel() {
 #[test]
 fn cancel_errors_are_classified() {
     let (a, t) = setup();
-    Routes::default().put(&p("/orders/6390/cancel"), 404, fx!("cancel_reject_404.json")).install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::NotFound(_))));
-    Routes::default().put(&p("/orders/6390/cancel"), 401, fx!("error_401.json")).install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Exchange(e)) if e[0].class == ErrorClass::Auth));
-    Routes::default().put(&p("/orders/6390/cancel"), 429, fx!("error_429.json")).with_header("Retry-After", "3").install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::RateLimited { retry_after_secs: Some(3), .. })));
-    Routes::default().put(&p("/orders/6390/cancel"), 503, fx!("error_503_html.txt")).install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Http(503))));
-    Routes::default().put(&p("/orders/6390/cancel"), 200, fx!("cancel_no_txn.json")).install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Malformed(_))));
-    Routes::default().fail(HttpMethod::Put, &p("/orders/6390/cancel"), TransportError::Timeout).install(&t);
-    assert!(matches!(a.cancel_order("6390"), Err(BrokerError::Transport(TransportError::Timeout))));
+    // RECORDED: cancelling again is HTTP 404 ORDER_DOESNT_EXIST with an orderCancelRejectTransaction
+    Routes::default().put(&p("/orders/34/cancel"), 404, rfx!("cancel_again")).install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::NotFound(_))));
+    Routes::default().put(&p("/orders/34/cancel"), 401, fx!("error_401.json")).install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::Exchange(e)) if e[0].class == ErrorClass::Auth));
+    Routes::default().put(&p("/orders/34/cancel"), 429, fx!("error_429.json")).with_header("Retry-After", "3").install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::RateLimited { retry_after_secs: Some(3), .. })));
+    Routes::default().put(&p("/orders/34/cancel"), 503, fx!("error_503_html.txt")).install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::Http(503))));
+    Routes::default().put(&p("/orders/34/cancel"), 200, fx!("cancel_no_txn.json")).install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::Malformed(_))));
+    Routes::default().fail(HttpMethod::Put, &p("/orders/34/cancel"), TransportError::Timeout).install(&t);
+    assert!(matches!(a.cancel_order("34"), Err(BrokerError::Transport(TransportError::Timeout))));
 }
 
 #[test]
@@ -1085,10 +1689,25 @@ fn cancel_and_settle_returns_the_order_as_it_ended() {
 }
 
 #[test]
+fn cancel_and_settle_survives_a_broker_that_will_not_serve_the_cancelled_order_by_id() {
+    // RECORDED: the cancel 200, then the order is read back; if GET /orders/34 is a 404 the stream (34, 35) answers.
+    let create = real_json(rfx!("place_limit"))["orderCreateTransaction"].clone();
+    let cancel = real_json(rfx!("cancel_by_client_id"))["orderCancelTransaction"].clone();
+    let (a, t) = setup();
+    Routes::default()
+        .put(&p("/orders/34/cancel"), 200, rfx!("cancel_by_client_id"))
+        .get(&p("/orders/34"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(33), 200, &page(33, 35, &[create, cancel]))
+        .install(&t);
+    let (out, report) = a.cancel_and_settle("34").unwrap();
+    assert_eq!((out.canceled_count, report.status, report.reason.as_deref()), (1, OrderStatus::Canceled, Some("CLIENT_REQUEST")));
+}
+
+#[test]
 fn cancel_of_an_order_that_already_filled_reports_the_fill_with_a_zero_cancel_count() {
     let (a, t) = setup();
     Routes::default()
-        .put(&p("/orders/6372/cancel"), 404, fx!("cancel_reject_404.json"))
+        .put(&p("/orders/6372/cancel"), 404, rfx!("cancel_again"))
         .get(&p("/orders/6372"), 200, fx!("order_filled_market.json"))
         .get(&p("/transactions/6373"), 200, fx!("txn_fill_buy.json"))
         .install(&t);
@@ -1101,8 +1720,9 @@ fn cancel_of_an_order_that_already_filled_reports_the_fill_with_a_zero_cancel_co
 fn cancel_of_an_unknown_order_is_target_not_found() {
     let (a, t) = setup();
     Routes::default()
-        .put(&p("/orders/9999/cancel"), 404, fx!("cancel_reject_404.json"))
-        .get(&p("/orders/9999"), 404, fx!("error_404_order.json"))
+        .put(&p("/orders/9999/cancel"), 404, rfx!("cancel_again"))
+        .get(&p("/orders/9999"), 404, rfx!("get_by_client_id_missing"))
+        .get(&scan_path(9998), 200, &page(9998, 9998, &[]))
         .install(&t);
     assert!(matches!(a.cancel_and_settle("9999"), Err(BrokerError::CancelTargetNotFound(id)) if id == "9999"));
     // any other failure is passed through, not swallowed
@@ -1113,14 +1733,33 @@ fn cancel_of_an_unknown_order_is_target_not_found() {
 // ---------------------------------------------------------------- close / flatten one instrument
 
 const CLOSE_TAG: &str = "rb1:fl:20260921T150000Z:EURUSD:1:abc";
-const CLOSE_TAG_PATH: &str = "%40rb1%3Afl%3A20260921T150000Z%3AEURUSD%3A1%3Aabc";
 
-fn close_routes(pos_fixture: &str, put_status: u16, put_body: &str, instrument: &str) -> Routes {
+/// Summary, the recent-window scan, the position read and the close.
+fn close_routes(inst: &str, position: &str, put_status: u16, put_body: &str) -> Routes {
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
-        .get(&p(&format!("/positions/{instrument}")), 200, pos_fixture)
-        .put(&p(&format!("/positions/{instrument}/close")), put_status, put_body)
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
+        .get(&p(&format!("/positions/{inst}")), 200, position)
+        .put(&p(&format!("/positions/{inst}/close")), put_status, put_body)
+}
+
+fn close_routes_seq(inst: &str, position_seq: &[(u16, String)], put_status: u16, put_body: &str) -> Routes {
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
+        .get_seq(&p(&format!("/positions/{inst}")), position_seq)
+        .put(&p(&format!("/positions/{inst}/close")), put_status, put_body)
+}
+
+fn close_routes_err(inst: &str, position: &str, e: TransportError) -> Routes {
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&scan_path(LAST), 200, &page(LAST, LAST, &[]))
+        .get(&p(&format!("/positions/{inst}")), 200, position)
+        .fail(HttpMethod::Put, &p(&format!("/positions/{inst}/close")), e)
 }
 
 fn puts(t: &FakeTransport) -> Vec<HttpRequest> {
@@ -1128,57 +1767,56 @@ fn puts(t: &FakeTransport) -> Vec<HttpRequest> {
 }
 
 #[test]
-fn closing_a_long_position_sends_long_units_all_with_the_tag() {
+fn closing_a_long_sends_all_for_the_long_side_and_none_for_the_short_side() {
+    // RECORDED response (close_long_only): 14 long units closed by selling 14.
     let (a, t) = setup();
-    close_routes(fx!("position_single_long.json"), 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
+    close_routes("EUR_USD", &position_body("EUR_USD", "14", "0"), 200, rfx!("close_long_only")).install(&t);
     match a.close_position("EUR/USD", CLOSE_TAG).unwrap() {
         CloseOutcome::Closed { broker_order_id, fill } => {
-            assert_eq!(broker_order_id, "6410");
-            assert_eq!((fill.units, fill.price, fill.pl), (d("-10000"), d("1.10148"), Some(d("481.0000"))));
+            assert_eq!(broker_order_id, "49");
+            assert_eq!((fill.units, fill.price, fill.pl), (d("-14"), d("1.13781"), Some(d("-0.0072"))));
         }
         other => panic!("{other:?}"),
     }
     let put = &puts(&t)[0];
-    let expected: serde_json::Value = serde_json::from_str(
-        r#"{"longUnits":"ALL","longClientExtensions":{"id":"rb1:fl:20260921T150000Z:EURUSD:1:abc","tag":"mendl-rb"}}"#,
+    let expected: Value = serde_json::from_str(
+        r#"{"longUnits":"ALL","shortUnits":"NONE","longClientExtensions":{"id":"rb1:fl:20260921T150000Z:EURUSD:1:abc","tag":"mendl-rb"}}"#,
     )
     .unwrap();
     assert_eq!(body_json(put), expected);
     assert!(line(put).ends_with("/positions/EUR_USD/close"));
+    assert_eq!(a.tag_checkpoint(CLOSE_TAG), Some(LAST));
 }
 
 #[test]
-fn closing_a_short_position_sends_short_units_all() {
+fn closing_a_short_sends_all_for_the_short_side_and_none_for_the_long_side() {
+    // RECORDED response (close_short): a 3-unit USD_JPY short closed.
     let (a, t) = setup();
-    Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
-        .get(&p("/positions/GBP_USD"), 200, fx!("position_single_short.json"))
-        .put(&p("/positions/GBP_USD/close"), 200, fx!("close_short_ok.json"))
-        .install(&t);
-    match a.close_position("GBP_USD", CLOSE_TAG).unwrap() {
-        CloseOutcome::Closed { fill, .. } => assert_eq!(fill.units, d("5000")),
+    close_routes("USD_JPY", &position_body("USD_JPY", "0", "-3"), 200, rfx!("close_short")).install(&t);
+    match a.close_position("USD_JPY", CLOSE_TAG).unwrap() {
+        CloseOutcome::Closed { fill, broker_order_id } => {
+            assert_eq!((broker_order_id.as_str(), fill.units, fill.price), ("43", d("3"), d("158.329")));
+        }
         other => panic!("{other:?}"),
     }
     let body = body_json(&puts(&t)[0]);
     assert_eq!(body["shortUnits"], "ALL");
-    assert!(body.get("longUnits").is_none());
+    assert_eq!(body["longUnits"], "NONE", "ALL for a side that does not exist is HTTP 400 at OANDA: never sent");
     assert_eq!(body["shortClientExtensions"]["id"], CLOSE_TAG);
+    assert!(body.get("longClientExtensions").is_none());
 }
 
 #[test]
 fn nothing_to_close_sends_no_put() {
-    for pos in [fx!("position_single_flat.json")] {
-        let (a, t) = setup();
-        close_routes(pos, 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
-        assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
-        assert!(puts(&t).is_empty());
-    }
+    let (a, t) = setup();
+    close_routes("EUR_USD", &position_body("EUR_USD", "0", "0"), 200, rfx!("close_long_only")).install(&t);
+    assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
+    assert!(puts(&t).is_empty());
     // a 404 on the position read also means no position
     let (a, t) = setup();
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
         .get(&p("/positions/EUR_USD"), 404, fx!("error_404_account.json"))
         .install(&t);
     assert_eq!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::NothingToClose);
@@ -1186,15 +1824,19 @@ fn nothing_to_close_sends_no_put() {
 }
 
 #[test]
-fn closing_twice_with_the_same_tag_adopts_the_first_close() {
+fn closing_twice_with_the_same_tag_adopts_the_first_close_when_the_stream_names_it() {
+    // DERIVED from the recorded close_short: the recording sent no client extensions; they are added where OANDA puts them
+    // on a market order and its fill. (Whether a real close echoes longClientExtensions is UNMEASURED.)
+    let body = with_client_id(rfx!("close_short"), CLOSE_TAG);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let recs = [v["shortOrderCreateTransaction"].clone(), v["shortOrderFillTransaction"].clone()];
     let (a, t) = setup();
     Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 200, fx!("order_filled_close.json"))
-        .get(&p("/transactions/6411"), 200, fx!("txn_fill_close.json"))
+        .get(&p("/summary"), 200, &summary_with_last(44))
+        .get(&scan_path(44 - WINDOW), 200, &page(44 - WINDOW, 44, &recs))
         .install(&t);
-    match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
-        CloseOutcome::AlreadyDone { report } => assert_eq!(report.broker_order_id, "6410"),
+    match a.close_position("USD_JPY", CLOSE_TAG).unwrap() {
+        CloseOutcome::AlreadyDone { report } => assert_eq!((report.broker_order_id.as_str(), report.status), ("43", OrderStatus::Filled)),
         other => panic!("{other:?}"),
     }
     assert!(puts(&t).is_empty(), "no second close is sent");
@@ -1203,63 +1845,128 @@ fn closing_twice_with_the_same_tag_adopts_the_first_close() {
 #[test]
 fn a_hedged_position_is_refused_without_sending_a_close() {
     let (a, t) = setup();
-    close_routes(fx!("position_single_hedged.json"), 200, fx!("close_long_ok.json"), "EUR_USD").install(&t);
+    close_routes("EUR_USD", &position_body("EUR_USD", "10", "-10"), 200, rfx!("close_long_only")).install(&t);
     assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::Unsupported(_))));
     assert!(puts(&t).is_empty());
 }
 
 #[test]
+fn a_closeout_that_the_broker_says_does_not_exist_is_settled_by_re_reading_the_position() {
+    // RECORDED: 404 close_nothing (nothing open) and 400 close_wrong_side (ALL for an absent side), both
+    // CLOSEOUT_POSITION_DOESNT_EXIST. We read the position moments ago, so the broker's answer means it changed.
+    for (status, body) in [(404u16, rfx!("close_nothing")), (400, rfx!("close_wrong_side"))] {
+        // the position is gone on the re-read: already flat
+        let (a, t) = setup();
+        close_routes_seq("USD_JPY", &[(200, position_body("USD_JPY", "0", "-3")), (404, fx!("error_404_account.json").to_string())], status, body).install(&t);
+        match a.close_position("USD_JPY", CLOSE_TAG).unwrap() {
+            CloseOutcome::AlreadyFlat { detail } => assert!(detail.contains("no position to close"), "{detail}"),
+            other => panic!("{status}: {other:?}"),
+        }
+        assert_eq!(puts(&t).len(), 1);
+        // the position is still there on the re-read: a contradiction, unknown
+        let (a, t) = setup();
+        close_routes("USD_JPY", &position_body("USD_JPY", "0", "-3"), status, body).install(&t);
+        match a.close_position("USD_JPY", CLOSE_TAG).unwrap() {
+            CloseOutcome::UnknownOutcome { reason } => assert!(reason.contains("still shows") && reason.contains(&format!("[oanda-tag-checkpoint={LAST}]")), "{reason}"),
+            other => panic!("{status}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn close_outcomes_are_parsed_into_rejected_and_unknown() {
-    // a 400 with a reject transaction under the long/short prefix
+    // a 400 with a reject transaction under the long/short prefix (AUTHORED body)
     let (a, t) = setup();
-    close_routes(fx!("position_single_long.json"), 400, fx!("close_rejected_400.json"), "EUR_USD").install(&t);
+    close_routes("EUR_USD", &position_body("EUR_USD", "10000", "0"), 400, fx!("close_rejected_400.json")).install(&t);
     match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
         CloseOutcome::Rejected { errors } => {
             assert!(errors[0].code.contains("MARKET_HALTED") && errors[0].code.starts_with("oanda:400"), "{}", errors[0].code);
         }
         other => panic!("{other:?}"),
     }
+    assert_eq!(a.tag_checkpoint(CLOSE_TAG), None, "a refused close created nothing");
     // cancelled at creation
     let (a, t) = setup();
-    close_routes(fx!("position_single_long.json"), 200, fx!("close_cancelled.json"), "EUR_USD").install(&t);
+    close_routes("EUR_USD", &position_body("EUR_USD", "10000", "0"), 200, fx!("close_cancelled.json")).install(&t);
     assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::Rejected { errors } if errors[0].code.contains("MARKET_HALTED")));
-    // untrustworthy successes and server trouble
+    // untrustworthy successes and server trouble: the follow-up scan finds nothing and the position is still open
     for (why, status, body) in [
         ("other tag", 200, fx!("close_wrong_tag.json")),
         ("no transactions", 200, fx!("close_no_transactions.json")),
         ("not JSON", 200, "OK"),
         ("500", 500, fx!("error_500.json")),
         ("503", 503, fx!("error_503_html.txt")),
-        ("404 on close", 404, fx!("error_404_account.json")),
+        ("404 that is not a closeout error", 404, fx!("error_404_account.json")),
     ] {
         let (a, t) = setup();
-        close_routes(fx!("position_single_long.json"), status, body, "EUR_USD").install(&t);
-        assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::UnknownOutcome { .. }), "{why}");
+        close_routes("EUR_USD", &position_body("EUR_USD", "10000", "0"), status, body).install(&t);
+        match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
+            CloseOutcome::UnknownOutcome { reason } => assert!(reason.contains(&format!("[oanda-tag-checkpoint={LAST}]")), "{why}: {reason}"),
+            other => panic!("{why}: {other:?}"),
+        }
         assert_eq!(puts(&t).len(), 1, "{why}: never retried");
     }
-    // a timeout on the PUT
-    let (a, t) = setup();
-    Routes::default()
-        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 404, fx!("error_404_order.json"))
-        .get(&p("/positions/EUR_USD"), 200, fx!("position_single_long.json"))
-        .fail(HttpMethod::Put, &p("/positions/EUR_USD/close"), TransportError::Timeout)
-        .install(&t);
-    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::UnknownOutcome { .. }));
     // rate limit: not sent
     let (a, t) = setup();
-    close_routes(fx!("position_single_long.json"), 429, fx!("error_429.json"), "EUR_USD").install(&t);
+    close_routes("EUR_USD", &position_body("EUR_USD", "10000", "0"), 429, fx!("error_429.json")).install(&t);
     assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::RateLimited { .. })));
+    assert_eq!(a.tag_checkpoint(CLOSE_TAG), None);
 }
 
 #[test]
-fn a_close_whose_tag_lookup_fails_sends_nothing() {
+fn a_close_whose_answer_is_lost_is_settled_from_the_stream_or_from_the_position() {
+    let long_open = position_body("EUR_USD", "10000", "0");
+    // 1. the stream names the close (extensions echoed): found, not repeated
+    let body = with_client_id(rfx!("close_long_only"), CLOSE_TAG);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let recs = [
+        { let mut c = v["longOrderCreateTransaction"].clone(); c["id"] = json!("6401"); c },
+        { let mut f = v["longOrderFillTransaction"].clone(); f["id"] = json!("6402"); f["orderID"] = json!("6401"); f },
+    ];
     let (a, t) = setup();
     Routes::default()
         .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
-        .get(&tag_lookup(CLOSE_TAG_PATH), 500, fx!("error_500.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get(&p("/positions/EUR_USD"), 200, &long_open)
+        .fail(HttpMethod::Put, &p("/positions/EUR_USD/close"), TransportError::Timeout)
+        .get(&scan_path(LAST), 200, &page(LAST, LAST + 2, &recs))
         .install(&t);
-    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::Preflight(_))));
+    match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::Closed { broker_order_id, fill } => assert_eq!((broker_order_id.as_str(), fill.units), ("6401", d("-14"))),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(puts(&t).len(), 1);
+
+    // 2. the stream does not name it (extensions NOT echoed) but the position is flat afterwards: reported as already flat
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 200, &page(LAST - WINDOW, LAST, &[]))
+        .get_seq(&p("/positions/EUR_USD"), &[(200, long_open.clone()), (404, fx!("error_404_account.json").to_string())])
+        .fail(HttpMethod::Put, &p("/positions/EUR_USD/close"), TransportError::Timeout)
+        .get(&scan_path(LAST), 200, &page(LAST, LAST + 2, &[]))
+        .install(&t);
+    match a.close_position("EUR_USD", CLOSE_TAG).unwrap() {
+        CloseOutcome::AlreadyFlat { detail } => assert!(detail.contains("now flat") && detail.contains("unverified"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+
+    // 3. still open and not in the stream: unknown, and the next call may send the close again (a repeated ALL is harmless)
+    let (a, t) = setup();
+    close_routes_err("EUR_USD", &long_open, TransportError::Io("reset".into())).install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::UnknownOutcome { .. }));
+    close_routes("EUR_USD", &long_open, 200, rfx!("close_long_only")).install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG).unwrap(), CloseOutcome::Closed { .. }));
+}
+
+#[test]
+fn a_close_whose_tag_scan_fails_sends_nothing() {
+    let (a, t) = setup();
+    Routes::default()
+        .get(&p("/summary"), 200, fx!("account_summary_ok.json"))
+        .get(&scan_path(LAST - WINDOW), 500, fx!("error_500.json"))
+        .install(&t);
+    assert!(matches!(a.close_position("EUR_USD", CLOSE_TAG), Err(BrokerError::Preflight(m)) if m.contains("nothing was sent")));
     assert!(puts(&t).is_empty());
     assert_eq!(count(&t, HttpMethod::Get, "/positions/"), 0);
 }

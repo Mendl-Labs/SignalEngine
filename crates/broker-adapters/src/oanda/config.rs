@@ -86,10 +86,16 @@ pub struct OandaConfig {
     base_url: String,
     own_tag_prefix: Option<String>,
     client_tag: String,
+    restart_scan_window: u64,
+    strict_unseen_tags: bool,
 }
 
 /// `clientExtensions.tag` sent with every order unless overridden: a fixed, non-secret marker.
 pub const DEFAULT_CLIENT_TAG: &str = "mendl-rb";
+
+/// How many of the most recent transaction ids a lookup by tag scans when this process holds no checkpoint for the tag
+/// (a restarted process, or a tag it never sent). See `broker_adapters::oanda` (module docs, "Idempotency").
+pub const DEFAULT_RESTART_SCAN_WINDOW: u64 = 400;
 
 impl OandaConfig {
     /// A PRACTICE config. `base_url` must be [`PRACTICE_BASE_URL`] (the practice host) or a
@@ -106,7 +112,41 @@ impl OandaConfig {
 
     fn build(environment: Environment, base_url: &str) -> Result<Self, BrokerError> {
         let base_url = check_base_url(environment, base_url)?;
-        Ok(Self { environment, base_url, own_tag_prefix: None, client_tag: DEFAULT_CLIENT_TAG.to_string() })
+        Ok(Self {
+            environment,
+            base_url,
+            own_tag_prefix: None,
+            client_tag: DEFAULT_CLIENT_TAG.to_string(),
+            restart_scan_window: DEFAULT_RESTART_SCAN_WINDOW,
+            strict_unseen_tags: false,
+        })
+    }
+
+    /// Size of the recent-transaction window (in transaction ids) scanned for a tag this process holds no checkpoint
+    /// for. 10..=100000. A window that reaches back to the start of the account's history proves a tag was never used;
+    /// a shorter one only proves it was not used recently.
+    pub fn with_restart_scan_window(mut self, ids: u64) -> Result<Self, BrokerError> {
+        if !(10..=100_000).contains(&ids) {
+            return Err(BrokerError::Config(format!("restart_scan_window {ids} is outside 10..=100000")));
+        }
+        self.restart_scan_window = ids;
+        Ok(self)
+    }
+
+    /// Strict mode: a tag this process has no checkpoint for is treated as possibly sent by an earlier process, so
+    /// `place_order` / `close_position` refuse to send it (`UnknownOutcome`) unless the scan reached the start of the
+    /// account's history, and `find_orders_by_tag` answers `LookupInconclusive` instead of "not found" in that case.
+    /// Off by default: on an account with more transactions than the window it would refuse every new tag.
+    pub fn with_strict_unseen_tags(mut self, on: bool) -> Self {
+        self.strict_unseen_tags = on;
+        self
+    }
+
+    pub fn restart_scan_window(&self) -> u64 {
+        self.restart_scan_window
+    }
+    pub fn strict_unseen_tags(&self) -> bool {
+        self.strict_unseen_tags
     }
 
     /// Only orders whose tag starts with `prefix` are treated as ours: placement refuses other

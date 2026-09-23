@@ -4,14 +4,32 @@
 //! margin-account exchange behind it: signed net positions, weighted-average entry, realised P&L, NAV, margin used.
 //!
 //! # What this is and is not
-//! It is a test double written from the same documentation the adapter was written from. A green run proves the
-//! adapter agrees with THIS model of OANDA; it is not evidence about OANDA. Every response shape is
-//! FROM-MEMORY-OF-DOCS, exactly as in the adapter, and reason strings the fake invents (marked below) are not OANDA's.
+//! It is a test double. Since 2026-09-23 it reproduces, on exactly these points, what a REAL OANDA practice account was
+//! MEASURED to do (recorded in `product-mandate/VENUE_FACTS.md`, fixtures in `broker-adapters/tests/fixtures/oanda/real/`):
+//!
+//! * `GET /orders/@<clientID>` finds ONLY pending orders (a filled or cancelled order is 404 `NO_SUCH_ORDER`);
+//! * client ids are NOT unique: a reused id is accepted and produces a second order and a second fill;
+//! * every transaction is stored in one stream with consecutive ids; a `MARKET_ORDER` carries `clientExtensions.id`, its
+//!   `ORDER_FILL` / `ORDER_CANCEL` / `ORDER_CANCEL_REJECT` carry `clientOrderID`;
+//! * `GET /transactions/sinceid?id=<n>` returns the transactions after `n` and the account's `lastTransactionID`, which
+//!   `/summary` also reports;
+//! * a position close needs `longUnits` / `shortUnits` of `ALL` or `NONE`: `ALL` for a side that does not exist is
+//!   HTTP 400, nothing open at all is HTTP 404, both `CLOSEOUT_POSITION_DOESNT_EXIST` with a reject transaction;
+//! * an unknown instrument is HTTP 400 `oanda::rest::core::InvalidParameterException` with NO reject transaction;
+//! * a client id longer than 128 characters is refused with `CLIENT_ORDER_ID_INVALID`;
+//! * `maximumPositionSize` is reported as `"0"` (no cap) unless the test sets one.
+//!
+//! Everything else is a model written from documentation: a green run proves the adapter agrees with THIS model, and
+//! reason strings the fake invents (marked below) are not OANDA's. Unmeasured behaviours are switchable so the adapter can
+//! be shown to survive either answer: [`OandaHandle::set_historic_order_lookup`] (does `GET /orders/<numeric id>` serve
+//! FILLED / CANCELLED orders?), [`OandaHandle::set_echo_close_client_ids`] (does a position close echo
+//! `longClientExtensions` on its transactions?) and [`OandaHandle::set_sinceid_page_limit`] (a server that truncates the
+//! stream).
 //!
 //! * It is in-process (no socket, no port), like the Kraken front end: nothing here can reach a network.
-//! * It is deliberately HOSTILE about idempotency: by default it does NOT reject a reused `clientExtensions.id`
-//!   (OANDA might not, for a filled order), so any "no double submit" result comes from the adapter's look-up-first
-//!   rule and not from the fake. [`OandaHandle::reject_duplicate_client_ids`] switches the strict behaviour on.
+//! * It is deliberately HOSTILE about idempotency: it does NOT reject a reused `clientExtensions.id` (MEASURED: OANDA
+//!   does not), so any "no double submit" result comes from the adapter's transaction-scan protocol and not from the
+//!   fake. [`OandaHandle::reject_duplicate_client_ids`] switches on a strict mode for PENDING orders only (unmeasured).
 //! * Faults reuse the Kraken front end's machinery ([`Fault`], `Timing`): `BeforeApply` (request lost), `AfterApply`
 //!   (applied, answer lost: the unknown-outcome case) and `Delayed`. `FaultKind::RateLimit` is answered as HTTP 429 and
 //!   `FaultKind::ExchangeError` as HTTP 500 here. Match paths with the FULL path, see [`OandaHandle::path`].
@@ -42,6 +60,8 @@ pub struct InstrumentSpec {
     pub trade_units_precision: u32,
     pub minimum_trade_size: Dec,
     pub maximum_order_units: Dec,
+    /// `maximumPositionSize`; zero = NO CAP (what a real practice account reports).
+    pub maximum_position_size: Dec,
     pub margin_rate: Dec,
 }
 
@@ -53,8 +73,14 @@ impl InstrumentSpec {
             trade_units_precision: 0,
             minimum_trade_size: dec("1"),
             maximum_order_units: dec("100000000"),
+            maximum_position_size: Dec::ZERO,
             margin_rate: dec("0.02"),
         }
+    }
+    /// A positive `maximumPositionSize` (the fake does not enforce it: the ADAPTER must).
+    pub fn with_max_position(mut self, units: &str) -> Self {
+        self.maximum_position_size = dec(units);
+        self
     }
     fn base(&self) -> &str {
         self.name.split_once('_').map(|(b, _)| b).unwrap_or("")
@@ -155,8 +181,15 @@ pub(crate) struct OandaWorld {
     liquidity: BTreeMap<String, Dec>,
     orders: Vec<FakeOrder>,
     fills: Vec<FakeFill>,
-    txns: BTreeMap<String, Value>,
+    /// The one transaction stream (id -> transaction), including rejects and cancel rejects.
+    txns: BTreeMap<u64, Value>,
     next_id: u64,
+    /// Unmeasured at real OANDA: does `GET /orders/<numeric id>` serve FILLED / CANCELLED orders?
+    historic_by_id: bool,
+    /// Unmeasured at real OANDA: are `longClientExtensions` / `shortClientExtensions` echoed onto closeout transactions?
+    echo_close_ids: bool,
+    /// A server that returns only the first `n` transactions of a `sinceid` page.
+    sinceid_limit: Option<usize>,
     scripts: VecDeque<OrderScript>,
     reject_duplicate_ids: bool,
     faults: FaultQueue,
@@ -185,6 +218,7 @@ pub struct FakeOandaBuilder {
     token: String,
     balance: Dec,
     instruments: Vec<(InstrumentSpec, Dec, Dec)>,
+    first_txn_id: u64,
 }
 
 impl Default for FakeOandaBuilder {
@@ -203,7 +237,15 @@ impl FakeOandaBuilder {
             token: DEFAULT_TOKEN.to_string(),
             balance: Dec::ZERO,
             instruments: Vec::new(),
+            first_txn_id: 6001,
         }
+    }
+
+    /// The id the first transaction gets. Small values (say 2) make the whole account history fit inside the adapter's
+    /// recent-transaction window; the default is large enough that it does not.
+    pub fn first_transaction_id(mut self, id: u64) -> Self {
+        self.first_txn_id = id.max(1);
+        self
     }
 
     /// EUR_USD, GBP_USD, USD_JPY, AUD_USD with realistic two-sided prices, and 100000 USD.
@@ -267,7 +309,10 @@ impl FakeOandaBuilder {
             orders: Vec::new(),
             fills: Vec::new(),
             txns: BTreeMap::new(),
-            next_id: 6001,
+            next_id: self.first_txn_id,
+            historic_by_id: true,
+            echo_close_ids: true,
+            sinceid_limit: None,
             scripts: VecDeque::new(),
             reject_duplicate_ids: false,
             faults: FaultQueue::default(),
@@ -275,6 +320,13 @@ impl FakeOandaBuilder {
             next_seq: 1,
             delayed: Vec::new(),
         };
+        let mut world = world;
+        // A real account has a history: every id before the first one we allocate already exists (id 1 is the account's
+        // creation). Without it a scan of "the last N ids" would find holes, which the adapter rightly refuses to trust.
+        for id in 1..self.first_txn_id {
+            let kind = if id == 1 { "CREATE" } else { "DAILY_FINANCING" };
+            world.txns.insert(id, json!({"id": id.to_string(), "time": unix_time(self.start_nanos), "type": kind}));
+        }
         FakeOanda { shared: Arc::new(Shared { world: Mutex::new(world), clock: Arc::new(FakeClock::new(self.start_nanos)) }) }
     }
 }
@@ -438,8 +490,22 @@ fn err_body(msg: &str) -> String {
     json!({ "errorMessage": msg }).to_string()
 }
 
-fn not_found_order() -> (u16, String) {
-    (404, json!({"errorCode": "ORDER_DOES_NOT_EXIST", "errorMessage": "The Order specified does not exist"}).to_string())
+/// MEASURED: HTTP 404 `NO_SUCH_ORDER` with the account's `lastTransactionID`.
+fn not_found_order(last: u64) -> (u16, String) {
+    (404, json!({"lastTransactionID": last.to_string(), "errorMessage": "The order ID specified does not exist", "errorCode": "NO_SUCH_ORDER"}).to_string())
+}
+
+/// `GET /transactions/sinceid?id=<n>`: the transactions with id greater than `n`, in order, plus the account's last id.
+fn sinceid(w: &mut OandaWorld, query: &str) -> (u16, String) {
+    let Some(params) = crate::kraken::wire::parse_form(query) else { return (400, err_body("bad query")) };
+    let Some(after) = params.iter().find(|(k, _)| k == "id").and_then(|(_, v)| v.parse::<u64>().ok()) else {
+        return (400, err_body("Invalid value specified for 'id'"));
+    };
+    let mut rows: Vec<Value> = w.txns.range(after + 1..).map(|(_, t)| t.clone()).collect();
+    if let Some(n) = w.sinceid_limit {
+        rows.truncate(n);
+    }
+    (200, json!({"transactions": rows, "lastTransactionID": w.last_id().to_string()}).to_string())
 }
 
 fn pct_decode(s: &str) -> Option<String> {
@@ -465,6 +531,14 @@ impl OandaWorld {
         let id = self.next_id;
         self.next_id += 1;
         id.to_string()
+    }
+
+    fn store(&mut self, id: &str, v: &Value) {
+        self.txns.insert(id.parse().expect("the fake allocates numeric ids"), v.clone());
+    }
+
+    fn last_id(&self) -> u64 {
+        self.next_id - 1
     }
 
     fn spec(&self, inst: &str) -> Option<&InstrumentSpec> {
@@ -607,6 +681,7 @@ impl OandaWorld {
         }
         t.insert("instrument".into(), json!(order.instrument));
         t.insert("units".into(), json!(units_str(units)));
+        t.insert("requestedUnits".into(), json!(units_str(order.units)));
         t.insert("price".into(), json!(self.price_str(&order.instrument, price)));
         t.insert("reason".into(), json!(reason));
         t.insert("pl".into(), json!(Self::fmt4(pl)));
@@ -614,7 +689,7 @@ impl OandaWorld {
         t.insert("commission".into(), json!("0.0000"));
         t.insert("accountBalance".into(), json!(Self::fmt4(self.account.balance)));
         let v = Value::Object(t);
-        self.txns.insert(id.clone(), v.clone());
+        self.store(&id, &v);
         (id, v)
     }
 
@@ -630,7 +705,7 @@ impl OandaWorld {
         }
         t.insert("reason".into(), json!(reason));
         let v = Value::Object(t);
-        self.txns.insert(id.clone(), v.clone());
+        self.store(&id, &v);
         (id, v)
     }
 
@@ -645,6 +720,10 @@ impl OandaWorld {
         t.insert("timeInForce".into(), json!(order.time_in_force));
         t.insert("positionFill".into(), json!(order.position_fill));
         t.insert("reason".into(), json!(if order.close_out { "POSITION_CLOSEOUT" } else { "CLIENT_ORDER" }));
+        if order.close_out {
+            let key = if order.units.is_negative() { "longPositionCloseout" } else { "shortPositionCloseout" };
+            t.insert(key.into(), json!({"instrument": order.instrument, "units": "ALL"}));
+        }
         if let Some(p) = order.limit_price {
             t.insert("price".into(), json!(self.price_str(&order.instrument, p)));
         }
@@ -657,7 +736,7 @@ impl OandaWorld {
             t.insert("clientExtensions".into(), Value::Object(ext));
         }
         let v = Value::Object(t);
-        self.txns.insert(order.id.clone(), v.clone());
+        self.store(&order.id, &v);
         v
     }
 
@@ -862,6 +941,7 @@ fn dispatch(w: &mut OandaWorld, now: u64, req: &HttpRequest, path: &str, query: 
                         "name": s.name, "type": "CURRENCY", "displayName": s.name.replace('_', "/"), "pipLocation": -(s.display_precision as i64) + 1,
                         "displayPrecision": s.display_precision, "tradeUnitsPrecision": s.trade_units_precision,
                         "minimumTradeSize": s.minimum_trade_size.to_string(), "maximumOrderUnits": s.maximum_order_units.to_string(),
+                        "maximumPositionSize": s.maximum_position_size.to_string(), "tags": [],
                         "marginRate": s.margin_rate.to_string()
                     })
                 })
@@ -882,23 +962,29 @@ fn dispatch(w: &mut OandaWorld, now: u64, req: &HttpRequest, path: &str, query: 
         }
         (Verb::Get, ["orders", spec]) => {
             let Some(spec) = pct_decode(spec) else { return (400, err_body("bad order specifier")) };
+            // MEASURED: by client id only a PENDING order is found (filled / cancelled: 404 NO_SUCH_ORDER). By numeric id
+            // OANDA's behaviour for finished orders is unmeasured: switchable.
             let found = if let Some(cid) = spec.strip_prefix('@') {
-                w.orders.iter().rev().find(|o| o.client_id.as_deref() == Some(cid))
+                w.orders.iter().rev().find(|o| o.client_id.as_deref() == Some(cid) && o.state == OrderState::Pending)
             } else {
-                w.orders.iter().find(|o| o.id == spec)
+                w.orders.iter().find(|o| o.id == spec && (w.historic_by_id || o.state == OrderState::Pending))
             };
             match found {
-                Some(o) => (200, json!({"order": w.order_json(o), "lastTransactionID": (w.next_id - 1).to_string()}).to_string()),
-                None => not_found_order(),
+                Some(o) => (200, json!({"order": w.order_json(o), "lastTransactionID": w.last_id().to_string()}).to_string()),
+                None => not_found_order(w.last_id()),
             }
         }
-        (Verb::Get, ["transactions", id]) => match w.txns.get(*id) {
-            Some(t) => (200, json!({"transaction": t, "lastTransactionID": (w.next_id - 1).to_string()}).to_string()),
+        (Verb::Get, ["transactions", "sinceid"]) => sinceid(w, query),
+        (Verb::Get, ["transactions", id]) => match id.parse::<u64>().ok().and_then(|n| w.txns.get(&n)) {
+            Some(t) => (200, json!({"transaction": t, "lastTransactionID": w.last_id().to_string()}).to_string()),
             None => (404, json!({"errorMessage": "The transaction specified does not exist"}).to_string()),
         },
         (Verb::Get, ["pricing"]) => pricing(w, now, query),
         (Verb::Post, ["orders"]) => place_order(w, now, req.body.as_deref().unwrap_or("")),
-        (Verb::Put, ["orders", id, "cancel"]) => cancel(w, now, id),
+        (Verb::Put, ["orders", id, "cancel"]) => {
+            let Some(id) = pct_decode(id) else { return (400, err_body("bad order specifier")) };
+            cancel(w, now, &id)
+        }
         (Verb::Put, ["positions", inst, "close"]) => close_position(w, now, inst, req.body.as_deref().unwrap_or("")),
         _ => (404, err_body("Not Found")),
     }
@@ -962,17 +1048,33 @@ struct OrderSpec {
     close_out: bool,
 }
 
-/// Validation failure of an order request: the `rejectReason`.
-type Rejection = (String, String);
+/// Validation failure of an order request.
+enum Bad {
+    /// HTTP 400 with a `*_ORDER_REJECT` transaction: `(rejectReason, message)`.
+    Reject(String, String),
+    /// MEASURED: an unknown or unparseable parameter is HTTP 400 `oanda::rest::core::InvalidParameterException` with NO
+    /// reject transaction. The message names the parameter.
+    Param(String),
+}
 
-fn parse_order_spec(w: &OandaWorld, o: &Value) -> Result<OrderSpec, Rejection> {
-    let rej = |r: &str, m: &str| Err((r.to_string(), m.to_string()));
+/// The longest client id OANDA accepts (MEASURED: 128 accepted, 129 refused).
+const MAX_CLIENT_ID: usize = 128;
+
+fn parse_order_spec(w: &OandaWorld, o: &Value) -> Result<OrderSpec, Bad> {
+    let rej = |r: &str, m: &str| Err(Bad::Reject(r.to_string(), m.to_string()));
     let kind = o.get("type").and_then(Value::as_str).unwrap_or("");
     if kind != "MARKET" && kind != "LIMIT" {
         return rej("ORDER_TYPE_INVALID", "unsupported order type");
     }
-    let Some(instrument) = o.get("instrument").and_then(Value::as_str) else { return rej("INSTRUMENT_MISSING", "instrument is missing") };
-    let Some(spec) = w.spec(instrument) else { return rej("INSTRUMENT_INVALID", "instrument is not tradeable") };
+    let Some(instrument) = o.get("instrument").and_then(Value::as_str) else {
+        return Err(Bad::Param("Invalid value specified for 'order.instrument'".into()));
+    };
+    let Some(spec) = w.spec(instrument) else { return Err(Bad::Param("Invalid value specified for 'order.instrument'".into())) };
+    if let Some(id) = o.get("clientExtensions").and_then(|e| e.get("id")).and_then(Value::as_str) {
+        if id.chars().count() > MAX_CLIENT_ID {
+            return rej("CLIENT_ORDER_ID_INVALID", "The client order ID specified is invalid");
+        }
+    }
     let Some(units_text) = o.get("units").and_then(Value::as_str) else { return rej("UNITS_MISSING", "units must be a string") };
     let Ok(units) = Dec::parse(units_text) else { return rej("UNITS_INVALID", "units is not a number") };
     if units.is_zero() {
@@ -1059,23 +1161,45 @@ fn submit(w: &mut OandaWorld, now: u64, spec: OrderSpec, script: Option<OrderScr
 }
 
 fn reject_response(w: &mut OandaWorld, now: u64, prefix: &str, o: Option<&Value>, reason: &str, msg: &str) -> (u16, String) {
+    reject_response_status(w, now, 400, prefix, o, reason, msg)
+}
+
+/// A refusal: the `*_ORDER_REJECT` transaction is part of the stream (it consumes an id, as measured) and echoes the
+/// request's client extensions when it carried them.
+fn reject_response_status(w: &mut OandaWorld, now: u64, status: u16, prefix: &str, o: Option<&Value>, reason: &str, msg: &str) -> (u16, String) {
     let tid = w.alloc();
     let mut t = Map::new();
     t.insert("id".into(), json!(tid));
     t.insert("time".into(), json!(unix_time(now)));
     t.insert("type".into(), json!("MARKET_ORDER_REJECT"));
     t.insert("rejectReason".into(), json!(reason));
-    if let Some(ext) = o.and_then(|o| o.get("clientExtensions")) {
-        t.insert("clientExtensions".into(), ext.clone());
+    if let Some(o) = o {
+        for k in ["instrument", "units", "timeInForce", "positionFill"] {
+            if let Some(v) = o.get(k) {
+                t.insert(k.into(), v.clone());
+            }
+        }
+        if let Some(ext) = o.get("clientExtensions") {
+            t.insert("clientExtensions".into(), ext.clone());
+        }
     }
+    let v = Value::Object(t);
+    w.store(&tid, &v);
     let key = format!("{prefix}RejectTransaction");
     let mut body = Map::new();
-    body.insert(key, Value::Object(t));
+    body.insert(key, v);
     body.insert("relatedTransactionIDs".into(), json!([tid]));
     body.insert("lastTransactionID".into(), json!(tid));
     body.insert("errorCode".into(), json!(reason));
     body.insert("errorMessage".into(), json!(msg));
-    (400, Value::Object(body).to_string())
+    (status, Value::Object(body).to_string())
+}
+
+fn bad_response(w: &mut OandaWorld, now: u64, o: &Value, bad: Bad) -> (u16, String) {
+    match bad {
+        Bad::Reject(r, m) => reject_response(w, now, "order", Some(o), &r, &m),
+        Bad::Param(m) => (400, json!({"errorMessage": m, "errorCode": "oanda::rest::core::InvalidParameterException"}).to_string()),
+    }
 }
 
 fn place_order(w: &mut OandaWorld, now: u64, body: &str) -> (u16, String) {
@@ -1087,14 +1211,14 @@ fn place_order(w: &mut OandaWorld, now: u64, body: &str) -> (u16, String) {
         }
         let spec = match parse_order_spec(w, o) {
             Ok(s) => s,
-            Err((r, m)) => return reject_response(w, now, "order", Some(o), &r, &m),
+            Err(bad) => return bad_response(w, now, o, bad),
         };
         let placed = submit(w, now, spec, Some(script));
         return created_response(placed, "order");
     }
     let spec = match parse_order_spec(w, o) {
         Ok(s) => s,
-        Err((r, m)) => return reject_response(w, now, "order", Some(o), &r, &m),
+        Err(bad) => return bad_response(w, now, o, bad),
     };
     if w.reject_duplicate_ids {
         if let Some(cid) = &spec.client_id {
@@ -1127,11 +1251,32 @@ fn created_response(p: Placed, prefix: &str) -> (u16, String) {
     (201, Value::Object(body).to_string())
 }
 
-fn cancel(w: &mut OandaWorld, now: u64, id: &str) -> (u16, String) {
-    let Some(idx) = w.orders.iter().position(|o| o.id == id && o.state == OrderState::Pending) else {
+/// `PUT /orders/<id or @clientID>/cancel`. MEASURED: cancelling a missing (or already cancelled / filled) order is HTTP
+/// 404 `ORDER_DOESNT_EXIST` with an `orderCancelRejectTransaction` that carries `clientOrderID` when addressed by it.
+fn cancel(w: &mut OandaWorld, now: u64, spec: &str) -> (u16, String) {
+    let (by_client, key) = match spec.strip_prefix('@') {
+        Some(c) => (true, c),
+        None => (false, spec),
+    };
+    let found = w.orders.iter().position(|o| {
+        o.state == OrderState::Pending && if by_client { o.client_id.as_deref() == Some(key) } else { o.id == key }
+    });
+    let Some(idx) = found else {
         let tid = w.alloc();
+        let mut rej = Map::new();
+        rej.insert("id".into(), json!(tid));
+        rej.insert("time".into(), json!(unix_time(now)));
+        rej.insert("type".into(), json!("ORDER_CANCEL_REJECT"));
+        rej.insert("rejectReason".into(), json!("ORDER_DOESNT_EXIST"));
+        if by_client {
+            rej.insert("clientOrderID".into(), json!(key));
+        } else {
+            rej.insert("orderID".into(), json!(key));
+        }
+        let v = Value::Object(rej);
+        w.store(&tid, &v);
         let body = json!({
-            "orderCancelRejectTransaction": {"id": tid, "type": "ORDER_CANCEL_REJECT", "orderID": id, "rejectReason": "ORDER_DOESNT_EXIST"},
+            "orderCancelRejectTransaction": v, "relatedTransactionIDs": [tid],
             "lastTransactionID": tid, "errorCode": "ORDER_DOESNT_EXIST", "errorMessage": "The Order specified does not exist"
         });
         return (404, body.to_string());
@@ -1142,28 +1287,37 @@ fn cancel(w: &mut OandaWorld, now: u64, id: &str) -> (u16, String) {
     (200, json!({"orderCancelTransaction": cancel, "relatedTransactionIDs": [tid], "lastTransactionID": tid}).to_string())
 }
 
+/// `PUT /positions/<inst>/close`. MEASURED: `{"longUnits":"ALL","shortUnits":"NONE"}` closes a long; `ALL` for a side
+/// that does not exist is HTTP 400 and nothing open at all is HTTP 404, both `CLOSEOUT_POSITION_DOESNT_EXIST` with a
+/// `long/shortOrderRejectTransaction`. Success is HTTP 200 (documented; the recorded files do not carry the status).
 fn close_position(w: &mut OandaWorld, now: u64, inst: &str, body: &str) -> (u16, String) {
     let Ok(root) = serde_json::from_str::<Value>(body) else { return (400, err_body("Invalid JSON")) };
-    let (prefix, ext_key, want_long) = match (root.get("longUnits"), root.get("shortUnits")) {
-        (Some(_), None) => ("longOrder", "longClientExtensions", true),
-        (None, Some(_)) => ("shortOrder", "shortClientExtensions", false),
-        _ => return (400, err_body("exactly one of longUnits / shortUnits is supported by this fake")),
-    };
-    let units_key = if want_long { "longUnits" } else { "shortUnits" };
-    if root.get(units_key).and_then(Value::as_str) != Some("ALL") {
-        return (400, err_body("this fake supports only \"ALL\""));
+    let side = |k: &str| root.get(k).and_then(Value::as_str);
+    let (lu, su) = (side("longUnits"), side("shortUnits"));
+    if lu.is_none() && su.is_none() {
+        return (400, err_body("at least one of longUnits / shortUnits is required"));
     }
+    for u in [lu, su].into_iter().flatten() {
+        if u != "ALL" && u != "NONE" {
+            return (400, err_body("this fake supports only \"ALL\" and \"NONE\""));
+        }
+    }
+    let (want_long, want_short) = (lu == Some("ALL"), su == Some("ALL"));
+    if want_long == want_short {
+        return (400, err_body("this fake closes exactly one side per request"));
+    }
+    let (prefix, ext_key) = if want_long { ("longOrder", "longClientExtensions") } else { ("shortOrder", "shortClientExtensions") };
     let Some(pos) = w.account.positions.get(inst).cloned() else {
-        return reject_response(w, now, prefix, None, "CLOSEOUT_POSITION_DOESNT_EXIST", "The position does not exist");
+        return reject_response_status(w, now, 404, prefix, None, "CLOSEOUT_POSITION_DOESNT_EXIST", "The Position requested to be closed out does not exist");
     };
-    if (want_long && !pos.units.is_positive()) || (!want_long && !pos.units.is_negative()) {
-        return reject_response(w, now, prefix, None, "CLOSEOUT_POSITION_DOESNT_EXIST", "No such side is open");
+    if (want_long && !pos.units.is_positive()) || (want_short && !pos.units.is_negative()) {
+        return reject_response(w, now, prefix, None, "CLOSEOUT_POSITION_DOESNT_EXIST", "The Position requested to be closed out does not exist");
     }
     let script = w.scripts.pop_front();
     if let Some(OrderScript::Reject(reason)) = &script {
         return reject_response(w, now, prefix, root.get(ext_key), reason, "close rejected (scripted)");
     }
-    let ext = root.get(ext_key);
+    let ext = if w.echo_close_ids { root.get(ext_key) } else { None };
     let spec = OrderSpec {
         instrument: inst.to_string(),
         units: neg(pos.units),
@@ -1175,7 +1329,8 @@ fn close_position(w: &mut OandaWorld, now: u64, inst: &str, body: &str) -> (u16,
         close_out: true,
     };
     let placed = submit(w, now, spec, script);
-    created_response(placed, prefix)
+    let (_, body) = created_response(placed, prefix);
+    (200, body)
 }
 
 // ---------------------------------------------------------------- control API
@@ -1350,6 +1505,45 @@ impl OandaHandle {
     /// Script the next order (or close) that reaches the exchange.
     pub fn script_next_order(&self, script: OrderScript) {
         self.control(format!("script_next_order {script:?}"), |w, _| w.scripts.push_back(script));
+    }
+
+    /// Unmeasured at real OANDA: does `GET /orders/<numeric id>` serve FILLED / CANCELLED orders? Default true. When false
+    /// only pending orders are found by id too, and the adapter must rebuild finished orders from the transaction stream.
+    pub fn set_historic_order_lookup(&self, on: bool) {
+        self.control(format!("set_historic_order_lookup {on}"), |w, _| w.historic_by_id = on);
+    }
+
+    /// Unmeasured at real OANDA: are `longClientExtensions` / `shortClientExtensions` echoed onto the closeout
+    /// transactions? Default true. When false the closeout transactions carry no client id at all.
+    pub fn set_echo_close_client_ids(&self, on: bool) {
+        self.control(format!("set_echo_close_client_ids {on}"), |w, _| w.echo_close_ids = on);
+    }
+
+    /// Make `GET /transactions/sinceid` return at most `n` transactions (a truncating server), `None` = all.
+    pub fn set_sinceid_page_limit(&self, n: Option<usize>) {
+        self.control(format!("set_sinceid_page_limit {n:?}"), |w, _| w.sinceid_limit = n);
+    }
+
+    /// Other activity on the account: `n` transactions that carry no client id (daily financing here). They only move
+    /// the transaction counter, which is what pushes a tag out of a bounded recent-transaction window.
+    pub fn add_external_transactions(&self, n: u32) {
+        self.control(format!("add_external_transactions {n}"), |w, now| {
+            for _ in 0..n {
+                let id = w.alloc();
+                let v = json!({"id": id, "time": unix_time(now), "type": "DAILY_FINANCING", "financing": "0.0000"});
+                w.store(&id, &v);
+            }
+        });
+    }
+
+    /// The account's last transaction id.
+    pub fn last_transaction_id(&self) -> u64 {
+        self.read(|w| w.last_id())
+    }
+
+    /// Every transaction in the stream, oldest first.
+    pub fn transactions(&self) -> Vec<Value> {
+        self.read(|w| w.txns.values().cloned().collect())
     }
 
     /// Strict mode: refuse a client id that belongs to a PENDING order (see the module docs for why it is off).

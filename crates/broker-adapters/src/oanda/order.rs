@@ -36,7 +36,9 @@ use crate::oanda::instrument::{canonical_symbol, normalize_instrument, Instrumen
 use crate::types::{OrderKind, OrderRequest, SentOrder, Side, TimeInForce};
 use serde_json::{json, Map, Value};
 
-/// OANDA's documented limit on a client id / tag (FROM-MEMORY-OF-DOCS).
+/// OANDA's limit on a client id / tag. MEASURED on a practice account (2026-09-23): 128 characters are accepted and 129
+/// are refused with HTTP 400 `CLIENT_ORDER_ID_INVALID`; `: . - _ / space` and a non-ASCII letter are accepted. This
+/// adapter is stricter on characters (printable ASCII only) and never truncates or hashes an id.
 pub const MAX_CLIENT_ID_LEN: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -178,6 +180,38 @@ pub fn prepare_order(req: &OrderRequest, info: &InstrumentInfo, opts: &PrepareOp
         client_id: req.tag.clone(),
         client_tag: opts.client_tag.clone(),
     })
+}
+
+/// Refuse (never truncate) an order that would take the NET position beyond the instrument's `maximumPositionSize`.
+///
+/// `net_units` is the current signed net position (positive long, negative short) and `order_units` the signed units
+/// about to be sent. A missing or zero cap (`maximum_position_size == None`; OANDA's `"0"` means "no cap") never refuses.
+/// An order that only shrinks the position on the side it is already on (even from a position that is already over
+/// the cap) is always allowed: refusing a reduction would trap the account. Flipping through zero into an over-cap
+/// position on the other side is refused.
+pub fn check_position_cap(info: &InstrumentInfo, net_units: Dec, order_units: Dec) -> Result<(), BrokerError> {
+    let Some(cap) = info.maximum_position_size else { return Ok(()) };
+    let after = net_units
+        .checked_add(order_units)
+        .ok_or_else(|| BrokerError::InvalidRequest(format!("{}: position arithmetic overflowed", info.name)))?;
+    let (abs_after, abs_now) = (abs(after), abs(net_units));
+    // Allowed even beyond the cap: an order that only shrinks the position on the side it is already on.
+    let shrinks_same_side = abs_after <= abs_now && (after.is_zero() || net_units.is_zero() || after.is_negative() == net_units.is_negative());
+    if abs_after > cap && !shrinks_same_side {
+        return Err(BrokerError::InvalidRequest(format!(
+            "{}: the order would take the net position from {net_units} to {after} units, beyond the instrument's maximumPositionSize {cap}; refusing to truncate",
+            info.name
+        )));
+    }
+    Ok(())
+}
+
+fn abs(d: Dec) -> Dec {
+    if d.is_negative() {
+        Dec::new(-d.units(), d.scale()).unwrap_or(d)
+    } else {
+        d
+    }
 }
 
 impl PreparedOrder {

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Generates the OANDA JSON fixtures in this directory.
 
-PROVENANCE: every fixture is AUTHORED FROM DOCUMENTATION (and the field names in the legacy
-SignalEngine connector's OANDA parse), NOT recorded from a live or practice account. They are the
-response shapes the adapter believes OANDA v20 sends; Rung 3 (a real practice account) is what
-checks that belief. Every object fixture carries `_fixture_provenance` so no one mistakes them
-for recordings; a test asserts the label is present.
+PROVENANCE: every fixture GENERATED HERE is AUTHORED FROM DOCUMENTATION (and the field names in the legacy
+SignalEngine connector's OANDA parse), NOT recorded from a live or practice account. They exist only for
+response shapes that have NOT been measured (see README.md next to this file); every shape that was measured
+on a practice account on 2026-09-23 uses the recorded, sanitised response under real/ instead, and the
+authored fixtures it replaced were deleted. Every object fixture carries `_fixture_provenance` so no one
+mistakes them for recordings; a test asserts the label is present.
 
 Run: python3 gen_fixtures.py   (rewrites the files next to it; output is deterministic)
 """
@@ -99,8 +100,6 @@ w("open_positions_hedged.json", {"positions": [
 w("open_positions_bad_sign.json", {"positions": [pos("EUR_USD", long_u="-1000")], "lastTransactionID": "6400"})
 w("position_single_long.json", {"position": pos("EUR_USD", long_u="10000", long_avg="1.10000", upl="290.5000", mu="220.0000"), "lastTransactionID": "6400"})
 w("position_single_short.json", {"position": pos("GBP_USD", short_u="-5000", short_avg="1.27000", upl="-40.0000", mu="127.0000"), "lastTransactionID": "6400"})
-w("position_single_hedged.json", {"position": pos("EUR_USD", long_u="1000", short_u="-400", long_avg="1.10000", short_avg="1.10500"), "lastTransactionID": "6400"})
-w("position_single_flat.json", {"position": pos("EUR_USD"), "lastTransactionID": "6400"})
 
 
 # ---- orders (resources)
@@ -168,9 +167,6 @@ def create_txn(tid, typ="MARKET_ORDER", units="1000", cid=TAG, instrument="EUR_U
 
 w("create_market_buy_filled.json", {"orderCreateTransaction": create_txn("6372"), "orderFillTransaction": fill("6373", "6372", "1000", "1.10052")["transaction"],
     "relatedTransactionIDs": ["6372", "6373"], "lastTransactionID": "6373"})
-w("create_market_sell_filled.json", {"orderCreateTransaction": create_txn("6382", units="-1000", cid="rb1:run1:EUR/USD:sell"),
-    "orderFillTransaction": fill("6383", "6382", "-1000", "1.09948", cid="rb1:run1:EUR/USD:sell")["transaction"],
-    "relatedTransactionIDs": ["6382", "6383"], "lastTransactionID": "6383"})
 w("create_market_partial_fill.json", {"orderCreateTransaction": create_txn("6372"), "orderFillTransaction": fill("6374", "6372", "400", "1.10052")["transaction"],
     "relatedTransactionIDs": ["6372", "6374"], "lastTransactionID": "6374"})
 w("create_market_cancelled_margin.json", {"orderCreateTransaction": create_txn("6372"),
@@ -182,8 +178,6 @@ w("create_market_cancelled_liquidity.json", {"orderCreateTransaction": create_tx
 w("create_market_cancelled_halted.json", {"orderCreateTransaction": create_txn("6372"),
     "orderCancelTransaction": {"id": "6373", "time": T1, "type": "ORDER_CANCEL", "orderID": "6372", "reason": "MARKET_HALTED"},
     "relatedTransactionIDs": ["6372", "6373"], "lastTransactionID": "6373"})
-w("create_limit_pending.json", {"orderCreateTransaction": create_txn("6390", typ="LIMIT_ORDER", units="2000", cid="rb1:run1:EUR/USD:limit"),
-    "relatedTransactionIDs": ["6390"], "lastTransactionID": "6390"})
 w("create_market_no_fill_no_cancel.json", {"orderCreateTransaction": create_txn("6372"), "relatedTransactionIDs": ["6372"], "lastTransactionID": "6372"})
 w("create_wrong_client_id.json", {"orderCreateTransaction": create_txn("6372", cid="rb1:someone-else"),
     "orderFillTransaction": fill("6373", "6372", "1000", "1.10052")["transaction"], "relatedTransactionIDs": ["6372", "6373"], "lastTransactionID": "6373"})
@@ -197,9 +191,6 @@ w("create_cancel_wrong_order.json", {"orderCreateTransaction": create_txn("6372"
 w("create_json_but_truncated.json", '{"orderCreateTransaction": {"id": "6372", "clientExtensions": {"id": "rb1:run1:EUR/')
 
 # ---- reject / error bodies
-w("error_400_units_invalid.json", {"orderRejectTransaction": {"id": "6373", "time": T1, "type": "MARKET_ORDER_REJECT", "instrument": "EUR_USD", "units": "1000",
-    "rejectReason": "UNITS_INVALID", "clientExtensions": {"id": TAG}}, "relatedTransactionIDs": ["6373"], "lastTransactionID": "6373",
-    "errorCode": "UNITS_INVALID", "errorMessage": "The units specified are invalid"})
 w("error_400_insufficient_margin.json", {"orderRejectTransaction": {"id": "6373", "time": T1, "type": "MARKET_ORDER_REJECT", "instrument": "EUR_USD", "units": "9000000",
     "rejectReason": "INSUFFICIENT_MARGIN", "clientExtensions": {"id": TAG}}, "relatedTransactionIDs": ["6373"], "lastTransactionID": "6373",
     "errorCode": "INSUFFICIENT_MARGIN", "errorMessage": "Insufficient margin to execute order"})
@@ -219,20 +210,8 @@ w("account_summary_truncated.json", '{"account": {"id": "101-001-1234567-001", "
 w("cancel_ok.json", {"orderCancelTransaction": {"id": "6391", "time": T1, "type": "ORDER_CANCEL", "orderID": "6390", "reason": "CLIENT_REQUEST"},
     "relatedTransactionIDs": ["6391"], "lastTransactionID": "6391"})
 w("cancel_no_txn.json", {"relatedTransactionIDs": [], "lastTransactionID": "6391"})
-w("cancel_reject_404.json", {"orderCancelRejectTransaction": {"id": "6392", "type": "ORDER_CANCEL_REJECT", "orderID": "6390", "rejectReason": "ORDER_DOESNT_EXIST"},
-    "lastTransactionID": "6392", "errorCode": "ORDER_DOESNT_EXIST", "errorMessage": "The Order specified does not exist"})
 
 CID = "rb1:fl:20260921T150000Z:EURUSD:1:abc"
-w("close_long_ok.json", {
-    "longOrderCreateTransaction": {**create_txn("6410", units="-10000", cid=CID), "positionFill": "REDUCE_ONLY", "reason": "POSITION_CLOSEOUT"},
-    "longOrderFillTransaction": fill("6411", "6410", "-10000", "1.10148", cid=CID, pl="481.0000")["transaction"],
-    "relatedTransactionIDs": ["6410", "6411"], "lastTransactionID": "6411"})
-w("order_filled_close.json", {"order": order("6410", "FILLED", "MARKET", units="-10000", cid=CID, fillingTransactionID="6411", filledTime=T1), "lastTransactionID": "6411"})
-w("txn_fill_close.json", fill("6411", "6410", "-10000", "1.10148", cid=CID, pl="481.0000"))
-w("close_short_ok.json", {
-    "shortOrderCreateTransaction": create_txn("6420", units="5000", cid=CID, instrument="GBP_USD"),
-    "shortOrderFillTransaction": fill("6421", "6420", "5000", "1.27020", instrument="GBP_USD", cid=CID)["transaction"],
-    "relatedTransactionIDs": ["6420", "6421"], "lastTransactionID": "6421"})
 w("close_cancelled.json", {
     "longOrderCreateTransaction": create_txn("6410", units="-10000", cid=CID),
     "longOrderCancelTransaction": {"id": "6411", "type": "ORDER_CANCEL", "orderID": "6410", "reason": "MARKET_HALTED"},

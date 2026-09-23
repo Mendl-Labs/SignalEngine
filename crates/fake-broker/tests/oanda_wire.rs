@@ -1,6 +1,9 @@
 //! The fake OANDA front end on its own, spoken to with hand-built requests (no adapter): auth, routing, order and
-//! position mechanics, margin, faults. These pin the model the adapter drills lean on, so a drill failure can be
-//! told apart from a fake bug. The fake is from documentation, not from OANDA: see the module docs of `fake_broker::oanda`.
+//! position mechanics, margin, faults, and the behaviours MEASURED on a real practice account (2026-09-23) that the fake
+//! must reproduce: pending-only lookup by client id, non-unique client ids, the transaction stream, one-sided closes,
+//! the unknown-instrument error shape, the 128-character client id limit. These pin the model the adapter drills lean on,
+//! so a drill failure can be told apart from a fake bug. Beyond those points the fake is from documentation, not from
+//! OANDA: see the module docs of `fake_broker::oanda`.
 
 use broker_adapters::transport::{HttpMethod, HttpRequest, HttpTransport, TransportError};
 use broker_adapters::Dec;
@@ -134,7 +137,6 @@ fn invalid_orders_are_rejected_with_a_400_and_create_nothing() {
         (market("10.5", "x"), "UNITS_PRECISION_EXCEEDED"),
         (market("abc", "x"), "UNITS_INVALID"),
         (market("999999999999", "x"), "UNITS_LIMIT_EXCEEDED"),
-        (json!({"order": {"type": "MARKET", "instrument": "XXX_YYY", "units": "1", "timeInForce": "FOK", "positionFill": "DEFAULT"}}), "INSTRUMENT_INVALID"),
         (json!({"order": {"type": "MARKET", "instrument": "EUR_USD", "units": "1", "timeInForce": "GTC", "positionFill": "DEFAULT"}}), "TIME_IN_FORCE_INVALID"),
         (json!({"order": {"type": "MARKET", "instrument": "EUR_USD", "units": "1", "timeInForce": "FOK", "positionFill": "DEFAULT", "price": "1.1"}}), "PRICE_NOT_ALLOWED"),
         (json!({"order": {"type": "STOP", "instrument": "EUR_USD", "units": "1"}}), "ORDER_TYPE_INVALID"),
@@ -146,6 +148,118 @@ fn invalid_orders_are_rejected_with_a_400_and_create_nothing() {
     }
     assert!(h.orders().is_empty());
     assert_eq!(send(&*t, req(HttpMethod::Post, &acct("/orders"), None)).0, 400);
+}
+
+#[test]
+fn an_unknown_instrument_is_an_invalid_parameter_exception_with_no_reject_transaction() {
+    // MEASURED: HTTP 400, errorCode oanda::rest::core::InvalidParameterException, NO reject transaction (and so no id used).
+    let (_f, t, h) = setup();
+    let before = h.last_transaction_id();
+    let (s, b) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(json!({"order": {"type": "MARKET", "instrument": "XXX_YYY", "units": "1",
+        "timeInForce": "FOK", "positionFill": "DEFAULT"}}))));
+    assert_eq!(s, 400);
+    assert_eq!(b["errorCode"], "oanda::rest::core::InvalidParameterException");
+    assert_eq!(b["errorMessage"], "Invalid value specified for 'order.instrument'");
+    assert!(b.get("orderRejectTransaction").is_none() && b.get("lastTransactionID").is_none());
+    assert_eq!(h.last_transaction_id(), before, "nothing entered the transaction stream");
+    assert!(h.orders().is_empty());
+}
+
+#[test]
+fn a_client_id_of_129_characters_is_refused_and_128_is_accepted() {
+    // MEASURED: 128 accepted, 129 -> HTTP 400 CLIENT_ORDER_ID_INVALID (a MARKET_ORDER_REJECT with rejectReason == errorCode).
+    let (_f, t, h) = setup();
+    let (s, b) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("1", &"x".repeat(129)))));
+    assert_eq!((s, b["errorCode"].as_str(), b["orderRejectTransaction"]["rejectReason"].as_str()), (400, Some("CLIENT_ORDER_ID_INVALID"), Some("CLIENT_ORDER_ID_INVALID")));
+    assert!(h.orders().is_empty());
+    let odd = format!("{}{}", "a:b.c-d_e/f g", "x".repeat(128 - 13));
+    assert_eq!(odd.chars().count(), 128);
+    let (s, _) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("1", &odd))));
+    assert_eq!(s, 201, "128 characters with : . - _ / and a space are accepted");
+    let (s, _) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("1", "caf\u{e9}"))));
+    assert_eq!(s, 201, "a non-ASCII letter is accepted too");
+}
+
+#[test]
+fn instruments_report_maximum_position_size_zero_meaning_no_cap_unless_a_cap_is_set() {
+    let f = FakeOandaBuilder::new()
+        .balance("1000")
+        .instrument(InstrumentSpec::fx("EUR_USD", 5), "1.10048", "1.10052")
+        .instrument(InstrumentSpec::fx("GBP_USD", 5).with_max_position("25000"), "1.26996", "1.27004")
+        .build();
+    let (_, b) = send(&*f.transport(), req(HttpMethod::Get, &acct("/instruments"), None));
+    let rows = b["instruments"].as_array().unwrap();
+    let cap = |n: &str| rows.iter().find(|r| r["name"] == n).unwrap()["maximumPositionSize"].clone();
+    assert_eq!(cap("EUR_USD"), "0", "measured: the string \"0\" on every instrument");
+    assert_eq!(cap("GBP_USD"), "25000");
+}
+
+#[test]
+fn the_transaction_stream_is_consecutive_complete_and_agrees_with_the_summary() {
+    let (_f, t, h) = setup();
+    let last0 = h.last_transaction_id();
+    let (_, s) = send(&*t, req(HttpMethod::Get, &acct("/summary"), None));
+    assert_eq!(s["lastTransactionID"], last0.to_string());
+    assert_eq!(s["account"]["lastTransactionID"], last0.to_string());
+    // a fill (create + fill), a cancel-at-creation (create + cancel), a reject, a resting limit and its cancel
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("1000", "s1"))));
+    h.set_market_open(false);
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("100", "s2"))));
+    h.set_market_open(true);
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("0", "s3"))));
+    let lim = json!({"order": {"type": "LIMIT", "instrument": "EUR_USD", "units": "5", "price": "1.00000", "timeInForce": "GTC", "positionFill": "DEFAULT", "clientExtensions": {"id": "s4"}}});
+    let (_, b) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(lim)));
+    let oid = b["orderCreateTransaction"]["id"].as_str().unwrap().to_string();
+    send(&*t, req(HttpMethod::Put, &acct(&format!("/orders/{oid}/cancel")), None));
+    send(&*t, req(HttpMethod::Put, &acct(&format!("/orders/{oid}/cancel")), None));
+
+    let (st, page) = send(&*t, req(HttpMethod::Get, &acct(&format!("/transactions/sinceid?id={last0}")), None));
+    assert_eq!(st, 200);
+    let txns = page["transactions"].as_array().unwrap();
+    let last = h.last_transaction_id();
+    assert_eq!(page["lastTransactionID"], last.to_string());
+    let ids: Vec<u64> = txns.iter().map(|x| x["id"].as_str().unwrap().parse().unwrap()).collect();
+    assert_eq!(ids, (last0 + 1..=last).collect::<Vec<u64>>(), "every id after the checkpoint, once, in order (rejects included)");
+    let kinds: Vec<&str> = txns.iter().map(|x| x["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["MARKET_ORDER", "ORDER_FILL", "MARKET_ORDER", "ORDER_CANCEL", "MARKET_ORDER_REJECT", "LIMIT_ORDER", "ORDER_CANCEL", "ORDER_CANCEL_REJECT"]
+    );
+    // MEASURED placement of the client id: clientExtensions.id on the order, clientOrderID on fill / cancel / cancel-reject
+    for (t, want) in txns.iter().zip(["s1", "s1", "s2", "s2", "s3", "s4", "s4", ""]) {
+        let kind = t["type"].as_str().unwrap();
+        let carried = match kind {
+            "MARKET_ORDER" | "LIMIT_ORDER" | "MARKET_ORDER_REJECT" => t["clientExtensions"]["id"].as_str(),
+            _ => t["clientOrderID"].as_str(),
+        };
+        if want.is_empty() {
+            assert_eq!(carried, None, "{kind}: cancelled by numeric id, so it names none");
+        } else {
+            assert_eq!(carried, Some(want), "{kind}");
+        }
+    }
+    // after a later id only later transactions come back; at the end nothing
+    let (_, later) = send(&*t, req(HttpMethod::Get, &acct(&format!("/transactions/sinceid?id={}", last0 + 2)), None));
+    assert_eq!(later["transactions"].as_array().unwrap().len() as u64, last - (last0 + 2));
+    let (_, end) = send(&*t, req(HttpMethod::Get, &acct(&format!("/transactions/sinceid?id={last}")), None));
+    assert!(end["transactions"].as_array().unwrap().is_empty());
+    assert_eq!(end["lastTransactionID"], last.to_string());
+    assert_eq!(send(&*t, req(HttpMethod::Get, &acct("/transactions/sinceid?id=abc"), None)).0, 400);
+    h.assert_invariants();
+}
+
+#[test]
+fn external_activity_and_a_truncating_server_can_be_simulated() {
+    let (_f, t, h) = setup();
+    let last0 = h.last_transaction_id();
+    h.add_external_transactions(5);
+    assert_eq!(h.last_transaction_id(), last0 + 5);
+    h.set_sinceid_page_limit(Some(2));
+    let (_, page) = send(&*t, req(HttpMethod::Get, &acct(&format!("/transactions/sinceid?id={last0}")), None));
+    assert_eq!(page["transactions"].as_array().unwrap().len(), 2);
+    assert_eq!(page["lastTransactionID"], (last0 + 5).to_string(), "the account's real last id: the page is visibly short");
+    let small = FakeOandaBuilder::new().first_transaction_id(2).balance("1").build();
+    assert_eq!(small.handle().last_transaction_id(), 1);
 }
 
 #[test]
@@ -164,6 +278,9 @@ fn limit_orders_rest_until_the_price_reaches_them_and_can_be_cancelled() {
     assert_eq!((s, o["order"]["state"].as_str()), (200, Some("PENDING")));
     // price falls through the limit: it fills at the ask
     h.set_price("EUR_USD", "1.09400", "1.09404");
+    // MEASURED: once it is FILLED the lookup by client id is a 404 NO_SUCH_ORDER
+    let (s, o) = send(&*t, req(HttpMethod::Get, &acct("/orders/%40lim1"), None));
+    assert_eq!((s, o["errorCode"].as_str()), (404, Some("NO_SUCH_ORDER")));
     let (_, o) = send(&*t, req(HttpMethod::Get, &acct(&format!("/orders/{id}")), None));
     assert_eq!(o["order"]["state"], "FILLED");
     let fid = o["order"]["fillingTransactionID"].as_str().unwrap();
@@ -182,33 +299,77 @@ fn limit_orders_rest_until_the_price_reaches_them_and_can_be_cancelled() {
     assert_eq!(s, 404);
     assert!(c.get("orderCancelRejectTransaction").is_some());
     assert_eq!(send(&*t, req(HttpMethod::Put, &acct(&format!("/orders/{id}/cancel")), None)).0, 404);
-    // unknown client id
+    // unknown client id, and (MEASURED) a CANCELLED order's client id is unknown too
     assert_eq!(send(&*t, req(HttpMethod::Get, &acct("/orders/%40nobody"), None)).0, 404);
+    let (s, o) = send(&*t, req(HttpMethod::Get, &acct("/orders/%40lim2"), None));
+    assert_eq!((s, o["errorCode"].as_str()), (404, Some("NO_SUCH_ORDER")));
+    // MEASURED: cancelling again is 404 ORDER_DOESNT_EXIST with a cancel-reject transaction naming the client id when addressed by it
+    let (s, c) = send(&*t, req(HttpMethod::Put, &acct("/orders/%40lim2/cancel"), None));
+    assert_eq!((s, c["orderCancelRejectTransaction"]["clientOrderID"].as_str(), c["errorCode"].as_str()), (404, Some("lim2"), Some("ORDER_DOESNT_EXIST")));
     h.assert_invariants();
 }
 
 #[test]
-fn close_position_closes_one_side_with_all() {
+fn close_position_needs_all_for_the_side_that_exists_and_none_for_the_other() {
     let (_f, t, h) = setup();
     send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("3000", "o"))));
-    let close = json!({"longUnits": "ALL", "longClientExtensions": {"id": "cl1", "tag": "t"}});
+    let close = json!({"longUnits": "ALL", "shortUnits": "NONE", "longClientExtensions": {"id": "cl1", "tag": "t"}});
     let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(close.clone())));
-    assert_eq!(s, 201);
+    assert_eq!(s, 200);
     assert_eq!(b["longOrderFillTransaction"]["units"], "-3000");
+    assert_eq!(b["longOrderFillTransaction"]["reason"], "MARKET_ORDER_POSITION_CLOSEOUT");
+    assert_eq!(b["longOrderCreateTransaction"]["reason"], "POSITION_CLOSEOUT");
     assert_eq!(b["longOrderCreateTransaction"]["clientExtensions"]["id"], "cl1");
     assert_eq!(h.position_units("EUR_USD"), Dec::ZERO);
-    // nothing left: a reject transaction under the same prefix
+    // MEASURED: nothing open at all -> HTTP 404 CLOSEOUT_POSITION_DOESNT_EXIST with a reject transaction
     let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(close)));
-    assert_eq!(s, 400);
-    assert!(b.get("longOrderRejectTransaction").is_some());
-    // the wrong side is refused too
+    assert_eq!((s, b["errorCode"].as_str()), (404, Some("CLOSEOUT_POSITION_DOESNT_EXIST")));
+    assert_eq!(b["longOrderRejectTransaction"]["rejectReason"], "CLOSEOUT_POSITION_DOESNT_EXIST");
+    // MEASURED: ALL for a side that does not exist -> HTTP 400 (long ALL against a short)
     send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("-100", "s"))));
-    let (s, _) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "ALL"}))));
+    let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "ALL", "shortUnits": "NONE"}))));
+    assert_eq!((s, b["errorCode"].as_str()), (400, Some("CLOSEOUT_POSITION_DOESNT_EXIST")));
+    assert!(b.get("longOrderRejectTransaction").is_some());
+    assert_eq!(h.position_units("EUR_USD"), d("-100"), "the refused close changed nothing");
+    // ALL for both sides of a one-sided position is refused too, and nothing closes
+    let (s, _) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "ALL", "shortUnits": "ALL"}))));
     assert_eq!(s, 400);
-    let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"shortUnits": "ALL"}))));
-    assert_eq!(s, 201);
+    assert_eq!(h.position_units("EUR_USD"), d("-100"));
+    // the short side, correctly
+    let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(json!({"longUnits": "NONE", "shortUnits": "ALL"}))));
+    assert_eq!(s, 200);
     assert_eq!(b["shortOrderFillTransaction"]["units"], "100");
+    // bodies that make no sense
+    for bad in [json!({}), json!({"longUnits": "NONE", "shortUnits": "NONE"}), json!({"longUnits": "5"})] {
+        assert_eq!(send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"), Some(bad))).0, 400);
+    }
     h.assert_invariants();
+}
+
+#[test]
+fn a_close_can_be_made_to_leave_no_client_id_on_its_transactions() {
+    // UNMEASURED at real OANDA (whether longClientExtensions is echoed): switchable so the adapter is shown to cope with both.
+    let (_f, t, h) = setup();
+    h.set_echo_close_client_ids(false);
+    send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("10", "o"))));
+    let (s, b) = send(&*t, req(HttpMethod::Put, &acct("/positions/EUR_USD/close"),
+        Some(json!({"longUnits": "ALL", "shortUnits": "NONE", "longClientExtensions": {"id": "cl1"}}))));
+    assert_eq!(s, 200);
+    assert!(b["longOrderCreateTransaction"].get("clientExtensions").is_none());
+    assert!(b["longOrderFillTransaction"].get("clientOrderID").is_none());
+}
+
+#[test]
+fn numeric_order_lookup_of_finished_orders_is_switchable() {
+    // UNMEASURED at real OANDA (by client id it is measured: pending only).
+    let (_f, t, h) = setup();
+    let (_, b) = send(&*t, req(HttpMethod::Post, &acct("/orders"), Some(market("10", "n"))));
+    let id = b["orderCreateTransaction"]["id"].as_str().unwrap().to_string();
+    let (s, o) = send(&*t, req(HttpMethod::Get, &acct(&format!("/orders/{id}")), None));
+    assert_eq!((s, o["order"]["state"].as_str()), (200, Some("FILLED")));
+    h.set_historic_order_lookup(false);
+    let (s, o) = send(&*t, req(HttpMethod::Get, &acct(&format!("/orders/{id}")), None));
+    assert_eq!((s, o["errorCode"].as_str()), (404, Some("NO_SUCH_ORDER")));
 }
 
 #[test]
@@ -262,6 +423,11 @@ fn the_fake_does_not_reject_a_reused_client_id_unless_asked_to() {
     }
     assert_eq!(h.orders_with_client_id("same").len(), 2, "hostile by default: only the ADAPTER can prevent a double submit");
     assert_eq!(h.position_units("EUR_USD"), d("200"));
+    // MEASURED: two FILLS carry the same clientOrderID, and the lookup by that id finds neither (both are filled)
+    let fills: Vec<Value> = h.transactions().into_iter().filter(|x| x["type"] == "ORDER_FILL").collect();
+    assert_eq!(fills.len(), 2);
+    assert_eq!(fills[0]["clientOrderID"], fills[1]["clientOrderID"]);
+    assert_eq!(send(&*t, req(HttpMethod::Get, &acct("/orders/%40same"), None)).0, 404);
     // strict mode refuses a client id that is still pending
     let (_f, t, h) = setup();
     h.reject_duplicate_client_ids(true);

@@ -1,10 +1,12 @@
 //! Rung 2: the REAL `OandaAdapter` against the fake OANDA exchange, over the adapter's own `HttpTransport` trait.
-//! Place / look up / cancel / close, unknown outcomes then lookup by tag, restart mid-run idempotency, margin and
-//! market-hours refusals, partial fills, netting through zero, and consistency of what the adapter reads with the
-//! exchange's own books.
+//! Place / look up / cancel / close, the transaction-stream idempotency protocol (lost response, lost request, restart with
+//! and without a checkpoint, a reused client id, a delayed request, a truncating server), maximumPositionSize, margin and
+//! market-hours refusals, partial fills, netting through zero, and consistency of what the adapter reads with the exchange's
+//! own books.
 //!
-//! What a green run means: the adapter agrees with THIS model of OANDA, which was written from the same documentation
-//! as the adapter. It says nothing about the real service (see the module docs of `broker_adapters::oanda`).
+//! What a green run means: the adapter agrees with THIS model of OANDA. On the points measured on a real practice account
+//! (2026-09-23: pending-only lookup by client id, non-unique client ids, the transaction stream, one-sided closes, reject
+//! shapes) the fake reproduces what OANDA did; elsewhere it is a model from documentation. It says nothing about the live host.
 
 use broker_adapters::oanda::{CloseOutcome, InstrumentTable};
 use broker_adapters::transport::{HttpMethod, TransportError};
@@ -192,80 +194,264 @@ fn a_wrong_token_or_account_is_refused_by_the_exchange() {
 }
 
 // ---------------------------------------------------------------- unknown outcomes, restarts, idempotency
+//
+// The protocol under test (module docs of `broker_adapters::oanda`): a checkpoint (`lastTransactionID`) before the first send,
+// a scan of `transactions/sinceid` for the tag after any ambiguous outcome, and a re-send only after a complete scan from the
+// FIRST checkpoint found nothing. The fake is HOSTILE about ids: it accepts a reused client id and produces a second fill, and
+// `GET /orders/@tag` finds only pending orders, exactly as measured on a real practice account.
+
+fn posts_applied(rig: &OandaRig) -> usize {
+    rig.handle.applied(HttpMethod::Post, "/orders").len()
+}
+
+/// Index (in the request log) of the last `sinceid` scan and of the last POST that reached the exchange.
+fn last_scan_and_post(rig: &OandaRig) -> (Option<usize>, Option<usize>) {
+    let reqs = rig.handle.requests();
+    let scan = reqs.iter().rposition(|r| r.method == HttpMethod::Get && r.path.ends_with("/transactions/sinceid"));
+    let post = reqs.iter().rposition(|r| r.reached_exchange && r.method == HttpMethod::Post && r.path.ends_with("/orders"));
+    (scan, post)
+}
 
 #[test]
-fn response_lost_after_the_order_was_placed_then_lookup_by_tag_finds_it_and_a_replace_does_not_resend() {
+fn response_lost_after_the_order_was_applied_the_scan_finds_it_and_it_is_not_placed_again() {
     let rig = OandaRig::new();
     rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/orders")));
+    // the answer is lost, but place_order itself scans the stream from its checkpoint and finds the fill
     let out = rig.adapter.place_order(&buy("t:lost", "700")).unwrap();
-    assert!(matches!(out, PlaceOutcome::UnknownOutcome { .. }), "{out:?}");
-    // the order really exists
-    assert_eq!(rig.handle.orders_with_client_id("t:lost").len(), 1);
-    // the caller's contract: look it up by tag, never blind-retry
-    let found = rig.adapter.find_orders_by_tag("t:lost").unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!((found[0].status, found[0].executed_quantity), (OrderStatus::Filled, d("700")));
-    // even a careless second place() with the same tag sends nothing: it adopts
+    let id = accepted_id(out);
+    assert_eq!(rig.handle.orders_with_client_id("t:lost").len(), 1, "the order really exists");
+    let by_tag = rig.adapter.find_orders_by_tag("t:lost").unwrap();
+    assert_eq!(by_tag.len(), 1);
+    assert_eq!((by_tag[0].broker_order_id.as_str(), by_tag[0].status, by_tag[0].executed_quantity), (id.as_str(), OrderStatus::Filled, d("700")));
+    // MEASURED: the fill is invisible to GET /orders/@tag (only pending orders are found by client id)
+    let (s, _) = raw_get(&rig, &format!("/orders/%40{}", "t%3Alost"));
+    assert_eq!(s, 404);
+    // even a careless second place() with the same tag sends nothing
     let second = rig.adapter.place_order(&buy("t:lost", "700")).unwrap();
-    assert_eq!(accepted_id(second), found[0].broker_order_id);
-    assert_eq!(rig.handle.applied(HttpMethod::Post, "/orders").len(), 1, "exactly one POST ever reached the exchange");
+    assert!(matches!(&second, PlaceOutcome::Accepted { broker_order_id, warnings, .. } if *broker_order_id == id && warnings[0].contains("already existed")), "{second:?}");
+    assert_eq!(posts_applied(&rig), 1, "exactly one POST ever reached the exchange");
     assert_eq!(rig.handle.position_units("EUR_USD"), d("700"), "no double position");
     rig.handle.assert_invariants();
 }
 
+/// A plain GET against the fake (bypassing the adapter): status and parsed body.
+fn raw_get(rig: &OandaRig, tail: &str) -> (u16, serde_json::Value) {
+    use broker_adapters::transport::{HttpRequest, HttpTransport};
+    let req = HttpRequest {
+        method: HttpMethod::Get,
+        url: format!("https://api-fxpractice.oanda.com/v3/accounts/{}{tail}", rig.account_id),
+        headers: vec![("Authorization".into(), format!("Bearer {}", rig.token))],
+        body: None,
+    };
+    let r = rig.transport.execute(&req).unwrap();
+    (r.status, serde_json::from_str(&r.body).unwrap_or(serde_json::Value::Null))
+}
+
 #[test]
-fn request_lost_before_it_arrived_is_found_absent_and_a_replace_places_it_once() {
+fn request_lost_before_it_arrived_is_scanned_for_found_absent_and_only_then_replaced_exactly_once() {
     let rig = OandaRig::new();
     rig.handle.inject_fault(Fault::io_error().on_path(&rig.handle.path("/orders")));
-    assert!(matches!(rig.adapter.place_order(&buy("t:gone", "300")).unwrap(), PlaceOutcome::UnknownOutcome { .. }));
-    assert!(rig.adapter.find_orders_by_tag("t:gone").unwrap().is_empty(), "nothing exists");
+    let out = rig.adapter.place_order(&buy("t:gone", "300")).unwrap();
+    let PlaceOutcome::UnknownOutcome { reason, .. } = &out else { panic!("{out:?}") };
+    let checkpoint = rig.adapter.tag_checkpoint("t:gone").expect("the first attempt's checkpoint is registered");
+    assert!(reason.ends_with(&format!("[oanda-tag-checkpoint={checkpoint}]")), "{reason}");
+    assert!(rig.handle.orders().is_empty(), "the request never arrived");
+    // the lookup covers everything since the checkpoint and finds nothing: PROVABLY not placed
+    assert!(rig.adapter.find_orders_by_tag("t:gone").unwrap().is_empty());
+    // only now is it sent again, once
     let id = accepted_id(rig.adapter.place_order(&buy("t:gone", "300")).unwrap());
     assert!(!id.is_empty());
     assert_eq!(rig.handle.orders_with_client_id("t:gone").len(), 1);
+    assert_eq!(posts_applied(&rig), 1);
     assert_eq!(rig.handle.position_units("EUR_USD"), d("300"));
-}
-
-#[test]
-fn an_error_answer_after_the_order_was_placed_is_an_unknown_outcome_and_the_order_is_found() {
-    for fault in [Fault::http(502), Fault::http(500), Fault::malformed_body(), Fault::exchange_error("boom")] {
-        let rig = OandaRig::new();
-        rig.handle.inject_fault(fault.after_apply().on_path(&rig.handle.path("/orders")));
-        let out = rig.adapter.place_order(&buy("t:e", "200")).unwrap();
-        assert!(matches!(out, PlaceOutcome::UnknownOutcome { .. }), "{out:?}");
-        assert_eq!(rig.adapter.find_orders_by_tag("t:e").unwrap().len(), 1);
-        assert_eq!(rig.handle.applied(HttpMethod::Post, "/orders").len(), 1);
-    }
-}
-
-#[test]
-fn restart_mid_run_with_no_state_carried_over_does_not_double_submit() {
-    let mut rig = OandaRig::new();
-    // run 1 places two orders, then "dies" after the second was applied but before it was recorded
-    rig.adapter.place_order(&buy("rb:run7:EUR/USD:buy", "1000")).unwrap();
-    rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/orders")));
-    let _ = rig.adapter.place_order(&OrderRequest::market("rb:run7:GBP/USD:sell", "GBP/USD", Side::Sell, d("500"))).unwrap();
-    assert_eq!(rig.handle.applied(HttpMethod::Post, "/orders").len(), 2);
-    // process restart: a brand-new adapter, nothing persisted
-    rig.restart_adapter();
-    // run 2 replays the same plan with the same tags
-    let a = rig.adapter.place_order(&buy("rb:run7:EUR/USD:buy", "1000")).unwrap();
-    let b = rig.adapter.place_order(&OrderRequest::market("rb:run7:GBP/USD:sell", "GBP/USD", Side::Sell, d("500"))).unwrap();
-    assert!(matches!(a, PlaceOutcome::Accepted { ref warnings, .. } if warnings[0].contains("already existed")));
-    assert!(matches!(b, PlaceOutcome::Accepted { .. }));
-    assert_eq!(rig.handle.applied(HttpMethod::Post, "/orders").len(), 2, "the replay sent nothing");
-    assert_eq!(rig.handle.position_units("EUR_USD"), d("1000"));
-    assert_eq!(rig.handle.position_units("GBP_USD"), d("-500"));
+    let (scan, post) = last_scan_and_post(&rig);
+    assert!(scan.unwrap() < post.unwrap(), "the scan since the checkpoint preceded the re-send");
+    assert_eq!(rig.adapter.tag_checkpoint("t:gone"), Some(checkpoint), "the checkpoint of the FIRST attempt never moves");
     rig.handle.assert_invariants();
 }
 
 #[test]
-fn the_fake_being_strict_about_ids_changes_nothing_because_the_adapter_looks_first() {
-    // Same drill with an exchange that refuses reused PENDING client ids: still exactly one order.
+fn an_error_answer_after_the_order_was_placed_is_resolved_from_the_stream_never_resent() {
+    for fault in [Fault::http(502), Fault::http(500), Fault::malformed_body(), Fault::exchange_error("boom")] {
+        let rig = OandaRig::new();
+        rig.handle.inject_fault(fault.after_apply().on_path(&rig.handle.path("/orders")));
+        let out = rig.adapter.place_order(&buy("t:e", "200")).unwrap();
+        assert!(matches!(out, PlaceOutcome::Accepted { .. }), "{out:?}");
+        assert_eq!(rig.adapter.find_orders_by_tag("t:e").unwrap().len(), 1);
+        assert_eq!(posts_applied(&rig), 1);
+    }
+}
+
+#[test]
+fn an_order_cancelled_at_creation_whose_answer_was_lost_is_resolved_as_rejected_from_the_stream() {
     let rig = OandaRig::new();
-    rig.handle.reject_duplicate_client_ids(true);
-    rig.adapter.place_order(&buy("t:s", "100")).unwrap();
-    rig.adapter.place_order(&buy("t:s", "100")).unwrap();
-    assert_eq!(rig.handle.orders_with_client_id("t:s").len(), 1);
+    rig.handle.set_market_open(false);
+    rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/orders")));
+    match rig.adapter.place_order(&buy("t:halt", "100")).unwrap() {
+        PlaceOutcome::Rejected { errors, .. } => assert!(errors[0].code.contains("MARKET_HALTED") && errors[0].code.starts_with("oanda:scan"), "{}", errors[0].code),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.handle.position_units("EUR_USD"), Dec::ZERO);
+    // the tag now belongs to a dead order: a re-place says so instead of sending
+    rig.handle.set_market_open(true);
+    let again = rig.adapter.place_order(&buy("t:halt", "100")).unwrap();
+    assert!(matches!(again, PlaceOutcome::Rejected { ref errors, .. } if errors[0].code.contains("use a new tag")), "{again:?}");
+    assert_eq!(posts_applied(&rig), 1);
+}
+
+#[test]
+fn restart_mid_run_with_no_checkpoint_finds_the_tags_in_the_recent_window_and_does_not_double_submit() {
+    let mut rig = OandaRig::new();
+    // run 1 places two orders, then "dies" after the second was applied but before its answer arrived
+    rig.adapter.place_order(&buy("rb:run7:EUR/USD:buy", "1000")).unwrap();
+    rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/orders")));
+    let _ = rig.adapter.place_order(&OrderRequest::market("rb:run7:GBP/USD:sell", "GBP/USD", Side::Sell, d("500"))).unwrap();
+    assert_eq!(posts_applied(&rig), 2);
+    // process restart: a brand-new adapter, nothing persisted, so NO checkpoints
+    rig.restart_adapter();
+    assert_eq!(rig.adapter.tag_checkpoint("rb:run7:EUR/USD:buy"), None);
+    // run 2 replays the same plan with the same tags
+    let a = rig.adapter.place_order(&buy("rb:run7:EUR/USD:buy", "1000")).unwrap();
+    let b = rig.adapter.place_order(&OrderRequest::market("rb:run7:GBP/USD:sell", "GBP/USD", Side::Sell, d("500"))).unwrap();
+    assert!(matches!(a, PlaceOutcome::Accepted { ref warnings, .. } if warnings[0].contains("already existed")), "{a:?}");
+    assert!(matches!(b, PlaceOutcome::Accepted { ref warnings, .. } if warnings[0].contains("already existed")), "{b:?}");
+    assert_eq!(posts_applied(&rig), 2, "the replay sent nothing");
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("1000"));
+    assert_eq!(rig.handle.position_units("GBP_USD"), d("-500"));
+    // and the lookup finds both without any state
+    assert_eq!(rig.adapter.find_orders_by_tag("rb:run7:EUR/USD:buy").unwrap().len(), 1);
+    rig.handle.assert_invariants();
+}
+
+#[test]
+fn restart_when_the_first_attempt_is_older_than_the_window_is_the_documented_limit_and_two_things_close_it() {
+    // KNOWN LIMIT (module docs, "Restart with no checkpoint"): a restarted process holds no checkpoint, scans only the last
+    // `restart_scan_window` transaction ids, and a tag older than that is invisible. Here: 1000 unrelated transactions
+    // (default window 400) push the first attempt out of the window.
+    let mut rig = OandaRig::new();
+    rig.adapter.place_order(&buy("t:old", "100")).unwrap();
+    let checkpoint = rig.adapter.tag_checkpoint("t:old").unwrap();
+    rig.handle.add_external_transactions(1000);
+    rig.restart_adapter();
+    assert!(rig.adapter.find_orders_by_tag("t:old").unwrap().is_empty(), "NOT found: outside the window (this is the limit, asserted so nobody mistakes it for a guarantee)");
+
+    // (1) a persisted checkpoint restores exact coverage: the tag is found and nothing is sent twice
+    rig.adapter.seed_tag_checkpoint("t:old", checkpoint);
+    let found = rig.adapter.find_orders_by_tag("t:old").unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(matches!(rig.adapter.place_order(&buy("t:old", "100")).unwrap(), PlaceOutcome::Accepted { ref warnings, .. } if warnings[0].contains("already existed")));
+    assert_eq!(posts_applied(&rig), 1);
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("100"));
+
+    // (2) strict mode turns the invisible case into an alert instead of a send
+    let short_history = fake_broker::oanda::FakeOandaBuilder::standard().first_transaction_id(50).build();
+    let mut strict = OandaRig::with_fake(short_history, |c| c.with_strict_unseen_tags(true));
+    strict.adapter.place_order(&buy("t:old", "100")).unwrap();
+    strict.handle.add_external_transactions(1000);
+    strict.restart_adapter();
+    assert!(matches!(strict.adapter.find_orders_by_tag("t:old"), Err(BrokerError::LookupInconclusive(_))));
+    let out = strict.adapter.place_order(&buy("t:old", "100")).unwrap();
+    assert!(matches!(&out, PlaceOutcome::UnknownOutcome { reason, .. } if reason.contains("strict mode")), "{out:?}");
+    assert_eq!(posts_applied(&strict), 1, "strict mode did not send again");
+}
+
+#[test]
+fn a_reused_client_id_is_accepted_by_the_hostile_fake_yet_the_adapter_never_double_submits() {
+    let rig = OandaRig::new();
+    // the exchange itself would happily fill the same id again (MEASURED at real OANDA) ...
+    assert!(rig.handle.orders_with_client_id("t:dup").is_empty());
+    let first = accepted_id(rig.adapter.place_order(&buy("t:dup", "100")).unwrap());
+    // ... but the adapter looks in the stream first, so every further attempt adopts the first order
+    for _ in 0..3 {
+        let again = rig.adapter.place_order(&buy("t:dup", "100")).unwrap();
+        assert!(matches!(&again, PlaceOutcome::Accepted { broker_order_id, .. } if *broker_order_id == first), "{again:?}");
+    }
+    assert_eq!(rig.handle.orders_with_client_id("t:dup").len(), 1);
+    assert_eq!(posts_applied(&rig), 1);
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("100"));
+    // a different QUANTITY under the same tag is refused, not sent as a second order
+    let clash = rig.adapter.place_order(&buy("t:dup", "250")).unwrap();
+    assert!(matches!(clash, PlaceOutcome::Rejected { ref errors, .. } if errors[0].code.contains("differs")), "{clash:?}");
+    assert_eq!(posts_applied(&rig), 1);
+    // and once the exchange HAS been made to hold two orders under one tag (a double submit from elsewhere), the adapter alerts
+    let raw = serde_json::json!({"order": {"type": "MARKET", "instrument": "EUR_USD", "units": "100", "timeInForce": "FOK", "positionFill": "DEFAULT",
+        "clientExtensions": {"id": "t:dup"}}});
+    let req = broker_adapters::transport::HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("https://api-fxpractice.oanda.com/v3/accounts/{}/orders", rig.account_id),
+        headers: vec![("Authorization".into(), format!("Bearer {}", rig.token))],
+        body: Some(raw.to_string()),
+    };
+    use broker_adapters::transport::HttpTransport;
+    assert_eq!(rig.transport.execute(&req).unwrap().status, 201, "the fake, like OANDA, accepts the reused id");
+    let out = rig.adapter.place_order(&buy("t:dup", "100")).unwrap();
+    assert!(matches!(&out, PlaceOutcome::UnknownOutcome { reason, .. } if reason.contains("DUPLICATE_TAG")), "{out:?}");
+    assert_eq!(rig.adapter.find_orders_by_tag("t:dup").unwrap().len(), 2, "the lookup reports both");
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("200"));
+}
+
+#[test]
+fn a_delayed_request_that_lands_after_the_scan_is_the_known_limit_and_is_at_least_detected() {
+    // KNOWN LIMIT (module docs, "Residual risks"): a request delayed in the network can be processed AFTER the scan that found
+    // nothing. Nothing the client does can close that window; the drill shows what happens and that the double is DETECTED.
+    let rig = OandaRig::new();
+    rig.handle.inject_fault(Fault::timeout().delayed().on_path(&rig.handle.path("/orders")));
+    let out = rig.adapter.place_order(&buy("t:late", "400")).unwrap();
+    assert!(matches!(out, PlaceOutcome::UnknownOutcome { .. }), "{out:?}");
+    assert!(rig.handle.orders().is_empty(), "the first request is still in flight");
+    // the scan since the checkpoint finds nothing, so the caller retries and the second request is placed
+    assert!(rig.adapter.find_orders_by_tag("t:late").unwrap().is_empty());
+    let second = accepted_id(rig.adapter.place_order(&buy("t:late", "400")).unwrap());
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("400"));
+    // now the delayed first request lands: the account is double
+    let late = rig.handle.deliver_delayed();
+    assert_eq!(late.len(), 1);
+    assert_eq!(rig.handle.orders_with_client_id("t:late").len(), 2, "the residual: two orders under one tag");
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("800"));
+    // detection: the lookup returns both, and a further place() alerts instead of adopting one of them
+    let found = rig.adapter.find_orders_by_tag("t:late").unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(found.iter().any(|r| r.broker_order_id == second));
+    let alert = rig.adapter.place_order(&buy("t:late", "400")).unwrap();
+    assert!(matches!(&alert, PlaceOutcome::UnknownOutcome { reason, .. } if reason.contains("DUPLICATE_TAG")), "{alert:?}");
+}
+
+#[test]
+fn a_server_that_truncates_the_stream_never_lets_the_adapter_conclude_absence() {
+    // no earlier attempt: nothing is sent
+    let rig = OandaRig::new();
+    rig.handle.set_sinceid_page_limit(Some(3));
+    assert!(matches!(rig.adapter.place_order(&buy("t:trunc", "100")), Err(BrokerError::Preflight(m)) if m.contains("nothing was sent")));
+    assert!(matches!(rig.adapter.find_orders_by_tag("t:trunc"), Err(BrokerError::LookupInconclusive(_))));
+    assert_eq!(rig.handle.order_affecting_requests(), 0);
+    // an earlier attempt exists and the follow-up scan is truncated: unknown, and the replay does not send
+    let rig = OandaRig::new();
+    rig.handle.inject_fault(Fault::io_error().on_path(&rig.handle.path("/orders")));
+    assert!(matches!(rig.adapter.place_order(&buy("t:trunc2", "100")).unwrap(), PlaceOutcome::UnknownOutcome { .. }));
+    rig.handle.add_external_transactions(10);
+    rig.handle.set_sinceid_page_limit(Some(3));
+    let out = rig.adapter.place_order(&buy("t:trunc2", "100")).unwrap();
+    assert!(matches!(&out, PlaceOutcome::UnknownOutcome { reason, .. } if reason.contains("earlier attempt") && reason.contains("incomplete")), "{out:?}");
+    assert_eq!(posts_applied(&rig), 0);
+    // the stream is whole again: NOW it is provably absent and the order is sent
+    rig.handle.set_sinceid_page_limit(None);
+    assert!(matches!(rig.adapter.place_order(&buy("t:trunc2", "100")).unwrap(), PlaceOutcome::Accepted { .. }));
+    assert_eq!(posts_applied(&rig), 1);
+}
+
+#[test]
+fn a_broker_that_will_not_serve_finished_orders_by_id_is_read_from_the_stream() {
+    // UNMEASURED at real OANDA whether GET /orders/<numeric id> serves finished orders; both answers must work.
+    let rig = OandaRig::new();
+    rig.handle.set_historic_order_lookup(false);
+    let id = accepted_id(rig.adapter.place_order(&buy("t:hist", "150")).unwrap());
+    let r = rig.adapter.get_order(&id).unwrap();
+    assert_eq!((r.status, r.executed_quantity, r.avg_price, r.tag.as_deref()), (OrderStatus::Filled, d("150"), Some(d("1.10052")), Some("t:hist")));
+    // a cancelled limit order too, through cancel_and_settle
+    let lim = accepted_id(rig.adapter.place_order(&OrderRequest::limit("t:hist-l", "EUR/USD", Side::Buy, d("100"), d("1.05000"))).unwrap());
+    let (out, report) = rig.adapter.cancel_and_settle(&lim).unwrap();
+    assert_eq!((out.canceled_count, report.status, report.reason.as_deref()), (1, OrderStatus::Canceled, Some("CLIENT_REQUEST")));
+    assert!(matches!(rig.adapter.cancel_and_settle("99999"), Err(BrokerError::CancelTargetNotFound(_))));
 }
 
 #[test]
@@ -279,14 +465,61 @@ fn a_preflight_failure_sends_nothing_and_leaves_the_tag_free() {
 }
 
 #[test]
-fn rate_limiting_and_an_unreachable_exchange_mean_not_sent() {
+fn rate_limiting_and_an_unreachable_exchange_mean_not_sent_and_leave_no_checkpoint() {
     let rig = OandaRig::new();
     rig.handle.inject_fault(Fault::rate_limit().on_path(&rig.handle.path("/orders")));
     assert!(matches!(rig.adapter.place_order(&buy("t:rl", "100")), Err(BrokerError::RateLimited { .. })));
     assert!(rig.handle.orders().is_empty());
+    assert_eq!(rig.adapter.tag_checkpoint("t:rl"), None);
     rig.handle.inject_fault(Fault::connect_failed().on_path(&rig.handle.path("/orders")));
     assert!(matches!(rig.adapter.place_order(&buy("t:rl", "100")), Err(BrokerError::Transport(TransportError::ConnectFailed(_)))));
     assert!(rig.handle.orders().is_empty());
+    assert_eq!(rig.adapter.tag_checkpoint("t:rl"), None);
+}
+
+#[test]
+fn an_unknown_instrument_at_the_exchange_is_a_definite_rejection_that_creates_nothing() {
+    // The adapter's own table says the instrument exists, the exchange disagrees (MEASURED shape: HTTP 400
+    // InvalidParameterException, no reject transaction).
+    let rig = OandaRig::new();
+    let mut info = rig.adapter.instrument("EUR_USD").unwrap();
+    info.name = "XXX_USD".into();
+    rig.adapter.upsert_instrument(info);
+    let before = rig.handle.last_transaction_id();
+    match rig.adapter.place_order(&OrderRequest::market("t:x", "XXX/USD", Side::Buy, d("100"))).unwrap() {
+        PlaceOutcome::Rejected { errors, .. } => {
+            assert_eq!(errors[0].class, ErrorClass::InvalidArguments);
+            assert!(errors[0].code.contains("InvalidParameterException"), "{}", errors[0].code);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.handle.last_transaction_id(), before, "nothing entered the stream");
+    assert_eq!(rig.adapter.tag_checkpoint("t:x"), None);
+}
+
+#[test]
+fn maximum_position_size_is_enforced_by_the_adapter_and_never_truncates() {
+    use fake_broker::oanda::{FakeOandaBuilder, InstrumentSpec};
+    let fake = FakeOandaBuilder::new()
+        .balance("100000")
+        .instrument(InstrumentSpec::fx("EUR_USD", 5).with_max_position("5000"), "1.10048", "1.10052")
+        .instrument(InstrumentSpec::fx("GBP_USD", 5), "1.26996", "1.27004")
+        .build();
+    let rig = OandaRig::with_fake(fake, |c| c);
+    assert_eq!(rig.adapter.instrument("EUR_USD").unwrap().maximum_position_size, Some(d("5000")));
+    assert_eq!(rig.adapter.instrument("GBP_USD").unwrap().maximum_position_size, None, "the fake reports \"0\": no cap");
+    rig.adapter.place_order(&buy("cap:1", "3000")).unwrap();
+    let e = rig.adapter.place_order(&buy("cap:2", "2001")).unwrap_err();
+    assert!(matches!(e, BrokerError::InvalidRequest(ref m) if m.contains("maximumPositionSize")), "{e:?}");
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("3000"), "nothing was sent and nothing truncated");
+    assert_eq!(posts_applied(&rig), 1);
+    rig.adapter.place_order(&buy("cap:3", "2000")).unwrap();
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("5000"));
+    // no cap on GBP_USD: any size the exchange allows
+    rig.adapter.place_order(&OrderRequest::market("cap:4", "GBP/USD", Side::Buy, d("9000000"))).unwrap();
+    // selling down from the cap is a reduction
+    rig.adapter.place_order(&sell("cap:5", "1000")).unwrap();
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("4000"));
 }
 
 // ---------------------------------------------------------------- partial fills, limits, cancel
@@ -354,9 +587,12 @@ fn foreign_orders_are_visible_but_not_ours_when_a_prefix_is_configured() {
 }
 
 // ---------------------------------------------------------------- close / flatten one instrument
+//
+// MEASURED: a close sends ALL for the side that exists and NONE for the other; ALL for an absent side is a 400 at the exchange
+// (and at the fake), so every successful close below is also proof that the adapter sent only the side that exists.
 
 #[test]
-fn close_position_flattens_long_and_short_and_is_idempotent_by_tag() {
+fn close_position_flattens_long_and_short_one_sided_and_is_idempotent_by_tag() {
     let rig = OandaRig::new();
     rig.adapter.place_order(&buy("t:l", "8000")).unwrap();
     rig.adapter.place_order(&OrderRequest::market("t:s", "GBP/USD", Side::Sell, d("3000"))).unwrap();
@@ -369,26 +605,58 @@ fn close_position_flattens_long_and_short_and_is_idempotent_by_tag() {
         other => panic!("{other:?}"),
     }
     assert!(rig.adapter.get_open_positions().unwrap().is_empty());
-    // the same tag again adopts the earlier close; a fresh tag on a flat account has nothing to do
+    // the same tag again adopts the earlier close (the fake echoes the extensions); a fresh tag on a flat account has nothing to do
     assert!(matches!(rig.adapter.close_position("EUR_USD", "t:close-eur").unwrap(), CloseOutcome::AlreadyDone { .. }));
     assert_eq!(rig.adapter.close_position("EUR_USD", "t:close-eur-2").unwrap(), CloseOutcome::NothingToClose);
     assert_eq!(rig.handle.applied(HttpMethod::Put, "/close").len(), 2);
+    // no request of the adapter was ever answered 400 CLOSEOUT_POSITION_DOESNT_EXIST: it never sent ALL for an absent side
+    assert!(rig.handle.requests().iter().filter(|r| r.path.ends_with("/close")).all(|r| r.produced.as_ref().is_some_and(|(s, _)| *s == 200)));
     rig.handle.assert_invariants();
 }
 
 #[test]
-fn a_close_whose_answer_is_lost_is_found_by_tag_and_never_sent_twice() {
+fn a_close_whose_answer_is_lost_is_found_in_the_stream_when_the_extensions_are_echoed() {
     let rig = OandaRig::new();
     rig.adapter.place_order(&buy("t:l", "4000")).unwrap();
     rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/positions/EUR_USD/close")));
-    assert!(matches!(rig.adapter.close_position("EUR_USD", "t:c").unwrap(), CloseOutcome::UnknownOutcome { .. }));
+    match rig.adapter.close_position("EUR_USD", "t:c").unwrap() {
+        CloseOutcome::Closed { fill, .. } => assert_eq!(fill.units, d("-4000")),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(rig.handle.position_units("EUR_USD"), Dec::ZERO, "the close was applied");
-    // the by-tag lookup finds the close order; a restart-and-retry adopts it
     assert_eq!(rig.adapter.find_orders_by_tag("t:c").unwrap().len(), 1);
+    // a restart-and-retry adopts it from the recent window; nothing is sent
     let mut rig = rig;
     rig.restart_adapter();
     assert!(matches!(rig.adapter.close_position("EUR_USD", "t:c").unwrap(), CloseOutcome::AlreadyDone { .. }));
     assert_eq!(rig.handle.applied(HttpMethod::Put, "/close").len(), 1);
+}
+
+#[test]
+fn a_close_whose_answer_is_lost_is_settled_from_the_position_when_the_extensions_are_not_echoed() {
+    // UNMEASURED at real OANDA whether longClientExtensions is echoed onto the closeout transactions. If it is not, the tag is
+    // invisible in the stream and the position itself must decide.
+    let rig = OandaRig::new();
+    rig.handle.set_echo_close_client_ids(false);
+    rig.adapter.place_order(&buy("t:l", "4000")).unwrap();
+    rig.handle.inject_fault(Fault::timeout().after_apply().on_path(&rig.handle.path("/positions/EUR_USD/close")));
+    match rig.adapter.close_position("EUR_USD", "t:c").unwrap() {
+        CloseOutcome::AlreadyFlat { detail } => assert!(detail.contains("now flat") && detail.contains("unverified"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.handle.position_units("EUR_USD"), Dec::ZERO);
+    // a retry of the same tag finds the position flat and sends nothing
+    assert_eq!(rig.adapter.close_position("EUR_USD", "t:c").unwrap(), CloseOutcome::NothingToClose);
+    assert_eq!(rig.handle.applied(HttpMethod::Put, "/close").len(), 1);
+    // the request that never arrived leaves the position open: unknown, and the retry closes it exactly once
+    rig.adapter.place_order(&buy("t:l2", "1000")).unwrap();
+    rig.handle.inject_fault(Fault::io_error().on_path(&rig.handle.path("/positions/EUR_USD/close")));
+    assert!(matches!(rig.adapter.close_position("EUR_USD", "t:c2").unwrap(), CloseOutcome::UnknownOutcome { .. }));
+    assert_eq!(rig.handle.position_units("EUR_USD"), d("1000"));
+    assert!(matches!(rig.adapter.close_position("EUR_USD", "t:c2").unwrap(), CloseOutcome::Closed { .. }));
+    assert_eq!(rig.handle.position_units("EUR_USD"), Dec::ZERO);
+    assert_eq!(rig.handle.applied(HttpMethod::Put, "/close").len(), 2);
+    rig.handle.assert_invariants();
 }
 
 #[test]
@@ -401,6 +669,7 @@ fn a_close_that_is_refused_is_reported_and_leaves_the_position() {
         other => panic!("{other:?}"),
     }
     assert_eq!(rig.handle.position_units("EUR_USD"), d("4000"));
+    assert_eq!(rig.adapter.tag_checkpoint("t:c1"), None, "a refused close created nothing");
     rig.handle.set_market_open(false);
     match rig.adapter.close_position("EUR_USD", "t:c2").unwrap() {
         CloseOutcome::Rejected { errors } => assert!(errors[0].code.contains("MARKET_HALTED")),

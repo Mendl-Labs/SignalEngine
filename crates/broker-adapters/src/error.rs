@@ -102,6 +102,11 @@ pub enum BrokerError {
     /// the broker has forgotten it; the caller must reconcile by tag and balances.
     #[error("cancel target {0} was refused as unknown and the follow-up query found no such order")]
     CancelTargetNotFound(String),
+    /// A lookup by tag could not PROVE either "the order exists" or "it does not" (an incomplete or inconsistent
+    /// transaction scan, or a scan window that does not reach back far enough). Callers must treat the tag as
+    /// possibly placed: never re-send, alert a human. (Added for the OANDA adapter: "not found" would be a lie.)
+    #[error("lookup by tag is inconclusive: {0}")]
+    LookupInconclusive(String),
 }
 
 fn fmt_retry_after(secs: &Option<u64>) -> String {
