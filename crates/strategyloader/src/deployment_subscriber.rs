@@ -149,6 +149,89 @@ fn resolve_asset_class(params_json: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Parse a tenant id read from the database: anything that is not a valid UUID
+/// (NULL, empty, garbage) becomes the nil UUID, which no provider serves.
+pub fn parse_row_tenant(raw: Option<&str>) -> Uuid {
+    raw.map(str::trim)
+        .and_then(|t| Uuid::parse_str(t).ok())
+        .unwrap_or_else(Uuid::nil)
+}
+
+/// Real tenant of every active deployment row, keyed by deployment id.
+///
+/// Production's `deployed_strategies` has a `tenant_id` column (private
+/// schema); the public/OSS schema does not. The column's existence is checked
+/// through `information_schema` (once per call), and rows are read with a raw
+/// query so this compiles against both. NEVER fails the reconcile: when the
+/// column is absent, or any query errors, the map is empty (with a WARN for
+/// the error case) and every row is treated as tenant-less (nil) -- which a
+/// live deployment cannot pass. Rows whose tenant is NULL or not a UUID are
+/// simply left out of the map for the same reason.
+#[cfg(feature = "postgres")]
+pub async fn load_reconcile_tenants(
+    conn: &mut AsyncPgConnection,
+) -> std::collections::HashMap<Uuid, Uuid> {
+    use diesel::sql_types::{Bool, Nullable, Text, Uuid as SqlUuid};
+
+    #[derive(diesel::QueryableByName)]
+    struct Present {
+        #[diesel(sql_type = Bool)]
+        present: bool,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct TenantRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: Uuid,
+        #[diesel(sql_type = Nullable<Text>)]
+        tenant: Option<String>,
+    }
+
+    let mut out = std::collections::HashMap::new();
+
+    let present = match diesel::sql_query(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns          WHERE table_schema = ANY (current_schemas(false))          AND table_name = 'deployed_strategies' AND column_name = 'tenant_id') AS present",
+    )
+    .load::<Present>(conn)
+    .await
+    {
+        Ok(rows) => rows.iter().next().map(|r| r.present).unwrap_or(false),
+        Err(e) => {
+            ultra_warn!(format!(
+                "⚠️ reconcile: could not check for deployed_strategies.tenant_id ({}); \
+                 replayed deployments keep the nil tenant (live ones are rejected)",
+                e
+            ));
+            return out;
+        }
+    };
+    if !present {
+        return out;
+    }
+
+    match diesel::sql_query(
+        "SELECT id, tenant_id::text AS tenant FROM deployed_strategies \
+         WHERE is_active = true AND status = 'active'",
+    )
+    .load::<TenantRow>(conn)
+    .await
+    {
+        Ok(rows) => {
+            for r in rows {
+                let t = parse_row_tenant(r.tenant.as_deref());
+                if !t.is_nil() {
+                    out.insert(r.id, t);
+                }
+            }
+        }
+        Err(e) => ultra_warn!(format!(
+            "⚠️ reconcile: could not read deployed_strategies.tenant_id ({}); \
+             replayed deployments keep the nil tenant (live ones are rejected)",
+            e
+        )),
+    }
+    out
+}
+
 /// Information about a deployed strategy for tracking
 #[derive(Debug)]
 pub struct DeployedStrategy {
@@ -219,6 +302,10 @@ pub struct DeployedStrategy {
     pub asset_class: Option<String>,
     /// Pairs-trading declaration, see `DeploymentPythonConfig::pair_spec`.
     pub pair_spec: Option<serde_json::Value>,
+    /// Exchanges for which `handle_deployment` published a `MarketDataSubscribe`
+    /// (subscription id `{instance_id}_{exchange}`). `reject_live_deployment`
+    /// drains this to unsubscribe exactly what was subscribed, once.
+    pub subscribed_exchanges: parking_lot::Mutex<Vec<String>>,
 }
 
 impl DeployedStrategy {
@@ -294,6 +381,7 @@ impl DeployedStrategy {
             candle_interval_minutes: python_config.candle_interval_minutes,
             asset_class: python_config.asset_class,
             pair_spec: python_config.pair_spec,
+            subscribed_exchanges: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -616,8 +704,24 @@ impl DeploymentSubscriber {
         if database_url.is_empty() {
             return Ok(0);
         }
+        self.reconcile_from_database_url(&database_url).await
+    }
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
+    /// [`Self::reconcile_active_deployments_from_db`] against an explicit URL.
+    ///
+    /// Each replayed deployment carries its REAL tenant, read from the shared
+    /// database's `deployed_strategies.tenant_id` when that column exists (see
+    /// [`load_reconcile_tenants`]). A row with no tenant (public/OSS schema, or
+    /// a NULL) keeps the nil tenant, so a live one is rejected (fail closed).
+    /// A row is NEVER attributed to the process's configured tenant: the shared
+    /// database holds many tenants and that would run another tenant's
+    /// deployment with this tenant's credentials.
+    #[cfg(feature = "postgres")]
+    pub async fn reconcile_from_database_url(
+        &self,
+        database_url: &str,
+    ) -> Result<usize, DeploymentSubscriberError> {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
         let pool: Pool<AsyncPgConnection> = Pool::builder(manager)
             .max_size(5)
             .build()
@@ -637,6 +741,9 @@ impl DeploymentSubscriber {
             .load(&mut conn)
             .await
             .map_err(|e| DeploymentSubscriberError::LoadError(format!("Query active deployments: {}", e)))?;
+
+        // One column-existence check + one query per reconcile run (never per row).
+        let tenants = load_reconcile_tenants(&mut conn).await;
 
         let mut replayed = 0usize;
 
@@ -680,10 +787,13 @@ impl DeploymentSubscriber {
             let deployment_msg = StrategyDeployment {
                 strategy_id: deployment.backtest_result_id.to_string(),
                 instance_id: deployment.id.to_string(),
-                // No tenant concept in the OSS schema -- this is a wire-protocol
-                // field on StrategyDeployment (MessageBrokerEngine's protocol
-                // crate), not a database column, so it can't simply be dropped.
-                tenant_id: uuid::Uuid::nil().to_string(),
+                // The row's real tenant when the shared DB has one; nil otherwise
+                // (the OSS schema has no tenant column). Nil is never served.
+                tenant_id: tenants
+                    .get(&deployment.id)
+                    .copied()
+                    .unwrap_or_else(Uuid::nil)
+                    .to_string(),
                 strategy_type,
                 strategy_name: deployment.name.clone(),
                 version: "1.0".to_string(),
@@ -831,7 +941,7 @@ impl DeploymentSubscriber {
         node_id: &str,
         deployment_tx: Option<&mpsc::Sender<DeploymentEvent>>,
     ) {
-        let (success, error_message, active_exchanges, symbols, instance_id_str, tenant_id_str) =
+        let (success, error_message, active_exchanges, symbols, instance_id_str, tenant_id_str, deployed_entry) =
             match DeployedStrategy::from_deployment(&deployment, python_config) {
             Ok(strategy) => {
                 let instance_id = strategy.instance_id;
@@ -843,15 +953,16 @@ impl DeploymentSubscriber {
 
                 // Add to deployed strategies map
                 deployed_strategies.insert(instance_id, strategy.clone());
+                let entry = strategy.clone();
 
                 // Notify strategy manager
                 if let Some(tx) = deployment_tx {
                     let _ = tx.send(DeploymentEvent::Deploy(strategy)).await;
                 }
 
-                (true, String::new(), exchanges, symbols, instance_id_str, tenant_id_str)
+                (true, String::new(), exchanges, symbols, instance_id_str, tenant_id_str, Some(entry))
             }
-            Err(e) => (false, e.to_string(), Vec::new(), Vec::new(), String::new(), String::new()),
+            Err(e) => (false, e.to_string(), Vec::new(), Vec::new(), String::new(), String::new(), None),
         };
 
         // Send acknowledgment
@@ -916,7 +1027,14 @@ impl DeploymentSubscriber {
                         payload: Some(publish_request::Payload::RawData(market_sub_bytes)),
                     };
                     let encoded = request.encode_to_vec();
-                    if let Err(_e) = pub_arc.publish_raw(encoded, topics::MARKET_DATA_SUBSCRIBE).await {
+                    let published = pub_arc.publish_raw(encoded, topics::MARKET_DATA_SUBSCRIBE).await;
+                    if published.is_ok() {
+                        // Remember it so a later rejection can unsubscribe exactly this.
+                        if let Some(entry) = &deployed_entry {
+                            entry.subscribed_exchanges.lock().push(exchange.clone());
+                        }
+                    }
+                    if let Err(_e) = published {
                         ultra_warn!(format!(
                             "⚠️ Failed to publish MarketDataSubscribe for exchange {}: {:?}",
                             exchange, _e
@@ -1313,12 +1431,10 @@ mod tests {
         let live_id = insert_deployment(&db_url, "live", None).await;
         let paper_id = insert_deployment(&db_url, "paper", None).await;
 
-        // The only test in this crate that touches the process-wide DATABASE_URL.
-        std::env::set_var("DATABASE_URL", &db_url);
         let mut sub = DeploymentSubscriber::new("127.0.0.1:1", "node");
         let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(10_000);
         sub.set_deployment_channel(tx);
-        sub.reconcile_active_deployments_from_db().await.unwrap();
+        sub.reconcile_from_database_url(&db_url).await.unwrap();
 
         let mut live_seen = None;
         let mut paper_seen = false;
@@ -1359,11 +1475,133 @@ mod tests {
         let mut sub2 = DeploymentSubscriber::new("127.0.0.1:1", "node");
         let (tx2, mut rx2) = mpsc::channel::<DeploymentEvent>(10_000);
         sub2.set_deployment_channel(tx2);
-        sub2.reconcile_active_deployments_from_db().await.unwrap();
+        sub2.reconcile_from_database_url(&db_url).await.unwrap();
         while let Ok(ev) = rx2.try_recv() {
             if let DeploymentEvent::Deploy(s2) = ev {
                 assert_ne!(s2.instance_id, live_id, "a rejected live row must not be replayed again");
             }
         }
+    }
+
+    // ---- FIX 1: tenant on the reconcile path --------------------------------
+
+    #[test]
+    fn parse_row_tenant_fails_closed_to_nil() {
+        let t = Uuid::new_v4();
+        assert_eq!(parse_row_tenant(Some(&t.to_string())), t);
+        assert_eq!(parse_row_tenant(Some(&format!(" {} ", t))), t);
+        for bad in [None, Some(""), Some("garbage"), Some("1234")] {
+            assert!(parse_row_tenant(bad).is_nil(), "{:?}", bad);
+        }
+    }
+
+    /// handle_deployment with no publisher subscribes nothing, so a rejection
+    /// that follows must publish no unsubscribe (nothing was subscribed).
+    #[tokio::test]
+    async fn deployment_without_publisher_subscribed_nothing_so_rejection_unsubscribes_nothing() {
+        let map: Arc<DashMap<Uuid, Arc<DeployedStrategy>>> = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(4);
+        let id = Uuid::new_v4();
+        DeploymentSubscriber::handle_deployment(
+            deployment_msg(id, "live"),
+            DeploymentPythonConfig::default(),
+            &map,
+            None,
+            "node",
+            Some(&tx),
+        )
+        .await;
+        let DeploymentEvent::Deploy(s) = rx.recv().await.unwrap() else { panic!() };
+        assert!(s.subscribed_exchanges.lock().is_empty());
+        let sink = Arc::new(RecordingSink::default());
+        let sender = AckSender::with_sink(sink.clone(), "node");
+        reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+        assert!(sink.unsubs.lock().unwrap().is_empty());
+        assert_eq!(sink.acks.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn replay(db_url: &str) -> std::collections::HashMap<Uuid, Arc<DeployedStrategy>> {
+        let mut sub = DeploymentSubscriber::new("127.0.0.1:1", "node");
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(10_000);
+        sub.set_deployment_channel(tx);
+        sub.reconcile_from_database_url(db_url).await.unwrap();
+        let mut out = std::collections::HashMap::new();
+        while let Ok(DeploymentEvent::Deploy(s)) = rx.try_recv() {
+            out.insert(s.instance_id, s);
+        }
+        out
+    }
+
+    /// Public/OSS schema: no tenant column. Every replayed row keeps the nil
+    /// tenant (a live one cannot be served), and the reconcile does not fail.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn reconcile_without_tenant_column_keeps_nil_tenant() {
+        use crate::live_rejection::tests::db::{insert_deployment, url};
+        use diesel_async::AsyncConnection;
+        let Some(db_url) = url() else { return };
+        let live = insert_deployment(&db_url, "live", None).await;
+        let paper = insert_deployment(&db_url, "paper", None).await;
+
+        let mut conn = AsyncPgConnection::establish(&db_url).await.unwrap();
+        assert!(load_reconcile_tenants(&mut conn).await.is_empty(), "no tenant column -> empty map");
+
+        let ev = replay(&db_url).await;
+        assert_eq!(ev[&live].mode, "live");
+        assert!(ev[&live].tenant_id.is_nil(), "live row without a tenant column stays nil (fail closed)");
+        assert_eq!(ev[&paper].mode, "paper");
+        assert!(ev[&paper].tenant_id.is_nil());
+    }
+
+    /// Private-schema shape: each row's REAL tenant is used; NULL stays nil; the
+    /// configured tenant is never substituted for another tenant's row, and the
+    /// single-tenant provider serves only the configured tenant's row.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn reconcile_with_tenant_column_uses_each_rows_real_tenant() {
+        use crate::live_rejection::tests::db::{insert_deployment_tenant, tenant_url};
+        use smartorderrouter::{CredentialError, CredentialProvider, SingleTenantDbProvider};
+        let Some(db_url) = tenant_url() else { return };
+        let tenant_a = Uuid::new_v4(); // the configured (single) tenant
+        let tenant_b = Uuid::new_v4(); // another tenant sharing the database
+        let live_a = insert_deployment_tenant(&db_url, "live", None, Some(Some(tenant_a))).await;
+        let live_b = insert_deployment_tenant(&db_url, "live", None, Some(Some(tenant_b))).await;
+        let live_null = insert_deployment_tenant(&db_url, "live", None, Some(None)).await;
+        let paper_b = insert_deployment_tenant(&db_url, "paper", None, Some(Some(tenant_b))).await;
+
+        let ev = replay(&db_url).await;
+        assert_eq!(ev[&live_a].tenant_id, tenant_a);
+        assert_eq!(ev[&live_b].tenant_id, tenant_b, "another tenant's row keeps ITS tenant");
+        assert!(ev[&live_null].tenant_id.is_nil(), "NULL tenant stays nil");
+        assert_eq!(ev[&paper_b].tenant_id, tenant_b);
+        assert_eq!(ev[&paper_b].mode, "paper", "paper reconcile is unchanged");
+        assert_eq!(ev[&live_a].mode, "live");
+
+        // Provider bound to tenant A (unreachable DB: reaching it = passed the tenant check).
+        let pool = smartorderrouter::create_pool("postgres://nobody:nothing@127.0.0.1:1/none").await.unwrap();
+        let provider = SingleTenantDbProvider::self_hosted_single_tenant_only(Arc::new(pool), tenant_a);
+
+        let served = provider.credentials_for(ev[&live_a].tenant_id, "kraken", true).await.unwrap_err();
+        assert!(matches!(served, CredentialError::Backend(_)), "A's row passes the tenant check: {:?}", served);
+        for (name, id) in [("other tenant", live_b), ("NULL tenant", live_null)] {
+            let err = provider.credentials_for(ev[&id].tenant_id, "kraken", true).await.unwrap_err();
+            assert!(
+                matches!(err, CredentialError::TenantNotServed { served, .. } if served == tenant_a),
+                "{} must be refused: {:?}",
+                name,
+                err
+            );
+        }
+
+        // Rejecting them ends the same way as before: stopped rows, gone from the set.
+        let sink = Arc::new(RecordingSink::default());
+        let sender = AckSender::with_sink(sink.clone(), "node");
+        let map: DashMap<Uuid, Arc<DeployedStrategy>> = DashMap::new();
+        map.insert(live_b, ev[&live_b].clone());
+        reject_live_deployment(&map, Some(&sender), Some(&db_url), "s", live_b, &reason_no_provider()).await;
+        assert!(map.is_empty());
+        assert_eq!(crate::live_rejection::tests::db::row_json(&db_url, live_b).await["status"], "stopped");
+        assert_eq!(crate::live_rejection::tests::db::row_json(&db_url, live_a).await["status"], "active");
     }
 }

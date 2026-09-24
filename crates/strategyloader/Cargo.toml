@@ -42,6 +42,11 @@ prost = "0.13"
 # Database schema (shared with BacktestingEngine)
 databaseschema = { path = "../../../databaseschema", optional = true }
 
+[dev-dependencies]
+# Reconcile tests prove a replayed row's tenant is refused by the single-tenant
+# provider unless it is the configured tenant.
+smartorderrouter = { path = "../smartorderrouter", features = ["postgres"] }
+
 [features]
 default = []
 postgres = ["diesel", "diesel-async", "deadpool", "bigdecimal", "databaseschema"]

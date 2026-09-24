@@ -4517,6 +4517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signalengine-core",
+ "smartorderrouter",
  "subscriber",
  "thiserror 1.0.69",
  "tokio",

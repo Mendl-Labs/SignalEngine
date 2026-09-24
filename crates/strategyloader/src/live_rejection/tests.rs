@@ -1,6 +1,7 @@
 use super::*;
 use protocol::broker::messages::StrategyDeployment;
 use std::sync::Mutex;
+use protocol::broker::messages::MarketDataUnsubscribe;
 
 // ---- test support --------------------------------------------------------
 
@@ -8,7 +9,9 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub(crate) struct RecordingSink {
     pub acks: Mutex<Vec<StrategyDeploymentAck>>,
+    pub unsubs: Mutex<Vec<MarketDataUnsubscribe>>,
     pub fail: bool,
+    pub fail_unsub: bool,
 }
 
 #[async_trait]
@@ -18,6 +21,14 @@ impl AckSink for RecordingSink {
             return Err("broker down".to_string());
         }
         self.acks.lock().unwrap().push(ack);
+        Ok(())
+    }
+
+    async fn publish_unsubscribe(&self, unsub: MarketDataUnsubscribe) -> Result<(), String> {
+        if self.fail_unsub {
+            return Err("unsubscribe path down".to_string());
+        }
+        self.unsubs.lock().unwrap().push(unsub);
         Ok(())
     }
 }
@@ -200,8 +211,32 @@ pub(crate) mod db {
         }
     }
 
+    /// A scratch database whose `deployed_strategies` ALSO has a nullable
+    /// `tenant_id uuid` column (the private-schema shape).
+    pub(crate) fn tenant_url() -> Option<String> {
+        match std::env::var("FOLLOWUP_TENANT_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => Some(u),
+            _ => {
+                eprintln!("SKIPPED: FOLLOWUP_TENANT_DATABASE_URL not set");
+                None
+            }
+        }
+    }
+
     /// Insert a backtest_results row plus a deployed_strategies row.
     pub(crate) async fn insert_deployment(url: &str, mode: &str, metadata: Option<&str>) -> Uuid {
+        insert_deployment_tenant(url, mode, metadata, None).await
+    }
+
+    /// Like [`insert_deployment`]; `tenant` = `Some(t)` also writes the
+    /// `tenant_id` column (`Some(None)` writes NULL). It only works against a
+    /// database whose `deployed_strategies` HAS that column.
+    pub(crate) async fn insert_deployment_tenant(
+        url: &str,
+        mode: &str,
+        metadata: Option<&str>,
+        tenant: Option<Option<Uuid>>,
+    ) -> Uuid {
         let mut c = AsyncPgConnection::establish(url).await.unwrap();
         let bt = Uuid::new_v4();
         let dep = Uuid::new_v4();
@@ -217,9 +252,14 @@ pub(crate) mod db {
             Some(m) => format!("'{}'::jsonb", m),
             None => "NULL".to_string(),
         };
+        let (tcol, tval) = match tenant {
+            None => (String::new(), String::new()),
+            Some(None) => (", tenant_id".to_string(), ", NULL".to_string()),
+            Some(Some(t)) => (", tenant_id".to_string(), format!(", '{t}'")),
+        };
         diesel::sql_query(format!(
-            "INSERT INTO deployed_strategies (id, backtest_result_id, name, capital_allocation, mode, metadata) \
-             VALUES ('{dep}', '{bt}', 'lf', 1000, '{mode}', {md})"
+            "INSERT INTO deployed_strategies (id, backtest_result_id, name, capital_allocation, mode, metadata{tcol}) \
+             VALUES ('{dep}', '{bt}', 'lf', 1000, '{mode}', {md}{tval})"
         ))
         .execute(&mut c)
         .await
@@ -337,4 +377,151 @@ pub(crate) mod db {
             out.errors
         );
     }
+}
+
+// ---- unsubscribe of leaked market-data subscriptions ------------------------
+
+fn deployed_subscribed(
+    instance_id: Uuid,
+    mode: &str,
+    exchanges: &[&str],
+    symbols: &[&str],
+    subscribed: &[&str],
+) -> Arc<DeployedStrategy> {
+    let mut msg = deployment_msg(instance_id, mode);
+    msg.target_exchanges = exchanges.iter().map(|s| s.to_string()).collect();
+    msg.symbols = symbols.iter().map(|s| s.to_string()).collect();
+    let d = DeployedStrategy::from_deployment(&msg, Default::default()).unwrap();
+    *d.subscribed_exchanges.lock() = subscribed.iter().map(|s| s.to_string()).collect();
+    Arc::new(d)
+}
+
+fn setup(entry: Arc<DeployedStrategy>) -> (DashMap<Uuid, Arc<DeployedStrategy>>, Arc<RecordingSink>, AckSender) {
+    let map: DashMap<Uuid, Arc<DeployedStrategy>> = DashMap::new();
+    map.insert(entry.instance_id, entry);
+    let sink = Arc::new(RecordingSink::default());
+    let sender = AckSender::with_sink(sink.clone(), "node");
+    (map, sink, sender)
+}
+
+#[tokio::test]
+async fn one_unsubscribe_per_subscribed_exchange_with_the_subscribe_ids() {
+    let id = Uuid::new_v4();
+    let (map, sink, sender) = setup(deployed_subscribed(
+        id, "live", &["kraken", "binance"], &["BTC-USD", "ETH-USD"], &["kraken", "binance"],
+    ));
+    let out = reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    assert_eq!(out.unsubscribes_published, 2);
+    let unsubs = sink.unsubs.lock().unwrap();
+    assert_eq!(unsubs.len(), 2, "exactly one per exchange");
+    for (u, ex) in unsubs.iter().zip(["kraken", "binance"]) {
+        assert_eq!(u.subscription_id, format!("{}_{}", id, ex), "same id handle_deployment subscribed with");
+        assert_eq!(u.exchange, ex);
+        assert_eq!(u.strategy_instance_id, id.to_string());
+        assert_eq!(u.symbols, vec!["BTC-USD".to_string(), "ETH-USD".to_string()]);
+        assert!(!u.reason.is_empty());
+    }
+    assert_eq!(sink.acks.lock().unwrap().len(), 1, "the failure ack still goes out once");
+}
+
+#[tokio::test]
+async fn only_exchanges_actually_subscribed_are_unsubscribed() {
+    let id = Uuid::new_v4();
+    let (map, sink, sender) =
+        setup(deployed_subscribed(id, "live", &["kraken", "binance"], &["BTC-USD"], &["kraken"]));
+    reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    let unsubs = sink.unsubs.lock().unwrap();
+    assert_eq!(unsubs.len(), 1);
+    assert_eq!(unsubs[0].exchange, "kraken");
+}
+
+#[tokio::test]
+async fn no_unsubscribe_when_nothing_was_subscribed() {
+    let id = Uuid::new_v4();
+    let (map, sink, sender) =
+        setup(deployed_subscribed(id, "live", &["kraken"], &["BTC-USD"], &[]));
+    let out = reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    assert_eq!(out.unsubscribes_published, 0);
+    assert!(sink.unsubs.lock().unwrap().is_empty());
+    assert!(out.removed_from_map);
+}
+
+#[tokio::test]
+async fn no_unsubscribe_for_a_paper_entry() {
+    let id = Uuid::new_v4();
+    let (map, sink, sender) =
+        setup(deployed_subscribed(id, "paper", &["kraken"], &["BTC-USD"], &["kraken"]));
+    reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    assert!(sink.unsubs.lock().unwrap().is_empty(), "the live-only path must not touch a paper subscription");
+}
+
+#[tokio::test]
+async fn second_rejection_publishes_no_further_unsubscribes() {
+    let id = Uuid::new_v4();
+    let entry = deployed_subscribed(id, "live", &["kraken"], &["BTC-USD"], &["kraken"]);
+    let (map, sink, sender) = setup(entry.clone());
+    reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    reject_live_deployment(&map, Some(&sender), None, "s", id, "nope again").await;
+    assert_eq!(sink.unsubs.lock().unwrap().len(), 1, "unsubscribe happens once per deployment");
+    // Even if the same entry were re-inserted (a second holder), the drained list stays empty.
+    map.insert(id, entry);
+    reject_live_deployment(&map, Some(&sender), None, "s", id, "third").await;
+    assert_eq!(sink.unsubs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unsubscribe_failure_is_reported_but_rejection_stands() {
+    let id = Uuid::new_v4();
+    let (map, sink_ok, _) = setup(deployed_subscribed(id, "live", &["kraken"], &["BTC-USD"], &["kraken"]));
+    drop(sink_ok);
+    let sink = Arc::new(RecordingSink { fail_unsub: true, ..Default::default() });
+    let sender = AckSender::with_sink(sink.clone(), "node");
+    let out = reject_live_deployment(&map, Some(&sender), None, "s", id, "nope").await;
+    assert_eq!(out.unsubscribes_published, 0);
+    assert!(out.removed_from_map && out.ack_published, "rejection and failure ack still stand");
+    assert!(out.errors.iter().any(|e| e.contains("unsubscribe") && e.contains("DataEngine")), "{:?}", out.errors);
+    assert!(map.is_empty());
+}
+
+#[tokio::test]
+async fn missing_publisher_reports_the_leaked_subscription() {
+    let id = Uuid::new_v4();
+    let (map, _sink, _sender) = setup(deployed_subscribed(id, "live", &["kraken"], &["BTC-USD"], &["kraken"]));
+    let out = reject_live_deployment(&map, None, None, "s", id, "nope").await;
+    assert!(out.errors.iter().any(|e| e.contains("unsubscribe") && e.contains("no broker publisher")), "{:?}", out.errors);
+}
+
+// ---- wire format ------------------------------------------------------------
+
+#[test]
+fn unsubscribe_wire_bytes_decode_the_way_dataengine_reads_them() {
+    // DataEngine (SubscriptionManager): PublishRequest::decode, then act only on
+    // `RawData` payloads on topic market.subscription.unsubscribe.
+    let id = Uuid::new_v4();
+    let unsubs = build_unsubscribes(id, &["BTC-USD".to_string()], &["kraken".to_string()], "why");
+    let bytes = unsubscribe_wire_bytes(&unsubs[0]);
+    let req = PublishRequest::decode(bytes.as_slice()).unwrap();
+    assert_eq!(req.topic, "market.subscription.unsubscribe");
+    let Some(publish_request::Payload::RawData(data)) = req.payload else { panic!("not RawData") };
+    let back = MarketDataUnsubscribe::decode(data.as_slice()).unwrap();
+    assert_eq!(back.subscription_id, format!("{}_kraken", id));
+    assert_eq!(back.strategy_instance_id, id.to_string());
+    assert_eq!(back.exchange, "kraken");
+    assert_eq!(back.symbols, vec!["BTC-USD".to_string()]);
+}
+
+/// Evidence for a suspected pre-existing bug (NOT changed here): the
+/// deactivation path publishes the bare `MarketDataUnsubscribe` bytes with no
+/// `PublishRequest` envelope. Decoded the way DataEngine decodes, that is not a
+/// `RawData` payload, so DataEngine would ignore it.
+#[test]
+fn bare_unsubscribe_bytes_are_not_a_rawdata_publish_request() {
+    let id = Uuid::new_v4();
+    let u = build_unsubscribes(id, &["BTC-USD".to_string()], &["kraken".to_string()], "why").remove(0);
+    let bare = u.encode_to_vec();
+    let is_rawdata = matches!(
+        PublishRequest::decode(bare.as_slice()).map(|r| r.payload),
+        Ok(Some(publish_request::Payload::RawData(_)))
+    );
+    assert!(!is_rawdata, "bare bytes must not look like the enveloped form");
 }
