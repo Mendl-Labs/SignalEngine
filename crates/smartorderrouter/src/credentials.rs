@@ -16,10 +16,12 @@
 //!   `exchange_credentials` table, which has **no tenant column**. It is
 //!   therefore bound to exactly one tenant at construction and refuses every
 //!   other tenant. Self-hosted, single-tenant deployments only.
-//! * The multi-tenant (SaaS) provider is implemented OUTSIDE this public
-//!   repository, against the private schema that carries `tenant_id`. It
-//!   implements [`CredentialProvider`] and is handed to the execution handlers
-//!   by the (private) host binary.
+//! * A multi-tenant provider does NOT exist yet. One would have to be written
+//!   against a schema that carries `tenant_id`, implement [`CredentialProvider`]
+//!   and be handed in through `HostedObjectBuilder::with_credential_provider`.
+//!   No host binary does that today: until one does, live trading is only
+//!   possible through the single-tenant provider above, and a multi-tenant
+//!   (SaaS) deployment must run paper-only.
 //!
 //! # Fail closed
 //!

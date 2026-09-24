@@ -111,7 +111,13 @@ spec:
                   name: signalengine-db-secret
                   key: database
                   optional: true
-            # Tenant ID for multi-tenant credential loading
+            # Declared credential mode (none | single_tenant), validated at render
+            # time. The runtime cross-checks it against what it can actually do
+            # (DATABASE_URL + a valid TENANT_ID) and falls back to none with an
+            # ERROR on a mismatch: live trading is never enabled by accident.
+            - name: CREDENTIAL_MODE
+              value: {{ include "signal-engine-helm.credentialMode" . | quote }}
+            # Tenant served by credentialMode=single_tenant (unused for none)
             - name: TENANT_ID
               valueFrom:
                 configMapKeyRef:

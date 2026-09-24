@@ -271,6 +271,8 @@ use strategyhandler::{
     MarketData as StratMarketData,
 };
 use strategyloader::{DeploymentSubscriber, DeploymentEvent};
+#[cfg(feature = "postgres")]
+use executionhandler::CredentialMode;
 use std::{env, error::Error, sync::{Arc, RwLock}, collections::HashMap};
 use tokio::sync::broadcast;
 use orderbook::Orderbook;
@@ -525,12 +527,13 @@ pub struct HostedObject {
     strategy_manager: Option<StrategyManager>,
     // Phase 2: Ultra-fast order management (853x faster)
     ultra_order_manager: Option<Arc<SignalEngineUltraOrderManager>>,
-    /// Where exchange credentials come from. The caller passes this in (the
-    /// multi-tenant SaaS provider lives outside this public repo). When left
-    /// unset, a `postgres` build falls back to the public-schema
+    /// Where exchange credentials come from. A caller MAY inject a provider
+    /// (no multi-tenant provider or host binary that does so exists today).
+    /// When left unset, a `postgres` build falls back to the public-schema
     /// `SingleTenantDbProvider` bound to the `TENANT_ID` env var -- serving
-    /// that ONE tenant only -- and with no `TENANT_ID` there is no provider
-    /// at all, so no exchange credential is ever loaded (fail closed).
+    /// that ONE tenant only -- and with no valid `TENANT_ID` there is no
+    /// provider at all: credential mode `none`, live trading disabled, every
+    /// live deployment rejected loudly (fail closed). See `CredentialMode`.
     credential_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
 }
 
@@ -560,23 +563,90 @@ impl HostedObject {
     }
 }
 
-/// The credential provider to use: the injected one, else (self-hosted
-/// single-tenant fallback) the public-schema provider bound to `TENANT_ID`.
-/// `None` means no credential can be resolved for any tenant.
+/// The credential provider to use, decided by the startup [`CredentialMode`]:
+/// `Injected` -> the injected provider; `SingleTenant(t)` -> the public-schema
+/// provider bound to `t` (it serves that ONE tenant only); `None` -> no
+/// provider, so no credential can be resolved for any tenant (live trading is
+/// disabled and every live deployment is rejected loudly).
 #[cfg(feature = "postgres")]
 fn effective_credential_provider(
     injected: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
     pool: Option<&Arc<smartorderrouter::DbPool>>,
+    mode: CredentialMode,
 ) -> Option<Arc<dyn smartorderrouter::CredentialProvider>> {
-    if injected.is_some() {
-        return injected;
+    match mode {
+        CredentialMode::None => None,
+        CredentialMode::Injected => injected,
+        CredentialMode::SingleTenant(tenant_id) => {
+            let pool = pool?;
+            Some(Arc::new(smartorderrouter::SingleTenantDbProvider::self_hosted_single_tenant_only(
+                Arc::clone(pool),
+                tenant_id,
+            )))
+        }
     }
-    let pool = pool?;
-    let tenant_id = std::env::var("TENANT_ID").ok().and_then(|s| uuid::Uuid::parse_str(&s).ok())?;
-    Some(Arc::new(smartorderrouter::SingleTenantDbProvider::self_hosted_single_tenant_only(
-        Arc::clone(pool),
-        tenant_id,
-    )))
+}
+
+/// Decide, state and publish this process's credential mode (once, at
+/// startup): computes it from (injected provider, DATABASE_URL, TENANT_ID),
+/// cross-checks the deployment's declared `CREDENTIAL_MODE`, logs ONE clear
+/// line (WARN when live trading is disabled, ERROR when the declaration
+/// disagrees with reality) and publishes it for `/health` and `/metrics`.
+#[cfg(feature = "postgres")]
+fn startup_credential_mode(injected_provider: bool) -> CredentialMode {
+    let database_url = DeploymentSubscriber::database_url_from_env();
+    let tenant_id = env::var("TENANT_ID").ok();
+    let computed = executionhandler::compute_credential_mode(
+        injected_provider,
+        database_url.as_deref(),
+        tenant_id.as_deref(),
+    );
+    let declared = env::var("CREDENTIAL_MODE").ok();
+    let resolved = executionhandler::resolve_credential_mode(computed, declared.as_deref());
+    if let Some(err) = &resolved.error {
+        ultra_error!(format!("❌ {}", err));
+    }
+    if let Some(warn) = &resolved.warning {
+        ultra_warn!(format!("⚠️ {}", warn));
+    }
+    let line = resolved.mode.startup_line();
+    if resolved.mode.live_enabled() {
+        ultra_info!(format!("🔑 {}", line));
+    } else {
+        ultra_warn!(format!("⚠️ {}", line));
+    }
+    executionhandler::publish_credential_mode(resolved.mode);
+    resolved.mode
+}
+
+/// Everything needed to reject a LIVE deployment loudly (see
+/// `strategyloader::reject_live_deployment`): the subscriber's shared
+/// deployed-set, the ack channel, the shared DB, plus this host's own
+/// registries so a rejected redeploy of a running instance stops it too.
+#[derive(Clone)]
+struct LiveRejector {
+    subscriber_map: strategyloader::DeployedSet,
+    ack: Option<strategyloader::AckSender>,
+    database_url: Option<String>,
+    registry: PaperDeploymentRegistry,
+    strategies: DeployedStrategyRegistry,
+}
+
+impl LiveRejector {
+    async fn reject(&self, strategy: &strategyloader::DeployedStrategy, reason: &str) {
+        // Fail closed for a redeploy of an instance that was already running.
+        self.registry.remove(&strategy.instance_id);
+        self.strategies.remove(&strategy.instance_id);
+        strategyloader::reject_live_deployment(
+            &*self.subscriber_map,
+            self.ack.as_ref(),
+            self.database_url.as_deref(),
+            &strategy.strategy_id.to_string(),
+            strategy.instance_id,
+            reason,
+        )
+        .await;
+    }
 }
 
 impl Default for HostedObject {
@@ -605,6 +675,7 @@ impl HostedObject {
     async fn create_handlers(
         #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         injected_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
+        #[cfg(feature = "postgres")] credential_mode: CredentialMode,
     ) -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler, Config), Box<dyn Error>> {
         // Load environment variables
         dotenv().ok();
@@ -642,7 +713,7 @@ impl HostedObject {
                             // fallback is the single-tenant public-schema
                             // provider bound to THIS process's TENANT_ID.
                             let pool = Arc::new(pool);
-                            match effective_credential_provider(injected_provider.clone(), Some(&pool)) {
+                            match effective_credential_provider(injected_provider.clone(), Some(&pool), credential_mode) {
                                 Some(provider) => {
                                     match execution_handler.initialize_from_provider(provider.as_ref(), tenant_id).await {
                                         Ok(count) => {
@@ -804,8 +875,20 @@ impl HostedObject {
             return Err("HostedObject is already running".into());
         }
         
+        // State the credential mode ONCE, loudly, before anything can try to
+        // resolve a credential (postgres builds only: without a database
+        // there is no tenant credential store to describe).
+        #[cfg(feature = "postgres")]
+        let credential_mode = startup_credential_mode(self.credential_provider.is_some());
+        #[cfg(not(feature = "postgres"))]
+        ultra_info!("ℹ️ credential mode not applicable: built without the postgres feature (exchange credentials come from YAML only)");
+
         // Create handlers (exchanges are loaded from YAML config inside create_handlers)
-        let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers(self.credential_provider.clone()).await?;
+        let (datahandler, portfoliohandler, strategyhandler, execution_handler, config) = Self::create_handlers(
+            self.credential_provider.clone(),
+            #[cfg(feature = "postgres")]
+            credential_mode,
+        ).await?;
 
         // Capture the market-data receiver BEFORE the datahandler is moved into
         // its blocking task — this is the channel `process_trade()` writes to
@@ -1317,6 +1400,17 @@ impl HostedObject {
             }
         }
         
+        // Everything the handler needs to REJECT a live deployment loudly (the
+        // subscriber already acked success and listed it as deployed before
+        // this host's credential checks run; see strategyloader::live_rejection).
+        let live_rejector = LiveRejector {
+            subscriber_map: deployment_subscriber.get_deployed_strategies(),
+            ack: deployment_subscriber.ack_sender(),
+            database_url: DeploymentSubscriber::database_url_from_env(),
+            registry: paper_registry.clone(),
+            strategies: deployed_strategies.clone(),
+        };
+
         // Spawn deployment event handler — processes Deploy/Deactivate events
         // and wires deployed strategies into the signal generation + execution pipeline
         let deployment_ultra_mgr = self.ultra_order_manager.clone();
@@ -1332,7 +1426,7 @@ impl HostedObject {
         // tenant the provider does not serve is rejected below (fail closed).
         #[cfg(feature = "postgres")]
         let deploy_credential_provider =
-            effective_credential_provider(self.credential_provider.clone(), deploy_db_pool.as_ref());
+            effective_credential_provider(self.credential_provider.clone(), deploy_db_pool.as_ref(), credential_mode);
         // For exchanges whose fills don't reliably land within
         // `check_order_fill`'s short poll window (Alpaca; see its
         // `subscribe_to_updates`), this is how a WebSocket-confirmed fill
@@ -1366,6 +1460,12 @@ impl HostedObject {
                                  Fix the deployment row's exchange_targets and re-publish.",
                                 strategy.strategy_name, strategy.instance_id
                             ));
+                            if is_live {
+                                live_rejector.reject(
+                                    &strategy,
+                                    "live deployment has no target exchanges (empty exchange_targets)",
+                                ).await;
+                            }
                             continue;
                         }
                         if strategy.symbols.is_empty() {
@@ -1373,6 +1473,9 @@ impl HostedObject {
                                 "❌ Rejected deployment {} ({}): symbols is empty.",
                                 strategy.strategy_name, strategy.instance_id
                             ));
+                            if is_live {
+                                live_rejector.reject(&strategy, "live deployment has no symbols").await;
+                            }
                             continue;
                         }
                         
@@ -1547,17 +1650,28 @@ impl HostedObject {
                             },
                             risk_limit: strategy.position_size_pct.unwrap_or(0.02),
                         };
-                        let strat_instance: Arc<tokio::sync::Mutex<Box<dyn Strategy>>> =
+                        // (The error is a Box<dyn Error>, which is not Send, so it
+                        // must not be alive across the rejection's await.)
+                        let strat_instance: Option<Arc<tokio::sync::Mutex<Box<dyn Strategy>>>> =
                             match strategyhandler::create_strategy(strat_config) {
-                                Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+                                Ok(s) => Some(Arc::new(tokio::sync::Mutex::new(s))),
                                 Err(e) => {
                                     ultra_logger::ultra_error!(format!(
                                         "❌ Rejected deployment {} ({}): failed to construct strategy: {}",
                                         strategy.strategy_name, strategy.instance_id, e
                                     ));
-                                    continue;
+                                    None
                                 }
                             };
+                        let Some(strat_instance) = strat_instance else {
+                            if is_live {
+                                live_rejector.reject(
+                                    &strategy,
+                                    "live deployment rejected: the strategy could not be constructed (see SignalEngine logs)",
+                                ).await;
+                            }
+                            continue;
+                        };
 
                         // SimpleMarketMakingStrategy's initialize() is a no-op
                         // (just logs), but PythonBridgeStrategy's is where the
@@ -1565,11 +1679,22 @@ impl HostedObject {
                         // spawned -- every deployment must be initialized
                         // before its first generate_signals() call or a
                         // Python-backed deployment will error on every tick.
-                        if let Err(e) = strat_instance.lock().await.initialize().await {
+                        let init_failed = if let Err(e) = strat_instance.lock().await.initialize().await {
                             ultra_logger::ultra_error!(format!(
                                 "❌ Rejected deployment {} ({}): strategy initialize() failed: {}",
                                 strategy.strategy_name, strategy.instance_id, e
                             ));
+                            true
+                        } else {
+                            false
+                        };
+                        if init_failed {
+                            if is_live {
+                                live_rejector.reject(
+                                    &strategy,
+                                    "live deployment rejected: the strategy failed to initialize (see SignalEngine logs)",
+                                ).await;
+                            }
                             continue;
                         }
 
@@ -1603,6 +1728,7 @@ impl HostedObject {
                                     (deployment_ultra_mgr.as_ref(), deploy_credential_provider.as_ref())
                                 {
                                     let mut rejected = false;
+                                    let mut rejected_venue: Option<String> = None;
                                     for venue in &venues {
                                         let mut handler = ultra_mgr.execution_handler().write().await;
                                         // live_only=true: a live deployment must
@@ -1632,11 +1758,22 @@ impl HostedObject {
                                                     e,
                                                 ));
                                                 rejected = true;
+                                                rejected_venue = Some(venue.clone());
                                                 break;
                                             }
                                         }
                                     }
                                     if rejected {
+                                        // The exact cause (missing/disabled/testnet-only
+                                        // credential, tenant not served by this provider,
+                                        // connector owned by another tenant) is in the
+                                        // ERROR log above; the published reason stays
+                                        // plain and free of connector internals.
+                                        let venue = rejected_venue.unwrap_or_default();
+                                        live_rejector.reject(
+                                            &strategy,
+                                            &strategyloader::reason_credential_unavailable(&venue),
+                                        ).await;
                                         continue;
                                     }
                                 } else {
@@ -1645,6 +1782,12 @@ impl HostedObject {
                                          manager available — cannot resolve a tenant-scoped exchange credential.",
                                         strategy.strategy_name, strategy.instance_id
                                     ));
+                                    let reason = if deploy_credential_provider.is_none() {
+                                        strategyloader::reason_no_provider()
+                                    } else {
+                                        "live deployment rejected: the order manager is not available on this SignalEngine".to_string()
+                                    };
+                                    live_rejector.reject(&strategy, &reason).await;
                                     continue;
                                 }
 
@@ -2013,6 +2156,9 @@ impl HostedObjectTrait for HostedObject {
         if let Some(ref path) = self.config_path {
             hosted_object.config_path = Some(path.clone());
         }
+        // Carry the injected credential provider over: the fresh instance
+        // would otherwise silently run with NO provider (live trading off).
+        hosted_object.credential_provider = self.credential_provider.clone();
         hosted_object.run_async().await
     }
 }

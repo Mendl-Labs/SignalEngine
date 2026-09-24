@@ -148,7 +148,8 @@ async fn handle_request(request: &str, dlq: &Option<Arc<DeadLetterQueue>>) -> St
     match path {
         "/metrics" => {
             // Prometheus format metrics
-            let metrics = get_prometheus_metrics();
+            let mut metrics = get_prometheus_metrics();
+            metrics.push_str(&crate::credential_mode::credential_mode_prometheus());
             http_response(200, "text/plain; version=0.0.4; charset=utf-8", &metrics)
         }
         

@@ -13,6 +13,7 @@ pub mod prometheus_metrics;
 pub mod dead_letter_queue;
 pub mod bounded_dlq;
 pub mod metrics_server;
+pub mod credential_mode;
 pub mod backpressure;
 pub mod fill_probability;
 pub mod latency_optimizer;
@@ -93,6 +94,10 @@ pub use dead_letter_queue::{
 };
 pub use metrics_server::{
     start_metrics_server, MetricsServerConfig, MetricsServerHandle,
+};
+pub use credential_mode::{
+    CredentialMode, ResolvedCredentialMode, compute_credential_mode, resolve_credential_mode,
+    publish_credential_mode, published_credential_mode,
 };
 pub use backpressure::{
     BackpressureController, BackpressureConfig, BackpressureError,
