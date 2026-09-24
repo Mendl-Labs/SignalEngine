@@ -1,13 +1,21 @@
 {{/*
-Validated credential mode: none | single_tenant (see values.yaml config.credentialMode).
-Fails the render on an unknown mode, and on single_tenant without a UUID tenantId or
-without the ConfigMap that carries it, so a live-capable release can never be rendered
-by accident with a missing/garbled tenant.
+Validated credential mode: none | single_tenant | multi_tenant (see values.yaml config.credentialMode).
+Fails the render on an unknown mode; on single_tenant without a UUID tenantId or without the
+ConfigMap that carries it; and on multi_tenant WITH a tenantId (multi_tenant serves each live
+deployment's OWN tenant from the database, so a process-wide tenant makes no sense and would
+only invite the two modes being confused). A live-capable release can never be rendered by
+accident with a missing/garbled tenant, and multi_tenant is never implied: it must be named.
 */}}
 {{- define "signal-engine-helm.credentialMode" -}}
 {{- $mode := default "none" .Values.config.credentialMode | toString | lower -}}
-{{- if not (has $mode (list "none" "single_tenant")) -}}
-{{- fail (printf "config.credentialMode must be 'none' or 'single_tenant', got '%s'. There is no multi-tenant mode: no multi-tenant credential provider exists yet." $mode) -}}
+{{- if not (has $mode (list "none" "single_tenant" "multi_tenant")) -}}
+{{- fail (printf "config.credentialMode must be 'none', 'single_tenant' or 'multi_tenant', got '%s'." $mode) -}}
+{{- end -}}
+{{- if eq $mode "multi_tenant" -}}
+{{- $mtTenant := default "" .Values.config.tenantId | toString -}}
+{{- if ne $mtTenant "" -}}
+{{- fail (printf "config.credentialMode=multi_tenant serves every tenant from the database (each live deployment's own tenant); config.tenantId must be empty, got '%s'. Use single_tenant to bind one tenant." $mtTenant) -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $mode "single_tenant" -}}
 {{- $tenant := default "" .Values.config.tenantId | toString -}}

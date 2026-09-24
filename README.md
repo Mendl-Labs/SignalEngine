@@ -446,6 +446,25 @@ helm upgrade --install signal-engine ./k8s/signal-engine-helm `
 | `KRAKEN_API_SECRET` | Kraken API secret | For CEX trading |
 | `SUI_WALLET_PATH` | Path to Sui wallet keystore | For DEX trading |
 | `RUST_LOG` | Log level (info, debug, trace) | No |
+| `CREDENTIAL_MODE` | How live trading gets exchange credentials: `none` (default; live disabled, paper only), `single_tenant` (public schema, one `TENANT_ID`), `multi_tenant` (opt-in, private schema, see below) | No |
+| `TENANT_ID` | The one tenant served by `single_tenant`; must be unset/empty for `multi_tenant` | With `single_tenant` |
+| `CREDENTIALS_ENCRYPTION_KEY` | 64 hex chars (AES-256-GCM); must match the key BacktestingEngine encrypts `exchange_credentials` with | With `single_tenant` / `multi_tenant` |
+
+### Live-trading credentials: `CREDENTIAL_MODE`
+
+Live deployments only run when a tenant-scoped credential provider exists; otherwise they are
+rejected loudly (paper trading is unaffected). `multi_tenant` selects `MultiTenantDbProvider`
+(`crates/smartorderrouter/src/tenant_provider.rs`): each live deployment signs with **its own
+tenant's** `exchange_credentials` row (`tenant_id` = the deployment's tenant), never another
+tenant's and never a default/first row. It exists, but:
+
+- it is **opt-in**: never selected implicitly, and `credentialMode` stays `none` in `values.yaml` and
+  `values-prod.yaml` (the chart refuses `multi_tenant` together with a `tenantId`);
+- it needs the **private** schema (`exchange_credentials.tenant_id`); against the public schema, or
+  without a valid `CREDENTIALS_ENCRYPTION_KEY`, SignalEngine logs an ERROR and runs as `none`;
+- several enabled credentials for one tenant + exchange are an error (ambiguous), not a pick;
+- the execution handler keeps one connector per exchange name, so a second tenant's live deployment
+  on an exchange another tenant already holds is rejected (fail closed).
 
 ---
 

@@ -8,7 +8,8 @@ metadata:
     {{- include "signal-engine-helm.labels" . | nindent 4 }}
     app.kubernetes.io/component: configuration
 data:
-  # Tenant served by credentialMode=single_tenant (validated in _helpers.tpl)
+  # Tenant served by credentialMode=single_tenant (validated in _helpers.tpl;
+  # must be empty for multi_tenant)
   credential-mode: {{ include "signal-engine-helm.credentialMode" . | quote }}
   tenant-id: {{ .Values.config.tenantId | default "" | quote }}
   

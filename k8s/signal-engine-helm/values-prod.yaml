@@ -94,7 +94,9 @@ configMap:
       # with config.credentialMode=none (values.yaml default): NO credential provider,
       # live trading disabled, live deployments rejected loudly; paper trading only.
       # The single-tenant provider (config.credentialMode=single_tenant + tenantId)
-      # is for self-hosted, one-tenant installs; no multi-tenant provider exists yet.
+      # is for self-hosted, one-tenant installs. An opt-in multi-tenant provider
+      # (config.credentialMode=multi_tenant, private schema) exists but production
+      # deliberately stays on `none` until the owner decides otherwise.
       exchanges: []
       performance:
         worker_threads: 4

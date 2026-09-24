@@ -96,7 +96,8 @@ pub use metrics_server::{
     start_metrics_server, MetricsServerConfig, MetricsServerHandle,
 };
 pub use credential_mode::{
-    CredentialMode, ResolvedCredentialMode, compute_credential_mode, resolve_credential_mode,
+    CredentialMode, MultiTenantPrerequisites, ResolvedCredentialMode, compute_credential_mode,
+    resolve_credential_mode, resolve_credential_mode_with,
     publish_credential_mode, published_credential_mode,
 };
 pub use backpressure::{

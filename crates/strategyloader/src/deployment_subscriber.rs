@@ -1604,4 +1604,127 @@ mod tests {
         assert_eq!(crate::live_rejection::tests::db::row_json(&db_url, live_b).await["status"], "stopped");
         assert_eq!(crate::live_rejection::tests::db::row_json(&db_url, live_a).await["status"], "active");
     }
+
+    /// The multi-tenant provider (private schema) behind the deployment
+    /// pipeline: each live deployment's OWN tenant -- from the reconcile row or
+    /// from the broker message -- is what the provider is asked about, so A's
+    /// deployment is served A's key, B's is served B's, and a row with NO tenant
+    /// (NULL -> nil) is refused even though a credential row stored under the
+    /// nil tenant exists. Refused deployments are rejected the usual way.
+    ///
+    /// Needs TWO scratch databases: FOLLOWUP_TENANT_DATABASE_URL (deployed_strategies
+    /// with tenant_id) and TENANTCRED_TEST_DATABASE_URL (a scratch schema for the
+    /// private-shaped exchange_credentials is created and dropped in it).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn multi_tenant_provider_serves_each_deployments_own_tenant_and_refuses_nil() {
+        use crate::live_rejection::tests::db::{insert_deployment_tenant, row_json, tenant_url};
+        use crate::live_rejection::reason_credential_unavailable;
+        use diesel::sql_types::{Nullable, Text, Uuid as SqlUuid};
+        use diesel_async::{AsyncConnection, RunQueryDsl};
+        use smartorderrouter::{
+            resolve_credential, CredentialError, CredentialProvider, MultiTenantDbProvider,
+        };
+
+        let Some(dep_url) = tenant_url() else { return };
+        let cred_base = match std::env::var("TENANTCRED_TEST_DATABASE_URL") {
+            Ok(u) if !u.trim().is_empty() => u,
+            _ => {
+                eprintln!("SKIPPED: TENANTCRED_TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        // A well-formed (fake) key: the provider refuses to exist without one.
+        // Every value below uses the legacy `enc:` (base64) format, which needs no key.
+        std::env::set_var("CREDENTIALS_ENCRYPTION_KEY", "11".repeat(32));
+
+        // Scratch schema with the private-shaped table.
+        let schema = format!("tcsl_{}", Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(&cred_base).await.unwrap();
+        diesel::sql_query(format!("CREATE SCHEMA {schema}")).execute(&mut admin).await.unwrap();
+        diesel::sql_query(format!(
+            "CREATE TABLE {schema}.exchange_credentials (\
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id UUID NOT NULL, \
+                exchange VARCHAR(50) NOT NULL, label VARCHAR(255) NOT NULL, \
+                api_key_encrypted TEXT NOT NULL, api_secret_encrypted TEXT NOT NULL, \
+                passphrase_encrypted TEXT, is_testnet BOOLEAN NOT NULL DEFAULT false, \
+                is_enabled BOOLEAN NOT NULL DEFAULT true, \
+                CONSTRAINT unique_tenant_exchange_label UNIQUE (tenant_id, exchange, label))"
+        ))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let sep = if cred_base.contains('?') { '&' } else { '?' };
+        let cred_url = format!("{cred_base}{sep}options=-c%20search_path%3D{schema}");
+
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let mut c = AsyncPgConnection::establish(&cred_url).await.unwrap();
+        // (tenant, base64 key, base64 secret): "fake-key-A"/"fake-secret-A" etc.
+        for (tenant, key, secret) in [
+            (tenant_a, "ZmFrZS1rZXktQQ==", "ZmFrZS1zZWNyZXQtQQ=="),
+            (tenant_b, "ZmFrZS1rZXktQg==", "ZmFrZS1zZWNyZXQtQg=="),
+            (Uuid::nil(), "ZmFrZS1rZXktTklM", "ZmFrZS1zZWNyZXQtTklM"),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO exchange_credentials (tenant_id, exchange, label, api_key_encrypted, \
+                 api_secret_encrypted, passphrase_encrypted) VALUES ($1, 'kraken', 'main', $2, $3, $4)",
+            )
+            .bind::<SqlUuid, _>(tenant)
+            .bind::<Text, _>(format!("enc:{key}"))
+            .bind::<Text, _>(format!("enc:{secret}"))
+            .bind::<Nullable<Text>, _>(None::<String>)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        }
+        let pool = smartorderrouter::create_pool(&cred_url).await.unwrap();
+        let provider = MultiTenantDbProvider::new(Arc::new(pool)).await.expect("private-shaped table");
+
+        // Reconcile path: real rows, each with ITS tenant (one NULL).
+        let live_a = insert_deployment_tenant(&dep_url, "live", None, Some(Some(tenant_a))).await;
+        let live_b = insert_deployment_tenant(&dep_url, "live", None, Some(Some(tenant_b))).await;
+        let live_null = insert_deployment_tenant(&dep_url, "live", None, Some(None)).await;
+        let ev = replay(&dep_url).await;
+
+        // What hostbuilder's Deploy handler does: ask for the DEPLOYMENT's own tenant.
+        let ca = resolve_credential(&provider, ev[&live_a].tenant_id, "kraken", true).await.unwrap();
+        assert_eq!(ca.api_key, "fake-key-A");
+        let cb = resolve_credential(&provider, ev[&live_b].tenant_id, "kraken", true).await.unwrap();
+        assert_eq!(cb.api_key, "fake-key-B");
+        assert!(ev[&live_null].tenant_id.is_nil());
+        let err = resolve_credential(&provider, ev[&live_null].tenant_id, "kraken", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CredentialError::NotFound { .. }), "nil tenant must be refused: {err:?}");
+        let err = provider.all_credentials_for(ev[&live_null].tenant_id).await.unwrap_err();
+        assert!(matches!(err, CredentialError::NotFound { .. }), "{err:?}");
+
+        // Broker-message path: the message's tenant is the deployment's tenant.
+        let map: Arc<DashMap<Uuid, Arc<DeployedStrategy>>> = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(4);
+        let id = Uuid::new_v4();
+        let mut msg = deployment_msg(id, "live");
+        msg.tenant_id = tenant_b.to_string();
+        DeploymentSubscriber::handle_deployment(msg, DeploymentPythonConfig::default(), &map, None, "node", Some(&tx)).await;
+        let DeploymentEvent::Deploy(s) = rx.recv().await.unwrap() else { panic!() };
+        assert_eq!(s.tenant_id, tenant_b);
+        assert_eq!(
+            resolve_credential(&provider, s.tenant_id, "kraken", true).await.unwrap().api_key,
+            "fake-key-B"
+        );
+
+        // The refused deployment is rejected the usual way; the served ones stay active.
+        let sink = Arc::new(RecordingSink::default());
+        let sender = AckSender::with_sink(sink.clone(), "node");
+        let dmap: DashMap<Uuid, Arc<DeployedStrategy>> = DashMap::new();
+        dmap.insert(live_null, ev[&live_null].clone());
+        reject_live_deployment(&dmap, Some(&sender), Some(&dep_url), "s", live_null, &reason_credential_unavailable("kraken")).await;
+        assert!(dmap.is_empty());
+        assert_eq!(row_json(&dep_url, live_null).await["status"], "stopped");
+        assert_eq!(row_json(&dep_url, live_a).await["status"], "active");
+        assert_eq!(row_json(&dep_url, live_b).await["status"], "active");
+
+        diesel::sql_query(format!("DROP SCHEMA {schema} CASCADE")).execute(&mut admin).await.unwrap();
+    }
 }

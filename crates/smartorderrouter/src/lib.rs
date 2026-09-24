@@ -17,6 +17,9 @@ pub use credentials::{
 #[cfg(feature = "postgres")]
 pub mod database;
 
+#[cfg(feature = "postgres")]
+pub mod tenant_provider;
+
 // NOTE: there is intentionally NO tenant-blind credential loader in the public
 // API. Credentials are obtained through `CredentialProvider` with an explicit
 // tenant id (see the `credentials` module).
@@ -28,6 +31,12 @@ pub use database::{
     create_pool,
     BackgroundSorWriter,
     SorDbEvent,
+};
+
+#[cfg(feature = "postgres")]
+pub use tenant_provider::{
+    check_encryption_key, multi_tenant_encryption_key_status, MultiTenantDbProvider,
+    ENCRYPTION_KEY_ENV,
 };
 
 // Stub types when postgres feature is not enabled, so downstream crates compile.

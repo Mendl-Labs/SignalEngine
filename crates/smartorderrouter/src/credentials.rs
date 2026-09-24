@@ -16,18 +16,26 @@
 //!   `exchange_credentials` table, which has **no tenant column**. It is
 //!   therefore bound to exactly one tenant at construction and refuses every
 //!   other tenant. Self-hosted, single-tenant deployments only.
-//! * A multi-tenant provider does NOT exist yet. One would have to be written
-//!   against a schema that carries `tenant_id`, implement [`CredentialProvider`]
-//!   and be handed in through `HostedObjectBuilder::with_credential_provider`.
-//!   No host binary does that today: until one does, live trading is only
-//!   possible through the single-tenant provider above, and a multi-tenant
-//!   (SaaS) deployment must run paper-only.
+//! * `MultiTenantDbProvider` (feature `postgres`, module `tenant_provider`) --
+//!   reads the PRIVATE schema's `exchange_credentials`, where every row carries
+//!   `tenant_id UUID NOT NULL`, and serves each tenant ONLY its own rows. It is
+//!   opt-in (`CREDENTIAL_MODE=multi_tenant`, never selected implicitly), refuses
+//!   to be constructed against a table without a `tenant_id` column (i.e. the
+//!   PUBLIC schema) or without a valid `CREDENTIALS_ENCRYPTION_KEY`, never
+//!   serves the nil tenant, and treats ambiguity (several enabled rows for one
+//!   tenant + exchange) as an error rather than picking one. In that mode
+//!   the host passes each deployment's OWN tenant (`deployed_strategies.tenant_id`)
+//!   to it, never the process-wide `TENANT_ID`.
+//!
+//!   Without that mode, live trading is only possible through the single-tenant
+//!   provider above, and a multi-tenant (SaaS) deployment must run paper-only.
 //!
 //! # Fail closed
 //!
 //! Unknown tenant, unknown exchange, disabled credential, testnet-only
 //! credential for a live request, wrong-tenant request against a
-//! single-tenant provider, or any backend error all yield a
+//! single-tenant provider, an ambiguous match, a schema that is not
+//! tenant-scoped, or any backend error all yield a
 //! [`CredentialError`]. Callers must propagate it and place no order. Nothing
 //! in this module ever falls back to "some other tenant's credential" or to
 //! "the first row".
@@ -107,6 +115,14 @@ pub enum CredentialError {
     NoLiveCredential { exchange: String },
     /// A single-tenant provider was asked for a tenant other than the one it serves.
     TenantNotServed { requested: TenantId, served: TenantId },
+    /// More than one enabled credential matches this tenant + exchange (+ mode);
+    /// the provider refuses to choose. The tenant must disable or remove all
+    /// but one.
+    Ambiguous { tenant: TenantId, exchange: String, matches: usize },
+    /// The database a tenant-scoped provider was pointed at has no usable
+    /// `tenant_id` column on its credentials table (e.g. the PUBLIC schema), so
+    /// it cannot tell whose credential a row is. It reads nothing.
+    SchemaNotTenantScoped(String),
     /// The provider returned something that violates the provider contract.
     Invalid(String),
     /// The backing store failed (database down, decryption failure, ...).
@@ -130,6 +146,15 @@ impl fmt::Display for CredentialError {
                 "credential provider serves only tenant {} and refuses tenant {}",
                 served, requested
             ),
+            CredentialError::Ambiguous { tenant, exchange, matches } => write!(
+                f,
+                "tenant {} has {} enabled credentials for exchange '{}': refusing to choose one \
+                 (disable or remove all but one)",
+                tenant, matches, exchange
+            ),
+            CredentialError::SchemaNotTenantScoped(m) => {
+                write!(f, "credential store is not tenant-scoped: {}", m)
+            }
             CredentialError::Invalid(m) => write!(f, "invalid credential provider response: {}", m),
             CredentialError::Backend(m) => write!(f, "credential backend error: {}", m),
         }
