@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 broker-adapters = { path = "../broker-adapters" }
 mandate-core = { path = "../mandate-core" }
-reference-rules = { path = "../reference-rules" }
+reference-rules = { workspace = true }
 rebalancer-core = { path = "../rebalancer-core" }
 rebalancer-risk = { path = "../rebalancer-risk" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

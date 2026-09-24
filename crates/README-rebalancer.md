@@ -1,6 +1,6 @@
 # Rebalancer crates
 
-`reference-rules`, `broker-adapters`, `fake-broker`, `mandate-core`, `rebalancer-core`,
+`reference-rules` (now in the public BacktestingCore repository, see `crates/reference-rules/MOVED.md`), `broker-adapters`, `fake-broker`, `mandate-core`, `rebalancer-core`,
 `rebalancer-risk`, `rebalancer-run` are the MVP rebalancer. They are deliberately isolated from
 `crates/executionhandler` and `crates/hostbuilder` (and every other pre-existing crate in this
 workspace) — no dependency, import, or reference in either direction. `executionhandler` and

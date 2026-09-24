@@ -17,7 +17,6 @@ members = [
     "crates/signal",
     "crates/signaldispatcher",
     "crates/pythonbridge-worker",
-    "crates/reference-rules",
     "crates/broker-adapters",
     "crates/fake-broker",
     "crates/mandate-core",
@@ -32,6 +31,15 @@ resolver = "2"
 [workspace.dependencies]
 # Ultra-low latency logging engine
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }
+
+# The decision rules (ETF trend, crypto trend, FX momentum) live in the public BacktestingCore repository: ONE
+# implementation shared with the backtester, so the rebalancer and the backtest agree by construction
+# (product-mandate/BACKTESTER_TRUTH_DESIGN.md, stage T2). The crate moved there with its public API unchanged.
+#
+# TODO(T2, owner): replace the placeholder rev with the merged BacktestingCore commit, or with `tag = "vX.Y.Z"` once
+# the release tag exists. Until then this line is a PLACEHOLDER: the workspace does not resolve and CI cannot build.
+# Local verification used a temporary path override that was NOT committed.
+reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "TODO_MERGED_BACKTESTINGCORE_COMMIT" }
 
 # Internal workspace crates
 smartorderrouter = { path = "crates/smartorderrouter" }
