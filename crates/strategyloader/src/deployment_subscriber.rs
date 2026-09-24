@@ -525,6 +525,21 @@ impl DeploymentSubscriber {
         self.deployment_tx = Some(tx);
     }
 
+    /// A cloneable failure-ack sender over the same publisher this subscriber
+    /// uses. `None` until [`Self::start`] has connected the publisher.
+    pub fn ack_sender(&self) -> Option<crate::live_rejection::AckSender> {
+        self.publisher
+            .as_ref()
+            .map(|p| crate::live_rejection::AckSender::from_publisher(p.clone(), &self.node_id))
+    }
+
+    /// The shared-database URL from the environment (with the same
+    /// `$(POSTGRES_*)` placeholder resolution the subscriber's own queries
+    /// use). `None` when unset, empty or unresolvable.
+    pub fn database_url_from_env() -> Option<String> {
+        Self::resolved_database_url().ok().filter(|u| !u.is_empty())
+    }
+
     /// Get the deployed strategies map for external access
     pub fn get_deployed_strategies(&self) -> Arc<DashMap<Uuid, Arc<DeployedStrategy>>> {
         self.deployed_strategies.clone()
