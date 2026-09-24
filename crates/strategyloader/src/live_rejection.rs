@@ -14,7 +14,13 @@
 //!    with the reason in `metadata`, because the Engine does not consume acks
 //!    but does read that row and it is what the UI shows.
 //!
-//! [`reject_live_deployment`] does all three, never panics, never blocks for
+//! 4. unsubscribe the market data `handle_deployment` subscribed for it (one
+//!    `MarketDataUnsubscribe` per subscribed exchange, same subscription ids).
+//!    DataEngine keeps a subscription until it is unsubscribed, and it counts
+//!    against the tenant's tier limits, so a rejected deployment must not
+//!    leave one behind.
+//!
+//! [`reject_live_deployment`] does all of these, never panics, never blocks for
 //! more than a bounded time, and reports what it managed to do. A failure of
 //! step 2 or 3 is logged at ERROR and the rejection still stands.
 
@@ -23,7 +29,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
 use prost::Message;
-use protocol::broker::messages::{publish_request, PublishRequest, StrategyDeploymentAck};
+use protocol::broker::messages::{
+    publish_request, MarketDataUnsubscribe, PublishRequest, StrategyDeploymentAck,
+};
 use publisher::UltraFastPublisher;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -105,6 +113,21 @@ fn redact_token(tok: &str) -> String {
 #[async_trait]
 pub trait AckSink: Send + Sync {
     async fn publish_ack(&self, ack: StrategyDeploymentAck) -> Result<(), String>;
+    /// Publish a market-data unsubscribe (topic `market.subscription.unsubscribe`).
+    async fn publish_unsubscribe(&self, unsub: MarketDataUnsubscribe) -> Result<(), String>;
+}
+
+/// Wire bytes DataEngine's `SubscriptionManager` accepts for an unsubscribe:
+/// a `PublishRequest` on `market.subscription.unsubscribe` carrying the
+/// `MarketDataUnsubscribe` bytes as `RawData` -- the same envelope
+/// `handle_deployment` uses for `MarketDataSubscribe`. (DataEngine decodes
+/// `PublishRequest` first and only acts on its `RawData` payload.)
+pub fn unsubscribe_wire_bytes(unsub: &MarketDataUnsubscribe) -> Vec<u8> {
+    PublishRequest {
+        topic: topics::MARKET_DATA_UNSUBSCRIBE.to_string(),
+        payload: Some(publish_request::Payload::RawData(unsub.encode_to_vec())),
+    }
+    .encode_to_vec()
 }
 
 struct BrokerAckSink(Arc<UltraFastPublisher>);
@@ -119,6 +142,15 @@ impl AckSink for BrokerAckSink {
         };
         self.0
             .publish_raw(request.encode_to_vec(), topics::STRATEGY_DEPLOYMENT_ACK)
+            .await
+            .map_err(|e| format!("publish: {:?}", e))?;
+        self.0.flush().await.map_err(|e| format!("flush: {:?}", e))?;
+        Ok(())
+    }
+
+    async fn publish_unsubscribe(&self, unsub: MarketDataUnsubscribe) -> Result<(), String> {
+        self.0
+            .publish_raw(unsubscribe_wire_bytes(&unsub), topics::MARKET_DATA_UNSUBSCRIBE)
             .await
             .map_err(|e| format!("publish: {:?}", e))?;
         self.0.flush().await.map_err(|e| format!("flush: {:?}", e))?;
@@ -155,6 +187,14 @@ impl AckSender {
             error_message: reason.to_string(),
             loaded_at: Utc::now().timestamp_millis(),
             active_exchanges: Vec::new(),
+        }
+    }
+
+    /// Publish a market-data unsubscribe (bounded by [`REJECTION_IO_TIMEOUT`]).
+    pub async fn send_unsubscribe(&self, unsub: MarketDataUnsubscribe) -> Result<(), String> {
+        match tokio::time::timeout(REJECTION_IO_TIMEOUT, self.sink.publish_unsubscribe(unsub)).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("unsubscribe publish timed out after {:?}", REJECTION_IO_TIMEOUT)),
         }
     }
 
@@ -214,6 +254,29 @@ pub async fn mark_live_rejected_in_db(
 // The helper
 // ---------------------------------------------------------------------------
 
+/// One `MarketDataUnsubscribe` per subscribed exchange, mirroring exactly what
+/// `handle_deployment` subscribed: subscription id `{instance_id}_{exchange}`,
+/// the deployment's symbols and strategy instance id. (The message has no
+/// tenant field; DataEngine reads the tenant from the stored subscription.)
+pub fn build_unsubscribes(
+    instance_id: Uuid,
+    symbols: &[String],
+    subscribed_exchanges: &[String],
+    reason: &str,
+) -> Vec<MarketDataUnsubscribe> {
+    subscribed_exchanges
+        .iter()
+        .map(|exchange| MarketDataUnsubscribe {
+            subscription_id: format!("{}_{}", instance_id, exchange),
+            strategy_instance_id: instance_id.to_string(),
+            exchange: exchange.clone(),
+            symbols: symbols.to_vec(),
+            reason: reason.to_string(),
+            timestamp: Utc::now().timestamp_millis(),
+        })
+        .collect()
+}
+
 /// What [`reject_live_deployment`] managed to do (for logs and tests).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LiveRejectionOutcome {
@@ -221,6 +284,8 @@ pub struct LiveRejectionOutcome {
     pub removed_from_map: bool,
     /// A failure ack was published.
     pub ack_published: bool,
+    /// Market-data unsubscribes published (one per subscribed exchange).
+    pub unsubscribes_published: usize,
     /// Rows changed in `deployed_strategies` (None: no DB write attempted or it failed).
     pub db_rows_updated: Option<usize>,
     /// One line per external effect that failed (already logged at ERROR).
@@ -247,9 +312,45 @@ pub async fn reject_live_deployment(
     let mut out = LiveRejectionOutcome::default();
 
     // (a) SignalEngine must stop reporting it as deployed.
+    // Draining `subscribed_exchanges` makes the unsubscribe below happen at most
+    // once per deployment: a second rejection finds no entry (and even a second
+    // holder of the same Arc finds the list empty).
+    let mut unsubscribes: Vec<MarketDataUnsubscribe> = Vec::new();
     if let Some((_, entry)) = deployed.remove(&instance_id) {
         entry.is_active.store(false, Ordering::SeqCst);
         out.removed_from_map = true;
+        if entry.mode == "live" {
+            let exchanges = std::mem::take(&mut *entry.subscribed_exchanges.lock());
+            unsubscribes = build_unsubscribes(instance_id, &entry.symbols, &exchanges, "live deployment rejected");
+        }
+    }
+
+    // (a2) DataEngine must stop streaming (and stop counting it against the
+    // tenant's tier limits) for what handle_deployment subscribed.
+    for unsub in unsubscribes {
+        let exchange = unsub.exchange.clone();
+        match ack {
+            Some(sender) => match sender.send_unsubscribe(unsub).await {
+                Ok(()) => out.unsubscribes_published += 1,
+                Err(e) => {
+                    let msg = format!(
+                        "market-data unsubscribe for {} on {} not published: {} (DataEngine may keep streaming)",
+                        instance_id, exchange, e
+                    );
+                    ultra_error!(format!("❌ {}", msg));
+                    out.errors.push(msg);
+                }
+            },
+            None => {
+                let msg = format!(
+                    "market-data unsubscribe for {} on {} not published: no broker publisher \
+                     (DataEngine may keep streaming)",
+                    instance_id, exchange
+                );
+                ultra_error!(format!("❌ {}", msg));
+                out.errors.push(msg);
+            }
+        }
     }
 
     // (b) tell the broker the truth.
@@ -311,8 +412,8 @@ pub async fn reject_live_deployment(
     }
 
     ultra_error!(format!(
-        "🚫 LIVE DEPLOYMENT REJECTED {}: {} (removed from deployed set: {}, failure ack: {}, db rows updated: {:?})",
-        instance_id, reason, out.removed_from_map, out.ack_published, out.db_rows_updated
+        "🚫 LIVE DEPLOYMENT REJECTED {}: {} (removed from deployed set: {}, failure ack: {}, unsubscribes: {}, db rows updated: {:?})",
+        instance_id, reason, out.removed_from_map, out.ack_published, out.unsubscribes_published, out.db_rows_updated
     ));
     out
 }
