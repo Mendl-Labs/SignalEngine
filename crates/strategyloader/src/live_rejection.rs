@@ -318,4 +318,4 @@ pub async fn reject_live_deployment(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

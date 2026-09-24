@@ -1229,4 +1229,141 @@ mod tests {
         assert_eq!(strategy.candle_interval_minutes, Some(240));
         assert_eq!(strategy.asset_class, Some("forex".to_string()));
     }
+
+    // ---- end to end: optimistic success, then the host's rejection undoes it --
+
+    use crate::live_rejection::tests::{deployment_msg, RecordingSink};
+    use crate::live_rejection::{reason_no_provider, reject_live_deployment, AckSender};
+
+    /// handle_deployment lists the deployment and forwards Deploy BEFORE the
+    /// host's credential check; the rejection must then undo the listing.
+    #[tokio::test]
+    async fn live_deploy_then_host_rejection_leaves_nothing_deployed() {
+        let map: Arc<DashMap<Uuid, Arc<DeployedStrategy>>> = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(8);
+        let id = Uuid::new_v4();
+
+        DeploymentSubscriber::handle_deployment(
+            deployment_msg(id, "live"),
+            DeploymentPythonConfig::default(),
+            &map,
+            None,
+            "node",
+            Some(&tx),
+        )
+        .await;
+
+        // The optimistic state the bug lived in: listed as deployed already.
+        assert!(map.contains_key(&id), "handle_deployment lists it before any credential check");
+        let DeploymentEvent::Deploy(s) = rx.recv().await.expect("Deploy forwarded") else {
+            panic!("expected Deploy")
+        };
+        assert_eq!(s.mode, "live");
+
+        // The host finds no provider and rejects.
+        let sink = Arc::new(RecordingSink::default());
+        let sender = AckSender::with_sink(sink.clone(), "node");
+        let out = reject_live_deployment(
+            &map,
+            Some(&sender),
+            None,
+            &s.strategy_id.to_string(),
+            s.instance_id,
+            &reason_no_provider(),
+        )
+        .await;
+
+        assert!(out.removed_from_map);
+        assert!(map.is_empty(), "SignalEngine must no longer list the strategy");
+        let acks = sink.acks.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert!(!acks[0].success);
+        assert_eq!(acks[0].instance_id, id.to_string());
+    }
+
+    /// A paper deployment's event is untouched by the (live-only) rejection path.
+    #[tokio::test]
+    async fn paper_deploy_stays_listed_when_nothing_rejects_it() {
+        let map: Arc<DashMap<Uuid, Arc<DeployedStrategy>>> = Arc::new(DashMap::new());
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(8);
+        let id = Uuid::new_v4();
+        DeploymentSubscriber::handle_deployment(
+            deployment_msg(id, "paper"),
+            DeploymentPythonConfig::default(),
+            &map,
+            None,
+            "node",
+            Some(&tx),
+        )
+        .await;
+        let DeploymentEvent::Deploy(s) = rx.recv().await.unwrap() else { panic!() };
+        assert_eq!(s.mode, "paper");
+        assert!(map.contains_key(&id));
+    }
+
+    /// The reconcile path: an active LIVE row in the shared DB is replayed as a
+    /// Deploy event (tenant nil: the OSS schema has no tenant column), the host
+    /// rejects it, and the row ends up stopped so the NEXT restart does not
+    /// replay (and re-reject) it again. A paper row is replayed and left alone.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn reconcile_replays_live_row_and_rejection_stops_it_for_good() {
+        use crate::live_rejection::tests::db::{insert_deployment, row_json, url};
+        let Some(db_url) = url() else { return };
+        let live_id = insert_deployment(&db_url, "live", None).await;
+        let paper_id = insert_deployment(&db_url, "paper", None).await;
+
+        // The only test in this crate that touches the process-wide DATABASE_URL.
+        std::env::set_var("DATABASE_URL", &db_url);
+        let mut sub = DeploymentSubscriber::new("127.0.0.1:1", "node");
+        let (tx, mut rx) = mpsc::channel::<DeploymentEvent>(10_000);
+        sub.set_deployment_channel(tx);
+        sub.reconcile_active_deployments_from_db().await.unwrap();
+
+        let mut live_seen = None;
+        let mut paper_seen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let DeploymentEvent::Deploy(s) = ev {
+                if s.instance_id == live_id {
+                    live_seen = Some(s);
+                } else if s.instance_id == paper_id {
+                    paper_seen = true;
+                    assert_eq!(s.mode, "paper");
+                }
+            }
+        }
+        let s = live_seen.expect("live row replayed as Deploy");
+        assert_eq!(s.mode, "live");
+        assert!(paper_seen, "paper row replayed");
+        assert!(sub.get_deployed_strategies().contains_key(&live_id));
+
+        // Host rejects the live one (it applies the same rule to reconciled events).
+        let sink = Arc::new(RecordingSink::default());
+        let sender = AckSender::with_sink(sink.clone(), "node");
+        let map = sub.get_deployed_strategies();
+        reject_live_deployment(
+            &map,
+            Some(&sender),
+            Some(&db_url),
+            &s.strategy_id.to_string(),
+            s.instance_id,
+            &reason_no_provider(),
+        )
+        .await;
+        assert!(!map.contains_key(&live_id));
+        assert!(map.contains_key(&paper_id), "paper deployment stays listed");
+        assert_eq!(row_json(&db_url, live_id).await["status"], "stopped");
+        assert_eq!(row_json(&db_url, paper_id).await["status"], "active");
+
+        // Next restart: the stopped live row is no longer replayed.
+        let mut sub2 = DeploymentSubscriber::new("127.0.0.1:1", "node");
+        let (tx2, mut rx2) = mpsc::channel::<DeploymentEvent>(10_000);
+        sub2.set_deployment_channel(tx2);
+        sub2.reconcile_active_deployments_from_db().await.unwrap();
+        while let Ok(ev) = rx2.try_recv() {
+            if let DeploymentEvent::Deploy(s2) = ev {
+                assert_ne!(s2.instance_id, live_id, "a rejected live row must not be replayed again");
+            }
+        }
+    }
 }

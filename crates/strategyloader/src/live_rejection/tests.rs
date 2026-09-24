@@ -179,7 +179,7 @@ async fn reason_is_sanitized_again_inside_the_helper() {
 // public databaseschema migrations applied. Without it these tests print
 // SKIPPED and return (so the suite still builds in CI without a DB).
 #[cfg(feature = "postgres")]
-mod db {
+pub(crate) mod db {
     use super::*;
     use diesel::sql_types::Text;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -190,7 +190,7 @@ mod db {
         j: String,
     }
 
-    fn url() -> Option<String> {
+    pub(crate) fn url() -> Option<String> {
         match std::env::var("LIVEFAIL_TEST_DATABASE_URL") {
             Ok(u) if !u.is_empty() => Some(u),
             _ => {
