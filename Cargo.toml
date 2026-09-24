@@ -39,7 +39,7 @@ ultra-logger = { path = "../LoggingEngine/ultra-logger" }
 # TODO(T2, owner): replace the placeholder rev with the merged BacktestingCore commit, or with `tag = "vX.Y.Z"` once
 # the release tag exists. Until then this line is a PLACEHOLDER: the workspace does not resolve and CI cannot build.
 # Local verification used a temporary path override that was NOT committed.
-reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "TODO_MERGED_BACKTESTINGCORE_COMMIT" }
+reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "f1a65a168f9089edf6e7a963226cafc54c98a91e" }
 
 # Internal workspace crates
 smartorderrouter = { path = "crates/smartorderrouter" }

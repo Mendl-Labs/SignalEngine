@@ -3731,6 +3731,7 @@ dependencies = [
 [[package]]
 name = "reference-rules"
 version = "0.0.1"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=f1a65a168f9089edf6e7a963226cafc54c98a91e#f1a65a168f9089edf6e7a963226cafc54c98a91e"
 dependencies = [
  "chrono",
  "hex",
