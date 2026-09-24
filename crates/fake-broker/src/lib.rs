@@ -12,6 +12,11 @@
 //!   (`alpaca/`) that owns its own auth state and rendering and calls the same `Core`; the
 //!   shared `World` in [`broker`] would gain one more state field. Nothing in `exchange`, `fault`,
 //!   `log` or the control API is Kraken specific except the error strings a test scripts.
+//! * [`oanda`] is a SECOND, self-contained wire front end: an in-process OANDA v20 REST subset over its own small
+//!   margin-account exchange (signed net positions, NAV, margin), with its own control API
+//!   ([`oanda::OandaHandle`]) and [`oanda_rig::OandaRig`] (real `OandaAdapter` + the fake). It shares only the clock,
+//!   the fault machinery and the request log with the Kraken side; it does NOT use the spot `exchange::Core`, whose
+//!   invariants (no negative balances, no shorts) do not fit a margin account.
 //! * [`FakeBrokerHandle`] is the control API (plain methods, no HTTP): move the market, script
 //!   fills, inject faults, drift balances, add foreign orders, read the event log.
 //! * [`testkit`] wires a real `KrakenAdapter` to the fake; [`scenarios`] are one-call setups for
@@ -44,6 +49,8 @@ pub mod fault;
 pub mod kraken;
 pub mod log;
 pub mod money;
+pub mod oanda;
+pub mod oanda_rig;
 pub mod rng;
 pub mod scenarios;
 pub mod testkit;

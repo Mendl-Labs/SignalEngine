@@ -9,6 +9,8 @@ pub enum HttpMethod {
     Post,
     /// Added for Alpaca (cancel order, close position). Kraken uses only GET and POST.
     Delete,
+    /// Added for OANDA (cancel order, close position). Kraken and Alpaca do not use it.
+    Put,
 }
 
 #[derive(Clone)]
@@ -158,6 +160,7 @@ pub mod reqwest_transport {
                 HttpMethod::Get => self.client.get(&req.url),
                 HttpMethod::Post => self.client.post(&req.url),
                 HttpMethod::Delete => self.client.delete(&req.url),
+                HttpMethod::Put => self.client.put(&req.url),
             };
             for (k, v) in &req.headers {
                 b = b.header(k.as_str(), v.as_str());

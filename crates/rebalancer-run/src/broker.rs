@@ -15,12 +15,15 @@ use std::collections::BTreeMap;
 
 use broker_adapters::alpaca::AlpacaAdapter;
 use broker_adapters::kraken::KrakenAdapter;
+use broker_adapters::oanda::{OandaAdapter, Pricing};
 use broker_adapters::{
     BalanceKind, BrokerAdapter, BrokerError, CancelOutcome, Dec, OrderReport, OrderRequest, PlaceOutcome, Quote,
 };
 use chrono::{DateTime, Utc};
 
-use crate::view::{alpaca_snapshot, kraken_snapshot, BrokerSnapshot, KrakenViewInput, ViewError};
+use crate::view::{
+    alpaca_snapshot, kraken_snapshot, oanda_snapshot, BrokerSnapshot, KrakenViewInput, OandaSnapshot, OandaViewInput, ViewError,
+};
 
 /// Every order tag this rebalancer creates starts with this (planner tags, flatten tags). An open order without it
 /// (and whose id we never recorded) is FOREIGN.
@@ -174,6 +177,83 @@ impl Broker for AlpacaBroker<'_> {
         let open_orders = self.adapter.open_orders()?;
         let class = self.asset_class.clone();
         Ok(alpaca_snapshot(&account, &positions, open_orders, &move |_| class.clone(), now)?)
+    }
+
+    fn place(&self, req: &OrderRequest) -> Result<PlaceOutcome, BrokerError> {
+        self.adapter.place_order(req)
+    }
+
+    fn get_order(&self, id: &str) -> Result<OrderReport, BrokerError> {
+        self.adapter.get_order(id)
+    }
+
+    fn open_orders(&self) -> Result<Vec<OrderReport>, BrokerError> {
+        self.adapter.open_orders()
+    }
+
+    fn find_by_tag(&self, tag: &str) -> Result<Vec<OrderReport>, BrokerError> {
+        self.adapter.find_orders_by_tag(tag)
+    }
+
+    fn cancel_and_settle(&self, id: &str) -> Result<(CancelOutcome, OrderReport), BrokerError> {
+        self.adapter.cancel_and_settle(id)
+    }
+
+    fn quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
+        self.adapter.get_quote(symbol)
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------
+// OANDA
+// ------------------------------------------------------------------------------------------------------------
+
+/// The OANDA FX margin account. Configure the adapter with `with_own_tag_prefix(OWN_TAG_PREFIX)` so foreign orders come
+/// back with `tag: None`. Never run against a real OANDA account: see `broker_adapters::oanda`.
+///
+/// `flatten` (the kill path) works on this broker for LONG positions only: it sells the held units with ordinary
+/// market orders, and it reports a short as `FLATTEN_SHORT_HELD` and leaves it alone (its spot-shaped rule "never open
+/// a short"). Closing a short needs OANDA's position-close endpoint, which the `Broker` trait has no method for.
+pub struct OandaBroker<'a> {
+    pub adapter: &'a OandaAdapter,
+    pub asset_class: String,
+}
+
+impl<'a> OandaBroker<'a> {
+    pub fn fx(adapter: &'a OandaAdapter) -> Self {
+        Self { adapter, asset_class: "fx_spot".to_string() }
+    }
+
+    /// The snapshot together with the broker's margin figures.
+    pub fn snapshot_with_margin(&self, now: DateTime<Utc>) -> Result<OandaSnapshot, SnapshotError> {
+        let account = self.adapter.get_account_summary()?;
+        match self.adapter.check_account(&account) {
+            Ok(()) => {}
+            Err(BrokerError::AccountBlocked(m)) => return Err(SnapshotError::View(ViewError::AccountBlocked(m))),
+            Err(e) => return Err(SnapshotError::Broker(e)),
+        }
+        let positions = self.adapter.get_open_positions()?;
+        let open_orders = self.adapter.open_orders()?;
+        let pricing = if positions.is_empty() {
+            Pricing { prices: Vec::new(), home_conversions: Vec::new() }
+        } else {
+            let names: Vec<&str> = positions.iter().map(|p| p.instrument.as_str()).collect();
+            self.adapter.get_pricing(&names)?
+        };
+        Ok(oanda_snapshot(
+            &OandaViewInput { account: &account, positions: &positions, open_orders, pricing: &pricing, asset_class: &self.asset_class },
+            now,
+        )?)
+    }
+}
+
+impl Broker for OandaBroker<'_> {
+    fn venue(&self) -> &'static str {
+        "oanda"
+    }
+
+    fn snapshot(&self, now: DateTime<Utc>) -> Result<BrokerSnapshot, SnapshotError> {
+        Ok(self.snapshot_with_margin(now)?.snapshot)
     }
 
     fn place(&self, req: &OrderRequest) -> Result<PlaceOutcome, BrokerError> {

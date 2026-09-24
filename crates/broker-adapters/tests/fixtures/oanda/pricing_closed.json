@@ -1,0 +1,18 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "time": "1758463201.250000000",
+  "prices": [
+    {
+      "type": "PRICE",
+      "time": "1758463201.250000000",
+      "status": "non-tradeable",
+      "tradeable": false,
+      "instrument": "EUR_USD",
+      "bids": [],
+      "asks": [],
+      "closeoutBid": "1.10048",
+      "closeoutAsk": "1.10052"
+    }
+  ],
+  "homeConversions": []
+}
