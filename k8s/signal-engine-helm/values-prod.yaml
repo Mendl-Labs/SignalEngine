@@ -89,10 +89,12 @@ configMap:
             max_order_size: 5000.0
             max_daily_loss: 1000.0
             max_position_value: 50000.0
-      # Per-tenant exchange API keys are NOT configured here. Users add their own
-      # keys via the Settings UI; they are stored encrypted in `exchange_credentials`
-      # and loaded by SignalEngine on startup (warm load via TENANT_ID) and on
-      # demand at deploy time (UltraLowLatencyExecutionHandler::ensure_exchange_for_tenant).
+      # Exchange API keys are NOT configured here. Users add their own keys via the
+      # Settings UI (stored encrypted in `exchange_credentials`). Production runs
+      # with config.credentialMode=none (values.yaml default): NO credential provider,
+      # live trading disabled, live deployments rejected loudly; paper trading only.
+      # The single-tenant provider (config.credentialMode=single_tenant + tenantId)
+      # is for self-hosted, one-tenant installs; no multi-tenant provider exists yet.
       exchanges: []
       performance:
         worker_threads: 4

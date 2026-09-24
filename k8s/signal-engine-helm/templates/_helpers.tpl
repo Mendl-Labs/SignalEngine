@@ -1,4 +1,30 @@
 {{/*
+Validated credential mode: none | single_tenant (see values.yaml config.credentialMode).
+Fails the render on an unknown mode, and on single_tenant without a UUID tenantId or
+without the ConfigMap that carries it, so a live-capable release can never be rendered
+by accident with a missing/garbled tenant.
+*/}}
+{{- define "signal-engine-helm.credentialMode" -}}
+{{- $mode := default "none" .Values.config.credentialMode | toString | lower -}}
+{{- if not (has $mode (list "none" "single_tenant")) -}}
+{{- fail (printf "config.credentialMode must be 'none' or 'single_tenant', got '%s'. There is no multi-tenant mode: no multi-tenant credential provider exists yet." $mode) -}}
+{{- end -}}
+{{- if eq $mode "single_tenant" -}}
+{{- $tenant := default "" .Values.config.tenantId | toString -}}
+{{- if not (regexMatch "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" $tenant) -}}
+{{- fail (printf "config.credentialMode=single_tenant requires config.tenantId to be a UUID, got '%s'" $tenant) -}}
+{{- end -}}
+{{- if eq (lower $tenant) "00000000-0000-0000-0000-000000000000" -}}
+{{- fail "config.credentialMode=single_tenant requires a real config.tenantId, not the nil UUID" -}}
+{{- end -}}
+{{- if not .Values.configMap.enabled -}}
+{{- fail "config.credentialMode=single_tenant needs configMap.enabled=true (TENANT_ID is read from the chart ConfigMap)" -}}
+{{- end -}}
+{{- end -}}
+{{- $mode -}}
+{{- end }}
+
+{{/*
 Expand the name of the chart.
 */}}
 {{- define "signal-engine-helm.name" -}}

@@ -481,8 +481,8 @@ use crate::credentials::{
 // tenant: it reads every enabled row, for ALL tenants. It must never be
 // exposed. The only public way to reach it is `SingleTenantDbProvider`, which
 // is bound to exactly one tenant and refuses every other. The multi-tenant
-// (SaaS) provider is implemented OUTSIDE this public repository, against the
-// private schema that carries `tenant_id`.
+// (SaaS) provider does not exist yet (it would need a schema that carries
+// `tenant_id`); until it does, multi-tenant live trading is disabled.
 // ----------------------------------------------------------------------------
 
 /// Provider over the PUBLIC-schema `exchange_credentials` table, for

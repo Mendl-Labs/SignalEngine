@@ -527,12 +527,13 @@ pub struct HostedObject {
     strategy_manager: Option<StrategyManager>,
     // Phase 2: Ultra-fast order management (853x faster)
     ultra_order_manager: Option<Arc<SignalEngineUltraOrderManager>>,
-    /// Where exchange credentials come from. The caller passes this in (the
-    /// multi-tenant SaaS provider lives outside this public repo). When left
-    /// unset, a `postgres` build falls back to the public-schema
+    /// Where exchange credentials come from. A caller MAY inject a provider
+    /// (no multi-tenant provider or host binary that does so exists today).
+    /// When left unset, a `postgres` build falls back to the public-schema
     /// `SingleTenantDbProvider` bound to the `TENANT_ID` env var -- serving
-    /// that ONE tenant only -- and with no `TENANT_ID` there is no provider
-    /// at all, so no exchange credential is ever loaded (fail closed).
+    /// that ONE tenant only -- and with no valid `TENANT_ID` there is no
+    /// provider at all: credential mode `none`, live trading disabled, every
+    /// live deployment rejected loudly (fail closed). See `CredentialMode`.
     credential_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
 }
 

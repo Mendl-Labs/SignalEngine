@@ -326,8 +326,25 @@ config:
   environment: "development"
   log_level: "info"
   
-  # Tenant ID for multi-tenant credential loading from database
-  # Set this to your tenant UUID to enable loading exchange credentials from the database
+  # How this SignalEngine obtains EXCHANGE credentials, i.e. whether LIVE trading is
+  # possible at all. One of:
+  #   none          (default) no credential provider: live trading is DISABLED. Every
+  #                 live deployment is rejected loudly (failure ack, deployment row
+  #                 marked stopped with the reason). Paper deployments are unaffected.
+  #                 This is the only correct setting for a multi-tenant / SaaS install.
+  #   single_tenant the public-schema provider bound to ONE tenant (tenantId below).
+  #                 It serves that tenant only and refuses every other. Requires
+  #                 tenantId to be a UUID (the chart fails to render otherwise).
+  # There is NO multi-tenant mode: no multi-tenant credential provider exists yet.
+  # The value is passed to the container as CREDENTIAL_MODE and cross-checked at
+  # startup; a disagreement (e.g. single_tenant without a valid TENANT_ID) is logged
+  # at ERROR and the process runs as `none`.
+  credentialMode: none
+
+  # Tenant ID served by credentialMode=single_tenant (a UUID, e.g.
+  # 123e4567-e89b-12d3-a456-426614174000). Ignored unless credentialMode is
+  # single_tenant: with credentialMode=none the runtime switches live trading off even
+  # if this is set.
   tenantId: ""
   
   # Message broker configuration
@@ -441,14 +458,17 @@ exchanges:
 # Secrets (stored separately for security)
 # DO NOT PUT REAL CREDENTIALS IN THIS FILE - IT GOES TO GIT
 #
-# NOTE: Per-tenant exchange API keys are NOT configured here. Users add their
-# own keys for any supported exchange via the Settings UI; they are stored
-# encrypted in the `exchange_credentials` table and loaded by SignalEngine on
-# demand through a tenant-scoped smartorderrouter::CredentialProvider (see
+# NOTE: Exchange API keys are NOT configured here. Users add their own keys via
+# the Settings UI; they are stored encrypted in the `exchange_credentials` table.
+# SignalEngine reads them through a tenant-scoped
+# smartorderrouter::CredentialProvider (see
 # UltraLowLatencyExecutionHandler::initialize_from_provider and
-# ensure_exchange_for_tenant). The public build only ships a single-tenant
-# provider bound to TENANT_ID; the multi-tenant provider is injected by the
-# private host binary.
+# ensure_exchange_for_tenant). The ONLY provider that exists today is the
+# single-tenant fallback bound to TENANT_ID (config.credentialMode=single_tenant).
+# NO multi-tenant provider exists and NO host binary injects one, so multi-tenant
+# live trading is DISABLED: with config.credentialMode=none (the default) every
+# live deployment is rejected loudly and only paper trading works. Live trading for
+# more than one tenant needs a per-tenant provider to be implemented first.
 secrets:
   # Database credentials
   database:
