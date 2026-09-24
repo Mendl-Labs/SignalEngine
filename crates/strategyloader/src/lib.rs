@@ -48,7 +48,7 @@ pub use deployment_subscriber::{
 };
 pub use live_rejection::{
     reject_live_deployment, sanitize_reason, reason_no_provider, reason_credential_unavailable,
-    AckSender, AckSink, LiveRejectionOutcome,
+    AckSender, AckSink, DeployedSet, LiveRejectionOutcome,
 };
 
 #[cfg(feature = "postgres")]

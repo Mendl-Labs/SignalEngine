@@ -31,6 +31,10 @@ use std::time::Duration;
 use ultra_logger::{ultra_error, ultra_warn};
 use uuid::Uuid;
 
+/// The subscriber's shared deployed-set (DeploymentSubscriber::get_deployed_strategies).
+/// A named alias so callers linking a different dashmap version still get the right type.
+pub type DeployedSet = Arc<DashMap<Uuid, Arc<DeployedStrategy>>>;
+
 /// Upper bound for each of the two external effects (ack publish, DB write).
 pub const REJECTION_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest reason text that is ever published or stored.
