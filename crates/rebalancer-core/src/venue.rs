@@ -11,7 +11,7 @@
 //!
 //! Sizes are ALWAYS rounded down or refused; nothing is ever bumped up to a minimum.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use broker_adapters::alpaca::{self, AssetTable};
 use broker_adapters::kraken::order::{prepare_order as kraken_prepare, PrepareOptions as KrakenPrepareOptions};
@@ -132,15 +132,145 @@ impl VenueRules for OandaRules<'_> {
     }
 }
 
-/// The venue rule sets a plan may use, keyed by lower-case venue name (`"kraken"`, `"alpaca"`, `"oanda"`).
+/// Whether one instrument may be sold short on a venue, as the venue/account/instrument say (NOT the mandate: the
+/// mandate's own `universe.shorting` is a separate, additional condition).
+///
+/// This is DATA the caller reads from the broker (Alpaca: account `shorting_enabled`, account equity >= $2,000, asset
+/// `shortable` / `easy_to_borrow`, crypto never; Kraken: a margin-enabled pair with a non-empty `leverage_sell`
+/// and room under `short_position_limit`, pair `status`; OANDA: every position is margin based). Nothing here is a
+/// constant of this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortPolicy {
+    /// The venue, account or instrument cannot be sold short. `reason` says why, for the denial message.
+    Forbidden { reason: String },
+    /// A short may be opened.
+    Allowed,
+    /// A short may be opened only against an approved borrow locate (Alpaca hard-to-borrow). The guard accepts it only
+    /// when the caller ALSO lists a locate for that instrument in [`InstrumentRules::with_locate`].
+    NeedsLocate,
+}
+
+/// What one instrument on one venue allows, for a SIGNED (short and/or levered) plan. Every field is a fact from the
+/// venue, supplied by the caller; the guard invents no default. A rule that is ABSENT for an instrument means the
+/// venue's short facts are unknown, and a short in it is denied (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentVenueRule {
+    pub short: ShortPolicy,
+    /// The largest gross exposure, as a multiple of the capital base, a book that includes an order in this
+    /// instrument may reach (Kraken: the pair's largest `leverage_sell`/`leverage_buy`; OANDA: `1 / marginRate`).
+    /// It joins the mandate's caps in the effective gross cap (see the guard docs). `None`: the venue states none.
+    pub max_leverage: Option<Dec>,
+    /// The largest position, in instrument UNITS (either side), the venue accepts (OANDA `maximumPositionSize`;
+    /// Kraken `short_position_limit` / `long_position_limit`). An order that would take the position above it is
+    /// refused, never shrunk. `None`: the venue states none.
+    pub max_position_units: Option<Dec>,
+}
+
+impl InstrumentVenueRule {
+    fn with_short(short: ShortPolicy) -> Self {
+        Self { short, max_leverage: None, max_position_units: None }
+    }
+
+    /// Shorting is allowed.
+    pub fn shortable() -> Self {
+        Self::with_short(ShortPolicy::Allowed)
+    }
+
+    /// Shorting is not possible (for example every crypto asset on Alpaca).
+    pub fn never_shortable(reason: &str) -> Self {
+        Self::with_short(ShortPolicy::Forbidden { reason: reason.to_string() })
+    }
+
+    /// Shorting needs a borrow locate first.
+    pub fn short_needs_locate() -> Self {
+        Self::with_short(ShortPolicy::NeedsLocate)
+    }
+
+    pub fn with_max_leverage(mut self, max: Dec) -> Self {
+        self.max_leverage = Some(max);
+        self
+    }
+
+    pub fn with_max_position_units(mut self, max: Dec) -> Self {
+        self.max_position_units = Some(max);
+        self
+    }
+
+    fn fingerprint(&self) -> String {
+        let short = match &self.short {
+            ShortPolicy::Forbidden { reason } => format!("forbidden({reason})"),
+            ShortPolicy::Allowed => "allowed".to_string(),
+            ShortPolicy::NeedsLocate => "needs_locate".to_string(),
+        };
+        let f = |d: Option<Dec>| d.map_or("-".to_string(), |v| v.normalized().to_string());
+        format!("short={short}|max_leverage={}|max_position_units={}", f(self.max_leverage), f(self.max_position_units))
+    }
+}
+
+/// Per-instrument venue facts and borrow locates for a SIGNED plan, keyed by (venue, symbol) (venue trimmed and
+/// lower-cased, symbol trimmed and upper-cased). Empty by default: with no entry for an instrument, a short in it is
+/// denied. A long-only plan never consults it.
+///
+/// The caller fills it from the broker, one entry per instrument it is willing to short or to cap:
+/// * Alpaca: `Allowed` only when the account has `shorting_enabled` and equity >= 2000 and the asset is `shortable`
+///   and easy-to-borrow; `NeedsLocate` for a shortable hard-to-borrow asset (plus a locate); `Forbidden` otherwise and
+///   always for crypto.
+/// * Kraken: `Allowed` for a pair whose status permits it, that has margin (`leverage_sell` non-empty) and room under
+///   `short_position_limit`, with `max_leverage` from the arrays; `Forbidden` for a pair without margin.
+/// * OANDA: `Allowed` (every position is margin based) with `max_leverage` from `marginRate` and `max_position_units`
+///   from `maximumPositionSize`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstrumentRules {
+    rules: BTreeMap<(String, String), InstrumentVenueRule>,
+    locates: BTreeSet<(String, String)>,
+}
+
+fn rule_key(venue: &str, symbol: &str) -> (String, String) {
+    (venue.trim().to_lowercase(), symbol.trim().to_uppercase())
+}
+
+impl InstrumentRules {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_rule(mut self, venue: &str, symbol: &str, rule: InstrumentVenueRule) -> Self {
+        self.rules.insert(rule_key(venue, symbol), rule);
+        self
+    }
+
+    /// Record an approved borrow locate for `symbol`. Presence only: this crate does not track its size or expiry.
+    pub fn with_locate(mut self, venue: &str, symbol: &str) -> Self {
+        self.locates.insert(rule_key(venue, symbol));
+        self
+    }
+
+    pub fn rule(&self, venue: &str, symbol: &str) -> Option<&InstrumentVenueRule> {
+        self.rules.get(&rule_key(venue, symbol))
+    }
+
+    pub fn has_locate(&self, venue: &str, symbol: &str) -> bool {
+        self.locates.contains(&rule_key(venue, symbol))
+    }
+
+    /// Deterministic text of what is known about one instrument; part of a signed plan's inputs digest.
+    pub fn fingerprint(&self, venue: &str, symbol: &str) -> String {
+        let rule = self.rule(venue, symbol).map_or("absent".to_string(), InstrumentVenueRule::fingerprint);
+        format!("{rule}|locate={}", self.has_locate(venue, symbol))
+    }
+}
+
+/// The venue rule sets a plan may use, keyed by lower-case venue name (`"kraken"`, `"alpaca"`, `"oanda"`), plus the per-instrument
+/// facts a SIGNED plan needs ([`InstrumentRules`], empty by default).
 #[derive(Default)]
 pub struct VenueRuleBook<'a> {
     by_venue: BTreeMap<String, &'a dyn VenueRules>,
+    instruments: InstrumentRules,
 }
 
 impl<'a> VenueRuleBook<'a> {
     pub fn new() -> Self {
-        Self { by_venue: BTreeMap::new() }
+        Self { by_venue: BTreeMap::new(), instruments: InstrumentRules::new() }
     }
 
     pub fn with(mut self, venue: &str, rules: &'a dyn VenueRules) -> Self {
@@ -150,5 +280,15 @@ impl<'a> VenueRuleBook<'a> {
 
     pub fn get(&self, venue: &str) -> Option<&'a dyn VenueRules> {
         self.by_venue.get(&venue.trim().to_lowercase()).copied()
+    }
+
+    /// Supply the per-instrument facts a signed plan's guard needs (replaces any set before).
+    pub fn with_instrument_rules(mut self, instruments: InstrumentRules) -> Self {
+        self.instruments = instruments;
+        self
+    }
+
+    pub fn instrument_rules(&self) -> &InstrumentRules {
+        &self.instruments
     }
 }

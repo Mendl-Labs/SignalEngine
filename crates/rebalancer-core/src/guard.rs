@@ -23,12 +23,27 @@
 //!   position on the account, including holdings the mandate does not cover, so unrelated holdings in a shared
 //!   account consume the allocation's headroom (fail closed).
 //!
-//! * **Signed plans (opt-in).** `PreTradeGuard::check` is unchanged and knows only the caller's `uses_margin` flag.
-//!   `PreTradeGuard::check_margin` adds what a short or levered book needs: it derives margin use from the account
-//!   itself (`margin_use`: an order that is not a pure reduction and leaves the instrument short, or gross above the
-//!   broker's equity, or negative cash), denies it `LEVERAGE_FORBIDDEN` when the mandate's `leverage_max_gross` is 1,
-//!   and tests funding against the broker's buying power (`MarginContext`) instead of cash. Shorting stays governed
-//!   by `universe.shorting` (`SHORTING_FORBIDDEN`), and every cap above still applies.
+//! * **Signed plans (opt-in).** `PreTradeGuard::check` is unchanged and knows only the caller's `uses_margin` flag
+//!   (the long-only path). [`PreTradeGuard::check_signed`] adds what a short or levered book needs, and decides
+//!   shorting and leverage from the right facts:
+//!   - **Shorting** (an order that sells more than the long held: it opens or deepens a short) is denied
+//!     `SHORTING_FORBIDDEN` when the MANDATE says `universe.shorting: false`, OR when the VENUE facts for that
+//!     instrument ([`InstrumentRules`], supplied by the caller from the broker) forbid it, do not exist (fail
+//!     closed: nothing is assumed allowed), or say it needs a borrow locate and none was supplied.
+//!   - **Leverage** is denied `LEVERAGE_FORBIDDEN` only when the projected GROSS exposure after a non-reducing order
+//!     exceeds the effective gross cap, `min(mandate leverage_max_gross, mandate exposure.max_gross, the
+//!     instrument's venue max_leverage where given)` times the capital base. A short by itself is not leverage: a
+//!     long/short book with gross within 1x of equity is legal on the venues that allow shorting.
+//!     `margin_use` (short, or gross above the broker's equity, or negative cash) remains derived, informational
+//!     data; it no longer denies anything by itself, but it still makes buying power REQUIRED: with no
+//!     `MarginContext::buying_power_left` an order that uses margin is denied `CASH_RESERVE`.
+//!   - The funding test of a non-reducing order uses the broker's buying power instead of cash. The effective limit
+//!     is therefore the lowest of the mandate (gross cap), the venue rule (max_leverage, `max_position_units`) and the
+//!     broker's live buying power.
+//!   - A venue `max_position_units` (OANDA `maximumPositionSize`) REFUSES an order that would take the position
+//!     above it (`MAX_POSITION`); it never shrinks the order.
+//!   `check_margin` is `check_signed` with NO venue facts, so every short is denied by it. Every cap above (position,
+//!   asset class, gross, net, notional, turnover, reserve) still applies to signed plans unchanged.
 //!
 //! The guard does not mutate anything. The planner simulates its own sequence of orders (see `planner`).
 
@@ -37,6 +52,7 @@ use chrono::{DateTime, Utc};
 
 use crate::dec_math::{abs, add, mul, neg, sub, MathError};
 use crate::policy::{Limits, Policy, Standing, MAX_FUTURE_SKEW_SECS};
+use crate::venue::{InstrumentRules, InstrumentVenueRule, ShortPolicy};
 
 /// Stable machine codes. Never rename a variant's string: alerts, dashboards and tests key on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -280,7 +296,10 @@ fn after_state(account: &AccountView, order: &ProposedOrder, notional: Dec, clas
     })
 }
 
-/// Would this order put the account on margin? True only for an order that is not a pure reduction and that leaves
+/// Would this order put the account on margin? INFORMATIONAL: it is data about the order (the planner records it on
+/// every accepted order), not a permission test; a short or a levered book is denied only by the conditions in the
+/// module docs (mandate shorting, venue facts, the effective gross cap), and margin use makes buying power required.
+/// True only for an order that is not a pure reduction and that leaves
 /// the account (a) short in this instrument, or (b) with gross exposure above the broker's equity (levered), or
 /// (c) with negative cash (borrowing). A reduction (a sell up to the long held, a buy up to the short held) is never
 /// margin use: it can only shrink what margin is used. `price` must be the order's usable price.
@@ -303,6 +322,41 @@ pub fn margin_use(account: &AccountView, order: &ProposedOrder, price: Dec) -> R
     Ok(short_after || after.gross > account.equity || after.cash.is_negative())
 }
 
+/// Why the VENUE facts do not let this short be opened, or `None` when they do. `rule` is `instruments`'s rule for the
+/// order's instrument. Absent rule: unknown, so denied. `NeedsLocate` passes only with a locate on record.
+fn venue_short_block(instruments: &InstrumentRules, rule: Option<&InstrumentVenueRule>, order: &ProposedOrder) -> Option<String> {
+    let Some(rule) = rule else {
+        return Some(format!(
+            "no venue rule is known for {}/{}, so whether it can be shorted is unknown and the short is refused",
+            order.venue.trim().to_lowercase(),
+            order.symbol.trim().to_uppercase()
+        ));
+    };
+    match &rule.short {
+        ShortPolicy::Allowed => None,
+        ShortPolicy::Forbidden { reason } => Some(format!("the venue does not allow shorting {}: {reason}", order.symbol.trim().to_uppercase())),
+        ShortPolicy::NeedsLocate => {
+            if instruments.has_locate(&order.venue, &order.symbol) {
+                None
+            } else {
+                Some(format!("shorting {} needs a borrow locate and none was supplied", order.symbol.trim().to_uppercase()))
+            }
+        }
+    }
+}
+
+/// The gross cap, as a multiple of the capital base, that applies to a signed order: the lowest of the mandate's
+/// `leverage_max_gross`, the mandate's (deployment-tightened) `max_gross`, and the instrument's venue `max_leverage`
+/// where the venue gives one. `Policy::compile` already folds the first two into `Limits::max_gross`; taking both
+/// here keeps the cap correct even for a limit set whose `max_gross` was loosened after compilation.
+fn effective_gross_cap(limits: &Limits, rule: Option<&InstrumentVenueRule>) -> Dec {
+    let mut cap = std::cmp::min(limits.leverage_max_gross, limits.max_gross);
+    if let Some(v) = rule.and_then(|r| r.max_leverage) {
+        cap = std::cmp::min(cap, v);
+    }
+    cap
+}
+
 /// The part of a non-reducing order that ADDS exposure (an order that flips through zero closes first, and only the
 /// remainder adds). Exact.
 fn increasing_notional(account: &AccountView, order: &ProposedOrder, price: Dec) -> Result<Dec, MathError> {
@@ -321,22 +375,42 @@ impl PreTradeGuard {
         Self::run(policy, account, order, day, None)
     }
 
-    /// [`check`](Self::check) for an order of a SIGNED plan (shorts and/or gross above 1x). Every check of `check`
-    /// still applies unchanged (universe, shorting permission, per-position / class / gross / net caps, order and
-    /// turnover limits), plus:
-    /// * the guard derives margin use itself ([`margin_use`]); an order that uses margin (flagged by the caller OR
-    ///   derived) is denied `LEVERAGE_FORBIDDEN` unless the mandate's `leverage_max_gross` is above 1;
-    /// * the funding test of a non-reducing order changes from "cash after the order stays above the reserve" to
+    /// [`check`](Self::check) for an order of a SIGNED plan (shorts and/or gross above 1x), with the venue's
+    /// per-instrument facts. Every check of `check` still applies (universe, per-position / class / gross / net caps,
+    /// order and turnover limits), plus, in this order of evaluation:
+    /// * **shorting**: an order that sells more than the long held is denied `SHORTING_FORBIDDEN` when the mandate has
+    ///   `shorting: false`, or when `instruments` has no rule for the instrument (unknown: fail closed), a
+    ///   `Forbidden` rule, or a `NeedsLocate` rule without a locate. One denial carries every cause;
+    /// * **leverage**: a non-reducing order is denied `LEVERAGE_FORBIDDEN` only when the gross exposure after it
+    ///   exceeds `min(leverage_max_gross, max_gross, the rule's max_leverage) * capital base`. The caller's
+    ///   `uses_margin` flag and the derived [`margin_use`] deny nothing here;
+    /// * **position units**: a non-reducing order that would take the position above the rule's `max_position_units`
+    ///   is denied `MAX_POSITION` (refused whole, never clipped);
+    /// * **funding**: the test of a non-reducing order changes from "cash after the order stays above the reserve" to
     ///   "buying power left after the order stays above the reserve" when `buying_power_left` is given, because on a
     ///   margin book cash is not what limits an order (short proceeds are collateral, not spendable) and the
     ///   broker's own buying-power figure is. The shortfall is reported as `CASH_RESERVE`;
-    /// * with no buying power supplied, an order that uses margin is denied `CASH_RESERVE` (nothing to verify it
-    ///   against), and every other order keeps the plain cash test.
-    pub fn check_margin(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: &MarginContext) -> Verdict {
-        Self::run(policy, account, order, day, Some(margin))
+    /// * with no buying power supplied, an order that uses margin (derived, or flagged by the caller) is denied
+    ///   `CASH_RESERVE` (nothing to verify it against), and every other order keeps the plain cash test.
+    pub fn check_signed(
+        policy: &Policy,
+        account: &AccountView,
+        order: &ProposedOrder,
+        day: &DayCounters,
+        margin: &MarginContext,
+        instruments: &InstrumentRules,
+    ) -> Verdict {
+        Self::run(policy, account, order, day, Some((margin, instruments)))
     }
 
-    fn run(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: Option<&MarginContext>) -> Verdict {
+    /// [`check_signed`](Self::check_signed) with NO venue facts: every short is denied (`SHORTING_FORBIDDEN`, the
+    /// venue's short rules being unknown) and no venue leverage or position-size limit applies. Kept for callers that
+    /// only ever check reductions and longs.
+    pub fn check_margin(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: &MarginContext) -> Verdict {
+        Self::check_signed(policy, account, order, day, margin, &InstrumentRules::new())
+    }
+
+    fn run(policy: &Policy, account: &AccountView, order: &ProposedOrder, day: &DayCounters, margin: Option<(&MarginContext, &InstrumentRules)>) -> Verdict {
         let mut reasons = Vec::new();
         if let Err(e) = check_inner(policy, account, order, day, margin, &mut reasons) {
             deny(&mut reasons, DenialCode::ArithmeticOverflow, e.to_string());
@@ -350,9 +424,11 @@ fn check_inner(
     account: &AccountView,
     order: &ProposedOrder,
     day: &DayCounters,
-    margin: Option<&MarginContext>,
+    signed: Option<(&MarginContext, &InstrumentRules)>,
     reasons: &mut Vec<Denial>,
 ) -> Result<(), MathError> {
+    let margin = signed.map(|(m, _)| m);
+    let instruments = signed.map(|(_, i)| i);
     // --- 1. Is there a usable mandate at all?
     let standing = policy.standing(account.now);
     match &standing {
@@ -416,13 +492,29 @@ fn check_inner(
     // --- 6. Universe.
     check_universe(limits, order, reasons);
 
+    // The ONE capital base (min of broker equity and the mandate's allocation): the denominator of every
+    // percentage-of-equity limit below and of the cash-reserve fraction. Only `after.cash` (the cash test) uses
+    // the broker's actual cash.
+    let equity = policy.capital_base(account.equity, &account.ccy);
+    let venue_rule: Option<&InstrumentVenueRule> = instruments.and_then(|i| i.rule(&order.venue, &order.symbol));
+
     // --- 7. Shorting, derivatives, leverage.
-    if order.side == Side::Sell && !limits.shorting && order.quantity > held_long {
-        deny(
-            reasons,
-            DenialCode::ShortingForbidden,
-            format!("selling {} {} would exceed the {} held and shorting is off", order.quantity, order.symbol, held_long),
-        );
+    let opens_short = order.side == Side::Sell && order.quantity > held_long;
+    let mandate_blocks_short = opens_short && !limits.shorting;
+    // Venue facts are consulted on the signed path only; a plain `check` knows none and behaves as it always did.
+    let venue_blocks_short: Option<String> = match instruments {
+        Some(i) if opens_short => venue_short_block(i, venue_rule, order),
+        _ => None,
+    };
+    if mandate_blocks_short || venue_blocks_short.is_some() {
+        let mut why = Vec::new();
+        if mandate_blocks_short {
+            why.push(format!("selling {} {} would exceed the {} held and shorting is off", order.quantity, order.symbol, held_long));
+        }
+        if let Some(v) = venue_blocks_short {
+            why.push(v);
+        }
+        deny(reasons, DenialCode::ShortingForbidden, why.join("; "));
     }
     if order.is_derivative && !limits.derivatives {
         deny(reasons, DenialCode::DerivativesForbidden, "derivatives are not allowed by the mandate");
@@ -432,8 +524,36 @@ fn check_inner(
         (Some(_), Some(p)) => margin_use(account, order, p)?,
         _ => false,
     };
-    if (order.uses_margin || derived_margin) && limits.leverage_max_gross <= one() {
-        deny(reasons, DenialCode::LeverageForbidden, "the order uses margin and the mandate allows no leverage");
+    match (signed, price) {
+        // Signed path: leverage is a GROSS test against the effective cap, never a property of "being short".
+        (Some(_), Some(p)) => {
+            if !reducing {
+                let after = after_state(account, order, mul(order.quantity, p)?, &order.asset_class.trim().to_lowercase())?;
+                let mult = effective_gross_cap(limits, venue_rule);
+                let cap = mul(mult, equity)?;
+                if after.gross > cap {
+                    deny(
+                        reasons,
+                        DenialCode::LeverageForbidden,
+                        format!(
+                            "gross exposure would be {} after the order; the effective gross cap is {cap} ({mult}x the capital base: the lowest of mandate leverage {}, mandate/deployment max gross {}, venue max leverage {})",
+                            after.gross,
+                            limits.leverage_max_gross,
+                            limits.max_gross,
+                            venue_rule.and_then(|r| r.max_leverage).map_or("none given".to_string(), |v| v.to_string())
+                        ),
+                    );
+                }
+            }
+        }
+        // Long-only path: the caller's flag, as always.
+        (None, _) => {
+            if order.uses_margin && limits.leverage_max_gross <= one() {
+                deny(reasons, DenialCode::LeverageForbidden, "the order uses margin and the mandate allows no leverage");
+            }
+        }
+        // Signed path without a usable price: PRICE_MISSING/PRICE_STALE already denies it.
+        (Some(_), None) => {}
     }
 
     // --- 8. Limits that need a price.
@@ -441,10 +561,6 @@ fn check_inner(
     let notional = mul(order.quantity, price)?;
     let class = order.asset_class.trim().to_lowercase();
     let after = after_state(account, order, notional, &class)?;
-    // The ONE capital base (min of broker equity and the mandate's allocation): the denominator of every
-    // percentage-of-equity limit below and of the cash-reserve fraction. Only `after.cash` (the cash test) uses
-    // the broker's actual cash.
-    let equity = policy.capital_base(account.equity, &account.ccy);
 
     if !reducing {
         if notional > limits.max_order_notional {
@@ -461,6 +577,21 @@ fn check_inner(
                 DenialCode::MaxPosition,
                 format!("{} would be {} after the order; the cap is {cap}", order.symbol, after.position_value),
             );
+        }
+        // A venue's own position-size limit (signed path only): the order is refused whole, never shrunk.
+        if let Some(max_units) = venue_rule.and_then(|r| r.max_position_units) {
+            let signed_qty = match order.side {
+                Side::Buy => order.quantity,
+                Side::Sell => neg(order.quantity)?,
+            };
+            let units_after = abs(add(pos_qty, signed_qty)?)?;
+            if units_after > max_units {
+                deny(
+                    reasons,
+                    DenialCode::MaxPosition,
+                    format!("{} would be {units_after} units after the order; the venue's maximum position size is {max_units}", order.symbol),
+                );
+            }
         }
         if let Some(class_cap) = limits.max_asset_class.get(&class) {
             let cap = mul(*class_cap, equity)?;
