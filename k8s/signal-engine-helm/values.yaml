@@ -444,8 +444,11 @@ exchanges:
 # NOTE: Per-tenant exchange API keys are NOT configured here. Users add their
 # own keys for any supported exchange via the Settings UI; they are stored
 # encrypted in the `exchange_credentials` table and loaded by SignalEngine on
-# demand (see crates/hostbuilder/src/lib.rs::initialize_from_database and
-# UltraLowLatencyExecutionHandler::ensure_exchange_for_tenant).
+# demand through a tenant-scoped smartorderrouter::CredentialProvider (see
+# UltraLowLatencyExecutionHandler::initialize_from_provider and
+# ensure_exchange_for_tenant). The public build only ships a single-tenant
+# provider bound to TENANT_ID; the multi-tenant provider is injected by the
+# private host binary.
 secrets:
   # Database credentials
   database:

@@ -8,16 +8,23 @@ use exchangemetricaggregator::ExchangeMetricsAggregator;
 use dashmap::DashMap;
 use crossbeam::utils::CachePadded;
 
+pub mod credentials;
+pub use credentials::{
+    CredentialError, CredentialProvider, ExchangeCredential, StaticCredentialProvider, TenantId,
+    resolve_all_credentials, resolve_credential, select_credential,
+};
+
 #[cfg(feature = "postgres")]
 pub mod database;
 
+// NOTE: there is intentionally NO tenant-blind credential loader in the public
+// API. Credentials are obtained through `CredentialProvider` with an explicit
+// tenant id (see the `credentials` module).
 #[cfg(feature = "postgres")]
 pub use database::{
-    OrderDatabasePersistence, 
+    OrderDatabasePersistence,
     DbPool,
-    ExchangeCredential,
-    load_exchange_credentials,
-    load_credentials_for_exchange,
+    SingleTenantDbProvider,
     create_pool,
     BackgroundSorWriter,
     SorDbEvent,
@@ -26,35 +33,6 @@ pub use database::{
 // Stub types when postgres feature is not enabled, so downstream crates compile.
 #[cfg(not(feature = "postgres"))]
 pub type DbPool = ();
-
-#[cfg(not(feature = "postgres"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExchangeCredential {
-    pub id: uuid::Uuid,
-    pub exchange: String,
-    pub label: String,
-    pub api_key: String,
-    pub api_secret: String,
-    pub passphrase: Option<String>,
-    pub is_testnet: bool,
-    pub is_enabled: bool,
-}
-
-#[cfg(not(feature = "postgres"))]
-pub async fn load_exchange_credentials(
-    _pool: &DbPool,
-) -> anyhow::Result<Vec<ExchangeCredential>> {
-    Ok(vec![])
-}
-
-#[cfg(not(feature = "postgres"))]
-pub async fn load_credentials_for_exchange(
-    _pool: &DbPool,
-    _exchange: &str,
-    _live_only: bool,
-) -> anyhow::Result<Option<ExchangeCredential>> {
-    Ok(None)
-}
 
 #[cfg(not(feature = "postgres"))]
 pub async fn create_pool(_database_url: &str) -> anyhow::Result<DbPool> {

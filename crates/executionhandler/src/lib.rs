@@ -286,6 +286,10 @@ impl DatabaseExecutionPersistence for InMemoryExecutionDatabase {
 #[derive(Clone)]
 pub struct UltraLowLatencyExecutionHandler {
     connectors: Arc<RwLock<HashMap<String, Box<dyn ExchangeConnector>>>>,
+    /// exchange name -> tenant whose credentials the connector was built from
+    /// (only for connectors registered via the credential path). Guards against
+    /// one tenant replacing or using another tenant's connector.
+    connector_owners: Arc<RwLock<HashMap<String, smartorderrouter::TenantId>>>,
     default_exchange: Option<String>,
     global_metrics: Arc<core::MetricsCollector>,
     core_assignment: optimizations::CoreAssignment,
@@ -328,6 +332,7 @@ impl UltraLowLatencyExecutionHandler {
         
         Self {
             connectors: Arc::new(RwLock::new(HashMap::new())),
+            connector_owners: Arc::new(RwLock::new(HashMap::new())),
             default_exchange: None,
             global_metrics: Arc::new(core::MetricsCollector::new()),
             core_assignment,
@@ -490,7 +495,9 @@ impl UltraLowLatencyExecutionHandler {
         
         let mut connectors = self.connectors.write().await;
         connectors.insert(exchange_name.clone(), connector);
-        
+        // Config-built connector: process-level credentials, not tenant-owned.
+        self.connector_owners.write().await.remove(&exchange_name);
+
         // Set first exchange as default if none set
         if self.default_exchange.is_none() {
             self.default_exchange = Some(exchange_name);
@@ -507,6 +514,7 @@ impl UltraLowLatencyExecutionHandler {
         let connector = Box::new(crate::PaperTradingConnector::new(paper_config));
         let mut connectors = self.connectors.write().await;
         connectors.insert(exchange_name.clone(), connector as Box<dyn crate::core::ExchangeConnector>);
+        self.connector_owners.write().await.remove(&exchange_name);
         if self.default_exchange.is_none() {
             self.default_exchange = Some(exchange_name);
         }
@@ -531,19 +539,57 @@ impl UltraLowLatencyExecutionHandler {
         }
     }
 
-    /// Add an exchange connector from database-stored credentials
-    /// 
-    /// This is the primary method for production use - loads credentials stored 
-    /// via the Settings UI and creates a properly configured connector.
+    /// The tenant that owns the connector registered for `exchange_name` via
+    /// the credential path, if any. `None` for connectors registered from
+    /// static config (`add_exchange`, `add_paper_exchange`) or when no
+    /// connector exists.
+    pub async fn connector_owner(&self, exchange_name: &str) -> Option<smartorderrouter::TenantId> {
+        self.connector_owners.read().await.get(exchange_name).copied()
+    }
+
+    /// Add an exchange connector from a credential resolved for `tenant_id`.
+    ///
+    /// The connector map of this handler is keyed by exchange name only, so a
+    /// connector holds exactly one tenant's keys. To stop tenant B from
+    /// silently replacing (and so hijacking the order flow of) tenant A's
+    /// connector, this FAILS CLOSED if a different tenant already owns the
+    /// connector for that exchange. Use one handler per tenant, or
+    /// `MultiTenantExecutionHandler`, for multi-tenant processes.
+    ///
+    /// The caller passes the credential in; this method never loads one.
     pub async fn add_exchange_from_credential(
-        &mut self, 
+        &mut self,
+        tenant_id: smartorderrouter::TenantId,
         credential: &smartorderrouter::ExchangeCredential
     ) -> Result<(), ExecutionError> {
-        let connector = ExchangeFactory::create_connector_from_credential(credential).await?;
-        
+        self.add_exchange_from_credential_with(
+            tenant_id,
+            credential,
+            &multi_tenant::DefaultConnectorBuilder,
+        ).await
+    }
+
+    /// [`Self::add_exchange_from_credential`] with an explicit connector builder.
+    pub async fn add_exchange_from_credential_with(
+        &mut self,
+        tenant_id: smartorderrouter::TenantId,
+        credential: &smartorderrouter::ExchangeCredential,
+        builder: &dyn multi_tenant::ConnectorBuilder,
+    ) -> Result<(), ExecutionError> {
+        if let Some(owner) = self.connector_owner(&credential.exchange).await {
+            if owner != tenant_id {
+                return Err(ExecutionError::Rejected(format!(
+                    "Refusing to register '{}' for tenant {}: connector is already owned by tenant {}",
+                    credential.exchange, tenant_id, owner
+                )));
+            }
+        }
+        let connector = builder.build(credential).await?;
+
         let mut connectors = self.connectors.write().await;
         connectors.insert(credential.exchange.clone(), connector);
-        
+        self.connector_owners.write().await.insert(credential.exchange.clone(), tenant_id);
+
         // Set first exchange as default if none set
         if self.default_exchange.is_none() {
             self.default_exchange = Some(credential.exchange.clone());
@@ -557,22 +603,26 @@ impl UltraLowLatencyExecutionHandler {
         Ok(())
     }
     
-    /// Initialize all exchanges from database credentials for a tenant
-    /// 
-    /// Call this at startup to load all configured exchange credentials from the
-    /// database and initialize connectors for live trading.
-    pub async fn initialize_from_database(
+    /// Initialize all exchanges from the credentials `provider` holds for
+    /// `tenant_id`.
+    ///
+    /// Call this at startup to initialize connectors for live trading. The
+    /// provider is asked for exactly this tenant's credentials; any provider
+    /// error aborts (fail closed) and no connector is registered.
+    pub async fn initialize_from_provider(
         &mut self,
-        pool: &smartorderrouter::DbPool,
+        provider: &dyn smartorderrouter::CredentialProvider,
         tenant_id: uuid::Uuid,
     ) -> Result<usize, ExecutionError> {
-        let credentials = smartorderrouter::load_exchange_credentials(pool)
+        let credentials = smartorderrouter::resolve_all_credentials(provider, tenant_id)
             .await
-            .map_err(|e| ExecutionError::Unknown(format!("Failed to load credentials: {}", e)))?;
-        
+            .map_err(|e| ExecutionError::Unknown(format!(
+                "Failed to load credentials for tenant {}: {}", tenant_id, e
+            )))?;
+
         let mut initialized_count = 0;
         for credential in &credentials {
-            match self.add_exchange_from_credential(credential).await {
+            match self.add_exchange_from_credential(tenant_id, credential).await {
                 Ok(_) => {
                     initialized_count += 1;
                 }
@@ -619,16 +669,17 @@ impl UltraLowLatencyExecutionHandler {
         }
     }
 
-    /// Lazily load (or refresh) a single tenant+exchange credential from the
-    /// database and register the resulting connector. Idempotent — calling this
-    /// repeatedly always rebuilds the connector with the latest stored creds, so
-    /// users who edit their API keys in the UI see the change without a pod
-    /// restart.
+    /// Resolve a single tenant+exchange credential through `provider` and
+    /// register the resulting connector. Idempotent — calling this repeatedly
+    /// rebuilds the connector with the latest credentials, so users who edit
+    /// their API keys in the UI see the change without a pod restart.
     ///
-    /// Returns `Ok(true)` if a credential was found and a connector was
-    /// registered, `Ok(false)` if no enabled credential exists for that
-    /// (tenant, exchange) pair, and an error if the DB lookup or connector
-    /// initialization failed.
+    /// FAILS CLOSED: returns an error (and registers nothing) if the tenant
+    /// has no usable credential for the exchange (unknown tenant/exchange,
+    /// disabled, sandbox-only when `live_only`), if the provider errors, if the
+    /// connector cannot be initialized, or if a different tenant already owns
+    /// the connector for `exchange`. There is no fallback to another tenant's
+    /// credential and no "first row".
     ///
     /// `live_only: true` restricts the lookup to non-testnet credentials and
     /// MUST be set when registering a connector for a live deployment — a
@@ -636,35 +687,67 @@ impl UltraLowLatencyExecutionHandler {
     /// orders signed with the sandbox key.
     pub async fn ensure_exchange_for_tenant(
         &mut self,
-        pool: &smartorderrouter::DbPool,
+        provider: &dyn smartorderrouter::CredentialProvider,
         tenant_id: uuid::Uuid,
         exchange: &str,
         live_only: bool,
-    ) -> Result<bool, ExecutionError> {
-        let credential = smartorderrouter::load_credentials_for_exchange(pool, exchange, live_only)
+    ) -> Result<(), ExecutionError> {
+        self.ensure_exchange_for_tenant_with(
+            provider,
+            tenant_id,
+            exchange,
+            live_only,
+            &multi_tenant::DefaultConnectorBuilder,
+        ).await
+    }
+
+    /// [`Self::ensure_exchange_for_tenant`] with an explicit connector builder.
+    pub async fn ensure_exchange_for_tenant_with(
+        &mut self,
+        provider: &dyn smartorderrouter::CredentialProvider,
+        tenant_id: uuid::Uuid,
+        exchange: &str,
+        live_only: bool,
+        builder: &dyn multi_tenant::ConnectorBuilder,
+    ) -> Result<(), ExecutionError> {
+        let cred = smartorderrouter::resolve_credential(provider, tenant_id, exchange, live_only)
             .await
             .map_err(|e| ExecutionError::Unknown(format!(
-                "Failed to load credential for tenant={} exchange={}: {}",
-                tenant_id, exchange, e
+                "No usable credential for tenant={} exchange={} (live_only={}): {}",
+                tenant_id, exchange, live_only, e
             )))?;
 
-        match credential {
-            Some(cred) => {
-                self.add_exchange_from_credential(&cred).await?;
-                log::info!(
-                    "[EXECUTION] Lazily loaded {} credential for tenant {} (live_only={})",
-                    exchange, tenant_id, live_only
-                );
-                Ok(true)
+        self.add_exchange_from_credential_with(tenant_id, &cred, builder).await?;
+        log::info!(
+            "[EXECUTION] Loaded {} credential for tenant {} (live_only={})",
+            exchange, tenant_id, live_only
+        );
+        Ok(())
+    }
+
+    /// Execute an order on behalf of `tenant_id`, refusing unless the
+    /// connector for `exchange_name` was registered from THAT tenant's
+    /// credentials. Use this (not `execute_order_on_exchange`) whenever the
+    /// order belongs to a tenant, so an order can never be signed with another
+    /// tenant's keys.
+    pub async fn execute_order_on_exchange_for_tenant(
+        &self,
+        tenant_id: smartorderrouter::TenantId,
+        signal: &Signal,
+        exchange_name: &str,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        match self.connector_owner(exchange_name).await {
+            Some(owner) if owner == tenant_id => {
+                self.execute_order_on_exchange(signal, exchange_name).await
             }
-            None => {
-                log::warn!(
-                    "[EXECUTION] No enabled{} credential for tenant={} exchange={}",
-                    if live_only { " non-testnet" } else { "" },
-                    tenant_id, exchange
-                );
-                Ok(false)
-            }
+            Some(owner) => Err(ExecutionError::Rejected(format!(
+                "Exchange '{}' connector belongs to tenant {}, not tenant {}",
+                exchange_name, owner, tenant_id
+            ))),
+            None => Err(ExecutionError::Rejected(format!(
+                "No tenant-owned connector for exchange '{}' (tenant {})",
+                exchange_name, tenant_id
+            ))),
         }
     }
 
@@ -672,7 +755,8 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn remove_exchange(&mut self, exchange_name: &str) -> Result<(), ExecutionError> {
         let mut connectors = self.connectors.write().await;
         connectors.remove(exchange_name);
-        
+        self.connector_owners.write().await.remove(exchange_name);
+
         // Update default if removed
         if self.default_exchange.as_deref() == Some(exchange_name) {
             self.default_exchange = connectors.keys().next().cloned();
@@ -1202,6 +1286,9 @@ impl UltraLowLatencyExecutionHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod credential_isolation_tests;
 
 #[cfg(test)]
 mod tests {

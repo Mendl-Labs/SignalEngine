@@ -468,21 +468,84 @@ fn decrypt_credential_value(encrypted: &str) -> Option<String> {
     }
 }
 
-/// Decrypted credential for use in trading
-#[derive(Debug, Clone)]
-pub struct ExchangeCredential {
-    pub id: Uuid,
-    pub exchange: String,
-    pub label: String,
-    pub api_key: String,
-    pub api_secret: String,
-    pub passphrase: Option<String>,
-    pub is_testnet: bool,
-    pub is_enabled: bool,
+pub use crate::credentials::ExchangeCredential;
+use crate::credentials::{
+    select_credential, CredentialError, CredentialProvider, TenantId,
+};
+
+// ----------------------------------------------------------------------------
+// TENANT-BLIND LOADER -- PRIVATE ON PURPOSE.
+//
+// The PUBLIC `databaseschema` `exchange_credentials` table has no `tenant_id`
+// column, so `unscoped_load_all_enabled_credentials` below cannot scope by
+// tenant: it reads every enabled row, for ALL tenants. It must never be
+// exposed. The only public way to reach it is `SingleTenantDbProvider`, which
+// is bound to exactly one tenant and refuses every other. The multi-tenant
+// (SaaS) provider is implemented OUTSIDE this public repository, against the
+// private schema that carries `tenant_id`.
+// ----------------------------------------------------------------------------
+
+/// Provider over the PUBLIC-schema `exchange_credentials` table, for
+/// **self-hosted, single-tenant** deployments only.
+///
+/// The public table carries no tenant column, so every row in it is attributed
+/// to the one tenant this provider is constructed for. To make that
+/// attribution impossible to misuse in a multi-tenant process, the provider is
+/// bound to a single [`TenantId`] and returns
+/// [`CredentialError::TenantNotServed`] for any other tenant BEFORE touching
+/// the database. Do NOT use this in a multi-tenant (SaaS) deployment; use the
+/// private-schema provider instead.
+pub struct SingleTenantDbProvider {
+    pool: Arc<DbPool>,
+    tenant: TenantId,
 }
 
-/// Load all enabled exchange credentials from the database.
-pub async fn load_exchange_credentials(
+impl SingleTenantDbProvider {
+    /// Explicitly opt in to the self-hosted single-tenant behaviour: all
+    /// enabled rows of the public `exchange_credentials` table belong to
+    /// `only_tenant`, and no other tenant is ever served.
+    pub fn self_hosted_single_tenant_only(pool: Arc<DbPool>, only_tenant: TenantId) -> Self {
+        Self { pool, tenant: only_tenant }
+    }
+
+    fn guard(&self, requested: TenantId) -> Result<(), CredentialError> {
+        if requested == self.tenant {
+            Ok(())
+        } else {
+            Err(CredentialError::TenantNotServed { requested, served: self.tenant })
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for SingleTenantDbProvider {
+    async fn credentials_for(
+        &self,
+        tenant: TenantId,
+        exchange: &str,
+        live_only: bool,
+    ) -> Result<ExchangeCredential, CredentialError> {
+        self.guard(tenant)?;
+        let all = unscoped_load_all_enabled_credentials(&self.pool)
+            .await
+            .map_err(|e| CredentialError::Backend(format!("{:#}", e)))?;
+        select_credential(&all, tenant, exchange, live_only)
+    }
+
+    async fn all_credentials_for(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<ExchangeCredential>, CredentialError> {
+        self.guard(tenant)?;
+        unscoped_load_all_enabled_credentials(&self.pool)
+            .await
+            .map_err(|e| CredentialError::Backend(format!("{:#}", e)))
+    }
+}
+
+/// Load all enabled exchange credentials from the database (ALL tenants --
+/// the public schema cannot tell them apart). Private; see the note above.
+async fn unscoped_load_all_enabled_credentials(
     pool: &DbPool,
 ) -> Result<Vec<ExchangeCredential>> {
     use databaseschema::schema::exchange_credentials;
@@ -532,70 +595,6 @@ pub async fn load_exchange_credentials(
         .collect();
 
     Ok(credentials)
-}
-
-/// Load credentials for a specific exchange.
-///
-/// `live_only: true` restricts the lookup to non-testnet credentials — REQUIRED
-/// for live deployments. Without it the first enabled row wins, and holding
-/// both sandbox and production keys for the same exchange could have live
-/// orders signed with the sandbox key (orders silently go nowhere real) or,
-/// inverted, a "sandbox" flow hit production. Paper/simulation flows may
-/// pass `false` to accept either.
-pub async fn load_credentials_for_exchange(
-    pool: &DbPool,
-    exchange: &str,
-    live_only: bool,
-) -> Result<Option<ExchangeCredential>> {
-    use databaseschema::schema::exchange_credentials;
-    use diesel_async::RunQueryDsl;
-
-    let mut conn = pool.get().await
-        .context("Failed to get database connection")?;
-
-    let mut query = exchange_credentials::table
-        .filter(exchange_credentials::exchange.eq(exchange.to_lowercase()))
-        .filter(exchange_credentials::is_enabled.eq(true))
-        .into_boxed();
-    if live_only {
-        query = query.filter(exchange_credentials::is_testnet.eq(false));
-    }
-    let query = query
-        .select((
-            exchange_credentials::id,
-            exchange_credentials::exchange,
-            exchange_credentials::label,
-            exchange_credentials::api_key_encrypted,
-            exchange_credentials::api_secret_encrypted,
-            exchange_credentials::passphrase_encrypted,
-            exchange_credentials::is_testnet,
-            exchange_credentials::is_enabled,
-        ));
-
-    let row: Option<(Uuid, String, String, String, String, Option<String>, bool, bool)> =
-        RunQueryDsl::first(query, &mut conn)
-            .await
-            .optional()
-            .context("Failed to query exchange credentials")?;
-
-    let credential = row.and_then(|(id, exchange, label, api_key_enc, api_secret_enc, passphrase_enc, is_testnet, is_enabled)| {
-        let api_key = decrypt_credential_value(&api_key_enc)?;
-        let api_secret = decrypt_credential_value(&api_secret_enc)?;
-        let passphrase = passphrase_enc.as_ref().and_then(|p| decrypt_credential_value(p));
-
-        Some(ExchangeCredential {
-            id,
-            exchange,
-            label,
-            api_key,
-            api_secret,
-            passphrase,
-            is_testnet,
-            is_enabled,
-        })
-    });
-
-    Ok(credential)
 }
 
 // ============================================================================
@@ -694,6 +693,27 @@ impl BackgroundSorWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public-schema provider is bound to ONE tenant. A request for any
+    /// other tenant must be refused before the database is touched (the pool
+    /// here points at a closed port, so reaching the DB would be a different
+    /// error, `Backend`, not `TenantNotServed`).
+    #[tokio::test]
+    async fn single_tenant_provider_refuses_a_second_tenant() {
+        let pool = create_pool("postgres://nobody:nothing@127.0.0.1:1/none").await.unwrap();
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let provider = SingleTenantDbProvider::self_hosted_single_tenant_only(Arc::new(pool), tenant_a);
+
+        let err = provider.credentials_for(tenant_b, "kraken", true).await.unwrap_err();
+        assert_eq!(err, CredentialError::TenantNotServed { requested: tenant_b, served: tenant_a });
+        let err = provider.all_credentials_for(tenant_b).await.unwrap_err();
+        assert_eq!(err, CredentialError::TenantNotServed { requested: tenant_b, served: tenant_a });
+
+        // The served tenant does reach the (unreachable) database and fails closed.
+        let err = provider.credentials_for(tenant_a, "kraken", true).await.unwrap_err();
+        assert!(matches!(err, CredentialError::Backend(_)), "got {:?}", err);
+    }
 
     #[test]
     fn test_order_side_conversion() {
