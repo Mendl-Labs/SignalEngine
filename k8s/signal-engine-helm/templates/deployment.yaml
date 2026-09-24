@@ -111,13 +111,17 @@ spec:
                   name: signalengine-db-secret
                   key: database
                   optional: true
-            # Declared credential mode (none | single_tenant), validated at render
-            # time. The runtime cross-checks it against what it can actually do
-            # (DATABASE_URL + a valid TENANT_ID) and falls back to none with an
-            # ERROR on a mismatch: live trading is never enabled by accident.
+            # Declared credential mode (none | single_tenant | multi_tenant),
+            # validated at render time. The runtime cross-checks it against what it
+            # can actually do (single_tenant: DATABASE_URL + a valid TENANT_ID;
+            # multi_tenant: DATABASE_URL, CREDENTIALS_ENCRYPTION_KEY and a private
+            # schema with exchange_credentials.tenant_id) and falls back to none with
+            # an ERROR on a mismatch: live trading is never enabled by accident.
             - name: CREDENTIAL_MODE
               value: {{ include "signal-engine-helm.credentialMode" . | quote }}
-            # Tenant served by credentialMode=single_tenant (unused for none)
+            # Tenant served by credentialMode=single_tenant (unused for none; must be
+            # empty, and is never read, for multi_tenant: each deployment's own tenant
+            # is used)
             - name: TENANT_ID
               valueFrom:
                 configMapKeyRef:

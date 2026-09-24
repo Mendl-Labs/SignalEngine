@@ -527,13 +527,15 @@ pub struct HostedObject {
     strategy_manager: Option<StrategyManager>,
     // Phase 2: Ultra-fast order management (853x faster)
     ultra_order_manager: Option<Arc<SignalEngineUltraOrderManager>>,
-    /// Where exchange credentials come from. A caller MAY inject a provider
-    /// (no multi-tenant provider or host binary that does so exists today).
+    /// Where exchange credentials come from. A caller MAY inject a provider.
     /// When left unset, a `postgres` build falls back to the public-schema
     /// `SingleTenantDbProvider` bound to the `TENANT_ID` env var -- serving
     /// that ONE tenant only -- and with no valid `TENANT_ID` there is no
     /// provider at all: credential mode `none`, live trading disabled, every
-    /// live deployment rejected loudly (fail closed). See `CredentialMode`.
+    /// live deployment rejected loudly (fail closed). The private-schema
+    /// `MultiTenantDbProvider` is used ONLY when the deployment declares
+    /// `CREDENTIAL_MODE=multi_tenant` (never implicitly), and then each live
+    /// deployment is served with its own tenant's credential. See `CredentialMode`.
     credential_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
 }
 
@@ -567,16 +569,21 @@ impl HostedObject {
 /// `Injected` -> the injected provider; `SingleTenant(t)` -> the public-schema
 /// provider bound to `t` (it serves that ONE tenant only); `None` -> no
 /// provider, so no credential can be resolved for any tenant (live trading is
-/// disabled and every live deployment is rejected loudly).
+/// disabled and every live deployment is rejected loudly); `MultiTenant` -> the
+/// already-verified `multi_tenant` provider built at startup (see
+/// [`build_multi_tenant_provider`]), or NO provider if there is none: it never
+/// degrades into the single-tenant provider or an injected one.
 #[cfg(feature = "postgres")]
 fn effective_credential_provider(
     injected: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
     pool: Option<&Arc<smartorderrouter::DbPool>>,
     mode: CredentialMode,
+    multi_tenant: Option<&Arc<dyn smartorderrouter::CredentialProvider>>,
 ) -> Option<Arc<dyn smartorderrouter::CredentialProvider>> {
     match mode {
         CredentialMode::None => None,
         CredentialMode::Injected => injected,
+        CredentialMode::MultiTenant => multi_tenant.cloned(),
         CredentialMode::SingleTenant(tenant_id) => {
             let pool = pool?;
             Some(Arc::new(smartorderrouter::SingleTenantDbProvider::self_hosted_single_tenant_only(
@@ -602,7 +609,15 @@ fn startup_credential_mode(injected_provider: bool) -> CredentialMode {
         tenant_id.as_deref(),
     );
     let declared = env::var("CREDENTIAL_MODE").ok();
-    let resolved = executionhandler::resolve_credential_mode(computed, declared.as_deref());
+    // multi_tenant is offered only when declared; these are the prerequisites
+    // that can be checked without a database round trip (the schema check
+    // follows in `build_multi_tenant_provider`).
+    let multi_tenant = executionhandler::MultiTenantPrerequisites {
+        database_url_set: database_url.as_deref().map(|u| !u.trim().is_empty()).unwrap_or(false),
+        encryption_key_ok: smartorderrouter::multi_tenant_encryption_key_status().is_ok(),
+    };
+    let resolved =
+        executionhandler::resolve_credential_mode_with(computed, declared.as_deref(), multi_tenant);
     if let Some(err) = &resolved.error {
         ultra_error!(format!("❌ {}", err));
     }
@@ -617,6 +632,45 @@ fn startup_credential_mode(injected_provider: bool) -> CredentialMode {
     }
     executionhandler::publish_credential_mode(resolved.mode);
     resolved.mode
+}
+
+/// For credential mode `multi_tenant`: connect, verify that `exchange_credentials`
+/// is tenant-scoped (has a `tenant_id` column) and build the
+/// `MultiTenantDbProvider`. FAILS CLOSED: on any error the mode is downgraded
+/// to `none` (ERROR logged, `/health` and `/metrics` say `none`) and there is no
+/// provider, so every live deployment is rejected; paper trading is unaffected.
+/// For every other mode this is a no-op.
+#[cfg(feature = "postgres")]
+async fn build_multi_tenant_provider(
+    mode: CredentialMode,
+) -> (CredentialMode, Option<Arc<dyn smartorderrouter::CredentialProvider>>) {
+    if mode != CredentialMode::MultiTenant {
+        return (mode, None);
+    }
+    let built: Result<Arc<dyn smartorderrouter::CredentialProvider>, String> = async {
+        let database_url = DeploymentSubscriber::database_url_from_env()
+            .ok_or_else(|| "DATABASE_URL is not set".to_string())?;
+        let pool = smartorderrouter::create_pool(&database_url)
+            .await
+            .map_err(|e| format!("could not create the database pool: {:#}", e))?;
+        let provider = smartorderrouter::MultiTenantDbProvider::new(Arc::new(pool))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Arc::new(provider) as Arc<dyn smartorderrouter::CredentialProvider>)
+    }
+    .await;
+    match built {
+        Ok(provider) => (CredentialMode::MultiTenant, Some(provider)),
+        Err(why) => {
+            ultra_error!(format!(
+                "❌ CREDENTIAL_MODE=multi_tenant refused: {}. Treating credential mode as none: \
+                 live trading DISABLED.",
+                why
+            ));
+            executionhandler::publish_credential_mode(CredentialMode::None);
+            (CredentialMode::None, None)
+        }
+    }
 }
 
 /// Everything needed to reject a LIVE deployment loudly (see
@@ -676,6 +730,7 @@ impl HostedObject {
         #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         injected_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
         #[cfg(feature = "postgres")] credential_mode: CredentialMode,
+        #[cfg(feature = "postgres")] multi_tenant_provider: Option<Arc<dyn smartorderrouter::CredentialProvider>>,
     ) -> Result<(DataHandler, PortfolioHandler, StrategyManager, UltraLowLatencyExecutionHandler, Config), Box<dyn Error>> {
         // Load environment variables
         dotenv().ok();
@@ -704,7 +759,12 @@ impl HostedObject {
         // Load exchange credentials from database (stored via Settings UI)
         // ======================================================================
         #[cfg(feature = "postgres")]
-        if let Ok(database_url) = env::var("DATABASE_URL") {
+        if credential_mode == CredentialMode::MultiTenant {
+            // No process-wide tenant in this mode: nothing is loaded here, and
+            // TENANT_ID is never read. Each live deployment loads ITS OWN
+            // tenant's credential when it is deployed.
+            ultra_info!("ℹ️ credential mode multi_tenant: no startup credential load (credentials are resolved per deployment, for that deployment's own tenant)");
+        } else if let Ok(database_url) = env::var("DATABASE_URL") {
             if let Ok(tenant_id_str) = env::var("TENANT_ID") {
                 if let Ok(tenant_id) = uuid::Uuid::parse_str(&tenant_id_str) {
                     match smartorderrouter::database::create_pool(&database_url).await {
@@ -713,7 +773,7 @@ impl HostedObject {
                             // fallback is the single-tenant public-schema
                             // provider bound to THIS process's TENANT_ID.
                             let pool = Arc::new(pool);
-                            match effective_credential_provider(injected_provider.clone(), Some(&pool), credential_mode) {
+                            match effective_credential_provider(injected_provider.clone(), Some(&pool), credential_mode, multi_tenant_provider.as_ref()) {
                                 Some(provider) => {
                                     match execution_handler.initialize_from_provider(provider.as_ref(), tenant_id).await {
                                         Ok(count) => {
@@ -879,7 +939,8 @@ impl HostedObject {
         // resolve a credential (postgres builds only: without a database
         // there is no tenant credential store to describe).
         #[cfg(feature = "postgres")]
-        let credential_mode = startup_credential_mode(self.credential_provider.is_some());
+        let (credential_mode, multi_tenant_provider) =
+            build_multi_tenant_provider(startup_credential_mode(self.credential_provider.is_some())).await;
         #[cfg(not(feature = "postgres"))]
         ultra_info!("ℹ️ credential mode not applicable: built without the postgres feature (exchange credentials come from YAML only)");
 
@@ -888,6 +949,8 @@ impl HostedObject {
             self.credential_provider.clone(),
             #[cfg(feature = "postgres")]
             credential_mode,
+            #[cfg(feature = "postgres")]
+            multi_tenant_provider.clone(),
         ).await?;
 
         // Capture the market-data receiver BEFORE the datahandler is moved into
@@ -1426,7 +1489,12 @@ impl HostedObject {
         // tenant the provider does not serve is rejected below (fail closed).
         #[cfg(feature = "postgres")]
         let deploy_credential_provider =
-            effective_credential_provider(self.credential_provider.clone(), deploy_db_pool.as_ref(), credential_mode);
+            effective_credential_provider(
+                self.credential_provider.clone(),
+                deploy_db_pool.as_ref(),
+                credential_mode,
+                multi_tenant_provider.as_ref(),
+            );
         // For exchanges whose fills don't reliably land within
         // `check_order_fill`'s short poll window (Alpaca; see its
         // `subscribe_to_updates`), this is how a WebSocket-confirmed fill
@@ -2322,5 +2390,93 @@ mod tests {
         let venues: Vec<String> = vec![];
         let symbols = vec!["BTC/USD".to_string()];
         assert_eq!(match_deployment_venue(&venues, &symbols, "BTC/USD", "kraken"), None);
+    }
+
+    // --- credential provider selection (multi_tenant is opt-in, never a fallback) ---
+
+    #[cfg(feature = "postgres")]
+    mod credential_selection {
+        use super::*;
+        use smartorderrouter::{CredentialProvider, StaticCredentialProvider};
+
+        fn provider() -> Arc<dyn CredentialProvider> {
+            Arc::new(StaticCredentialProvider::new())
+        }
+
+        async fn pool() -> Arc<smartorderrouter::DbPool> {
+            // Lazily connected: never dialled by these tests.
+            Arc::new(smartorderrouter::create_pool("postgres://nobody:nothing@127.0.0.1:1/none").await.unwrap())
+        }
+
+        #[tokio::test]
+        async fn multi_tenant_mode_uses_only_the_verified_multi_tenant_provider() {
+            let pool = pool().await;
+            let mt = provider();
+            let got = effective_credential_provider(None, Some(&pool), CredentialMode::MultiTenant, Some(&mt))
+                .expect("provider");
+            assert!(Arc::ptr_eq(&got, &mt), "the verified provider itself is used");
+        }
+
+        /// multi_tenant without a verified provider is NO provider: it must not
+        /// fall back to the single-tenant provider (which needs TENANT_ID), nor
+        /// to an injected one.
+        #[tokio::test]
+        async fn multi_tenant_mode_never_degrades_into_another_provider() {
+            let pool = pool().await;
+            let injected = provider();
+            assert!(effective_credential_provider(None, Some(&pool), CredentialMode::MultiTenant, None).is_none());
+            assert!(effective_credential_provider(
+                Some(injected),
+                Some(&pool),
+                CredentialMode::MultiTenant,
+                None
+            )
+            .is_none());
+        }
+
+        #[tokio::test]
+        async fn other_modes_never_use_the_multi_tenant_provider() {
+            let pool = pool().await;
+            let mt = provider();
+            let injected = provider();
+            assert!(effective_credential_provider(None, Some(&pool), CredentialMode::None, Some(&mt)).is_none());
+            let single = effective_credential_provider(
+                None,
+                Some(&pool),
+                CredentialMode::SingleTenant(uuid::Uuid::new_v4()),
+                Some(&mt),
+            )
+            .expect("single-tenant provider");
+            assert!(!Arc::ptr_eq(&single, &mt));
+            let inj = effective_credential_provider(
+                Some(injected.clone()),
+                Some(&pool),
+                CredentialMode::Injected,
+                Some(&mt),
+            )
+            .expect("injected");
+            assert!(Arc::ptr_eq(&inj, &injected));
+        }
+
+        /// multi_tenant declared but the database cannot be verified: the mode is
+        /// downgraded to none and there is no provider (fail closed).
+        #[tokio::test]
+        async fn multi_tenant_that_cannot_be_verified_downgrades_to_none() {
+            std::env::set_var("DATABASE_URL", "postgres://nobody:nothing@127.0.0.1:1/none");
+            std::env::set_var("CREDENTIALS_ENCRYPTION_KEY", "11".repeat(32));
+            let (mode, provider) = build_multi_tenant_provider(CredentialMode::MultiTenant).await;
+            assert_eq!(mode, CredentialMode::None);
+            assert!(provider.is_none());
+        }
+
+        /// Not multi_tenant => nothing to build (no database is touched).
+        #[tokio::test]
+        async fn build_multi_tenant_provider_is_a_noop_for_other_modes() {
+            for mode in [CredentialMode::None, CredentialMode::Injected, CredentialMode::SingleTenant(uuid::Uuid::new_v4())] {
+                let (m, p) = build_multi_tenant_provider(mode).await;
+                assert_eq!(m, mode);
+                assert!(p.is_none());
+            }
+        }
     }
 }

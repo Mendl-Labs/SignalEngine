@@ -434,7 +434,7 @@ fn convert_route_status(status: RouteStatus) -> OrderStatus {
 ///
 /// Returns `None` (and logs a warning) for any decode/decrypt failure so the
 /// engine can keep running rather than crashing on one bad row.
-fn decrypt_credential_value(encrypted: &str) -> Option<String> {
+pub(crate) fn decrypt_credential_value(encrypted: &str) -> Option<String> {
     if let Some(encoded) = encrypted.strip_prefix("aes:") {
         use aes_gcm::{Aes256Gcm, Key, Nonce};
         use aes_gcm::aead::{Aead, KeyInit};
@@ -481,8 +481,10 @@ use crate::credentials::{
 // tenant: it reads every enabled row, for ALL tenants. It must never be
 // exposed. The only public way to reach it is `SingleTenantDbProvider`, which
 // is bound to exactly one tenant and refuses every other. The multi-tenant
-// (SaaS) provider does not exist yet (it would need a schema that carries
-// `tenant_id`); until it does, multi-tenant live trading is disabled.
+// (SaaS) provider is `crate::tenant_provider::MultiTenantDbProvider`: it does
+// NOT use this loader (it needs a schema that carries `tenant_id` and queries
+// it with the tenant as a bound parameter); it is opt-in via
+// `CREDENTIAL_MODE=multi_tenant`.
 // ----------------------------------------------------------------------------
 
 /// Provider over the PUBLIC-schema `exchange_credentials` table, for
