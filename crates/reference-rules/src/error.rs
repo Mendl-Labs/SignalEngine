@@ -93,6 +93,16 @@ pub enum RuleError {
     },
     /// The panel has no completed month (no bar from a later month than its first month).
     NoCompletedMonth { symbol: String },
+    /// FX momentum: a pair's sample standard deviation of its last 60 daily returns is zero or not finite, so its
+    /// volatility-scaled size `sign / sigma` is undefined (the reference tool would emit inf/NaN weights).
+    ZeroVolatility { symbol: String },
+    /// FX momentum: the joint volatility scale of the sleeve cannot be formed (see `fx_joint_vol_scale`): the
+    /// sleeve's return series has zero or non-finite volatility (for example every pair has sign 0), or the inputs
+    /// are malformed. `reason` says which.
+    DegenerateSleeveVolatility { reason: &'static str },
+    /// A computed quantity is NaN or infinite (for example a daily return that overflows); no guess is made.
+    /// `symbol` is a pair, or a label such as `FX_JOINT_CALENDAR` when the quantity belongs to no single pair.
+    NonFiniteValue { symbol: String, what: &'static str },
 }
 
 impl fmt::Display for RuleError {
