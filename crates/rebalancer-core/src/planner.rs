@@ -17,9 +17,11 @@
 //!   value as the denominator of its percentage limits, so plan and guard agree.
 //!
 //! Instruments the sleeves do not name are left alone (unmanaged), though they still count in the guard's exposure
-//! sums. A pre-existing short is never touched (skipped with a reason).
+//! sums (so the guard can deny an order for exposure the sleeves do not manage, even when the planner's own gross
+//! check on the targets passed). A pre-existing short is never touched (skipped with a reason), unless a signed
+//! sleeve manages that instrument (see the last section).
 //!
-//! # Trade rules
+//! # Trade rules (long-only, the default)
 //! * `delta = target - held * price`. Trades with `|delta| < min_trade_abs`, or `|delta| < min_trade_pct * target`
 //!   (`* current` when the target is zero), are dropped (recorded in `skipped`).
 //! * Sizes are `floor(|delta| / price)` then rounded DOWN by the venue rules. A full exit (target zero) sells the
@@ -34,6 +36,33 @@
 //! * Every order goes through [`PreTradeGuard::check`] against a running simulation of the account (positions,
 //!   cash, day counters updated by each accepted order). Denied orders are dropped and recorded with their reasons.
 //!   The planner never clamps an order to make it pass.
+//!
+//! # Signed sleeves (shorts and gross above 1x): OPT-IN, default OFF
+//! Everything above describes the default, long-only unit-weight behaviour, which is unchanged byte for byte (see
+//! `tests/long_only_golden.rs`). A sleeve is SIGNED only when the caller says so explicitly, per sleeve, with
+//! [`PlanConfig::with_signed_sleeve`]; nothing is inferred from a weight's sign. For a signed sleeve:
+//! * the `[0, 1]` weight and `sum <= 1` rules are replaced by `|weight| <= max_abs_weight`, with `max_abs_weight`
+//!   in `(0, MAX_ABS_WEIGHT_CAP]` chosen by the caller ([`MAX_ABS_WEIGHT_CAP`] documents why 3). Weights are signed
+//!   fractions of the sleeve's capital; a negative target is a short. Share rules (each in (0, 1], sum <= 1) apply
+//!   to every sleeve. Targets are rounded toward ZERO (a short is never made bigger by rounding).
+//! * the planner refuses the whole plan ([`PlanError::GrossAboveCap`]) when the sum of `|target|` exceeds
+//!   `max_gross * capital_base`, and ([`PlanError::BuyingPowerRequired`]) when the targets need margin (any short,
+//!   or gross above the broker's equity) and the caller gave no `buying_power`. Whether shorting and leverage are
+//!   PERMITTED is the guard's call, not the planner's: those orders are denied with `SHORTING_FORBIDDEN` /
+//!   `LEVERAGE_FORBIDDEN` and recorded in `denied`.
+//! * `delta = target - held * price` is signed. A trade that moves toward zero is a REDUCTION (a sell of a long, a
+//!   buy that covers a short); one that moves away is an INCREASE. Reductions are ordered first, increases second,
+//!   each by (venue, symbol): risk is taken off before it is added, on any book.
+//! * A trade that CROSSES zero is always two orders, never one: a close leg (reduction, sized to exactly the held
+//!   quantity) and an open leg (increase, sized to `|target|` plus whatever the venue's rounding left of the old
+//!   position, so the final position never exceeds the target). See [`client_tag`] for their tags. The open leg
+//!   is only attempted when the close leg was accepted; if the venue refuses the open leg the account is left flat
+//!   (on a whole-share venue: holding only the dust the close leg could not sell).
+//! * A held short is no longer skipped (`ShortPositionHeld` remains for long-only instruments).
+//! * Increases are limited by the caller's `buying_power` (the broker's own number), not by cash: see
+//!   [`PlanConfig::buying_power`]. Without it (a plan that needs no margin) the plain cash rule above applies.
+//! * Each order carries `uses_margin`, derived from the account state by [`crate::guard::margin_use`], and the
+//!   guard is called through [`PreTradeGuard::check_margin`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,10 +74,25 @@ use sha2::{Digest, Sha256};
 
 use crate::dec_math::{abs, add, div_floor, mul, neg, ratio_to_dec, sub, sum, MathError, RatioRound};
 use crate::guard::{
-    AccountView, DayCounters, Denial, Position, PreTradeGuard, PricePoint, ProposedOrder,
+    margin_use, AccountView, DayCounters, Denial, MarginContext, Position, PreTradeGuard, PricePoint, ProposedOrder,
 };
 use crate::policy::Policy;
 use crate::venue::{SizeRefusal, VenueRuleBook};
+
+/// Hard ceiling on a signed sleeve's `max_abs_weight`. The reference FX rule clips every weight to +-3 AFTER its
+/// volatility scaling (and its observed maximum was 1.87), so a per-instrument weight above 3 is not a
+/// reproduction of any documented rule; it would only be a typo or a runaway scale. The mandate's own gross and
+/// leverage caps still bind on top of this, so this constant is a sanity ceiling on the INPUT, never a permission.
+pub const MAX_ABS_WEIGHT_CAP: i64 = 3;
+
+/// How a sleeve's weights are bounded. The default for every sleeve is [`WeightBounds::LongOnlyUnit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightBounds {
+    /// Today's rules: each weight in `[0, 1]`, weights summing to at most 1. Shorts and leverage are impossible.
+    LongOnlyUnit,
+    /// Signed: each weight `|w| <= max_abs_weight` (finite, positive, at most [`MAX_ABS_WEIGHT_CAP`]); no sum rule.
+    Signed { max_abs_weight: Dec },
+}
 
 /// One sleeve's target: which instruments, at what fraction of the sleeve, on which venue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +109,8 @@ pub struct SleeveTarget {
 pub struct TargetWeight {
     /// Tradable symbol on the venue (`SPY`, `BTC/USD`).
     pub symbol: String,
-    /// Fraction of the SLEEVE, in [0, 1].
+    /// Fraction of the SLEEVE: in [0, 1] for a long-only sleeve; signed, `|w| <= max_abs_weight`, for a signed one
+    /// (see [`PlanConfig::with_signed_sleeve`]).
     pub weight: Dec,
 }
 
@@ -122,6 +167,22 @@ pub struct PlanConfig {
     pub credit_sell_proceeds: bool,
     /// Orders already placed / turnover already traded today.
     pub day: DayCounters,
+    /// Sleeves that have opted in to signed weights, by (trimmed) sleeve id, with their `max_abs_weight`. EMPTY by
+    /// default: every sleeve is long-only. Set with [`PlanConfig::with_signed_sleeve`].
+    pub signed_sleeves: BTreeMap<String, Dec>,
+    /// The broker's own buying power, in the account currency, as of the account snapshot: the total notional of
+    /// exposure-INCREASING orders (buys that add long, sells that add short) the broker would accept now, i.e. what
+    /// is left after the margin the current positions already use (Alpaca `buying_power`; OANDA
+    /// margin-available / margin-rate). It is NOT `cash` and NOT `equity - gross`: only the broker can compute it,
+    /// which is why the planner takes it as an input instead of inventing a margin model.
+    ///
+    /// Used only by a plan with a signed sleeve. Required when that plan needs margin (a short target, or target
+    /// gross above the account's equity): its absence is [`PlanError::BuyingPowerRequired`]. When given, it
+    /// REPLACES cash as the budget of the increasing orders (`credit_sell_proceeds` is then ignored): the budget
+    /// is `buying_power - reserve`, the same reserve fraction of the capital base, and reductions are NOT credited
+    /// back (the figure is a snapshot; crediting a reduction would need the broker's margin numbers). A book that
+    /// is fully levered therefore rotates over two runs, never by borrowing against sells not yet filled.
+    pub buying_power: Option<Dec>,
 }
 
 impl PlanConfig {
@@ -134,6 +195,24 @@ impl PlanConfig {
             fee_rate,
             credit_sell_proceeds: true,
             day: DayCounters::ZERO,
+            signed_sleeves: BTreeMap::new(),
+            buying_power: None,
+        }
+    }
+
+    /// Opt ONE sleeve in to signed weights, `|weight| <= max_abs_weight`. Explicit and per sleeve; a sleeve never
+    /// named here keeps the long-only unit rules. Validated by the planner (unknown sleeve id, or a bound that is
+    /// not in `(0, MAX_ABS_WEIGHT_CAP]`, is an error).
+    pub fn with_signed_sleeve(mut self, sleeve: &str, max_abs_weight: Dec) -> Self {
+        self.signed_sleeves.insert(sleeve.trim().to_string(), max_abs_weight);
+        self
+    }
+
+    /// The bounds that apply to a sleeve.
+    pub fn bounds_for(&self, sleeve: &str) -> WeightBounds {
+        match self.signed_sleeves.get(sleeve.trim()) {
+            Some(m) => WeightBounds::Signed { max_abs_weight: *m },
+            None => WeightBounds::LongOnlyUnit,
         }
     }
 }
@@ -172,8 +251,10 @@ pub enum SkipReason {
     VenueRefused(SizeRefusal),
     /// The buy did not fit the cash left after the reserve and fees; scaled down, it fell below the venue minimum.
     CutBelowVenueMinimum,
-    /// No cash above the reserve.
+    /// No cash above the reserve (in a margin plan: no buying power above the reserve).
     NoCashAvailable,
+    /// The open leg of a trade that crosses zero was not attempted because its close leg was not accepted.
+    FlipCloseLegNotPlaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +288,40 @@ pub struct OrderPlan {
     pub denied: Vec<DeniedOrder>,
     pub skipped: Vec<SkippedTrade>,
     pub lines: Vec<InstrumentLine>,
+    /// Margin facts of the plan; all zero/false for a plan with no signed sleeve.
+    pub margin: MarginReport,
+}
+
+/// What the planner derived about margin. `uses_margin` is DATA here (and on every guarded order), not a constant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarginReport {
+    /// True when the plan had at least one signed sleeve (so the margin-aware paths ran).
+    pub signed: bool,
+    /// The TARGETS need margin: a short target, or projected gross above the broker's equity.
+    pub needs_margin: bool,
+    pub buying_power: Option<Dec>,
+    /// Buying power left after the accepted increasing orders (`None` when none was supplied).
+    pub buying_power_left: Option<Dec>,
+    /// Sum of `|target|` over the managed instruments.
+    pub target_gross: Dec,
+    /// `target_gross` plus the current value of every position the sleeves do not manage.
+    pub projected_gross: Dec,
+    /// Tags of the ACCEPTED orders that use margin.
+    pub margin_order_tags: Vec<String>,
+}
+
+impl MarginReport {
+    fn long_only() -> Self {
+        Self {
+            signed: false,
+            needs_margin: false,
+            buying_power: None,
+            buying_power_left: None,
+            target_gross: Dec::ZERO,
+            projected_gross: Dec::ZERO,
+            margin_order_tags: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,6 +350,16 @@ pub enum PlanError {
     VenueRoundedUp { symbol: String, wished: Dec, returned: Dec },
     #[error("two orders got the same tag {0}")]
     DuplicateTag(String),
+    #[error("signed sleeve {0:?} does not name any target sleeve")]
+    UnknownSignedSleeve(String),
+    #[error("signed sleeve {sleeve:?}: max_abs_weight {max} must be in (0, {cap}]", cap = MAX_ABS_WEIGHT_CAP)]
+    BadMaxAbsWeight { sleeve: String, max: Dec },
+    #[error("sleeve {sleeve:?}: |weight| of {symbol} exceeds the sleeve's max_abs_weight {max}")]
+    BadSignedWeight { sleeve: String, symbol: String, max: Dec },
+    #[error("the targets need margin (a short, or gross {gross} above equity) and no buying_power was supplied")]
+    BuyingPowerRequired { gross: Dec },
+    #[error("target gross {gross} exceeds the mandate's gross cap {cap}")]
+    GrossAboveCap { gross: Dec, cap: Dec },
     #[error(transparent)]
     Math(#[from] MathError),
 }
@@ -244,9 +369,23 @@ pub struct OrderPlanner;
 /// Deterministic client tag: `rb1:<scheduled UTC>:<symbol>:<side>:<20 hex of SHA-256>`, where the hash covers the
 /// full identity `rebalance:{account}:{scheduled_for}:{sleeve}:{symbol}:{side}`. The hash makes it unique even when
 /// the readable parts are shortened, and it stays well under Alpaca's 128 character limit.
+///
+/// A trade that crosses zero has two legs on the SAME side (a long-to-short flip is a sell to close then a sell to
+/// open). The close leg's identity gets a `:close` suffix (see [`client_tag_close_leg`]); the opening leg keeps the
+/// plain identity, so re-planning after only the close leg filled produces the very tag the open leg already had
+/// (same intent, same tag, never a second order).
 pub fn client_tag(account: &str, scheduled_for: DateTime<Utc>, sleeve: &str, symbol: &str, side: Side) -> String {
+    tag_with(account, scheduled_for, sleeve, symbol, side, "")
+}
+
+/// The tag of the close leg of a trade that crosses zero: [`client_tag`] with a `:close` identity suffix.
+pub fn client_tag_close_leg(account: &str, scheduled_for: DateTime<Utc>, sleeve: &str, symbol: &str, side: Side) -> String {
+    tag_with(account, scheduled_for, sleeve, symbol, side, ":close")
+}
+
+fn tag_with(account: &str, scheduled_for: DateTime<Utc>, sleeve: &str, symbol: &str, side: Side, suffix: &str) -> String {
     let sched = scheduled_for.format("%Y%m%dT%H%M%SZ").to_string();
-    let identity = format!("rebalance:{account}:{sched}:{sleeve}:{symbol}:{}", side.as_str());
+    let identity = format!("rebalance:{account}:{sched}:{sleeve}:{symbol}:{}{suffix}", side.as_str());
     let hash = hex::encode(Sha256::digest(identity.as_bytes()));
     let readable: String = symbol.chars().filter(char::is_ascii_alphanumeric).take(10).collect::<String>().to_uppercase();
     format!("rb1:{sched}:{readable}:{}:{}", side.as_str(), &hash[..20])
@@ -259,6 +398,8 @@ struct Managed {
     sleeves: BTreeSet<String>,
     /// Sum over sleeves of share * weight, exact.
     weight: Dec,
+    /// True when at least one sleeve that names this instrument is signed.
+    signed: bool,
 }
 
 impl Managed {
@@ -267,11 +408,24 @@ impl Managed {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// The whole trade, in one order.
+    Whole,
+    /// First order of a trade that crosses zero: closes the held position exactly.
+    Close,
+    /// Second order of a trade that crosses zero: opens the position on the other side.
+    Open,
+}
+
 struct Candidate<'a> {
     m: &'a Managed,
     side: Side,
     qty: Dec,
     price: PricePoint,
+    /// Moves the position toward zero (a sell of a long, a buy that covers a short). Everything else adds exposure.
+    reducing: bool,
+    leg: Leg,
 }
 
 fn one() -> Dec {
@@ -306,6 +460,18 @@ fn validate(targets: &[SleeveTarget], account: &AccountView, cfg: &PlanConfig) -
     if !account.equity.is_positive() {
         return Err(PlanError::EquityInvalid(account.equity));
     }
+    if cfg.buying_power.is_some_and(|bp| bp.is_negative()) {
+        return Err(PlanError::BadParam("buying_power must not be negative"));
+    }
+    let hard_cap = Dec::from_i64(MAX_ABS_WEIGHT_CAP);
+    for (id, max) in &cfg.signed_sleeves {
+        if !targets.iter().any(|t| t.sleeve.trim() == id) {
+            return Err(PlanError::UnknownSignedSleeve(id.clone()));
+        }
+        if *max <= Dec::ZERO || *max > hard_cap {
+            return Err(PlanError::BadMaxAbsWeight { sleeve: id.clone(), max: *max });
+        }
+    }
     let mut seen = BTreeSet::new();
     let mut total_share = Dec::ZERO;
     for t in targets {
@@ -318,16 +484,26 @@ fn validate(targets: &[SleeveTarget], account: &AccountView, cfg: &PlanConfig) -
         total_share = add(total_share, t.share)?;
         let mut symbols = BTreeSet::new();
         let mut total_weight = Dec::ZERO;
+        let bounds = cfg.bounds_for(&t.sleeve);
         for w in &t.weights {
-            if w.weight.is_negative() || w.weight > one() {
-                return Err(PlanError::BadWeight { sleeve: t.sleeve.clone(), symbol: w.symbol.clone() });
+            match bounds {
+                WeightBounds::LongOnlyUnit => {
+                    if w.weight.is_negative() || w.weight > one() {
+                        return Err(PlanError::BadWeight { sleeve: t.sleeve.clone(), symbol: w.symbol.clone() });
+                    }
+                }
+                WeightBounds::Signed { max_abs_weight } => {
+                    if abs(w.weight)? > max_abs_weight {
+                        return Err(PlanError::BadSignedWeight { sleeve: t.sleeve.clone(), symbol: w.symbol.clone(), max: max_abs_weight });
+                    }
+                }
             }
             if !symbols.insert(key(&w.symbol)) {
                 return Err(PlanError::DuplicateWeight { sleeve: t.sleeve.clone(), symbol: w.symbol.clone() });
             }
             total_weight = add(total_weight, w.weight)?;
         }
-        if total_weight > one() {
+        if bounds == WeightBounds::LongOnlyUnit && total_weight > one() {
             return Err(PlanError::WeightsExceedOne(t.sleeve.clone()));
         }
     }
@@ -337,9 +513,10 @@ fn validate(targets: &[SleeveTarget], account: &AccountView, cfg: &PlanConfig) -
     Ok(())
 }
 
-fn aggregate(targets: &[SleeveTarget]) -> Result<BTreeMap<String, Managed>, PlanError> {
+fn aggregate(targets: &[SleeveTarget], cfg: &PlanConfig) -> Result<BTreeMap<String, Managed>, PlanError> {
     let mut map: BTreeMap<String, Managed> = BTreeMap::new();
     for t in targets {
+        let signed = cfg.bounds_for(&t.sleeve) != WeightBounds::LongOnlyUnit;
         for w in &t.weights {
             let k = key(&w.symbol);
             let contribution = mul(t.share, w.weight)?;
@@ -351,6 +528,7 @@ fn aggregate(targets: &[SleeveTarget]) -> Result<BTreeMap<String, Managed>, Plan
                         return Err(PlanError::InstrumentConflict(k));
                     }
                     m.weight = add(m.weight, contribution)?;
+                    m.signed |= signed;
                     m.sleeves.insert(t.sleeve.trim().to_string());
                 }
                 None => {
@@ -362,6 +540,7 @@ fn aggregate(targets: &[SleeveTarget]) -> Result<BTreeMap<String, Managed>, Plan
                             asset_class: class,
                             sleeves: BTreeSet::from([t.sleeve.trim().to_string()]),
                             weight: contribution,
+                            signed,
                         },
                     );
                 }
@@ -369,6 +548,17 @@ fn aggregate(targets: &[SleeveTarget]) -> Result<BTreeMap<String, Managed>, Plan
         }
     }
     Ok(map)
+}
+
+/// Round a target notional to 8 decimals TOWARD ZERO: for a long that is the crate's usual floor, for a short it
+/// keeps the short from being made bigger by rounding (a plain floor would round it away from zero).
+fn round_toward_zero(v: Dec) -> Result<Dec, MathError> {
+    let down = |x: Dec| x.round_dp(8, Rounding::Floor).map_err(|_| MathError::Overflow);
+    if v.is_negative() {
+        neg(down(abs(v)?)?)
+    } else {
+        down(v)
+    }
 }
 
 /// Apply an accepted order to the simulated account and the day counters.
@@ -407,8 +597,10 @@ impl OrderPlanner {
         cfg: &PlanConfig,
     ) -> Result<OrderPlan, PlanError> {
         validate(targets, account, cfg)?;
-        let managed = aggregate(targets)?;
+        let managed = aggregate(targets, cfg)?;
         let prices: BTreeMap<String, PricePoint> = prices.iter().map(|(k, v)| (key(k), *v)).collect();
+        // Any signed sleeve at all switches the margin-aware paths on for the whole plan (account-level facts).
+        let signed_plan = !cfg.signed_sleeves.is_empty();
 
         let equity = account.equity;
         // The same capital base the guard uses as the denominator of its percentage limits.
@@ -425,8 +617,10 @@ impl OrderPlanner {
 
         let mut lines = Vec::new();
         let mut skipped = Vec::new();
-        let mut sells: Vec<Candidate<'_>> = Vec::new();
-        let mut buys: Vec<Candidate<'_>> = Vec::new();
+        // Reductions (toward zero) go first, increases second. For a long-only plan these are exactly the sells and
+        // the buys.
+        let mut reducers: Vec<Candidate<'_>> = Vec::new();
+        let mut increasers: Vec<Candidate<'_>> = Vec::new();
 
         for m in managed.values() {
             let skip = |reason: SkipReason| SkippedTrade { symbol: m.symbol.clone(), sleeve: m.sleeve_label(), reason };
@@ -439,14 +633,12 @@ impl OrderPlanner {
                 continue;
             };
             let held = account.position(&m.symbol).map_or(Dec::ZERO, |p| p.quantity);
-            if held.is_negative() {
+            if held.is_negative() && !m.signed {
                 skipped.push(skip(SkipReason::ShortPositionHeld));
                 continue;
             }
             let current = mul(held, price.price)?;
-            let target = mul(mul(capital_base, m.weight)?, cfg.risk_scale)?
-                .round_dp(8, Rounding::Floor)
-                .map_err(|_| MathError::Overflow)?;
+            let target = round_toward_zero(mul(mul(capital_base, m.weight)?, cfg.risk_scale)?)?;
             lines.push(InstrumentLine {
                 symbol: m.symbol.clone(),
                 sleeve: m.sleeve_label(),
@@ -463,46 +655,118 @@ impl OrderPlanner {
                 skipped.push(skip(SkipReason::BelowMinTradeAbs { delta: abs_delta, min: cfg.min_trade_abs }));
                 continue;
             }
-            let reference = if target.is_positive() { target } else { current };
+            let reference = if target.is_zero() { abs(current)? } else { abs(target)? };
             let pct_min = mul(cfg.min_trade_pct, reference)?;
             if abs_delta < pct_min {
                 skipped.push(skip(SkipReason::BelowMinTradePct { delta: abs_delta, min: pct_min }));
                 continue;
             }
-            let (side, wished) = if delta.is_positive() {
-                (Side::Buy, div_floor(abs_delta, price.price, 18)?)
-            } else if target.is_zero() {
-                (Side::Sell, held)
+
+            // The legs of this trade: (leg, side, wished quantity, reducing). Only a signed instrument can cross zero.
+            let held_abs = abs(held)?;
+            let crossing = (current.is_positive() && target.is_negative()) || (current.is_negative() && target.is_positive());
+            let legs: Vec<(Leg, Side, Dec, bool)> = if crossing {
+                let close_side = if held.is_positive() { Side::Sell } else { Side::Buy };
+                let open_side = if target.is_positive() { Side::Buy } else { Side::Sell };
+                vec![(Leg::Close, close_side, held_abs, true), (Leg::Open, open_side, div_floor(abs(target)?, price.price, 18)?, false)]
             } else {
-                (Side::Sell, std::cmp::min(div_floor(abs_delta, price.price, 18)?, held))
+                let side = if delta.is_positive() { Side::Buy } else { Side::Sell };
+                let reduction = (side == Side::Sell && held.is_positive()) || (side == Side::Buy && held.is_negative());
+                let wished = if !reduction {
+                    div_floor(abs_delta, price.price, 18)?
+                } else if target.is_zero() {
+                    held_abs
+                } else {
+                    std::cmp::min(div_floor(abs_delta, price.price, 18)?, held_abs)
+                };
+                vec![(Leg::Whole, side, wished, reduction)]
             };
-            let qty = match rules.round_quantity(&m.symbol, side, wished, price.price) {
-                Ok(q) => q,
-                Err(refusal) => {
-                    skipped.push(skip(SkipReason::VenueRefused(refusal)));
-                    continue;
+            let mut pending: Vec<Candidate<'_>> = Vec::new();
+            // What the close leg leaves behind when the venue rounds it down (dust on a whole-share venue).
+            let mut residual = Dec::ZERO;
+            for (leg, side, wished, reducing) in legs {
+                // The open leg has to cover that residual as well, or the book would end short of the target by it:
+                // it is sized `|target| / price + residual`, still rounded DOWN, so the final position can never be
+                // larger than the target.
+                let wished = if leg == Leg::Open { add(wished, residual)? } else { wished };
+                let qty = match rules.round_quantity(&m.symbol, side, wished, price.price) {
+                    Ok(q) => q,
+                    Err(refusal) => {
+                        skipped.push(skip(SkipReason::VenueRefused(refusal)));
+                        if leg == Leg::Close {
+                            // Cannot close: do not open the other side either.
+                            pending.clear();
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if qty > wished {
+                    return Err(PlanError::VenueRoundedUp { symbol: m.symbol.clone(), wished, returned: qty });
                 }
-            };
-            if qty > wished {
-                return Err(PlanError::VenueRoundedUp { symbol: m.symbol.clone(), wished, returned: qty });
+                if leg == Leg::Close {
+                    residual = sub(wished, qty)?;
+                }
+                pending.push(Candidate { m, side, qty, price, reducing, leg });
             }
-            let cand = Candidate { m, side, qty, price };
-            match side {
-                Side::Sell => sells.push(cand),
-                Side::Buy => buys.push(cand),
+            for cand in pending {
+                if cand.reducing {
+                    reducers.push(cand);
+                } else {
+                    increasers.push(cand);
+                }
             }
         }
 
+        // Signed plans: gross cap on the targets, and margin need vs the buying power the caller supplied.
+        let mut margin = MarginReport::long_only();
+        if signed_plan {
+            let mut target_gross = Dec::ZERO;
+            let mut named = BTreeSet::new();
+            for l in &lines {
+                target_gross = add(target_gross, abs(l.target_notional)?)?;
+                named.insert(key(&l.symbol));
+            }
+            let mut projected = target_gross;
+            for p in &sim.positions {
+                if !named.contains(&key(&p.symbol)) {
+                    projected = add(projected, abs(p.market_value)?)?;
+                }
+            }
+            if let Some(limits) = policy.limits() {
+                let cap = mul(limits.max_gross, capital_base)?;
+                if target_gross > cap {
+                    return Err(PlanError::GrossAboveCap { gross: target_gross, cap });
+                }
+            }
+            let needs_margin = lines.iter().any(|l| l.target_notional.is_negative()) || projected > equity;
+            if needs_margin && cfg.buying_power.is_none() {
+                return Err(PlanError::BuyingPowerRequired { gross: projected });
+            }
+            margin = MarginReport {
+                signed: true,
+                needs_margin,
+                buying_power: cfg.buying_power,
+                buying_power_left: cfg.buying_power,
+                target_gross,
+                projected_gross: projected,
+                margin_order_tags: Vec::new(),
+            };
+        }
+
         let by_venue_symbol = |a: &Candidate<'_>, b: &Candidate<'_>| (&a.m.venue, &a.m.symbol).cmp(&(&b.m.venue, &b.m.symbol));
-        sells.sort_by(by_venue_symbol);
-        buys.sort_by(by_venue_symbol);
+        reducers.sort_by(by_venue_symbol);
+        increasers.sort_by(by_venue_symbol);
 
         let mut orders: Vec<PlannedOrder> = Vec::new();
         let mut denied: Vec<DeniedOrder> = Vec::new();
-        let mut try_order = |c: &Candidate<'_>, qty: Dec, sim: &mut AccountView, day: &mut DayCounters| -> Result<(), PlanError> {
+        let mut bp_left = margin.buying_power_left;
+        let mut margin_tags: Vec<String> = Vec::new();
+        let mut closed: BTreeSet<String> = BTreeSet::new();
+        let mut try_order = |c: &Candidate<'_>, qty: Dec, sim: &mut AccountView, day: &mut DayCounters| -> Result<bool, PlanError> {
             let notional = mul(qty, c.price.price)?;
             let fee = fee_for(notional, cfg.fee_rate)?;
-            let proposed = ProposedOrder {
+            let mut proposed = ProposedOrder {
                 venue: c.m.venue.clone(),
                 asset_class: c.m.asset_class.clone(),
                 symbol: c.m.symbol.clone(),
@@ -513,10 +777,22 @@ impl OrderPlanner {
                 uses_margin: false,
                 is_derivative: false,
             };
-            let verdict = PreTradeGuard::check(policy, sim, &proposed, day);
+            let verdict = if signed_plan {
+                // Margin use is DATA derived from the simulated account, not a constant.
+                proposed.uses_margin = margin_use(sim, &proposed, c.price.price)?;
+                PreTradeGuard::check_margin(policy, sim, &proposed, day, &MarginContext { buying_power_left: bp_left })
+            } else {
+                PreTradeGuard::check(policy, sim, &proposed, day)
+            };
+            let sleeve = c.m.sleeve_label();
+            let tag = if c.leg == Leg::Close {
+                client_tag_close_leg(&account.account_id, cfg.scheduled_for, &sleeve, &c.m.symbol, c.side)
+            } else {
+                client_tag(&account.account_id, cfg.scheduled_for, &sleeve, &c.m.symbol, c.side)
+            };
             let planned = PlannedOrder {
-                tag: client_tag(&account.account_id, cfg.scheduled_for, &c.m.sleeve_label(), &c.m.symbol, c.side),
-                sleeve: c.m.sleeve_label(),
+                tag,
+                sleeve,
                 venue: c.m.venue.clone(),
                 asset_class: c.m.asset_class.clone(),
                 symbol: c.m.symbol.clone(),
@@ -528,21 +804,48 @@ impl OrderPlanner {
             };
             if verdict.allow {
                 apply(sim, day, c.m, c.side, qty, c.price.price, fee)?;
+                if let Some(bp) = bp_left {
+                    if !c.reducing {
+                        bp_left = Some(sub(sub(bp, notional)?, fee)?);
+                    }
+                }
+                if proposed.uses_margin {
+                    margin_tags.push(planned.tag.clone());
+                }
                 orders.push(planned);
+                Ok(true)
             } else {
                 denied.push(DeniedOrder { order: planned, reasons: verdict.reasons });
+                Ok(false)
             }
-            Ok(())
         };
 
-        // Sells first. Never more than held: `qty <= wished <= held` by construction.
-        for c in &sells {
-            try_order(c, c.qty, &mut sim, &mut day)?;
+        // Reductions first. Never more than held: `qty <= wished <= |held|` by construction.
+        for c in &reducers {
+            let placed = try_order(c, c.qty, &mut sim, &mut day)?;
+            if placed && c.leg == Leg::Close {
+                closed.insert(c.m.symbol.clone());
+            }
         }
 
-        // Buys: limited by cash after the reserve and fees.
+        // The open leg of a trade that crosses zero only follows an accepted close leg.
+        let mut buys: Vec<Candidate<'_>> = Vec::new();
+        for c in increasers {
+            if c.leg == Leg::Open && !closed.contains(&c.m.symbol) {
+                skipped.push(SkippedTrade { symbol: c.m.symbol.clone(), sleeve: c.m.sleeve_label(), reason: SkipReason::FlipCloseLegNotPlaced });
+            } else {
+                buys.push(c);
+            }
+        }
+
+        // Increases: limited by cash after the reserve and fees, or by the broker's buying power when the caller
+        // supplied it for a signed plan.
         let reserve = policy.reserve_amount(capital_base)?;
-        let budget = if cfg.credit_sell_proceeds { sim.cash } else { std::cmp::min(sim.cash, account.cash) };
+        let budget = match (signed_plan, cfg.buying_power) {
+            (true, Some(bp)) => bp,
+            _ if cfg.credit_sell_proceeds => sim.cash,
+            _ => std::cmp::min(sim.cash, account.cash),
+        };
         let available = sub(budget, reserve)?;
         let mut buy_qtys: Vec<Dec> = buys.iter().map(|c| c.qty).collect();
         if !buys.is_empty() {
@@ -553,8 +856,8 @@ impl OrderPlanner {
             }
             let total = sum(costs.iter().copied())?;
             if total > available {
-                // One common factor for every buy, computed against a budget shrunk by the per-order fee rounding
-                // slack (each fee is rounded UP by at most 1e-8), so the re-rounded total provably fits.
+                // One common factor for every increasing order, computed against a budget shrunk by the per-order fee
+                // rounding slack (each fee is rounded UP by at most 1e-8), so the re-rounded total provably fits.
                 let slack = mul(Dec::new(1, 8).map_err(|_| MathError::Overflow)?, Dec::from_i64(i64::try_from(buys.len()).unwrap_or(i64::MAX)))?;
                 let usable = sub(available, slack)?;
                 let factor = if usable.is_positive() { div_floor(usable, total, 18)? } else { Dec::ZERO };
@@ -564,7 +867,7 @@ impl OrderPlanner {
                         *q = Dec::ZERO;
                         continue;
                     }
-                    match venue_rules.get(&c.m.venue).map(|r| r.round_quantity(&c.m.symbol, Side::Buy, scaled, c.price.price)) {
+                    match venue_rules.get(&c.m.venue).map(|r| r.round_quantity(&c.m.symbol, c.side, scaled, c.price.price)) {
                         Some(Ok(rounded)) if rounded <= scaled => *q = rounded,
                         Some(Ok(rounded)) => {
                             return Err(PlanError::VenueRoundedUp { symbol: c.m.symbol.clone(), wished: scaled, returned: rounded })
@@ -590,6 +893,8 @@ impl OrderPlanner {
             }
         }
 
+        margin.buying_power_left = bp_left;
+        margin.margin_order_tags = margin_tags;
         let inputs_digest = digest_inputs(targets, account, &prices, venue_rules, policy, cfg, &managed);
         Ok(OrderPlan {
             inputs_digest,
@@ -602,6 +907,7 @@ impl OrderPlanner {
             denied,
             skipped,
             lines,
+            margin,
         })
     }
 }
@@ -672,6 +978,13 @@ fn digest_inputs(
         cfg.day.orders_today,
         dtxt(cfg.day.turnover_today)
     ));
+    // Only a plan with a signed sleeve carries these lines, so a long-only plan's digest is unchanged.
+    if !cfg.signed_sleeves.is_empty() {
+        for (id, max) in &cfg.signed_sleeves {
+            lines.push(format!("signed|{id}|{}", dtxt(*max)));
+        }
+        lines.push(format!("buying_power|{}", cfg.buying_power.map_or("-".to_string(), dtxt)));
+    }
     for m in managed.values() {
         if let Some(r) = venue_rules.get(&m.venue) {
             lines.push(format!("rules|{}", r.fingerprint(&m.symbol)));

@@ -4,6 +4,7 @@
 //! * [`policy`]: `Policy::compile(&MandateBody)`, the ONLY place mandate `f64` ratios become exact decimals.
 //! * [`guard`]: `PreTradeGuard::check`, a pure allow/deny function with stable machine codes.
 //! * [`planner`]: `OrderPlanner::plan`, targets to a sells-first list of guarded, idempotently tagged orders.
+//!   Signed sleeves (shorts, gross above 1x) are an explicit per-sleeve opt-in, default off; see the planner docs.
 //! * [`venue`]: venue size rules, filled from the broker adapters' own tables and code (no duplicated constants).
 //! * [`dec_math`]: exact decimal helpers.
 
