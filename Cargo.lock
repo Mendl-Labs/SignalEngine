@@ -3101,6 +3101,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "portfolio-construct"
+version = "0.1.0"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=075e63721998db4696fffbfc66c89f2d0c21886c#075e63721998db4696fffbfc66c89f2d0c21886c"
+
+[[package]]
+name = "portfolio-parity"
+version = "0.0.1"
+dependencies = [
+ "broker-adapters",
+ "chrono",
+ "mandate-core",
+ "portfolio-construct",
+ "rebalancer-core",
+ "rebalancer-risk",
+ "rebalancer-run",
+ "reference-rules",
+ "serde_json",
+ "weightsim",
+]
+
+[[package]]
 name = "portfoliohandler"
 version = "0.1.1"
 dependencies = [
@@ -5430,6 +5451,11 @@ checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "weightsim"
+version = "0.2.0"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=075e63721998db4696fffbfc66c89f2d0c21886c#075e63721998db4696fffbfc66c89f2d0c21886c"
 
 [[package]]
 name = "whoami"

@@ -1,0 +1,27 @@
+[package]
+name = "portfolio-parity"
+description = "Phase PF3 of product-mandate/PORTFOLIO_FIRST_BACKTESTER_DESIGN.md: TEST-ONLY parity between the backtester's portfolio construction (BacktestingCore weightsim + portfolio-construct, f64) and the live rebalancer (rebalancer-core / -risk / -run, exact decimals). Nothing in this crate is shipped and nothing depends on it."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# DEV-ONLY on purpose. The crate has NO normal dependencies at all: every dependency below is a dev-dependency, so
+# `cargo tree -e normal` of any shipped binary (`program`, `pythonbridge-worker`, `rebalancer-service`) cannot contain
+# `weightsim` or `portfolio-construct`, and nothing depends on this crate. The two Core crates are STANDALONE (zero
+# dependencies, each with its own [workspace]) and are consumed by git rev exactly like `reference-rules` already is.
+[dependencies]
+
+[dev-dependencies]
+# SignalEngine side (the code under test).
+rebalancer-core = { path = "../rebalancer-core" }
+rebalancer-risk = { path = "../rebalancer-risk" }
+rebalancer-run = { path = "../rebalancer-run" }
+mandate-core = { path = "../mandate-core" }
+broker-adapters = { path = "../broker-adapters" }
+reference-rules = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde_json = "1"
+
+# BacktestingCore side (the backtester's portfolio construction). Merged `local-dev` tip, standalone crates.
+weightsim = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "075e63721998db4696fffbfc66c89f2d0c21886c" }
+portfolio-construct = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "075e63721998db4696fffbfc66c89f2d0c21886c" }
