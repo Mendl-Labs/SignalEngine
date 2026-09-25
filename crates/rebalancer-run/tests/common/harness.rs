@@ -184,6 +184,7 @@ impl Harness {
             kill_flag: &self.kill,
             venue_rules: &bk,
             config: &self.cfg,
+            cache: None,
         };
         run_once(&ctx)
     }

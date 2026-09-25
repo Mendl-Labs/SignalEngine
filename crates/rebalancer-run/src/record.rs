@@ -14,6 +14,7 @@ use rebalancer_core::planner::{InstrumentLine, PlannedOrder, SkippedTrade};
 use rebalancer_risk::overlay::RiskDecision;
 use rebalancer_risk::state::{AccountStatus, Transition};
 
+use crate::data::{Cadence, SleeveKind};
 use crate::flatten::{CancelRecord, FlattenReport};
 use crate::recon::{ReconBaseline, ReconReport};
 
@@ -39,6 +40,10 @@ impl ExecutionMode {
 }
 
 /// The unique identity of a run: (account, scheduled time, sleeve set). A second run with the same key is a no-op.
+///
+/// The sleeve set is ALWAYS the account's CONFIGURED sleeves, never the subset that happened to be pending or due
+/// on that day: a slot must map to exactly one run whatever the data looked like at the moment each attempt read it
+/// (two attempts of one slot with different pending sets would otherwise be two keys and could both plan).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RunKey {
     pub account_id: String,
@@ -169,6 +174,8 @@ impl SnapshotSummary {
     }
 }
 
+/// One planned sleeve's target as the reference rule decided it. Present only for sleeves that were PLANNED in this
+/// run (a sleeve that was evaluated but not pending has a [`SleeveDecision`] and no `TargetSummary`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetSummary {
     pub sleeve: String,
@@ -176,6 +183,53 @@ pub struct TargetSummary {
     pub data_fingerprint: String,
     /// (symbol, weight of the sleeve) as the reference rule decided.
     pub weights: Vec<(String, Dec)>,
+}
+
+/// The evidence behind one instrument's signal: what the rule compared. `margin_bps` = `(close / sma - 1) * 10_000`
+/// (positive = above the average). Informational (fragility monitoring), never a trading input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentEvidence {
+    pub symbol: String,
+    pub close: f64,
+    pub sma: f64,
+    pub margin_bps: f64,
+    /// The rule's weight, as a fraction of the sleeve.
+    pub weight: f64,
+}
+
+/// What one run learned about one CONFIGURED sleeve, whether or not it was planned: the structured per-decision
+/// fields the council asked for (Ruling 7), kept on the record (and therefore in the Postgres `record_debug` text)
+/// until a structured ledger exists (work item W6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SleeveDecision {
+    pub sleeve: String,
+    pub kind: SleeveKind,
+    pub cadence: Cadence,
+    /// The decision date this run's plan (if any) is built on.
+    pub decision_date: NaiveDate,
+    /// The newest decision the rule can compute from this run's panel (`D_computable`; for the ETF sleeve the newest
+    /// COMPLETED month-end, `NextMonthBar`). Equal to `decision_date` in this version; kept apart because a
+    /// catch-up policy may later act on something else.
+    pub computable_decision_date: NaiveDate,
+    /// The newest bar of any instrument in the panel the rule saw.
+    pub newest_bar_date: NaiveDate,
+    /// Sessions elapsed since the decision: bars of the sleeve's first instrument dated AFTER `decision_date`.
+    /// 1 = acted on the first run after the first bar of the next period (the pre-registered one-session delay);
+    /// 0 = decided on the newest bar (crypto).
+    pub lag_sessions: u32,
+    /// `D_acted`: the newest decision this account had acted on for this sleeve before this run. `None` for a
+    /// `Daily` sleeve (not consulted) and for an `OnDecision` sleeve with no previous acted decision.
+    pub last_acted_decision: Option<NaiveDate>,
+    /// `Daily`: always. `OnDecision`: `decision_date > last_acted_decision`, or no `last_acted_decision`.
+    pub pending: bool,
+    /// An `OnDecision` sleeve planned only because nothing had ever been acted on (plan on the decision in force).
+    pub entry: bool,
+    /// The sleeve's target was handed to the planner in this run.
+    pub planned: bool,
+    /// The run completed with this sleeve planned: this decision counts as ACTED (`D_acted` advances). A run that
+    /// failed closed, was refused or halted acts on nothing.
+    pub acted: bool,
+    pub instruments: Vec<InstrumentEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +342,9 @@ pub struct RunRecord {
     pub state_after: Option<AccountStatus>,
     pub transitions: Vec<Transition>,
     pub risk: Option<RiskDecision>,
+    /// One entry per CONFIGURED sleeve that was evaluated (empty when the run stopped before the `decisions` step).
+    pub decisions: Vec<SleeveDecision>,
+    /// The targets of the PLANNED sleeves only (the pending ones).
     pub targets: Vec<TargetSummary>,
     pub plan: Option<PlanSummary>,
     /// The second plan of a live run, made after the sells settled and the account was re-read.

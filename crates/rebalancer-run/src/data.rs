@@ -12,12 +12,43 @@ use rebalancer_core::guard::PricePoint;
 use rebalancer_core::Dec;
 use reference_rules::Panel;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SleeveKind {
-    /// Faber-style ETF trend at month-ends (SPY, EFA, IEF, DBC, VNQ; 20% each of the sleeve).
+    /// Faber-style ETF trend (SPY, EFA, IEF, DBC, VNQ; 20% each of the sleeve). The RULE decides at a month-end
+    /// close; the platform ACTS on that decision on the first run after the first bar of the next month exists
+    /// (`MonthEndMode::NextMonthBar`: one session after the month's last close), see [`Cadence::OnDecision`]. It does
+    /// NOT act on the calendar month-end: a run on that date cannot yet see the month complete.
     EtfTrend,
     /// 100-day crypto trend (BTC, ETH; 50% each of the sleeve).
     CryptoTrend,
+}
+
+/// When a sleeve's target is ACTED on, as opposed to when its rule is evaluated (every driver run evaluates every
+/// sleeve). This is a property of the sleeve KIND (the rule's own rebalance policy), never of the mandate: a
+/// customer cannot configure a certified rule into a different cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Cadence {
+    /// Planned on every run (the rule re-decides every day: crypto trend).
+    Daily,
+    /// Planned only when the rule's decision is newer than the last decision this account ACTED on
+    /// (`D_computable > D_acted`; a missing `D_acted` is an entry, planned once on the decision in force).
+    OnDecision,
+}
+
+impl SleeveKind {
+    pub fn cadence(self) -> Cadence {
+        match self {
+            SleeveKind::CryptoTrend => Cadence::Daily,
+            SleeveKind::EtfTrend => Cadence::OnDecision,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SleeveKind::EtfTrend => "etf_trend",
+            SleeveKind::CryptoTrend => "crypto_trend",
+        }
+    }
 }
 
 /// One strategy sleeve of an account's plan.

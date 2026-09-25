@@ -13,6 +13,13 @@
 //!   The pipeline then resumes: it never sends an order whose tag already exists at the broker.
 //! * `finish` writes the record once; a second `finish` is an error (records are immutable).
 //!
+//! # Acted decisions (`D_acted`)
+//! [`RunStore::last_acted_decision`] is the pending-decision state of an `OnDecision` sleeve (the ETF sleeve): the
+//! newest decision date this account has acted on. `InMemoryRunStore` keeps it as explicit, monotone state written by
+//! `finish` from the record's `SleeveDecision::acted` flags (a run that failed closed, refused or halted advances
+//! nothing). A store that cannot answer returns `DecisionLedgerUnavailable` and the pipeline fails closed; the
+//! Postgres store does exactly that until the decision-ledger migration exists.
+//!
 //! # Missed runs
 //! Every record carries `scheduled_for` (expected) and `started_at` / `finished_at` (actual). [`find_missed`] compares
 //! a list of expected slots with the store's summaries, which is all a heartbeat / dead-man's switch needs.
@@ -34,6 +41,12 @@ pub enum RunStoreError {
     AlreadyFinished(String),
     #[error("RUNSTORE_NOT_STARTED: no run in progress for {0}")]
     NotStarted(String),
+    /// The store has no structured record of which decisions were ACTED on (the Postgres store until the decision
+    /// ledger migration, work item W6). A caller that needs it (any `OnDecision` sleeve) must FAIL CLOSED: falling
+    /// back to "nothing acted yet" would re-act on the ETF decision every run, and falling back to "everything
+    /// acted" would never act at all.
+    #[error("RUNSTORE_DECISION_LEDGER_UNAVAILABLE: {0}")]
+    DecisionLedgerUnavailable(String),
 }
 
 impl RunStoreError {
@@ -42,6 +55,7 @@ impl RunStoreError {
             RunStoreError::Unavailable(_) => "RUNSTORE_UNAVAILABLE",
             RunStoreError::AlreadyFinished(_) => "RUNSTORE_ALREADY_FINISHED",
             RunStoreError::NotStarted(_) => "RUNSTORE_NOT_STARTED",
+            RunStoreError::DecisionLedgerUnavailable(_) => "RUNSTORE_DECISION_LEDGER_UNAVAILABLE",
         }
     }
 }
@@ -98,6 +112,12 @@ pub trait RunStore {
     fn day_counters(&self, account_id: &str, day: NaiveDate) -> Result<DayCounters, RunStoreError>;
     fn summaries(&self, account_id: &str) -> Result<Vec<RunSummary>, RunStoreError>;
     fn get(&self, key: &RunKey) -> Result<Option<RunRecord>, RunStoreError>;
+    /// `D_acted`: the decision date of the newest decision this account has ACTED on for `sleeve_id`, or `None` when
+    /// it never has (an entry). It advances only when a run that PLANNED the sleeve ends `Completed`
+    /// ([`crate::record::SleeveDecision::acted`]), and only ever forward: a record carrying an older decision date
+    /// than the stored one leaves it unchanged. `Err(DecisionLedgerUnavailable)` when the store cannot say (see the
+    /// error's docs): the caller fails closed.
+    fn last_acted_decision(&self, account_id: &str, sleeve_id: &str) -> Result<Option<NaiveDate>, RunStoreError>;
 }
 
 // ------------------------------------------------------------------------------------------------------------
@@ -114,6 +134,8 @@ struct Inner {
     entries: BTreeMap<RunKey, Entry>,
     order: Vec<RunKey>,
     fail_next: u32,
+    /// `D_acted` per (account, sleeve): explicit state written by `finish`, monotone by construction.
+    acted: BTreeMap<(String, String), NaiveDate>,
 }
 
 #[derive(Default)]
@@ -214,6 +236,13 @@ impl RunStore for InMemoryRunStore {
         let key = record.key.clone();
         match g.entries.get(&key) {
             Some(Entry::InProgress { .. }) => {
+                for d in record.decisions.iter().filter(|d| d.acted) {
+                    let slot = g.acted.entry((key.account_id.clone(), d.sleeve.clone())).or_insert(d.decision_date);
+                    // Monotone: never move backwards, whatever order records finish in.
+                    if d.decision_date > *slot {
+                        *slot = d.decision_date;
+                    }
+                }
                 g.entries.insert(key, Entry::Done(Box::new(record)));
                 Ok(())
             }
@@ -315,6 +344,12 @@ impl RunStore for InMemoryRunStore {
             Some(Entry::Done(r)) => Some((**r).clone()),
             _ => None,
         })
+    }
+
+    fn last_acted_decision(&self, account_id: &str, sleeve_id: &str) -> Result<Option<NaiveDate>, RunStoreError> {
+        let mut g = self.lock();
+        Self::check(&mut g)?;
+        Ok(g.acted.get(&(account_id.to_string(), sleeve_id.to_string())).copied())
     }
 }
 

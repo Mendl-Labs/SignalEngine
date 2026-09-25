@@ -306,6 +306,7 @@ fn row_to_record(r: RunRow) -> Result<RunRecord, String> {
         state_after: None,
         transitions: Vec::new(),
         risk: None,
+        decisions: Vec::new(),
         targets: Vec::new(),
         plan: None,
         replan: None,
@@ -763,6 +764,20 @@ impl RunStore for PgRunStore {
             Some(r) if r.status != "done" => Ok(None),
             Some(r) => row_to_record(r).map(Some).map_err(unavailable),
         }
+    }
+
+    /// FAILS CLOSED, always. There is no structured decision ledger in Postgres yet (`rebalancer_runs` has no
+    /// decision-date column, `get` returns no targets, and the per-decision fields live only in the `record_debug`
+    /// text): the ledger and its append-only, monotone, tenant-scoped table are work item W6 and need the owner to
+    /// apply a migration. Until then this store cannot say which decision an account last acted on, and the only
+    /// two possible guesses are both wrong for the ETF sleeve: "nothing acted" would plan it on every run, and
+    /// "everything acted" would never plan it. So the pipeline gets `DecisionLedgerUnavailable`, the run fails
+    /// closed with `RUN_DECISION_LEDGER_UNAVAILABLE`, and NO `OnDecision` sleeve is planned. (Sleeves with a `Daily`
+    /// cadence never ask, so crypto-only accounts are unaffected.)
+    fn last_acted_decision(&self, account_id: &str, sleeve_id: &str) -> Result<Option<NaiveDate>, RunStoreError> {
+        Err(RunStoreError::DecisionLedgerUnavailable(format!(
+            "the Postgres run store has no decision ledger yet (account {account_id}, sleeve {sleeve_id}); the ETF sleeve cannot be planned until the ledger migration is applied"
+        )))
     }
 }
 
