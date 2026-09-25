@@ -9,6 +9,14 @@
 //! 3. `mandate`: no mandate, not active, or invalid means refuse with no order of any kind. An EXPIRED mandate
 //!    continues, and the guard then admits only reducing orders (SPEC B3). Assisted and Paper runs may rehearse
 //!    against a DRAFT mandate; Live never does.
+//! 3b. `decisions` (pre-flight, BEFORE the broker is read): every CONFIGURED sleeve is evaluated (data fetch,
+//!    fingerprint, reference rule) and classified. A `Daily` sleeve (crypto) is pending on every run; an `OnDecision`
+//!    sleeve (ETF) is pending iff its computable decision is newer than the last decision this account ACTED on
+//!    (`D_computable > D_acted`, `RunStore::last_acted_decision`), or nothing was ever acted on (an entry). The
+//!    per-decision evidence (decision date, newest bar, lag in sessions, per instrument close/SMA/margin) goes into
+//!    `RunRecord::decisions`. If sleeves are configured and none is pending, the run ends here as a `Completed`
+//!    no-op (`RUN_NOTHING_PENDING`): the broker is never read. A store that cannot say what was acted on
+//!    (`DecisionLedgerUnavailable`) fails the run closed.
 //! 4. `read_account`: the broker is the source of truth; unreachable means no trading and an alert. The account
 //!    state (HWM, day-start, status) is loaded. A `Halted` account is refused here; a `Flattening` one resumes its
 //!    flatten (Live) and stops.
@@ -18,16 +26,21 @@
 //!    flatten: we do not know what is true) and alerts.
 //! 7. `risk`: HWM and day-start are folded in and the ladder / daily-loss limit evaluated on BROKER equity. A halt
 //!    rung alerts, and in Live mode flattens (verify flat, then `Halted`); the run stops.
-//! 8. `targets`: the reference rules on validated data. ANY refusal (`RuleError`, data error) means no trade + alert.
+//! 8. `targets`: the targets of the PENDING sleeves only, built from the step 3b evaluations (ANY refusal of the
+//!    reference rules or the data layer already failed the run closed there). Sleeves that are not pending are left
+//!    out: the planner leaves instruments no target names alone, so their positions are untouched this run.
 //! 9. `plan`: `OrderPlanner` with the risk scale applied (targets scale by the shrink rung's factor, both ways).
-//!    Every guard denial is kept in the record.
+//!    Every guard denial is kept in the record. NOTE the consequence of planning only pending sleeves: a shrink
+//!    rung reaches an `OnDecision` sleeve's positions only when that sleeve is next planned (a halt rung flattens
+//!    everything regardless).
 //! 10. `execute` by mode: Assisted writes tickets and places nothing; Paper sends every order validate-only; Live
 //!     sends the sells (each tag looked up first, so an order that exists is never re-sent), waits for them to
 //!     settle, RE-READS the account, re-plans on the real cash and sends the buys. After an unknown outcome the order
 //!     is looked up by tag, never blindly retried in the same run.
 //! 11. `reconcile_post` (Paper/Live): re-read the account and reconcile against the expected effect of our fills;
 //!     any mismatch halts and alerts.
-//! 12. `finish`: the record is written (immutable) and returned.
+//! 12. `finish`: the record is written (immutable) and returned. A decision counts as ACTED (`D_acted` advances) only
+//!     when its sleeve was planned in a run that ended `Completed`.
 //!
 //! The rebalancer never places an order when the account is halting: the status is checked before every send. The
 //! only orders sent in a halt are flatten's SELLs of held quantities.
@@ -42,6 +55,7 @@
 //!   `Halted` and the alert says to flatten by hand.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use broker_adapters::{BrokerError, Dec, OrderReport, OrderRequest, OrderStatus, PlaceOutcome, Side};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -53,15 +67,15 @@ use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_risk::overlay::{step, RiskAction, RiskPolicy};
 use rebalancer_risk::state::{AccountState, AccountStatus, HaltReason};
 use rebalancer_risk::store::{StateStore, StoreError};
-use reference_rules::{decide_crypto_trend, decide_etf_trend, latest_decision_date, data_fingerprint, Options, ETF_SYMBOLS};
 
 use crate::broker::Broker;
 use crate::clock::Clock;
-use crate::data::{DataSource, SleeveKind, SleeveSpec};
+use crate::data::{Cadence, DataSource, SleeveSpec};
+use crate::decision::{evaluate, EvalCache, EvalError, Evaluation};
 use crate::flatten::{cancel_own_open_orders, flatten, FlattenSpec, FlattenVerdict};
 use crate::record::*;
 use crate::recon::{reconcile, ExpectedOrder, ReconBaseline, ReconCode, ReconInput, ReconReport, ReconTolerances, ReconVerdict, Severity};
-use crate::stores::{Begin, JournalEntry, KillFlag, Notifier, RunStore};
+use crate::stores::{Begin, JournalEntry, KillFlag, Notifier, RunStore, RunStoreError};
 use crate::view::BrokerSnapshot;
 
 /// Stable machine codes of a run's outcome (halts use `HaltReason::code()` instead).
@@ -83,10 +97,16 @@ pub enum RunCode {
     DataError,
     RuleError,
     PlanError,
+    /// A `Completed` run in which no configured sleeve had a pending decision: nothing was planned and the broker
+    /// was not read.
+    NothingPending,
+    /// The run store cannot say which decisions were acted on (the Postgres store before the decision ledger): the
+    /// run fails closed rather than act on every run or never.
+    DecisionLedgerUnavailable,
 }
 
 impl RunCode {
-    pub const ALL: [RunCode; 16] = [
+    pub const ALL: [RunCode; 18] = [
         RunCode::Completed,
         RunCode::KillFlagSet,
         RunCode::NoActiveMandate,
@@ -103,6 +123,8 @@ impl RunCode {
         RunCode::DataError,
         RunCode::RuleError,
         RunCode::PlanError,
+        RunCode::NothingPending,
+        RunCode::DecisionLedgerUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -123,6 +145,8 @@ impl RunCode {
             RunCode::DataError => "RUN_DATA_ERROR",
             RunCode::RuleError => "RUN_RULE_ERROR",
             RunCode::PlanError => "RUN_PLAN_ERROR",
+            RunCode::NothingPending => "RUN_NOTHING_PENDING",
+            RunCode::DecisionLedgerUnavailable => "RUN_DECISION_LEDGER_UNAVAILABLE",
         }
     }
 }
@@ -188,6 +212,8 @@ pub struct RunContext<'a> {
     pub kill_flag: &'a dyn KillFlag,
     pub venue_rules: &'a VenueRuleBook<'a>,
     pub config: &'a RunConfig,
+    /// The driver tick's shared evaluation memo (`run_all_due` supplies one per call); `None` evaluates afresh.
+    pub cache: Option<&'a EvalCache>,
 }
 
 /// Internal early exit: the outcome has already been set on the record.
@@ -206,6 +232,8 @@ struct Run<'a> {
     /// Broker ids whose fills are ALREADY inside `pre_baseline` (orders of a crashed earlier attempt), so the
     /// post-run expectation does not count them a second time when this attempt adopts them.
     applied_ids: BTreeSet<String>,
+    /// The sleeves whose decision is pending in this run, as `(index into ctx.sleeves and rec.decisions, evaluation)`.
+    pending: Vec<(usize, Arc<Evaluation>)>,
 }
 
 fn summarize(s: &BrokerSnapshot) -> SnapshotSummary {
@@ -235,6 +263,7 @@ fn is_anomaly(e: &BrokerError) -> bool {
 /// Run the pipeline once. See the module docs.
 pub fn run_once(ctx: &RunContext<'_>) -> RunRecord {
     let started_at = ctx.clock.now();
+    // The key is over the CONFIGURED sleeves, never over the pending or due subset (see `RunKey`).
     let ids: Vec<&str> = ctx.sleeves.iter().map(|s| s.id.as_str()).collect();
     let key = RunKey::new(ctx.account_id, ctx.scheduled_for, &ids);
     let mut run = Run {
@@ -260,6 +289,7 @@ pub fn run_once(ctx: &RunContext<'_>) -> RunRecord {
             state_after: None,
             transitions: Vec::new(),
             risk: None,
+            decisions: Vec::new(),
             targets: Vec::new(),
             plan: None,
             replan: None,
@@ -278,6 +308,7 @@ pub fn run_once(ctx: &RunContext<'_>) -> RunRecord {
         known_ids: BTreeSet::new(),
         pre_baseline: None,
         applied_ids: BTreeSet::new(),
+        pending: Vec::new(),
     };
 
     // 1. Acquire the run key.
@@ -347,6 +378,13 @@ impl Run<'_> {
     fn finish(mut self) -> RunRecord {
         self.rec.state_after = Some(self.state.status());
         self.rec.finished_at = self.now();
+        // A decision counts as ACTED only when its sleeve was planned in a run that completed. A run that failed
+        // closed (broker down, plan error, ...), was refused or halted acted on nothing, so the same decision is
+        // pending again on the next run.
+        let completed = self.rec.outcome.kind == OutcomeKind::Completed;
+        for d in &mut self.rec.decisions {
+            d.acted = d.planned && completed;
+        }
         if let Err(e) = self.ctx.runs.finish(self.rec.clone()) {
             // The record could not be written. Nothing more can be done about the trades already made; say so.
             let msg = format!("the run record could not be written: {e}");
@@ -359,6 +397,7 @@ impl Run<'_> {
     fn execute(&mut self) -> Result<(), Stop> {
         self.step_kill_flag()?;
         self.step_mandate()?;
+        self.step_decisions()?;
         self.step_read_account()?;
         self.step_halted_check()?;
         self.step_cleanup()?;
@@ -739,47 +778,119 @@ impl Run<'_> {
     // 8. targets from the reference rules
     // -------------------------------------------------------------------------------------------------------
 
+    /// The targets of the PENDING sleeves only, built from the evaluations `step_decisions` already made (no second
+    /// fetch, no second rule run). A sleeve that is not pending is simply not handed to the planner: the planner
+    /// leaves instruments no target names alone (`planner.rs`, "unmanaged"), so its positions are untouched this run.
     fn step_targets(&mut self) -> Result<Vec<SleeveTarget>, Stop> {
-        let as_of = self.ctx.scheduled_for.date_naive();
         let mut targets = Vec::new();
-        for s in self.ctx.sleeves {
-            let data = match self.ctx.data.sleeve_data(s, as_of) {
-                Ok(d) => d,
-                Err(e) => {
-                    self.note("targets", format!("data error for {}: {e}", s.id));
-                    return Err(self.fail_closed(RunCode::DataError, format!("sleeve {}: {e}", s.id)));
-                }
-            };
-            let fingerprint = data_fingerprint(&data.panel);
-            self.rec.data_fingerprints.push((s.id.clone(), fingerprint.clone()));
-            let decided = match s.kind {
-                SleeveKind::EtfTrend => latest_decision_date(&data.panel, &ETF_SYMBOLS)
-                    .and_then(|date| decide_etf_trend(&data.panel, date, &Options::etf_live(as_of)).map(|d| (date, d)))
-                    .map(|(date, d)| (date, SleeveTarget::from_etf(&s.id, s.share, &s.venue, &s.asset_class, &d))),
-                SleeveKind::CryptoTrend => {
-                    let date = as_of.pred_opt().unwrap_or(as_of);
-                    decide_crypto_trend(&data.panel, date, &Options::crypto_live(as_of))
-                        .map(|d| (date, SleeveTarget::from_crypto(&s.id, s.share, &s.venue, &s.asset_class, &s.quote, &d)))
-                }
-            };
-            let (date, target) = match decided {
-                Ok((date, Ok(t))) => (date, t),
-                Ok((_, Err(e))) => return Err(self.fail_closed(RunCode::RuleError, format!("sleeve {}: weight conversion failed: {e}", s.id))),
-                Err(e) => {
-                    self.note("targets", format!("rule refused for {}: {e}", s.id));
-                    return Err(self.fail_closed(RunCode::RuleError, format!("sleeve {}: the reference rule refused: {e}", s.id)));
-                }
+        for (idx, eval) in self.pending.clone() {
+            let s = &self.ctx.sleeves[idx];
+            let target = match eval.target(s) {
+                Ok(t) => t,
+                Err(e) => return Err(self.fail_closed(RunCode::RuleError, format!("sleeve {}: weight conversion failed: {e}", s.id))),
             };
             self.rec.targets.push(TargetSummary {
                 sleeve: s.id.clone(),
-                decision_date: date,
-                data_fingerprint: fingerprint,
+                decision_date: eval.decision_date,
+                data_fingerprint: eval.fingerprint.clone(),
                 weights: target.weights.iter().map(|w| (w.symbol.clone(), w.weight)).collect(),
             });
+            self.rec.decisions[idx].planned = true;
             targets.push(target);
         }
-        self.note("targets", format!("{} sleeve(s)", targets.len()));
+        self.note("targets", format!("{} of {} sleeve(s) planned", targets.len(), self.ctx.sleeves.len()));
         Ok(targets)
+    }
+
+    // -------------------------------------------------------------------------------------------------------
+    // 3b. decisions (pre-flight): which configured sleeves have a pending decision? BEFORE the broker is read.
+    // -------------------------------------------------------------------------------------------------------
+
+    /// Evaluate every CONFIGURED sleeve (fetch, fingerprint, rule; shared per tick through the cache) and decide
+    /// which are pending: a `Daily` sleeve always; an `OnDecision` sleeve (ETF) iff its decision is newer than the
+    /// last one this account acted on (`D_computable > D_acted`), or nothing was ever acted on (an entry: planned
+    /// once on the decision in force). Any data or rule refusal, and a store that cannot say what was acted on,
+    /// fails the whole run closed, exactly as a refusing sleeve always did.
+    ///
+    /// If sleeves are configured and none is pending, the run ends here as a no-op: the broker is not read, nothing
+    /// is planned. (An account that is halted or flattening is NOT short-circuited: it continues into the normal
+    /// steps so its refusal, alert and flatten resume happen exactly as before.)
+    fn step_decisions(&mut self) -> Result<(), Stop> {
+        let ctx = self.ctx;
+        let as_of = ctx.scheduled_for.date_naive();
+        for (idx, s) in ctx.sleeves.iter().enumerate() {
+            let eval = match evaluate(ctx.data, ctx.cache, s, as_of) {
+                Ok(e) => e,
+                Err(EvalError::Data(e)) => {
+                    self.note("decisions", format!("data error for {}: {e}", s.id));
+                    return Err(self.fail_closed(RunCode::DataError, format!("sleeve {}: {e}", s.id)));
+                }
+                Err(EvalError::Rule(e)) => {
+                    self.note("decisions", format!("rule refused for {}: {e}", s.id));
+                    return Err(self.fail_closed(RunCode::RuleError, format!("sleeve {}: the reference rule refused: {e}", s.id)));
+                }
+            };
+            self.rec.data_fingerprints.push((s.id.clone(), eval.fingerprint.clone()));
+            let cadence = s.kind.cadence();
+            let last_acted = match cadence {
+                Cadence::Daily => None,
+                Cadence::OnDecision => match ctx.runs.last_acted_decision(ctx.account_id, &s.id) {
+                    Ok(v) => v,
+                    Err(e @ RunStoreError::DecisionLedgerUnavailable(_)) => {
+                        self.note("decisions", format!("no decision ledger for {}: {e}", s.id));
+                        return Err(self.fail_closed(
+                            RunCode::DecisionLedgerUnavailable,
+                            format!("sleeve {}: {e}; it cannot be known whether this decision was already acted on, so nothing is planned", s.id),
+                        ));
+                    }
+                    Err(e) => return Err(self.fail_closed(RunCode::StoreUnavailable, format!("the run store failed: {e}"))),
+                },
+            };
+            let pending = match cadence {
+                Cadence::Daily => true,
+                Cadence::OnDecision => last_acted.is_none_or(|acted| eval.decision_date > acted),
+            };
+            let entry = cadence == Cadence::OnDecision && last_acted.is_none();
+            self.rec.decisions.push(SleeveDecision {
+                sleeve: s.id.clone(),
+                kind: s.kind,
+                cadence,
+                decision_date: eval.decision_date,
+                computable_decision_date: eval.decision_date,
+                newest_bar_date: eval.newest_bar_date,
+                lag_sessions: eval.lag_sessions,
+                last_acted_decision: last_acted,
+                pending,
+                entry,
+                planned: false,
+                acted: false,
+                instruments: eval.instruments.clone(),
+            });
+            if pending {
+                self.pending.push((idx, eval));
+            }
+        }
+        let pending_ids: Vec<&str> = self.pending.iter().map(|(i, _)| ctx.sleeves[*i].id.as_str()).collect();
+        let summary = format!("{} of {} sleeve(s) pending: [{}]", pending_ids.len(), ctx.sleeves.len(), pending_ids.join(","));
+        if ctx.sleeves.is_empty() || !self.pending.is_empty() {
+            self.note("decisions", summary);
+            return Ok(());
+        }
+        // Nothing pending. Only an account in good standing is short-circuited (state read, never the broker).
+        match ctx.state_store.load(ctx.account_id) {
+            Ok(Some(s)) if matches!(s.status(), AccountStatus::Active | AccountStatus::Shrunk) => {
+                self.rec.state_before = Some(s.status());
+                self.state = s;
+            }
+            Ok(None) => self.rec.state_before = Some(self.state.status()),
+            Ok(Some(_)) | Err(_) => {
+                // halted / flattening / unreadable: the normal steps handle it
+                self.note("decisions", format!("{summary}; the account is not in good standing (or its state is unreadable): continuing through the normal steps"));
+                return Ok(());
+            }
+        }
+        self.note("decisions", format!("{summary}; nothing pending: the broker is not read"));
+        Err(self.stop(OutcomeKind::Completed, RunCode::NothingPending.as_str(), "no sleeve has a pending decision: nothing planned, broker not read"))
     }
 
     // -------------------------------------------------------------------------------------------------------

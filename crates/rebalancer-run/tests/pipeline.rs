@@ -54,6 +54,8 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "RUN_DATA_ERROR",
             "RUN_RULE_ERROR",
             "RUN_PLAN_ERROR",
+            "RUN_NOTHING_PENDING",
+            "RUN_DECISION_LEDGER_UNAVAILABLE",
         ]
     );
     assert_eq!(run.iter().collect::<std::collections::BTreeSet<_>>().len(), run.len());
@@ -163,7 +165,7 @@ fn step_names_follow_the_documented_order() {
     let r = h.live(0);
     assert_eq!(
         r.step_names(),
-        ["acquire_run_key", "kill_flag", "mandate", "read_account", "cleanup", "reconcile_pre", "risk", "targets", "plan", "execute", "reconcile_post"]
+        ["acquire_run_key", "kill_flag", "mandate", "decisions", "read_account", "cleanup", "reconcile_pre", "risk", "targets", "plan", "execute", "reconcile_post"]
     );
 }
 
@@ -548,7 +550,7 @@ fn a_stale_open_order_of_ours_is_cancelled_before_a_live_run_trades() {
     assert!(!h.env.rig.handle.order(&stale).unwrap().status.is_live());
     assert_eq!(r.placed.len(), 2);
     // Cleanup happens between reading the account and reconciling: the step log says so.
-    assert_eq!(r.step_names()[3..6], ["read_account", "cleanup", "reconcile_pre"][..]);
+    assert_eq!(r.step_names()[4..7], ["read_account", "cleanup", "reconcile_pre"][..]);
 }
 
 #[test]

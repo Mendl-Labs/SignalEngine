@@ -4,7 +4,8 @@
 //!
 //! (a) two accounts both due -> both run, independently; one's failure (fake-broker fault injection)
 //!     does not stop the other.
-//! (b) an account not yet due is excluded.
+//! (b) an account is excluded before the day's slot, or when it has no sleeve (an ETF account is due EVERY day: the
+//!     ETF sleeve is evaluated on every run, its pending-ness is decided by the pipeline from the data).
 //! (c) an account whose mandate is not active is excluded.
 //! (d) calling `run_all_due` twice in quick succession does not double-run either account.
 //! (e) the Postgres-backed stores' round-trip is covered separately, in `rebalancer-store`'s own test
@@ -112,25 +113,30 @@ fn a_two_accounts_both_due_run_independently_and_one_failure_does_not_stop_the_o
 // ---------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn b_an_account_not_yet_due_is_excluded() {
+fn b_an_account_is_excluded_before_the_days_slot_or_when_it_has_no_sleeve() {
     let mut etf_account = crypto_account("acct-etf", "tenant-a");
-    etf_account.sleeves = vec![etf_sleeve("1")]; // ETF trend: due only at a calendar month-end.
+    etf_account.sleeves = vec![etf_sleeve("1")];
 
-    let source = InMemoryAccountSource::new().with_account(etf_account);
+    let source = InMemoryAccountSource::new().with_account(etf_account.clone());
 
-    // 2021-01-01 is not a month-end: excluded.
-    let not_due = find_due_runs(&source, slot_time(0)).unwrap();
-    assert!(not_due.is_empty(), "an ETF-only account must not be due on an ordinary day: {not_due:?}");
+    // The ETF sleeve is EVALUATED on every run slot (whether its decision is pending is the pipeline's question,
+    // answered from the data, not a calendar predicate): due on an ordinary day and on a month-end alike.
+    for slot in [slot_time(0), at("2021-01-31T00:10:00Z")] {
+        let due = find_due_runs(&source, slot).unwrap();
+        assert_eq!(due.len(), 1, "an ETF account is due on every day's slot: {slot}");
+        assert_eq!(due[0].account_id, "acct-etf");
+        assert_eq!(due[0].sleeves.len(), 1, "the run carries the CONFIGURED sleeves");
+    }
 
-    // 2021-01-31 IS a month-end: due.
-    let month_end = at("2021-01-31T00:10:00Z");
-    let due = find_due_runs(&source, month_end).unwrap();
-    assert_eq!(due.len(), 1, "the same account IS due once its sleeve's cadence boundary arrives");
-    assert_eq!(due[0].account_id, "acct-etf");
-
-    // Before the day's run time (00:10 UTC), even a month-end date is not yet due.
+    // Before the day's run time (00:10 UTC), nothing is due yet.
     let too_early = at("2021-01-31T00:00:00Z");
     assert!(find_due_runs(&source, too_early).unwrap().is_empty(), "not due until the day's anchor time");
+
+    // An account with no sleeve at all has nothing to evaluate and is never enumerated.
+    let mut empty = etf_account;
+    empty.sleeves = vec![];
+    let source = InMemoryAccountSource::new().with_account(empty);
+    assert!(find_due_runs(&source, slot_time(0)).unwrap().is_empty(), "no sleeve, nothing due");
 }
 
 // ---------------------------------------------------------------------------------------------------------------

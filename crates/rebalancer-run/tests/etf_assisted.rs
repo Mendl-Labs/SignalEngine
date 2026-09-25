@@ -117,6 +117,7 @@ fn the_etf_trend_sleeve_produces_tickets_from_real_month_end_data_on_an_alpaca_a
         kill_flag: &kill,
         venue_rules: &book,
         config: &cfg,
+        cache: None,
     };
     let r = run_once(&ctx);
     assert_eq!(r.outcome.kind, OutcomeKind::Completed, "{:?}", r.outcome);

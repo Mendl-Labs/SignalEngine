@@ -170,6 +170,7 @@ fn sample_record(account_id: &str, scheduled_for: chrono::DateTime<Utc>) -> RunR
         state_after: None,
         transitions: vec![],
         risk: None,
+        decisions: vec![],
         targets: vec![],
         plan: None,
         replan: None,

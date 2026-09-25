@@ -41,11 +41,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use mandate_core::mandate::MandateBody;
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
 use rebalancer_core::venue::VenueRuleBook;
-use reference_rules::is_calendar_month_end;
 
 use crate::broker::Broker;
 use crate::clock::Clock;
 use crate::data::{DataSource, SleeveKind, SleeveSpec};
+use crate::decision::EvalCache;
 use crate::pipeline::{run_once, RunConfig, RunContext};
 use crate::record::{ExecutionMode, RunRecord};
 use crate::stores::{KillFlag, Notifier, RunStore};
@@ -110,7 +110,8 @@ impl AccountSource for InMemoryAccountSource {
 }
 
 // -------------------------------------------------------------------------------------------------------------
-// Due-ness: reuses reference-rules' month-end logic (ETF) and a daily cadence (crypto); no new date math.
+// Due-ness: every configured sleeve is EVALUATED on every run slot; whether its decision is ACTED on is a
+// per-account, data-driven question the pipeline answers (`pipeline::step_decisions`), not a calendar predicate.
 // -------------------------------------------------------------------------------------------------------------
 
 /// The single daily UTC time every sleeve's run slot is anchored to, matching the existing test fixtures'
@@ -119,18 +120,24 @@ impl AccountSource for InMemoryAccountSource {
 pub const DAILY_RUN_HOUR_UTC: u32 = 0;
 pub const DAILY_RUN_MINUTE_UTC: u32 = 10;
 
-/// Is `kind`'s sleeve due on calendar date `date`? Crypto trend is daily (every date). ETF trend reuses
-/// `reference_rules::is_calendar_month_end` -- the same month-end concept the ETF rule itself uses, applied to the
-/// wall clock instead of a data panel (see this module's docs and that function's own doc comment for why they are
-/// two different questions that usually, but not always, agree).
-fn sleeve_due_on(kind: SleeveKind, date: NaiveDate) -> bool {
+/// Is `kind`'s sleeve evaluated on the run slot of calendar date `date`? Every kind is, on every date.
+///
+/// This used to make the ETF sleeve due only on the last CALENDAR day of the month
+/// (`reference_rules::is_calendar_month_end`, a wall-clock question with no data and no holidays). That predicate
+/// disagreed with the data-driven month-end the rule itself computes (`latest_decision_date`, which under
+/// `MonthEndMode::NextMonthBar` needs a bar of the NEXT month), so the run on the calendar month-end always saw the
+/// PREVIOUS month's decision and the sleeve acted a month late (finding U3). No refusal fires in that situation, so
+/// nothing in the rule's own checks catches it. Now the run is daily, the rule is evaluated each time, and the
+/// pipeline plans the ETF sleeve only when its computable decision is newer than the last one acted on. The
+/// `match` stays exhaustive so a new sleeve kind forces a decision here.
+fn sleeve_due_on(kind: SleeveKind, _date: NaiveDate) -> bool {
     match kind {
-        SleeveKind::CryptoTrend => true,
-        SleeveKind::EtfTrend => is_calendar_month_end(date),
+        SleeveKind::CryptoTrend | SleeveKind::EtfTrend => true,
     }
 }
 
-/// The most recent due slot at or before `now`, if any of `sleeves` has a boundary on that slot's date. Only the
+/// The most recent due slot at or before `now`, if any of `sleeves` is due on that slot's date (see
+/// [`sleeve_due_on`]: with the current kinds, every account with at least one sleeve is due every day). Only the
 /// CURRENT day's slot is considered (not a backlog of older missed slots): catching up on a run missed days ago is
 /// the dead-man's-switch / heartbeat's job (`crate::stores::find_missed`, already built), which alerts a person
 /// before anything trades against stale slots -- silently backfilling old slots here would place trades no one was
@@ -167,7 +174,10 @@ pub struct RunSpec {
 /// not `Active` (draft/superseded/revoked/expired -- the pipeline's own rehearsal allowance for a draft mandate in
 /// Assisted/Paper mode is a per-run concern the pipeline still applies; the driver's job is only "should a run be
 /// attempted at all", and an inactive mandate should not even be attempted for a scheduled, unattended tick), an
-/// account whose plan is not approved, and an account with no sleeve due today.
+/// account whose plan is not approved, and an account with no sleeve due today (none configured).
+///
+/// Each [`RunSpec`] carries ALL of the account's CONFIGURED sleeves: which of them are pending on the day is decided
+/// by the pipeline from the data, and the run key is over the configured set so one slot is one run.
 pub fn find_due_runs(source: &dyn AccountSource, now: DateTime<Utc>) -> Result<Vec<RunSpec>, String> {
     let accounts = source.active_accounts()?;
     let mut out = Vec::new();
@@ -293,6 +303,8 @@ pub fn run_all_due<'a, L: AccountLock>(
     config: &RunConfig,
 ) -> Vec<DueOutcome> {
     let mut out = Vec::with_capacity(due.len());
+    // One evaluation memo per tick: accounts that hold the same sleeve kind share one data fetch and one decision.
+    let cache = EvalCache::new();
     for spec in due {
         let guard = match lock.try_lock(&spec.account_id) {
             Ok(Some(g)) => g,
@@ -328,6 +340,7 @@ pub fn run_all_due<'a, L: AccountLock>(
             kill_flag,
             venue_rules,
             config,
+            cache: Some(&cache),
         };
         let result = panic::catch_unwind(AssertUnwindSafe(|| run_once(&ctx)));
         drop(guard);

@@ -12,11 +12,58 @@ use reference_rules::Panel;
 
 use crate::data::{DataError, DataSource, SleeveData, SleeveSpec};
 use crate::driver::AccountLock;
-use crate::record::Alert;
-use crate::stores::{KillFlag, Notifier};
+use crate::record::{Alert, RunKey, RunRecord, SnapshotSummary};
+use crate::stores::{Begin, InMemoryRunStore, JournalEntry, KillFlag, Notifier, RunStore, RunStoreError, RunSummary};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An [`InMemoryRunStore`] that, like `PgRunStore` before the decision-ledger migration, has NO structured record
+/// of which decisions were acted on: everything is delegated except `last_acted_decision`, which fails closed with
+/// `DecisionLedgerUnavailable`. Lets the pipeline's fail-closed handling be tested without a database.
+#[derive(Default)]
+pub struct NoLedgerRunStore {
+    pub inner: InMemoryRunStore,
+}
+
+impl NoLedgerRunStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl RunStore for NoLedgerRunStore {
+    fn begin(&self, key: &RunKey, trading_day: NaiveDate, started_at: DateTime<Utc>, lease_secs: i64) -> Result<Begin, RunStoreError> {
+        self.inner.begin(key, trading_day, started_at, lease_secs)
+    }
+    fn journal_order(&self, key: &RunKey, entry: JournalEntry) -> Result<(), RunStoreError> {
+        self.inner.journal_order(key, entry)
+    }
+    fn in_flight(&self, account_id: &str) -> Result<Vec<JournalEntry>, RunStoreError> {
+        self.inner.in_flight(account_id)
+    }
+    fn finish(&self, record: RunRecord) -> Result<(), RunStoreError> {
+        self.inner.finish(record)
+    }
+    fn last_snapshot(&self, account_id: &str) -> Result<Option<SnapshotSummary>, RunStoreError> {
+        self.inner.last_snapshot(account_id)
+    }
+    fn known_order_ids(&self, account_id: &str) -> Result<BTreeSet<String>, RunStoreError> {
+        self.inner.known_order_ids(account_id)
+    }
+    fn day_counters(&self, account_id: &str, day: NaiveDate) -> Result<rebalancer_core::guard::DayCounters, RunStoreError> {
+        self.inner.day_counters(account_id, day)
+    }
+    fn summaries(&self, account_id: &str) -> Result<Vec<RunSummary>, RunStoreError> {
+        self.inner.summaries(account_id)
+    }
+    fn get(&self, key: &RunKey) -> Result<Option<RunRecord>, RunStoreError> {
+        self.inner.get(key)
+    }
+    fn last_acted_decision(&self, _account_id: &str, _sleeve_id: &str) -> Result<Option<NaiveDate>, RunStoreError> {
+        Err(RunStoreError::DecisionLedgerUnavailable("this store has no decision ledger".to_string()))
+    }
 }
 
 /// Records every alert; can be told to fail delivery.
