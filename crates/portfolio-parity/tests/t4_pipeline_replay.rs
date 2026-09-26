@@ -19,13 +19,12 @@
 //! the run (relative 1e-9), positions (ETF shares exactly, crypto within one 1e-8 quantum), the orders of the run (symbol,
 //! side, quantity), the plan's target weights against `target_weights[k]`, and the decision dates.
 //!
-//! # Mixed accounts
-//! A weightsim book has ONE `execution_delay_bars`, so an ETF (1) + crypto (0) account cannot be configured natively:
-//! KNOWN GAP (needs weightsim per-sleeve execution delay; council Ruling 4; another agent is building it in Core). What
-//! CAN be asserted is asserted: the crypto sleeve's decisions and target weights are identical under a native delay of 0,
-//! the ETF decision dates are identical, the ETF fill bar differs by exactly one own bar, and with the delay EMULATED
-//! (`DelayedEtf`, a test-side rule that decides one own bar later) the whole mixed account agrees with the pipeline. The
-//! emulation is NOT the missing feature; it shows the gap is limited to it.
+//! # Mixed accounts (per-sleeve delay, weightsim 0.3)
+//! `SleeveSpec::with_execution_delay` gives each sleeve its own delay in its OWN bars, so the mixed ETF + crypto account is
+//! configured exactly as the council ruled: ETF 1, crypto 0 (book-level default 0). It is asserted to agree with the
+//! pipeline on equity, positions, orders and target weights, and to equal the test-side EMULATION (`DelayedEtf`, which
+//! decides one own bar later under a book delay of 0) that the first version of this test used before the feature existed.
+//! A wrong ETF delay (0) is asserted NOT to agree, so the agreement above is not vacuous.
 
 mod common;
 
@@ -69,6 +68,31 @@ fn window(world: &World) -> (NaiveDate, NaiveDate, NaiveDate) {
     (f + Duration::days(1), date(2020, 3, 31), world.cal.last_session(2019, 2))
 }
 
+/// The window of the NATIVE mixed comparison: `(first run day, last run day, account start bar)`.
+///
+/// Why a dedicated window: a native ETF delay of 1 needs the ETF's month-end DECISION bar `L` inside the book (the account
+/// must start at `L` for the entry decision to exist), while the pipeline's first run (day `F + 1`, bar `F`) also starts the
+/// crypto sleeve, which a book starting at `L` would already have started one bar earlier. The two coincide when the crypto
+/// rule is ALL CASH at `L` (nothing bought at `L`, so both accounts are flat and identical at `F`). So the window is the
+/// first month, from March 2019, whose last session has both crypto signals off (a property of the synthetic world, found
+/// here rather than hard-coded). The pipeline's ENTRY on the decision in force is what the book's `L` decision reproduces.
+fn mixed_native_window(world: &World) -> (NaiveDate, NaiveDate, NaiveDate) {
+    let (mut y, mut m) = (2019, 3);
+    loop {
+        let (py, pm) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+        let l = world.cal.last_session(py, pm);
+        let upto = world.crypto_days.partition_point(|d| *d <= l);
+        let dates: Vec<ws::Date> = world.crypto_days[..upto].iter().map(|d| from_naive(*d)).collect();
+        let cols: Vec<&[f64]> = (0..2).map(|i| &world.crypto[i][..upto]).collect();
+        let w = common::adapters::crypto_weights(&dates, &cols).expect("crypto decision");
+        if w.iter().all(|x| *x == 0.0) {
+            return (world.cal.first_session(y, m) + Duration::days(1), date(2020, 3, 31), l);
+        }
+        (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        assert!(y < 2020, "no all-cash month-end found");
+    }
+}
+
 fn sleeves_of(kind: Kind) -> Vec<rebalancer_run::data::SleeveSpec> {
     match kind {
         Kind::EtfOnly => vec![etf_sleeve("1")],
@@ -79,6 +103,10 @@ fn sleeves_of(kind: Kind) -> Vec<rebalancer_run::data::SleeveSpec> {
 
 fn se_replay(world: &World, kind: Kind, allocated: &str) -> Vec<DayLog> {
     let (from, to, _) = window(world);
+    se_replay_in(world, kind, allocated, from, to)
+}
+
+fn se_replay_in(world: &World, kind: Kind, allocated: &str, from: NaiveDate, to: NaiveDate) -> Vec<DayLog> {
     let acct = account(sleeves_of(kind), ExecutionMode::Live, replay_mandate(allocated, RESERVE));
     let rig = Rig::new(world, acct, CASH);
     let logs = rig.replay(from, to);
@@ -125,21 +153,19 @@ fn ws_run(world: &World, s: &WsSpec) -> BookResult {
     if s.kind != Kind::CryptoOnly {
         let universe: Vec<usize> = (0..5).collect();
         sleeves.push(match s.etf {
-            EtfTiming::Native(_) => SleeveSpec::from_rule("etf", EtfRule, universe, ShareSpec::Fixed(share_etf)),
+            EtfTiming::Native(d) => SleeveSpec::from_rule("etf", EtfRule, universe, ShareSpec::Fixed(share_etf)).with_execution_delay(d),
             EtfTiming::Emulated => SleeveSpec::from_rule("etf", DelayedEtf, universe, ShareSpec::Fixed(share_etf)),
         });
     }
     if s.kind != Kind::EtfOnly {
-        sleeves.push(SleeveSpec::from_rule("crypto", CryptoRule, (etf_n..etf_n + 2).collect(), ShareSpec::Fixed(share_cry)));
+        sleeves.push(SleeveSpec::from_rule("crypto", CryptoRule, (etf_n..etf_n + 2).collect(), ShareSpec::Fixed(share_cry)).with_execution_delay(0));
     }
     let book = Book::new(sleeves);
     let mut cfg = BookConfig::default();
     cfg.sim.on_refusal = OnRefusal::HoldPrevious;
     cfg.sim.initial_equity = 100_000.0;
-    cfg.sim.execution_delay_bars = match s.etf {
-        EtfTiming::Native(d) => d,
-        EtfTiming::Emulated => 0,
-    };
+    // the book-level value is only the DEFAULT now; every sleeve above states its own delay
+    cfg.sim.execution_delay_bars = 0;
     cfg.cadence = BookCadence::PerSleeve;
     cfg.account_start = Some(BarTime::from_date(from_naive(s.start_bar)));
     cfg.allocated_capital = s.allocated;
@@ -180,7 +206,7 @@ fn compare(logs: &[DayLog], res: &BookResult, kind: Kind, check_orders_and_posit
     let mut rep = Report::default();
     let by_bar: BTreeMap<NaiveDate, usize> = res.times.iter().enumerate().map(|(k, t)| (to_naive(t.date()), k)).collect();
     let symbols: Vec<String> = res.instruments.iter().map(|n| se_symbol(n)).collect();
-    let mut miss = |rep: &mut Report, msg: String| {
+    let miss = |rep: &mut Report, msg: String| {
         if rep.first_mismatch.is_none() {
             rep.first_mismatch = Some(msg);
         }
@@ -388,17 +414,7 @@ fn t4_allocated_capital_binding_makes_the_guard_deny_orders_the_backtester_place
 // Mixed ETF + crypto account
 // -------------------------------------------------------------------------------------------------------------
 
-/// With the per-sleeve delay EMULATED (ETF decides one own bar later, book delay 0) the whole mixed account agrees with
-/// the pipeline: equity, positions, orders, target weights.
-#[test]
-fn mixed_account_replay_agrees_when_the_etf_delay_is_emulated() {
-    let w = world();
-    let (from, to, _) = window(&w);
-    let logs = se_replay(&w, Kind::Mixed, "1000000000");
-    let res = ws_run(&w, &WsSpec { kind: Kind::Mixed, etf: EtfTiming::Emulated, live_faithful: true, allocated: None, start_bar: from.pred_opt().unwrap(), end_bar: to.pred_opt().unwrap() });
-    let rep = compare(&logs, &res, Kind::Mixed, true);
-    assert_clean("mixed_emulated_etf_delay", &rep);
-    assert!(rep.orders_compared >= 80 && rep.bars_compared > 380, "non-vacuous: {rep:?}");
+fn assert_only_due_at_order_level(logs: &[DayLog]) {
     // F1 at the ORDER level: on a day the ETF is not pending, the pipeline places no ETF order at all
     let etf_orders_on_non_action_days = logs
         .iter()
@@ -411,21 +427,64 @@ fn mixed_account_replay_agrees_when_the_etf_delay_is_emulated() {
     assert!(etf_planned_days <= 14, "the ETF sleeve is planned about once a month, not on every run ({etf_planned_days} of {})", logs.len());
 }
 
-/// KNOWN GAP (needs weightsim per-sleeve execution delay; council Ruling 4): with weightsim's native single book delay
-/// the mixed account cannot be configured to the pipeline's ETF-1 / crypto-0. This test pins precisely what agrees and
-/// what does not under the native delay 0 (crypto exact, ETF one own bar early).
+/// The council's configuration, NATIVE: ETF `with_execution_delay(1)`, crypto `with_execution_delay(0)`, book default 0.
+/// The whole mixed account agrees with the pipeline: equity, positions, orders, target weights.
 #[test]
-fn t4_mixed_account_native_delay_is_a_known_gap_pinned() {
+fn mixed_account_replay_agrees_with_native_per_sleeve_execution_delay() {
     let w = world();
-    let (from, to, _) = window(&w);
-    let logs = se_replay(&w, Kind::Mixed, "1000000000");
-    // the account starts at the ETF decision bar (last session of February) so that the first ETF decision is inside the
-    // native book too; the crypto sleeve therefore starts one bar earlier than the pipeline's first run
-    let start = window(&w).2;
-    let res = ws_run(&w, &WsSpec { kind: Kind::Mixed, etf: EtfTiming::Native(0), live_faithful: true, allocated: None, start_bar: start, end_bar: to.pred_opt().unwrap() });
+    let (from, to, start) = mixed_native_window(&w);
+    let logs = se_replay_in(&w, Kind::Mixed, "1000000000", from, to);
+    let res = ws_run(&w, &WsSpec { kind: Kind::Mixed, etf: EtfTiming::Native(1), live_faithful: true, allocated: None, start_bar: start, end_bar: to.pred_opt().unwrap() });
+    let rep = compare(&logs, &res, Kind::Mixed, true);
+    assert_clean("mixed_native_per_sleeve_delay_etf1_crypto0", &rep);
+    assert!(rep.orders_compared >= 60 && rep.bars_compared > 300, "non-vacuous: {rep:?}");
+    assert!(rep.plans_compared > 300, "{rep:?}");
+    assert_eq!(rep.denied_orders, 0);
+    assert_only_due_at_order_level(&logs);
+}
+
+/// The first version of the mixed test (before the feature existed) EMULATED the ETF delay: a rule that decides one own
+/// bar later under a book delay of 0. It still agrees with the pipeline, and the native per-sleeve delay reproduces it
+/// bar for bar (equity, units), so nothing was lost by switching.
+#[test]
+fn mixed_account_native_per_sleeve_delay_equals_the_test_side_emulation() {
+    let w = world();
+    let (from, to, start) = mixed_native_window(&w);
+    let logs = se_replay_in(&w, Kind::Mixed, "1000000000", from, to);
+    let mk = |etf, start_bar| ws_run(&w, &WsSpec { kind: Kind::Mixed, etf, live_faithful: true, allocated: None, start_bar, end_bar: to.pred_opt().unwrap() });
+    let native = mk(EtfTiming::Native(1), start);
+    let emulated = mk(EtfTiming::Emulated, from.pred_opt().unwrap());
+    let rep = compare(&logs, &emulated, Kind::Mixed, true);
+    assert_clean("mixed_emulated_etf_delay", &rep);
+    // the native book starts one bar earlier (at the decision bar): compare on the bars both have
+    let mut max_eq: f64 = 0.0;
+    let mut max_units: f64 = 0.0;
+    let mut compared = 0;
+    for (ke, t) in emulated.times.iter().enumerate() {
+        let Some(kn) = native.times.iter().position(|x| x == t) else { continue };
+        compared += 1;
+        max_eq = max_eq.max((native.equity[kn] - emulated.equity[ke]).abs() / native.equity[kn]);
+        for (a, b) in native.inst_row(&native.units, kn).iter().zip(emulated.inst_row(&emulated.units, ke)) {
+            max_units = max_units.max((a - b).abs());
+        }
+    }
+    assert!(compared > 300, "{compared}");
+    println!("REPLAY mixed native-vs-emulated: max rel equity diff {max_eq:.3e}, max units diff {max_units:.3e}");
+    assert!(max_eq <= 1e-12 && max_units <= 1e-9, "native per-sleeve delay == emulation: {max_eq:e} / {max_units:e}");
+}
+
+/// Sensitivity of the comparison itself: with the ETF delay set to 0 the ETF sleeve trades one own bar EARLIER than the
+/// pipeline and the accounts do not agree, while the crypto sleeve's decisions (target weights) stay identical. This is what
+/// the agreement above would have looked like if the delay were wrong.
+#[test]
+fn mixed_account_with_the_wrong_etf_delay_does_not_agree() {
+    let w = world();
+    let (from, to, start) = window(&w);
     let _ = from;
+    let logs = se_replay(&w, Kind::Mixed, "1000000000");
+    // the account starts at the ETF decision bar (last session of February) so that the first ETF decision is inside the book
+    let res = ws_run(&w, &WsSpec { kind: Kind::Mixed, etf: EtfTiming::Native(0), live_faithful: true, allocated: None, start_bar: start, end_bar: to.pred_opt().unwrap() });
     let by_bar: BTreeMap<NaiveDate, usize> = res.times.iter().enumerate().map(|(k, t)| (to_naive(t.date()), k)).collect();
-    // ---- AGREES (1): the crypto sleeve's decision (target weights) on every planned run
     let mut crypto_weights_compared = 0;
     let mut max_diff: f64 = 0.0;
     for l in &logs {
@@ -434,42 +493,30 @@ fn t4_mixed_account_native_delay_is_a_known_gap_pinned() {
         let tw = res.inst_row(&res.target_weights, k);
         for line in plan.lines.iter().filter(|x| !World::is_etf(&x.symbol)) {
             let j = res.instruments.iter().position(|n| se_symbol(n) == line.symbol).expect("crypto instrument");
-            let d = (line.target_notional.to_f64() / plan.capital_base.to_f64() - tw[j]).abs();
-            max_diff = max_diff.max(d);
+            max_diff = max_diff.max((line.target_notional.to_f64() / plan.capital_base.to_f64() - tw[j]).abs());
             crypto_weights_compared += 1;
         }
     }
-    println!("REPLAY mixed_native_d0: crypto target weights compared {crypto_weights_compared}, max diff {max_diff:.3e}");
+    println!("REPLAY mixed_etf_delay0: crypto target weights compared {crypto_weights_compared}, max diff {max_diff:.3e}");
     assert!(crypto_weights_compared > 300);
-    assert!(max_diff <= WEIGHT_TOL, "the crypto sleeve's decisions are identical under native delay 0 ({max_diff:e})");
-    // ---- AGREES (2): the ETF decision dates. The pipeline acts on day F+1 on the decision of the last session L; the
-    // native d = 0 book fills that same decision one own bar EARLIER, at the close of L.
+    assert!(max_diff <= WEIGHT_TOL, "the crypto sleeve is unaffected by the ETF sleeve's delay ({max_diff:e})");
     let mut shifts = 0;
     for l in &logs {
         let Some(d) = l.rec.decisions.iter().find(|d| d.sleeve == "etf" && d.planned) else { continue };
-        let f = l.day.pred_opt().unwrap(); // the first session of the month (the bar the pipeline fills at)
-        let own_prev = w.etf_days[w.etf_days.partition_point(|x| *x < f) - 1]; // the previous own bar = the decision bar L
+        let f = l.day.pred_opt().unwrap();
+        let own_prev = w.etf_days[w.etf_days.partition_point(|x| *x < f) - 1];
         assert_eq!(d.decision_date, own_prev, "{}: the acted decision is the previous own bar's (month-end) decision", l.day);
-        // weightsim d=0 changed the ETF units at bar L, the pipeline at bar F: one own bar apart (the first action's
-        // decision bar precedes the account's first bar, so the native book has nothing to compare there)
         let Some(&kl) = by_bar.get(&own_prev) else { continue };
-        let kf = by_bar[&f];
-        let etf_idx: Vec<usize> = (0..5).collect();
-        let changed = |k: usize| etf_idx.iter().any(|j| (res.inst_row(&res.units, k)[*j] - if k == 0 { 0.0 } else { res.inst_row(&res.units, k - 1)[*j] }).abs() > 1e-12);
-        let pipeline_changed = l.fills.iter().any(|(s, _, _)| World::is_etf(s));
-        if pipeline_changed {
-            assert!(changed(kl), "{}: native d=0 rebalanced the ETF sleeve at the decision bar {own_prev}", l.day);
+        let changed = |k: usize| (0..5).any(|j| (res.inst_row(&res.units, k)[j] - if k == 0 { 0.0 } else { res.inst_row(&res.units, k - 1)[j] }).abs() > 1e-12);
+        if l.fills.iter().any(|(s, _, _)| World::is_etf(s)) {
+            assert!(changed(kl), "{}: delay 0 rebalanced the ETF sleeve at the decision bar {own_prev}", l.day);
             shifts += 1;
         }
-        let _ = kf;
     }
-    println!("REPLAY mixed_native_d0: ETF rebalances one own bar earlier than the pipeline in {shifts} months (the gap)");
     assert!(shifts >= 10, "{shifts}");
-    // ---- DOES NOT AGREE: equity and positions (the account's equity carries the ETF fill one bar earlier, so every
-    // sizing after the first ETF rebalance differs)
     let rep = compare(&logs, &res, Kind::Mixed, true);
-    print("mixed_native_d0", &rep);
-    assert!(rep.first_mismatch.is_some(), "the native single delay must NOT reproduce the mixed account: that is the gap");
+    print("mixed_etf_delay0", &rep);
+    assert!(rep.first_mismatch.is_some(), "a wrong ETF delay must NOT reproduce the pipeline");
 }
 
 // -------------------------------------------------------------------------------------------------------------

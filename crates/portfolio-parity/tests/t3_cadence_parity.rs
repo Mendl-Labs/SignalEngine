@@ -10,9 +10,8 @@
 //! The ETF rule decides at the last session `L` of a month but, under `MonthEndMode::NextMonthBar`, the decision is
 //! computable only once a bar of the next month exists, i.e. at the run after the first session `F` of the new month:
 //! day `F + 1`, bar `F`. That is exactly `execution_delay_bars = 1` in the ETF sleeve's OWN bars (decision bar `L`, fill
-//! bar `F`), the pre-registered delay of council Ruling 4. A weightsim book has ONE delay for the whole book, so the mixed
-//! book is run with the ETF's delay 1; the crypto sleeve is `EveryBar`, whose FLAGS do not depend on the delay (its
-//! TARGETS would: that is the KNOWN GAP test 4 measures).
+//! bar `F`), the pre-registered delay of council Ruling 4. With weightsim 0.3 the delay is PER SLEEVE: the book is run with
+//! ETF `with_execution_delay(1)` and crypto `with_execution_delay(0)`, exactly as the council ruled.
 //!
 //! # What must agree, and what is allowed to differ
 //! With `BookCadence::PerSleeve` the two are EXACTLY equal on every day (the window is aligned so that the pipeline's
@@ -34,7 +33,10 @@ use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use common::adapters::{from_naive, to_naive, CadenceCrypto, CadenceEtf};
 use common::replay::{account, crypto_sleeve, etf_sleeve, replay_mandate, slot, Rig, ACCOUNT_ID};
 use common::world::{all_days, date, World};
-use portfolio_construct::schedule::{due, plan_flags, BookCadence as PcCadence, Cadence, CivilDate};
+use portfolio_construct::schedule::{
+    advance_acted, closed_bars, evaluate_decision, due, due_on, plan_flags, plan_flags_for, BookCadence as PcCadence, Cadence,
+    CivilDate, DueInputs,
+};
 use rebalancer_run::data::SleeveKind;
 use rebalancer_run::driver::{find_due_runs, ActiveAccount, InMemoryAccountSource};
 use rebalancer_run::record::{ExecutionMode, OutcomeKind};
@@ -79,7 +81,7 @@ fn drive(world: &World, sleeves: Vec<rebalancer_run::data::SleeveSpec>, from: Na
 
 /// The backtester's book over the same world: ETF sleeve 0.6 (monthly, on decision), crypto sleeve 0.4 (daily, every
 /// bar), the cadence stand-in rules (constant weights: this test is about WHEN, not WHAT). The account starts at bar
-/// `start_bar`; the ETF's own delay is 1 (see the module docs).
+/// `start_bar`; the ETF's own delay is 1, crypto's 0 (see the module docs).
 struct CoreRun {
     dates: Vec<NaiveDate>,
     etf_planned: Vec<bool>,
@@ -101,12 +103,12 @@ fn core_flags(world: &World, mode: BookCadence, start_bar: NaiveDate) -> CoreRun
         series.push(((*s).to_string(), SessionKind::Continuous, world.crypto_days.iter().zip(&world.crypto[i]).map(|(d, p)| (from_naive(*d), *p)).collect::<Vec<_>>()));
     }
     let panel = BookPanel::from_dated_series(series).expect("panel");
-    let etf = SleeveSpec::from_rule("etf", CadenceEtf, vec![0, 1, 2, 3, 4], ShareSpec::Fixed(0.6));
-    let cry = SleeveSpec::from_rule("crypto", CadenceCrypto, vec![5, 6], ShareSpec::Fixed(0.4));
+    let etf = SleeveSpec::from_rule("etf", CadenceEtf, vec![0, 1, 2, 3, 4], ShareSpec::Fixed(0.6)).with_execution_delay(1);
+    let cry = SleeveSpec::from_rule("crypto", CadenceCrypto, vec![5, 6], ShareSpec::Fixed(0.4)).with_execution_delay(0);
     let book = Book::new(vec![etf, cry]).with_allocator(AllocatorSpec::Fixed);
     let mut cfg = BookConfig::default();
     cfg.sim.on_refusal = OnRefusal::HoldPrevious;
-    cfg.sim.execution_delay_bars = 1;
+    cfg.sim.execution_delay_bars = 0; // only the default now; both sleeves state their own delay
     cfg.sim.initial_equity = 100_000.0;
     cfg.cadence = mode;
     cfg.account_start = Some(BarTime::from_date(from_naive(start_bar)));
@@ -278,6 +280,48 @@ fn thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence() 
     let weekend_actions = actions.iter().filter(|(d, _)| matches!(d.weekday(), Weekday::Sat | Weekday::Sun)).count();
     println!("CADENCE ETF actions {} (on a Saturday or Sunday: {weekend_actions})", actions.len());
     assert!(weekend_actions > 20 && weekend_actions < actions.len());
+}
+
+/// Core 0.2's `Cadence::DecisionPending` (council Ruling 1: evaluate every run, plan iff `D_computable > D_acted`) as PURE
+/// functions (`closed_bars`, `evaluate_decision`, `advance_acted`, `due_on`, `plan_flags_for`), driven day by day with a
+/// ledger of its own over 30 years, against the REAL pipeline (its `pending`, `decision_date` and `entry` on every run) and
+/// against weightsim PerSleeve. Three independent implementations of the same cadence, every day.
+#[test]
+fn decision_pending_cadence_of_portfolio_construct_equals_the_pipeline_every_day_for_thirty_years() {
+    let world = World::build(date(1994, 1, 1), date(2026, 6, 30));
+    let (from, to, start_bar) = aligned_window(&world);
+    let se = drive(&world, vec![etf_sleeve("1")], from, to);
+    let bars: Vec<CivilDate> = world.etf_days.iter().map(|d| civil(*d)).collect();
+    let per = core_flags(&world, BookCadence::PerSleeve, start_bar);
+    let by_bar: BTreeMap<NaiveDate, usize> = per.dates.iter().enumerate().map(|(k, d)| (*d, k)).collect();
+    let mut acted: Option<CivilDate> = None;
+    let (mut pending_days, mut entries) = (0usize, 0usize);
+    for (day, s) in &se {
+        let visible = closed_bars(&bars, civil(*day));
+        let ev = evaluate_decision(visible, acted).expect("ascending bars");
+        let inputs = [
+            DueInputs { date: civil(*day), next_bar: None, computable_decision: ev.computable, last_acted: acted },
+            DueInputs::stateless(civil(*day), None),
+        ];
+        // the crypto sleeve is Daily; both sleeves tradable every day in this pure view
+        let flags = plan_flags_for(PcCadence::PerSleeve, &[Cadence::DecisionPending, Cadence::Daily], &inputs, &[true, true]);
+        assert_eq!(flags[0], ev.pending, "{day}: plan_flags_for agrees with evaluate_decision");
+        assert!(flags[1], "{day}: Daily is always due");
+        assert_eq!(due_on(Cadence::DecisionPending, &inputs[0]), ev.pending);
+        assert_eq!(s.etf_pending, Some(ev.pending), "{day}: pipeline pending == portfolio_construct DecisionPending");
+        let se_computable = s.etf_decision.map(civil);
+        assert_eq!(se_computable, ev.computable, "{day}: D_computable agrees");
+        if ev.pending {
+            pending_days += 1;
+            entries += usize::from(acted.is_none());
+            acted = Some(advance_acted(acted, ev.computable.expect("pending implies computable")));
+        }
+        let k = by_bar[&day.pred_opt().unwrap()];
+        assert_eq!(ev.pending, per.etf_planned[k], "{day}: weightsim PerSleeve (ETF delay 1) plans exactly when DecisionPending is pending");
+    }
+    println!("CADENCE decision_pending: {} days, {pending_days} pending (of which {entries} entry), pipeline and weightsim agree on every day", se.len());
+    assert_eq!(entries, 1);
+    assert_eq!(pending_days, 360);
 }
 
 #[test]

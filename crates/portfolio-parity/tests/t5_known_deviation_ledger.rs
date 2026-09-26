@@ -10,7 +10,9 @@
 //! * pins the canonical text of the table with a digest, so that editing a row without updating the digest fails.
 //!
 //! Tags: `EXPECTED-DIVERGENCE` (both sides behave as coded; the difference is understood and accepted),
-//! `KNOWN GAP` (something the backtester cannot express yet), `MAPPING` (a row of the Amendment 12 D1-D8 list, pointing
+//! `KNOWN GAP` (something the backtester cannot express yet; none is open at the pinned Core rev, the tag is kept for the next one),
+//! `RESOLVED` (a former gap, closed; the entry stays so the history is visible and the tests that prove the closure are
+//! listed), `MAPPING` (a row of the Amendment 12 D1-D8 list, pointing
 //! at the entries that carry it), `NOT-TESTED` (outside what the five tests exercise, listed so it is not mistaken for a
 //! pass).
 
@@ -115,12 +117,12 @@ const LEDGER: &[Entry] = &[
     },
     Entry {
         id: "MIXED_ACCOUNT_PER_SLEEVE_DELAY",
-        tag: "KNOWN GAP (needs weightsim per-sleeve execution delay; council Ruling 4)",
-        what: "weightsim's execution_delay_bars is ONE integer for the whole book; the pipeline's mixed ETF + crypto account is ETF delay 1 / crypto delay 0",
-        sides: "native d=0: the ETF sleeve fills one own bar EARLIER than the pipeline (13 of 13 rebalances), equity and positions differ from the first ETF trade on; native d=1 would delay the crypto sleeve instead",
-        observed: "AGREES under native d=0: the crypto sleeve's decisions and target weights on every run (max 9.3e-14), the ETF decision dates. DOES NOT AGREE: equity (up to 1.2e-1 relative), positions, orders. With the delay EMULATED by a rule that decides one own bar later the whole mixed account agrees (equity 9e-16, 93 orders identical, targets 1.9e-16)",
-        pinned_by: &["t4_mixed_account_native_delay_is_a_known_gap_pinned", "mixed_account_replay_agrees_when_the_etf_delay_is_emulated"],
-        follow_up: "Core: per-sleeve execution_delay_bars in weightsim (being built in parallel); then replace the emulation by the native setting and flip the pinned test",
+        tag: "RESOLVED",
+        what: "was a KNOWN GAP: weightsim 0.2 had ONE execution_delay_bars for the whole book, so the pipeline's mixed ETF + crypto account (ETF delay 1, crypto delay 0, council Ruling 4) could not be configured. Closed by weightsim 0.3 SleeveSpec::with_execution_delay (BacktestingCore #44, e558995)",
+        sides: "native per-sleeve delay: ETF 1, crypto 0, book default 0; the pipeline: ETF acts one own bar after the month-end decision, crypto on the bar it decides",
+        observed: "over a 302-day window (starting at a month-end where the crypto rule is all cash, so the pipeline's entry on the decision in force and the book's first decision coincide) the whole mixed account agrees with the pipeline: equity 6e-16 relative, positions (ETF shares exact, crypto 7e-15), 71 orders identical, target weights 1.1e-16; the native setting reproduces the earlier test-side emulation EXACTLY (0 difference in equity and units); a WRONG ETF delay (0) does not agree (the ETF trades one own bar early in every rebalance, equity up to 1.2e-1) while the crypto sleeve's decisions stay identical (9e-14), so the agreement is not vacuous. The mid-month/any-day entry remains ENTRY_IN_FORCE_DECISION",
+        pinned_by: &["mixed_account_replay_agrees_with_native_per_sleeve_execution_delay", "mixed_account_native_per_sleeve_delay_equals_the_test_side_emulation", "mixed_account_with_the_wrong_etf_delay_does_not_agree"],
+        follow_up: "none",
     },
     Entry {
         id: "ENTRY_IN_FORCE_DECISION",
@@ -137,8 +139,8 @@ const LEDGER: &[Entry] = &[
         what: "wall-clock versus data-calendar cadence: portfolio-construct::schedule still ships Cadence::CalendarMonthEnd (the pre-#37 ETF cadence) beside LastBarOfMonth; the pipeline no longer uses the wall-clock predicate",
         sides: "pipeline: ETF acts on the run after the first session of a month (day 2 or later, never on a calendar month-end); schedule::CalendarMonthEnd: due on the last calendar day",
         observed: "over 30 years: 360 pipeline actions; 107 of 360 calendar month-ends are not sessions (weekend/holiday) and the two month-end predicates disagree on exactly 107 sessions; 51 actions land on a Saturday or Sunday (order queued over the weekend); 3,375 run days have no ETF bar (no-op runs); PerSleeve cadence equals the pipeline on all 10,957 days",
-        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence"],
-        follow_up: "Core W8: schedule.rs replaces CalendarMonthEnd with a pending-decision cadence",
+        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence", "decision_pending_cadence_of_portfolio_construct_equals_the_pipeline_every_day_for_thirty_years"],
+        follow_up: "none: Core 0.2 ships Cadence::DecisionPending (due_on, plan_flags_for, computable_decision_date, advance_acted); over 30 years it equals the pipeline's pending/D_computable/entry and weightsim PerSleeve (ETF delay 1) on all 10,957 run days. CalendarMonthEnd remains only as the documented U3 wall-clock predicate",
     },
     Entry {
         id: "F1_ALL_SLEEVES_ON_ANY_DUE_LEGACY",
@@ -146,7 +148,7 @@ const LEDGER: &[Entry] = &[
         what: "BookCadence::AllSleevesOnAnyDue (finding F1, the pre-#37 driver) is kept as a labelled legacy mode in weightsim and schedule; the pipeline is now only-due (council Ruling 3)",
         sides: "AllSleevesOnAnyDue plans the ETF sleeve on every open ETF bar (7,582 bars, 7,222 extra re-plans over 30 years); the pipeline plans it 360 times; at the ORDER level an ETF+crypto account places no ETF order on a day the ETF decision is not pending",
         observed: "as stated; PerSleeve + only-due is what the replay agrees with",
-        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence", "mixed_account_replay_agrees_when_the_etf_delay_is_emulated"],
+        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence", "mixed_account_replay_agrees_with_native_per_sleeve_execution_delay"],
         follow_up: "none (kept for the cadence_mode_swapped mutant)",
     },
     Entry {
@@ -236,7 +238,7 @@ const LEDGER: &[Entry] = &[
         what: "D7 (cadence timing: the driver's wall-clock month-end versus the rule's data-calendar decision; the U3 month-late lag)",
         sides: "VERIFIED at run time by the U3 tests and here: post-#37 the pipeline acts on the first run after the first session of the month, on the previous last session's decision, exactly once a month; see CALENDAR_MONTH_END_VS_DATA_CALENDAR",
         observed: "360 of 360 months match an independent calendar oracle over 30 years",
-        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence"],
+        pinned_by: &["thirty_years_of_run_days_and_pending_sleeves_versus_the_backtester_cadence", "decision_pending_cadence_of_portfolio_construct_equals_the_pipeline_every_day_for_thirty_years"],
         follow_up: "record D7 as verified in the next amendment (Amendment 12 is hashed)",
     },
     Entry {
@@ -259,7 +261,7 @@ const LEDGER: &[Entry] = &[
     },
 ];
 
-const TAGS: [&str; 4] = ["EXPECTED-DIVERGENCE", "KNOWN GAP (needs weightsim per-sleeve execution delay; council Ruling 4)", "MAPPING", "NOT-TESTED"];
+const TAGS: [&str; 5] = ["EXPECTED-DIVERGENCE", "KNOWN GAP", "RESOLVED", "MAPPING", "NOT-TESTED"];
 
 /// FNV-1a 64 of the canonical text (every field of every entry, in order).
 fn canonical() -> String {
@@ -281,7 +283,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// The digest of the ledger text. Editing any row changes it: update it deliberately, in the same commit, after
 /// re-reading the pinning tests.
-const LEDGER_DIGEST: u64 = 0xc9b4_ad3d_7303_b4e9;
+const LEDGER_DIGEST: u64 = 0xfa70_38a2_0f47_ce4d;
 
 #[test]
 fn the_known_deviation_ledger_is_printed_complete_and_pinned() {

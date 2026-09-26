@@ -23,5 +23,5 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 serde_json = "1"
 
 # BacktestingCore side (the backtester's portfolio construction). Merged `local-dev` tip, standalone crates.
-weightsim = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "075e63721998db4696fffbfc66c89f2d0c21886c" }
-portfolio-construct = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "075e63721998db4696fffbfc66c89f2d0c21886c" }
+weightsim = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "e558995c279b3d393935cf125947e064d9889341" }
+portfolio-construct = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "e558995c279b3d393935cf125947e064d9889341" }
