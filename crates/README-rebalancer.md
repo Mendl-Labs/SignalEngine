@@ -29,3 +29,16 @@ its residual risks are in the module docs of `broker_adapters::oanda`. `tests/oa
 `#[ignore]`d smoke test for the owner to run against the practice host. `rebalancer-run::view::oanda_snapshot` and
 `OandaRules` are additive; the planner, guard and reconciliation are still spot-shaped (no leverage) and are not
 correct for FX yet.
+
+## market-data (the first real `DataSource`: Massive daily bars)
+
+`crates/market-data` implements `rebalancer_run::data::DataSource` over the Massive (formerly Polygon.io) daily-aggregates
+REST API. It depends on `rebalancer-run` (never the reverse), reuses `broker-adapters`' `HttpTransport` (no new HTTP stack;
+the real reqwest transport is behind the opt-in `live` feature) and adds no dependency to any shipped binary. It returns only
+COMPLETE bars (dated before the run date AND over by its own clock), validates every response, retries transient failures
+with bounded, jittered backoff on an injectable clock, never sends the API key anywhere but the `Authorization: Bearer`
+header, and leaves a provenance record per instrument. It is fixture-tested with hand-written responses in the documented
+shape; it has NOT been run against the real API (an env-gated live test, `tests/live.rs`, is for the owner). Not built yet, on
+purpose: the two-source gate (a decorator over `market_data::SleeveFetcher`), the retry window across ticks, the
+Alpaca/Kraken/OANDA readers and any exchange calendar. See the crate docs for the completeness rule, the failure taxonomy
+and the decorator seam. `MassiveDataSource::prices` refuses: sizing prices come from a different source (`WithPrices`).
