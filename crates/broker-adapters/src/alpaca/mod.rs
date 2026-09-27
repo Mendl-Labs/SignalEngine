@@ -43,11 +43,13 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 pub mod order;
+pub mod paper_only;
 pub mod parse;
 pub mod time;
 
 pub use assets::{AssetInfo, AssetSource, AssetTable, FRACTIONAL_DP};
 pub use auth::AlpacaCredentials;
+pub use paper_only::PaperOnlyAlpaca;
 pub use config::{AlpacaConfig, Environment, LIVE_BASE_URL, PAPER_BASE_URL};
 pub use order::{PrepareOptions, PreparedOrder};
 pub use parse::{

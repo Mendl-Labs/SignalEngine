@@ -5,7 +5,8 @@
 //! modes and `portfolio_construct::schedule` (`due`, `plan_flags`).
 //!
 //! # The time mapping (the whole comparison rests on it)
-//! The driver runs at 00:10Z of calendar day `D` and sees only bars dated strictly before `D`. So the run of day `D`
+//! The driver runs at its slot of calendar day `D` (15:00Z for an account with an ETF sleeve since slice S-4, it was
+//! 00:10Z; the slot's time of day is irrelevant to the mapping) and sees only bars dated strictly before `D`. So the run of day `D`
 //! corresponds to the account-clock bar dated `D - 1`. The crypto rule decides on bar `D - 1` (fill: same close, delay 0).
 //! The ETF rule decides at the last session `L` of a month but, under `MonthEndMode::NextMonthBar`, the decision is
 //! computable only once a bar of the next month exists, i.e. at the run after the first session `F` of the new month:

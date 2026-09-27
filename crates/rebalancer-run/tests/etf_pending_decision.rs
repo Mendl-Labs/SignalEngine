@@ -15,10 +15,10 @@
 //! * the run key is over the CONFIGURED sleeves; a no-op run never reads the broker; per-tick memoisation.
 //!
 //! # The data-provider assumption (still: there is no real provider in this repository)
-//! `Vendor` below is an ASSUMED live provider: at 00:10Z of `as_of` only bars dated STRICTLY BEFORE `as_of` exist (the
+//! `Vendor` below is an ASSUMED live provider: at the run slot of `as_of` only bars dated STRICTLY BEFORE `as_of` exist (the
 //! reference tool's `load_api` also drops `date >= today`), optionally with a per-symbol LAG (bars hidden until a
 //! given run date) and a bounded look-back window. These tests prove what the code does under that assumption, not
-//! what a real vendor delivers at 00:10Z (work item W2 measures that).
+//! what a real vendor delivers at the run slot (work item W2 measures that).
 //!
 //! # The synthetic calendar
 //! Weekdays minus holidays, encoded from general knowledge (New Year, MLK, Presidents, Good Friday, Memorial, July 4,
@@ -40,7 +40,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use common::*;
 use rebalancer_core::guard::PricePoint;
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
-use rebalancer_core::venue::{AlpacaRules, VenueRuleBook};
+use rebalancer_core::venue::{AlpacaRules, SizeRefusal, VenueRuleBook, VenueRules};
 use rebalancer_risk::state::{AccountState, HaltReason};
 use rebalancer_risk::store::{InMemoryStateStore, StateStore};
 use rebalancer_run::broker::{AlpacaBroker, Broker};
@@ -63,8 +63,11 @@ fn date(y: i32, m: u32, d: u32) -> NaiveDate {
 }
 
 fn slot(day: NaiveDate) -> DateTime<Utc> {
-    // DAILY_RUN_HOUR_UTC:DAILY_RUN_MINUTE_UTC = 00:10Z, the driver's fixed daily slot.
-    at(&format!("{day}T00:10:00Z"))
+    // The ETF (market-hours) run slot is 15:00:00Z (slice S-4, `driver::MARKET_HOURS_RUN_*_UTC`): the driver ticks at
+    // that time and every ETF account is due on its slot. A crypto-ONLY account keeps its own 00:10Z slot and is
+    // also enumerated by a tick at 15:00Z (its run is still scheduled for 00:10Z). The DECISION does not depend on
+    // the slot: `as_of` is the slot's UTC date, so this changed no expected date in this file.
+    at(&format!("{day}T15:00:00Z"))
 }
 
 fn all_days(from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
@@ -177,7 +180,7 @@ impl Calendar {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Synthetic world: what the market printed. `Vendor` decides what a 00:10Z run may see of it.
+// Synthetic world: what the market printed. `Vendor` decides what a run of `as_of` may see of it.
 // ---------------------------------------------------------------------------------------------------------------
 
 fn month_index(d: NaiveDate) -> f64 {
@@ -348,6 +351,18 @@ fn mandate() -> mandate_core::mandate::MandateBody {
     v["exposure"]["max_asset_class"] = json!({"us_etf": 1.0, "crypto_spot": 1.0});
     v["exposure"]["max_position"] = json!(0.5);
     v["exposure"]["max_turnover_per_day"] = json!(2.0);
+    // The baseline's capital (5000), max_order_notional (1500) and max_gross/max_net (1.0, no headroom) were fine
+    // before slice S-3: a guard denial did not stop a decision from counting as acted, so these tests never noticed
+    // the crypto sleeve's buys (up to 2500 each on a 5000 account at share 1.0) being denied. Now a denial IS a gap
+    // (S-3), so this fixture's job -- exercising ETF pending-decision timing, not mandate limits -- needs headroom
+    // the baseline does not give it. Widened, not removed: still real limits, just not the binding constraint here.
+    // (max_order_notional may not exceed capital.allocated -- mandate-core validation -- so both move together; and
+    // max_gross/max_net may not exceed universe.leverage_max_gross, so all three move together too.)
+    v["capital"]["allocated"]["amount"] = json!("10000.00");
+    v["exposure"]["max_order_notional"] = json!({"amount": "6000.00", "ccy": "USD"});
+    v["universe"]["leverage_max_gross"] = json!(1.05);
+    v["exposure"]["max_gross"] = json!(1.05);
+    v["exposure"]["max_net"] = json!(1.05);
     serde_json::from_value(v).unwrap()
 }
 
@@ -375,6 +390,36 @@ fn account_json(holdings: bool) -> String {
         acct.replace("\"equity\": \"100210.55\"", "\"equity\": \"5000\"")
             .replace("\"portfolio_value\": \"100210.55\"", "\"portfolio_value\": \"5000\"")
             .replace("\"long_market_value\": \"47370.38\"", "\"long_market_value\": \"0\"")
+    }
+}
+
+/// The venue rules of the test account: the real Alpaca ETF rules plus a plain 8-decimal floor rule for the two
+/// synthetic crypto pairs. These tests give the "alpaca" venue a crypto sleeve (it is a fixture convenience, not a
+/// real Alpaca product); before slice S-3 the planner's `VenueRefused(UnknownInstrument)` skip of those legs went
+/// unnoticed, but S-3 counts a skip of an instrument the venue does not know as a gap in the run (the decision would
+/// not count as acted), so the fixture must be able to size them.
+struct EtfAndCryptoRules<'a> {
+    etf: AlpacaRules<'a>,
+}
+
+impl VenueRules for EtfAndCryptoRules<'_> {
+    fn round_quantity(&self, symbol: &str, side: broker_adapters::Side, quantity: broker_adapters::Dec, price: broker_adapters::Dec) -> Result<broker_adapters::Dec, SizeRefusal> {
+        if symbol.ends_with("/USD") {
+            let q = quantity.round_dp(8, broker_adapters::decimal::Rounding::Floor).map_err(|_| SizeRefusal::Other("overflow".into()))?;
+            if q.is_zero() || q.is_negative() {
+                return Err(SizeRefusal::RoundsToZero);
+            }
+            return Ok(q);
+        }
+        self.etf.round_quantity(symbol, side, quantity, price)
+    }
+
+    fn fingerprint(&self, symbol: &str) -> String {
+        if symbol.ends_with("/USD") {
+            format!("floor8:{symbol}")
+        } else {
+            self.etf.fingerprint(symbol)
+        }
     }
 }
 
@@ -417,7 +462,7 @@ fn with_alpaca<R>(holdings: bool, f: impl FnOnce(&Rig<'_>) -> R) -> R {
     let broker = AlpacaBroker::us_etf(&adapter);
     let assets = AssetTable::builtin();
     let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false };
-    let rules = AlpacaRules { assets: &assets, options: &opts };
+    let rules = EtfAndCryptoRules { etf: AlpacaRules { assets: &assets, options: &opts } };
     let book = VenueRuleBook::new().with("alpaca", &rules);
     f(&Rig { broker: &broker, book: &book, transport, down })
 }
@@ -452,7 +497,7 @@ impl<'a> Sim<'a> {
         }
     }
 
-    /// One driver tick at the 00:10Z slot of `day`: enumerate what is due, run it. Returns `(account, record)`.
+    /// One driver tick at the ETF slot (15:00Z) of `day`: enumerate what is due, run it. Returns `(account, record)`.
     fn tick_all(&self, day: NaiveDate, data: &dyn DataSource) -> Vec<(String, RunRecord)> {
         let now = slot(day);
         self.clock.set(now);
@@ -488,7 +533,7 @@ impl<'a> Sim<'a> {
         v
     }
 
-    /// A run made by hand at an arbitrary scheduled time (the driver only ever produces the 00:10Z slot).
+    /// A run made by hand at an arbitrary scheduled time (the driver only ever produces the account's own slot).
     fn run_direct(&self, acct: &ActiveAccount, scheduled_for: DateTime<Utc>, data: &dyn DataSource) -> RunRecord {
         self.clock.set(scheduled_for);
         let ctx = RunContext {
@@ -1263,5 +1308,118 @@ fn a_vendor_error_is_memoised_for_the_tick_so_it_is_not_asked_again_by_every_acc
         let out = sim.tick_all(date(2019, 9, 6), &vendor);
         assert!(out.iter().all(|(_, r)| etf_planned(r)), "recovered on the next tick (an entry each)");
         assert_eq!(vendor.etf_fetches(), 2);
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// S-4: the run slot. The ETF account runs at 15:00:00Z (market hours); a crypto-only account keeps 00:10:00Z
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn s4_the_etf_run_is_scheduled_at_1500z_and_repeating_the_tick_the_same_day_changes_nothing() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    with_alpaca(false, |rig| {
+        let runs = InMemoryRunStore::new();
+        let sim = Sim::new(rig, &runs, vec![account(vec![etf_sleeve("1")])]);
+        let first = sim.tick(date(2019, 9, 5), &vendor);
+        assert_eq!(first.scheduled_for, at("2019-09-05T15:00:00Z"), "the ETF run is scheduled for 15:00Z, not 00:10Z");
+        assert_eq!(first.key.canonical(), "alpaca-acct|2019-09-05T15:00:00+00:00|etf");
+        assert_eq!(first.trading_day, date(2019, 9, 5));
+        let (n, requests) = (runs.records().len(), rig.requests());
+
+        // The same tick again, and a tick hours later the same day: same slot, same key, the finished record comes
+        // back untouched and nothing new reaches the broker.
+        assert_eq!(sim.tick(date(2019, 9, 5), &vendor), first);
+        for later in ["2019-09-05T15:00:01Z", "2019-09-05T19:30:00Z", "2019-09-05T23:59:59Z"] {
+            let due = find_due_runs(&sim.source, at(later)).unwrap();
+            assert_eq!((due.len(), due[0].scheduled_for), (1, at("2019-09-05T15:00:00Z")), "{later}");
+        }
+        assert_eq!((runs.records().len(), rig.requests()), (n, requests));
+
+        // Before the slot the ETF account is not due at all (the run of 00:10Z is gone).
+        assert!(find_due_runs(&sim.source, at("2019-09-06T00:10:00Z")).unwrap().is_empty());
+        assert!(find_due_runs(&sim.source, at("2019-09-06T14:59:59Z")).unwrap().is_empty());
+        // The next day is a different key.
+        let next = sim.tick(date(2019, 9, 6), &vendor);
+        assert_eq!(next.key.canonical(), "alpaca-acct|2019-09-06T15:00:00+00:00|etf");
+        assert_ne!(next.key, first.key);
+    });
+}
+
+#[test]
+fn s4_a_mixed_account_runs_once_a_day_at_1500z_and_a_crypto_only_account_keeps_0010z() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    with_alpaca(false, |rig| {
+        let runs = InMemoryRunStore::new();
+        let accounts = vec![account_named("mixed", vec![etf_sleeve("0.5"), crypto_sleeve("0.5")]), account_named("crypto-only", vec![crypto_sleeve("1")])];
+        let sim = Sim::new(rig, &runs, accounts);
+        for day in all_days(date(2019, 9, 5), date(2019, 9, 7)) {
+            let out: BTreeMap<String, RunRecord> = sim.tick_all(day, &vendor).into_iter().collect();
+            assert_eq!(out.len(), 2, "{day}: both accounts are due at the 15:00Z tick");
+            assert_eq!(out["mixed"].scheduled_for, at(&format!("{day}T15:00:00Z")), "{day}: one run per day for the mixed account, at the market-hours slot");
+            assert_eq!(out["crypto-only"].scheduled_for, at(&format!("{day}T00:10:00Z")), "{day}: the crypto-only account keeps its own slot");
+        }
+        let per_account = |id: &str| runs.records().iter().filter(|r| r.key.account_id == id).count();
+        assert_eq!((per_account("mixed"), per_account("crypto-only")), (3, 3), "exactly one run per account per day");
+    });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// S-3 end to end on the ETF (OnDecision) sleeve: an unplaced order never advances D_acted
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn s3_an_etf_decision_whose_orders_are_not_carried_out_stays_pending_run_after_run_until_it_is_acted() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    with_alpaca(false, |rig| {
+        // Phase 0: the market is closed (Alpaca's clock check). Phase 1: the rig's transport cannot place an order
+        // (its clock answer is unusable), so the order is not sent for another reason.
+        let phase = Arc::new(AtomicUsize::new(0));
+        let ph = phase.clone();
+        let mut scripted = ScriptedPlaceBroker::new(rig.broker, move |_| {
+            (ph.load(Ordering::SeqCst) == 0).then(|| Err(broker_adapters::BrokerError::MarketClosed { next_open: "2019-09-06T13:30:00Z".into(), next_close: "2019-09-06T20:00:00Z".into() }))
+        });
+        scripted.empty_tag_lookup = true;
+        let rig2 = Rig { broker: &scripted, book: rig.book, transport: rig.transport.clone(), down: rig.down.clone() };
+        let runs = InMemoryRunStore::new();
+        let mut live = account(vec![etf_sleeve("1")]);
+        live.mode = ExecutionMode::Live;
+        let sim = Sim::new(&rig2, &runs, vec![live]);
+        let not_acted_alerts = || sim.notifier.alerts().into_iter().filter(|a| a.code.as_str() == "ALERT_DECISION_NOT_ACTED").collect::<Vec<_>>();
+
+        // 09-05 and 09-06: market closed. The entry decision is planned, no order is sent, D_acted does not move, a
+        // WARNING (not a failure: wait for the next session) is raised each run and the decision is pending again.
+        for day in [date(2019, 9, 5), date(2019, 9, 6)] {
+            let r = sim.tick(day, &vendor);
+            assert_eq!((r.outcome.kind, r.outcome.code.as_str()), (OutcomeKind::Completed, "RUN_DECISION_NOT_ACTED"), "{day}: {:?}", r.outcome);
+            let dec = etf_decision(&r);
+            assert!(dec.pending && dec.planned && dec.entry && !dec.acted, "{day}: {dec:?}");
+            assert!(!r.placed.is_empty() && r.placed.iter().all(|p| p.refused_market_closed()), "{day}: every leg was refused as market closed: {:?}", r.placed);
+            assert_eq!(runs.last_acted_decision("alpaca-acct", "etf").unwrap(), None, "{day}: D_acted did not move");
+        }
+        assert_eq!(not_acted_alerts().len(), 2);
+        assert!(not_acted_alerts().iter().all(|a| a.severity == rebalancer_run::record::AlertSeverity::Warning));
+
+        // 09-09: orders fail for a reason that is NOT the clock: CRITICAL, still not acted, still pending.
+        phase.store(1, Ordering::SeqCst);
+        let r = sim.tick(date(2019, 9, 9), &vendor);
+        assert_eq!((r.outcome.kind, r.outcome.code.as_str()), (OutcomeKind::Completed, "RUN_DECISION_NOT_ACTED"), "{:?}", r.outcome);
+        assert!(etf_decision(&r).pending && !etf_decision(&r).acted && etf_decision(&r).entry);
+        assert_eq!(runs.last_acted_decision("alpaca-acct", "etf").unwrap(), None);
+        assert_eq!(not_acted_alerts().len(), 3);
+        assert_eq!(not_acted_alerts()[2].severity, rebalancer_run::record::AlertSeverity::Critical);
+
+        // 09-10: the account is switched to Assisted (a person takes the tickets): the same entry decision is finally
+        // acted on, once; 09-11 has nothing pending.
+        sim.source.set_accounts(vec![account(vec![etf_sleeve("1")])]);
+        let r = sim.tick(date(2019, 9, 10), &vendor);
+        assert_eq!((r.outcome.kind, r.outcome.code.as_str()), (OutcomeKind::Completed, "RUN_COMPLETED"), "{:?}", r.outcome);
+        assert!(etf_decision(&r).acted && !etf_tickets(&r).is_empty());
+        assert_eq!(runs.last_acted_decision("alpaca-acct", "etf").unwrap(), Some(date(2019, 8, 30)));
+        assert_eq!(sim.tick(date(2019, 9, 11), &vendor).outcome.code, "RUN_NOTHING_PENDING");
+        assert_eq!(not_acted_alerts().len(), 3, "no further alert once it is acted");
     });
 }

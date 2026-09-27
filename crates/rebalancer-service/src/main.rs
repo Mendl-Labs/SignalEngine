@@ -37,6 +37,7 @@ use chrono::{DateTime, Utc};
 use rebalancer_run::clock::Clock;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource, InMemoryAccountSource};
 use rebalancer_run::pipeline::RunConfig;
+use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
 use rebalancer_store::{AccountTenants, PgAccountLock, PgKillFlag, PgNotifier, PgRunStore, PgStateStore};
 
 const DEFAULT_TICK_SECS: u64 = 300;
@@ -71,12 +72,22 @@ fn demo_accounts() -> Vec<rebalancer_run::driver::ActiveAccount> {
 }
 
 fn main() {
+    // The paper-pilot interlock (see `rebalancer_service::pilot`): this build serves ONE (tenant, account) pair and
+    // starts only with REBALANCER_PAPER_ONLY=true, PILOT_TENANT_ID and PILOT_ACCOUNT_ID set, and without the tenant
+    // credential master key in its environment. Anything else refuses to start (fail closed).
+    let pilot = match PilotConfig::from_env() {
+        Ok(p) => p,
+        Err(refusal) => {
+            eprintln!("rebalancer-service: refusing to start: {refusal}");
+            std::process::exit(1);
+        }
+    };
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         eprintln!("rebalancer-service: DATABASE_URL is not set; refusing to start (fail closed, matching every store's own posture)");
         std::process::exit(1);
     });
     let tick_secs = tick_secs();
-    log(format!("starting: tick interval {tick_secs}s"));
+    log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY pilot for tenant {} account {}", pilot.tenant_id, pilot.account_id));
 
     let tenants = Arc::new(AccountTenants::new());
     let pool = match rebalancer_store::pg::create_pool(&database_url, 10) {
@@ -129,9 +140,13 @@ fn main() {
     };
 
     let clock = SystemClock;
-    let config = RunConfig::default();
-    let accounts = InMemoryAccountSource::new();
-    accounts.set_accounts(demo_accounts());
+    // Paper-only: the pipeline refuses any broker that does not report a paper connection (`VenuePolicy::PaperOnly`).
+    let config: RunConfig = pilot_run_config();
+    let inner = InMemoryAccountSource::new();
+    inner.set_accounts(demo_accounts());
+    // Serve exactly the pilot (tenant, account) pair; anything else about it that the pilot forbids fails the whole
+    // enumeration loudly (`find_due_runs failed` in the log) and nothing runs.
+    let accounts = PilotAccountSource::new(inner, pilot);
 
     loop {
         match kill_flag_or_heartbeat(&kill_flag) {
@@ -156,7 +171,7 @@ fn kill_flag_or_heartbeat(kill_flag: &PgKillFlag) -> Result<bool, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_tick(
-    accounts: &InMemoryAccountSource,
+    accounts: &dyn AccountSource,
     tenants: &Arc<AccountTenants>,
     state_store: &PgStateStore,
     run_store: &PgRunStore,

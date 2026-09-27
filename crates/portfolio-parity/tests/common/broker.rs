@@ -30,6 +30,9 @@ struct St {
     seq: u32,
     /// Adverse fill offset in bps (0 = fill at the reference price).
     slippage_bps: i64,
+    /// While set, a (non validate-only) order is refused with `BrokerError::MarketClosed`, exactly as the Alpaca
+    /// adapter's pre-order clock check does. Nothing is sent, nothing is filled.
+    market_closed: bool,
 }
 
 pub struct SimBroker {
@@ -52,6 +55,7 @@ impl SimBroker {
                 fills: Vec::new(),
                 seq: 0,
                 slippage_bps: 0,
+                market_closed: false,
             }),
         }
     }
@@ -65,6 +69,11 @@ impl SimBroker {
 
     pub fn set_slippage_bps(&self, bps: i64) {
         lock(&self.st).slippage_bps = bps;
+    }
+
+    /// Open or close the market (default: open).
+    pub fn set_market_closed(&self, closed: bool) {
+        lock(&self.st).market_closed = closed;
     }
 
     pub fn cash(&self) -> Dec {
@@ -153,6 +162,9 @@ impl Broker for SimBroker {
         };
         if req.validate_only {
             return Ok(PlaceOutcome::ValidatedOnly { description: None, sent, warnings: Vec::new() });
+        }
+        if s.market_closed {
+            return Err(BrokerError::MarketClosed { next_open: "next session".into(), next_close: "next session".into() });
         }
         if !matches!(req.kind, OrderKind::Market) {
             return Err(BrokerError::Unsupported("SimBroker fills market orders only".into()));

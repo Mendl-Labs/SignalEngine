@@ -127,10 +127,21 @@ pub enum AlertCode {
     StillHalted,
     /// The mandate is unusable, so the run refused.
     MandateUnusable,
+    /// The run reached its end but at least one planned order was not carried out (never sent, refused by the
+    /// venue, denied by the guard, unknown, or cancelled with nothing executed): the decision was NOT counted as
+    /// acted and is planned again on the next run. Critical, except when every gap is "market closed" (Warning).
+    DecisionNotActed,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 5] = [AlertCode::Halt, AlertCode::FlattenIncomplete, AlertCode::RunFailed, AlertCode::StillHalted, AlertCode::MandateUnusable];
+    pub const ALL: [AlertCode; 6] = [
+        AlertCode::Halt,
+        AlertCode::FlattenIncomplete,
+        AlertCode::RunFailed,
+        AlertCode::StillHalted,
+        AlertCode::MandateUnusable,
+        AlertCode::DecisionNotActed,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -139,6 +150,7 @@ impl AlertCode {
             AlertCode::RunFailed => "ALERT_RUN_FAILED",
             AlertCode::StillHalted => "ALERT_STILL_HALTED",
             AlertCode::MandateUnusable => "ALERT_MANDATE_UNUSABLE",
+            AlertCode::DecisionNotActed => "ALERT_DECISION_NOT_ACTED",
         }
     }
 }
@@ -226,8 +238,10 @@ pub struct SleeveDecision {
     pub entry: bool,
     /// The sleeve's target was handed to the planner in this run.
     pub planned: bool,
-    /// The run completed with this sleeve planned: this decision counts as ACTED (`D_acted` advances). A run that
-    /// failed closed, was refused or halted acts on nothing.
+    /// This decision counts as ACTED (`D_acted` advances). True only when the run `Completed` with `RUN_COMPLETED`
+    /// (not `RUN_DECISION_NOT_ACTED`), this sleeve was planned, and every order the plan called for was carried out
+    /// or ticketed (see `pipeline` module docs, "When a decision counts as acted"). A run that failed closed, was
+    /// refused or halted, or whose orders were not carried out, acts on nothing: the decision stays pending.
     pub acted: bool,
     pub instruments: Vec<InstrumentEvidence>,
 }
@@ -298,6 +312,35 @@ pub struct PlacedOrder {
     /// Errors met reading it, e.g. an adapter "overfill anomaly".
     pub anomalies: Vec<String>,
     pub detail: String,
+}
+
+/// Marker in [`PlacedOrder::detail`] of an order the venue would not take because its market was closed (Alpaca's
+/// pre-order clock check). It lets the run tell "wait for the next session" from a real failure.
+pub const MARKET_CLOSED_MARKER: &str = "MARKET_CLOSED";
+
+impl PlacedOrder {
+    /// Did the venue take this order and act on it? This is the per-leg input of "did the run act on its decision"
+    /// (`RunCode::DecisionNotActed`). Precisely:
+    /// * `Filled`, `PartiallyFilled`: yes (accepted, and something executed).
+    /// * `Validated`: yes (Paper mode: the venue checked the order and created nothing, which is all Paper can do).
+    /// * `AdoptedExisting` (an earlier attempt of this run already placed it): yes iff it executed something.
+    /// * `UnknownNotFound` (the outcome was unknown and the look-up found nothing): no, unless the order turned up
+    ///   later and has executed something.
+    /// * `NothingExecuted` (accepted, then cancelled or expired with nothing executed), `Rejected`, `NotSent`,
+    ///   `Unsettled`: no.
+    pub fn carried(&self) -> bool {
+        match self.outcome {
+            PlacedOutcome::Filled | PlacedOutcome::PartiallyFilled | PlacedOutcome::Validated => true,
+            PlacedOutcome::AdoptedExisting => self.executed_quantity.is_positive(),
+            PlacedOutcome::UnknownNotFound => self.reports.iter().any(|r| r.executed_quantity.is_positive()),
+            PlacedOutcome::NothingExecuted | PlacedOutcome::Rejected | PlacedOutcome::NotSent | PlacedOutcome::Unsettled => false,
+        }
+    }
+
+    /// Never sent because the market was closed (see [`MARKET_CLOSED_MARKER`]).
+    pub fn refused_market_closed(&self) -> bool {
+        self.outcome == PlacedOutcome::NotSent && self.detail.contains(MARKET_CLOSED_MARKER)
+    }
 }
 
 /// One entry of the ordered step log.
