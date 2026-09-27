@@ -3750,6 +3750,7 @@ dependencies = [
  "diesel-async",
  "fake-broker",
  "futures-util",
+ "mandate-core",
  "rebalancer-core",
  "rebalancer-risk",
  "rebalancer-run",
