@@ -400,7 +400,7 @@ impl MassiveDataSource {
             if let Some(h) = resp.header("x-request-id") {
                 note_id(&h.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect::<String>());
             }
-            let page = parse_aggs_page(resp.body.as_bytes(), &plan.ticker, Some(key.expose())).map_err(&malformed)?;
+            let page = parse_aggs_page(resp.body.as_bytes(), &plan.ticker, Some(key.expose())).map_err(malformed)?;
             if let Some(id) = &page.request_id {
                 note_id(id);
             }
@@ -411,7 +411,7 @@ impl MassiveDataSource {
                     if page_no == self.cfg.max_pages {
                         return Err(malformed(format!("more than {} pages: refusing to follow next_url further", self.cfg.max_pages)));
                     }
-                    let s = sanitize_next_url(&next, &self.authority, Some(key.expose())).map_err(&malformed)?;
+                    let s = sanitize_next_url(&next, &self.authority, Some(key.expose())).map_err(malformed)?;
                     scrubbed |= s.scrubbed;
                     url = s.url;
                     record = s.record;
@@ -423,7 +423,7 @@ impl MassiveDataSource {
         let mut dates: Vec<NaiveDate> = Vec::with_capacity(raw.len());
         let mut closes: Vec<f64> = Vec::with_capacity(raw.len());
         for (t, c) in &raw {
-            let d = bar_date(plan.clock, *t).map_err(&malformed)?;
+            let d = bar_date(plan.clock, *t).map_err(malformed)?;
             if let Some(prev) = dates.last() {
                 if d <= *prev {
                     return Err(malformed(format!("bar dates are not strictly ascending: {prev} then {d}")));
