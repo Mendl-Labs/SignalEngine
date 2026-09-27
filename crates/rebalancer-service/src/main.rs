@@ -29,8 +29,9 @@
 //! `InMemoryAccountSource`/`demo_accounts()` wiring this replaces is gone, not merely unused): `PilotConfig::
 //! from_env`'s paper-only checks (`REBALANCER_PAPER_ONLY=true` plus both pilot ids) must already pass before any of
 //! the above runs, and nothing past that point reads an env var that would substitute a fake broker or a fake
-//! account list -- `tests/runtime_paper_only.rs` proves the startup gate itself refuses regardless of such a
-//! variable with a real call to the same function `main` calls, not just by reading the source.
+//! account list -- `tests/runtime_construction.rs::rebalancer_demo_cannot_bypass_the_paper_only_startup_refusal`
+//! proves the startup gate itself refuses regardless of such a variable with a real call to the same function
+//! `main` calls, not just by reading the source.
 //!
 //! Two read-only/print-only subcommands exist for the owner to run BEFORE a pilot plan row exists:
 //! `print-fingerprint` (connects read-only and prints the connected key's fingerprint, never the key) and
