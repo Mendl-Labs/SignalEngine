@@ -2388,6 +2388,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-data"
+version = "0.0.1"
+dependencies = [
+ "broker-adapters",
+ "chrono",
+ "hex",
+ "rebalancer-core",
+ "rebalancer-run",
+ "reference-rules",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
