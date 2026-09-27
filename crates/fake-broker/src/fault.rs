@@ -10,7 +10,7 @@
 //!   reaches the exchange later. Because Kraken rejects any nonce not above the highest seen, a
 //!   late request loses to every newer request that got there first.
 
-use broker_adapters::transport::TransportError;
+use broker_adapters::transport::{HttpMethod, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timing {
@@ -47,11 +47,15 @@ pub enum FaultKind {
 pub struct RequestMatcher {
     /// Exact URL path, for example `/0/private/AddOrder`. `None` = any path.
     pub path: Option<String>,
+    /// `None` = any method. Needed because Alpaca (unlike Kraken/OANDA) sometimes uses the SAME path for two
+    /// different calls distinguished only by HTTP method (`GET /v2/orders` lists, `POST /v2/orders` places): a
+    /// path-only matcher would otherwise fault the wrong one.
+    pub method: Option<HttpMethod>,
 }
 
 impl RequestMatcher {
-    pub(crate) fn matches(&self, path: &str) -> bool {
-        self.path.as_deref().is_none_or(|p| p == path)
+    pub(crate) fn matches(&self, method: HttpMethod, path: &str) -> bool {
+        self.path.as_deref().is_none_or(|p| p == path) && self.method.is_none_or(|m| m == method)
     }
 }
 
@@ -133,6 +137,11 @@ impl Fault {
         self.matcher.path = Some(path.to_string());
         self
     }
+    /// Restrict this fault to one HTTP method (see [`RequestMatcher::method`]).
+    pub fn on_method(mut self, method: HttpMethod) -> Self {
+        self.matcher.method = Some(method);
+        self
+    }
 }
 
 /// FIFO of pending faults. The first fault whose matcher matches decides the request.
@@ -155,8 +164,8 @@ impl FaultQueue {
     }
 
     /// Decide the fate of one request. `None` = pass through cleanly.
-    pub fn take(&mut self, path: &str) -> Option<(FaultKind, Timing)> {
-        let i = self.faults.iter().position(|f| f.remaining > 0 && f.matcher.matches(path))?;
+    pub fn take(&mut self, method: HttpMethod, path: &str) -> Option<(FaultKind, Timing)> {
+        let i = self.faults.iter().position(|f| f.remaining > 0 && f.matcher.matches(method, path))?;
         let f = &mut self.faults[i];
         if f.skip > 0 {
             f.skip -= 1;
@@ -191,12 +200,20 @@ mod tests {
     fn counts_skips_and_matchers() {
         let mut q = FaultQueue::default();
         q.push(Fault::timeout().times(2).after_requests(1).on_path("/a"));
-        assert_eq!(q.take("/b"), None, "other paths are untouched");
-        assert_eq!(q.take("/a"), None, "first matching request is skipped");
-        assert!(q.take("/a").is_some());
-        assert!(q.take("/a").is_some());
-        assert_eq!(q.take("/a"), None, "exhausted");
+        assert_eq!(q.take(HttpMethod::Get, "/b"), None, "other paths are untouched");
+        assert_eq!(q.take(HttpMethod::Get, "/a"), None, "first matching request is skipped");
+        assert!(q.take(HttpMethod::Get, "/a").is_some());
+        assert!(q.take(HttpMethod::Get, "/a").is_some());
+        assert_eq!(q.take(HttpMethod::Get, "/a"), None, "exhausted");
         assert!(q.pending().is_empty());
+    }
+
+    #[test]
+    fn a_method_restricted_fault_ignores_other_methods_on_the_same_path() {
+        let mut q = FaultQueue::default();
+        q.push(Fault::timeout().on_path("/v2/orders").on_method(HttpMethod::Post));
+        assert_eq!(q.take(HttpMethod::Get, "/v2/orders"), None, "GET on the same path is untouched");
+        assert!(q.take(HttpMethod::Post, "/v2/orders").is_some());
     }
 
     #[test]
@@ -204,10 +221,10 @@ mod tests {
         let mut q = FaultQueue::default();
         q.push(Fault::rate_limit().forever());
         for _ in 0..1000 {
-            assert!(q.take("/x").is_some());
+            assert!(q.take(HttpMethod::Get, "/x").is_some());
         }
         q.clear();
-        assert!(q.take("/x").is_none());
+        assert!(q.take(HttpMethod::Get, "/x").is_none());
     }
 
     #[test]
