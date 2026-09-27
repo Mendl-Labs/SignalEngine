@@ -144,11 +144,19 @@ fn refusal_codes_are_stable_and_distinct() {
 // ---------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn the_pilot_run_config_is_paper_only_and_otherwise_the_defaults() {
+fn the_pilot_run_config_is_paper_only_and_the_platform_defaults_except_where_s6_widens_them() {
     let c = pilot_run_config();
     assert_eq!(c.venue_policy, VenuePolicy::PaperOnly);
     let d = rebalancer_run::pipeline::RunConfig::default();
-    assert_eq!((c.max_polls, c.lease_secs, c.max_price_age_secs, c.min_trade_abs), (d.max_polls, d.lease_secs, d.max_price_age_secs, d.min_trade_abs));
+    // Unchanged from the platform default.
+    assert_eq!((c.max_polls, c.lease_secs, c.min_trade_abs), (d.max_polls, d.lease_secs, d.min_trade_abs));
+    // Deliberately widened for the pilot (slice S-6, `rebalancer_service::pilot::PILOT_MAX_PRICE_AGE_SECS` /
+    // `PILOT_RECON_VALUE_ABS`): the pilot's `DataSource` supplies the last COMPLETE daily close (days old, not
+    // minutes), and a paper dividend can move cash between monthly runs by more than the platform's $1 floor.
+    assert_ne!(c.max_price_age_secs, d.max_price_age_secs, "the pilot must NOT use the live-quote staleness window");
+    assert_eq!(c.max_price_age_secs, 4 * 24 * 60 * 60);
+    assert_ne!(c.tolerances.value_abs, d.tolerances.value_abs, "the pilot must NOT use the $1 platform recon floor");
+    assert_eq!(c.tolerances.value_abs, broker_adapters::Dec::from_i64(15));
 }
 
 // ---------------------------------------------------------------------------------------------------------------

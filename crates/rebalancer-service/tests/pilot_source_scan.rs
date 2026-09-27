@@ -92,18 +92,44 @@ fn the_paper_only_adapter_module_names_no_live_alpaca_environment_host_or_url() 
     assert!(hits.is_empty(), "{hits:?}");
 }
 
+fn normal_deps(rel: &str) -> String {
+    let manifest = fs::read_to_string(crates_dir().join(rel)).unwrap();
+    // dependency tables only: everything before a [dev-dependencies] section is a normal dependency
+    manifest.split("[dev-dependencies]").next().unwrap().to_string()
+}
+
+fn assert_no_legacy_crates(rel: &str, normal: &str) {
+    for legacy in ["smartorderrouter", "hostbuilder", "executionhandler", "signaldispatcher", "exchangemetricaggregator", "strategyloader"] {
+        assert!(!normal.lines().filter(|l| !l.trim_start().starts_with('#')).any(|l| l.trim_start().starts_with(legacy)), "{rel} depends on {legacy}");
+    }
+}
+
 #[test]
 fn the_service_does_not_depend_on_the_legacy_live_trading_crates() {
-    for rel in ["rebalancer-service/Cargo.toml", "rebalancer-run/Cargo.toml", "rebalancer-store/Cargo.toml"] {
-        let manifest = fs::read_to_string(crates_dir().join(rel)).unwrap();
-        // dependency tables only: everything before a [dev-dependencies] section is a normal dependency
-        let normal = manifest.split("[dev-dependencies]").next().unwrap();
-        for legacy in ["smartorderrouter", "hostbuilder", "executionhandler", "signaldispatcher", "exchangemetricaggregator", "strategyloader"] {
-            assert!(!normal.lines().filter(|l| !l.trim_start().starts_with('#')).any(|l| l.trim_start().starts_with(legacy)), "{rel} depends on {legacy}");
-        }
-        // the real HTTP transport is off unless a later slice turns it on deliberately
-        assert!(!normal.contains("reqwest-transport"), "{rel} enables the real transport: the pilot builder slice (S-6) must do that on purpose and update this test");
+    // rebalancer-run / rebalancer-store never need a real HTTP client (the pipeline is pure, the stores talk only to
+    // Postgres): the real transport stays off there, always.
+    for rel in ["rebalancer-run/Cargo.toml", "rebalancer-store/Cargo.toml"] {
+        let normal = normal_deps(rel);
+        assert_no_legacy_crates(rel, &normal);
+        assert!(!normal.contains("reqwest-transport"), "{rel} enables the real transport, which it should never need");
     }
+
+    // rebalancer-service: the pilot builder slice (S-6) turns the real transport ON deliberately (this is the
+    // comment the pre-S-6 version of this test told S-6 to update) -- for exactly the paper Alpaca adapter and the
+    // Massive data source it wires as the production `Broker`/`DataSource`, and ONLY as a `broker-adapters` feature,
+    // never as its own separate HTTP dependency (a second HTTP stack would be an unreviewed way to reach the network).
+    let rel = "rebalancer-service/Cargo.toml";
+    let normal = normal_deps(rel);
+    assert_no_legacy_crates(rel, &normal);
+    assert!(normal.contains("reqwest-transport"), "{rel} must turn the real HTTP transport on (S-6)");
+    assert!(
+        normal.lines().filter(|l| !l.trim_start().starts_with('#')).any(|l| l.trim_start().starts_with("broker-adapters") && l.contains("reqwest-transport")),
+        "{rel}: reqwest-transport must be requested as a feature of the broker-adapters dependency line, not floated free"
+    );
+    assert!(
+        !normal.lines().filter(|l| !l.trim_start().starts_with('#')).any(|l| l.trim_start().starts_with("reqwest ")),
+        "{rel} must not depend on reqwest directly; only through broker-adapters' feature"
+    );
 }
 
 #[test]

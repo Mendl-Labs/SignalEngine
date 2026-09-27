@@ -10,7 +10,12 @@ name = "rebalancer-service"
 path = "src/main.rs"
 
 [dependencies]
-broker-adapters = { path = "../broker-adapters" }
+# reqwest-transport (slice S-6): the pilot builder is the first thing in this workspace that needs a REAL HTTP
+# client for a production binary (every other adapter call in the workspace so far was test-only). See
+# tests/pilot_source_scan.rs, which asserts this on purpose and was updated in the same commit that adds it.
+broker-adapters = { path = "../broker-adapters", features = ["reqwest-transport"] }
+market-data = { path = "../market-data" }
+rebalancer-core = { path = "../rebalancer-core" }
 rebalancer-run = { path = "../rebalancer-run" }
 rebalancer-store = { path = "../rebalancer-store" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -18,7 +23,7 @@ uuid = { version = "1" }
 
 [dev-dependencies]
 mandate-core = { path = "../mandate-core" }
-rebalancer-core = { path = "../rebalancer-core" }
+rebalancer-risk = { path = "../rebalancer-risk" }
 serde_json = "1"
 
 # Deliberately NOT tokio at the top level: rebalancer-run's pipeline (and therefore run_all_due) is
