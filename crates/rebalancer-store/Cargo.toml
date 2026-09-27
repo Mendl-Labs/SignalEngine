@@ -9,6 +9,7 @@ publish = false
 rebalancer-core = { path = "../rebalancer-core" }
 rebalancer-risk = { path = "../rebalancer-risk" }
 rebalancer-run = { path = "../rebalancer-run" }
+mandate-core = { path = "../mandate-core" }
 broker-adapters = { path = "../broker-adapters" }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }

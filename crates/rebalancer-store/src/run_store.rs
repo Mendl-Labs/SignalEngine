@@ -32,14 +32,24 @@
 //! = $3 AND status = 'in_progress'` is what makes "this call, and only this call, gets to move the row
 //! from in_progress to done" true under concurrent callers) -- splitting them would reopen exactly the
 //! race the run-key uniqueness exists to close.
+//!
+//! # The decision ledger (`D_acted`) and the atomic `finish`
+//! `last_acted_decision` reads `rebalancer_decision_ledger` (see [`crate::ledger`]); `finish` writes the run's
+//! terminal row, its equity snapshots and one ledger row per `acted` decision in ONE transaction, so `D_acted`
+//! can never advance without the run record (or the reverse), and a crash between the two leaves neither. A
+//! missing ledger table, or a ledger that holds the account under another tenant, is
+//! `DecisionLedgerUnavailable` (fail closed), never `None`.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use broker_adapters::{Dec, Side};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use diesel::sql_types::{Date, Integer, Jsonb, Nullable, Text, Timestamptz};
-use diesel_async::RunQueryDsl;
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use rebalancer_core::guard::DayCounters;
+use rebalancer_core::planner::PlannedOrder;
 use rebalancer_run::record::{
     ExecutionMode, OutcomeKind, Phase, PlacedOrder, PlacedOutcome, RunKey, RunOutcome, RunRecord, SnapshotSummary,
 };
@@ -47,8 +57,10 @@ use rebalancer_run::stores::{Begin, JournalEntry, RunStore, RunStoreError, RunSu
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::ledger::{self, ActedRow, ActedRun, LedgerFault, ReadOutcome};
 use crate::pg::{Bridge, Pool};
-use crate::tenants::AccountTenants;
+use crate::provenance::PlanProvenanceRegistry;
+use crate::tenants::{AccountTenants, UNKNOWN_TENANT};
 
 fn unavailable(e: impl std::fmt::Display) -> RunStoreError {
     RunStoreError::Unavailable(e.to_string())
@@ -217,6 +229,30 @@ fn placed_vec_from_json(v: &Value) -> Result<Vec<PlacedOrder>, String> {
     v.as_array().ok_or("expected placed array")?.iter().map(placed_from_json).collect()
 }
 
+/// The tickets an assisted run issued (`RunRecord::tickets`), so the owner reads structured rows instead of a
+/// `{:?}` dump. Write-only here: `get()` keeps returning the record's narrative fields empty (module docs).
+fn tickets_to_json(tickets: &[PlannedOrder]) -> Value {
+    Value::Array(
+        tickets
+            .iter()
+            .map(|t| {
+                json!({
+                    "tag": t.tag,
+                    "sleeve": t.sleeve,
+                    "venue": t.venue,
+                    "asset_class": t.asset_class,
+                    "symbol": t.symbol,
+                    "side": side_to_str(t.side),
+                    "quantity": t.quantity.to_string(),
+                    "price": t.price.to_string(),
+                    "notional": t.notional.to_string(),
+                    "est_fee": t.est_fee.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------------------------------
@@ -340,57 +376,118 @@ fn journal_row_to_entry(r: JournalRow) -> Result<JournalEntry, String> {
 
 pub struct PgRunStore {
     bridge: Bridge,
-    tenants: std::sync::Arc<AccountTenants>,
+    tenants: Arc<AccountTenants>,
+    provenance: Option<Arc<PlanProvenanceRegistry>>,
+}
+
+/// Why a `finish` transaction did not commit (every variant rolls the whole transaction back).
+#[derive(Debug)]
+enum FinishError {
+    Db(String),
+    /// The run row was not `in_progress` any more (someone finished it first).
+    AlreadyFinished,
+    /// An `acted` decision needs the ledger and the ledger table does not exist.
+    LedgerMissing,
+    /// The ledger holds this account under another tenant.
+    LedgerForeignTenant,
+}
+
+impl From<diesel::result::Error> for FinishError {
+    fn from(e: diesel::result::Error) -> Self {
+        FinishError::Db(e.to_string())
+    }
+}
+
+/// Appends the finished run's pre/post broker snapshots to `rebalancer_equity_snapshots` (see that table's own
+/// migration comment: a flat time series for a dashboard, distinct from the per-run JSONB detail already on
+/// `rebalancer_runs`). Runs inside `finish`'s transaction: a failure here rolls the whole finish back.
+async fn insert_equity_snapshots(conn: &mut AsyncPgConnection, tenant_id: Uuid, record: &RunRecord) -> Result<(), diesel::result::Error> {
+    let account_id = record.key.account_id.clone();
+    let run_key = record.key.canonical();
+    let mut rows: Vec<(&str, DateTime<Utc>, Dec, Dec, Dec)> = Vec::new();
+    if let Some(s) = &record.pre_snapshot {
+        rows.push(("pre_run", s.taken_at, s.equity, s.cash, s.derived_equity));
+    }
+    if let Some(s) = &record.post_snapshot {
+        rows.push(("post_run", s.taken_at, s.equity, s.cash, s.derived_equity));
+    }
+    for (source, taken_at, equity, cash, derived_equity) in rows {
+        diesel::sql_query(
+            "INSERT INTO rebalancer_equity_snapshots              (tenant_id, account_id, taken_at, equity, cash, derived_equity, source, run_key)              VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6::numeric, $7, $8)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(tenant_id)
+        .bind::<Text, _>(&account_id)
+        .bind::<Timestamptz, _>(taken_at)
+        .bind::<Text, _>(equity.to_string())
+        .bind::<Text, _>(cash.to_string())
+        .bind::<Text, _>(derived_equity.to_string())
+        .bind::<Text, _>(source)
+        .bind::<Text, _>(&run_key)
+        .execute(conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The decisions of `record` that count as ACTED, in the ledger's shape. The pipeline decides what `acted`
+/// means (`SleeveDecision::acted`); this only carries it over.
+fn acted_rows(record: &RunRecord) -> Vec<ActedRow> {
+    let mut rows: Vec<ActedRow> = record
+        .decisions
+        .iter()
+        .filter(|d| d.acted)
+        .map(|d| ActedRow {
+            sleeve_id: d.sleeve.clone(),
+            decision_date: d.decision_date,
+            computable_decision_date: d.computable_decision_date,
+            newest_bar_date: d.newest_bar_date,
+            lag_sessions: i32::try_from(d.lag_sessions).unwrap_or(i32::MAX),
+            entry: d.entry,
+            data_fingerprint: record.targets.iter().find(|t| t.sleeve == d.sleeve).map(|t| t.data_fingerprint.clone()),
+        })
+        .collect();
+    // A stable order, so two writers of one account take the per-sleeve locks in the same order.
+    rows.sort_by(|a, b| a.sleeve_id.cmp(&b.sleeve_id));
+    rows
 }
 
 impl PgRunStore {
-    pub fn new(pool: Pool, tenants: std::sync::Arc<AccountTenants>) -> Result<Self, String> {
-        Ok(Self { bridge: Bridge::new(pool)?, tenants })
+    pub fn new(pool: Pool, tenants: Arc<AccountTenants>) -> Result<Self, String> {
+        Ok(Self { bridge: Bridge::new(pool)?, tenants, provenance: None })
     }
 
-    /// Appends the finished run's pre/post broker snapshots to `rebalancer_equity_snapshots` (see that
-    /// table's own migration comment: a flat time series for a dashboard, distinct from the per-run
-    /// JSONB detail already on `rebalancer_runs`). A failure here is logged into the caller's error
-    /// path via `Unavailable`, same fail-closed posture as every other write in this crate -- but by
-    /// the time this runs, `finish`'s own row update already succeeded, so the run record itself is
-    /// never lost even if this best-effort log append fails.
-    fn record_equity_snapshots(&self, record: &RunRecord) -> Result<(), RunStoreError> {
-        let tenant_id = self.tenants.get(&record.key.account_id);
-        let account_id = record.key.account_id.clone();
-        let run_key = record.key.canonical();
-        let mut rows: Vec<(String, chrono::DateTime<Utc>, Dec, Dec, Dec)> = Vec::new();
-        if let Some(s) = &record.pre_snapshot {
-            rows.push(("pre_run".to_string(), s.taken_at, s.equity, s.cash, s.derived_equity));
+    /// Record plan provenance (`plan_origin`, `plan_id`, `venue_environment`) on every finished run of an account
+    /// the registry knows (the account source fills it). Without it those columns stay NULL.
+    pub fn with_plan_provenance(mut self, registry: Arc<PlanProvenanceRegistry>) -> Self {
+        self.provenance = Some(registry);
+        self
+    }
+
+    /// Append a ledger `reset` row (council Ruling 9b): after a halt-and-flatten and a human resume, `D_acted` is
+    /// cleared so the sleeve re-enters on the decision in force. NEVER called by the service loop: it is the store
+    /// side of the human-only owner command. The database refuses a reset when nothing was acted since the last one.
+    pub fn reset_decision_ledger(&self, account_id: &str, sleeve_id: &str, actor: &str, reason: &str) -> Result<(), RunStoreError> {
+        let tenant = self.tenants.get(account_id);
+        if tenant == UNKNOWN_TENANT {
+            return Err(RunStoreError::DecisionLedgerUnavailable(format!("no tenant is registered for account {account_id}; refusing to write its ledger")));
         }
-        if let Some(s) = &record.post_snapshot {
-            rows.push(("post_run".to_string(), s.taken_at, s.equity, s.cash, s.derived_equity));
-        }
-        if rows.is_empty() {
-            return Ok(());
-        }
-        self.bridge
+        let (account, sleeve, actor_s, reason_s) = (account_id.to_string(), sleeve_id.to_string(), actor.to_string(), reason.to_string());
+        let outcome: Result<Option<LedgerFault>, FinishError> = self
+            .bridge
             .block_on(move |mut conn| async move {
-                for (source, taken_at, equity, cash, derived_equity) in rows {
-                    diesel::sql_query(
-                        "INSERT INTO rebalancer_equity_snapshots \
-                         (tenant_id, account_id, taken_at, equity, cash, derived_equity, source, run_key) \
-                         VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6::numeric, $7, $8)",
-                    )
-                    .bind::<diesel::sql_types::Uuid, _>(tenant_id)
-                    .bind::<Text, _>(&account_id)
-                    .bind::<Timestamptz, _>(taken_at)
-                    .bind::<Text, _>(equity.to_string())
-                    .bind::<Text, _>(cash.to_string())
-                    .bind::<Text, _>(derived_equity.to_string())
-                    .bind::<Text, _>(&source)
-                    .bind::<Text, _>(&run_key)
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|e| format!("record_equity_snapshots: {e}"))?;
-                }
-                Ok(())
+                Ok(conn
+                    .transaction::<_, FinishError, _>(|conn| {
+                        async move { Ok(ledger::append_reset(conn, tenant, &account, &sleeve, &actor_s, &reason_s, Utc::now()).await?) }.scope_boxed()
+                    })
+                    .await)
             })
-            .map_err(unavailable)
+            .map_err(unavailable)?;
+        match outcome {
+            Ok(None) => Ok(()),
+            Ok(Some(LedgerFault::Missing)) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::missing_message(account_id, sleeve_id))),
+            Ok(Some(LedgerFault::ForeignTenant)) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::foreign_tenant_message(account_id, sleeve_id))),
+            Err(e) => Err(unavailable(format!("reset_decision_ledger: {e:?}"))),
+        }
     }
 
     fn fetch_one(&self, account_id: &str, scheduled_for: DateTime<Utc>, sleeve_set: &str) -> Result<Option<RunRow>, RunStoreError> {
@@ -569,10 +666,23 @@ impl RunStore for PgRunStore {
         }
 
         let tenant_id = self.tenants.get(&record.key.account_id);
+        let acted = acted_rows(&record);
+        let acted_sleeves = acted.iter().map(|r| r.sleeve_id.as_str()).collect::<Vec<_>>().join("+");
+        if !acted.is_empty() && tenant_id == UNKNOWN_TENANT {
+            // The ledger is tenant-scoped and its rows are permanent: never write one for an account whose
+            // tenant was not resolved. Nothing was written yet, so the run stays in progress.
+            return Err(RunStoreError::DecisionLedgerUnavailable(format!(
+                "no tenant is registered for account {}; refusing to write its decision ledger",
+                record.key.account_id
+            )));
+        }
+        let provenance = self.provenance.as_ref().and_then(|r| r.get(&record.key.account_id));
+        let key_canonical = record.key.canonical();
+        let account_for_msg = record.key.account_id.clone();
         let account_id = record.key.account_id.clone();
         let scheduled_for = record.key.scheduled_for;
         let sleeve_set = record.key.sleeve_set.clone();
-        let mode = mode_to_str(record.mode).to_string();
+        let mode = mode_to_str(record.mode);
         let outcome_kind = outcome_to_str(record.outcome.kind).to_string();
         let outcome_code = record.outcome.code.clone();
         let outcome_message = record.outcome.message.clone();
@@ -582,52 +692,84 @@ impl RunStore for PgRunStore {
         let pre_json = record.pre_snapshot.as_ref().map(snapshot_to_json);
         let post_json = record.post_snapshot.as_ref().map(snapshot_to_json);
         let placed_json = placed_vec_to_json(&record.placed);
+        let tickets_json = tickets_to_json(&record.tickets);
         let finished_at = record.finished_at;
         let record_debug = format!("{record:?}");
+        let (plan_origin, plan_id, venue_environment) = match provenance {
+            Some(p) => (Some(p.origin.as_str().to_string()), Some(p.plan_id), Some(p.venue_environment.as_str().to_string())),
+            None => (None, None, None),
+        };
+        let acted_run = ActedRun { tenant: tenant_id, account_id: account_id.clone(), run_scheduled_for: scheduled_for, run_sleeve_set: sleeve_set.clone(), mode, acted_at: finished_at };
 
-        let updated: usize = self
+        // ONE transaction: the terminal run row, its equity snapshots and the ledger rows commit together or
+        // not at all. The ledger guard trigger insists the run row is already `done` when a ledger row arrives,
+        // so the UPDATE comes first and the ledger rows cannot exist without the run record.
+        let outcome: Result<(), FinishError> = self
             .bridge
             .block_on(move |mut conn| async move {
-                diesel::sql_query(
-                    "UPDATE rebalancer_runs SET \
-                     tenant_id = $1, status = 'done', mode = $4, finished_at = $5, \
-                     outcome_kind = $6, outcome_code = $7, outcome_message = $8, \
-                     mandate_hash = $9, mandate_version = $10, mandate_standing = $11, \
-                     pre_snapshot = $12, post_snapshot = $13, placed = $14, record_debug = $15 \
-                     WHERE account_id = $2 AND scheduled_for = $3 AND sleeve_set = $16 AND status = 'in_progress'",
-                )
-                .bind::<diesel::sql_types::Uuid, _>(tenant_id)
-                .bind::<Text, _>(&account_id)
-                .bind::<Timestamptz, _>(scheduled_for)
-                .bind::<Text, _>(&mode)
-                .bind::<Timestamptz, _>(finished_at)
-                .bind::<Text, _>(&outcome_kind)
-                .bind::<Text, _>(&outcome_code)
-                .bind::<Text, _>(&outcome_message)
-                .bind::<Text, _>(&mandate_hash)
-                .bind::<Nullable<Integer>, _>(mandate_version)
-                .bind::<Text, _>(&mandate_standing)
-                .bind::<Nullable<Jsonb>, _>(&pre_json)
-                .bind::<Nullable<Jsonb>, _>(&post_json)
-                .bind::<Jsonb, _>(&placed_json)
-                .bind::<Text, _>(&record_debug)
-                .bind::<Text, _>(&sleeve_set)
-                .execute(&mut conn)
-                .await
-                .map_err(|e| format!("finish: {e}"))
+                Ok(conn
+                    .transaction::<(), FinishError, _>(|conn| {
+                        async move {
+                            let updated = diesel::sql_query(
+                                "UPDATE rebalancer_runs SET \
+                                 tenant_id = $1, status = 'done', mode = $4, finished_at = $5, \
+                                 outcome_kind = $6, outcome_code = $7, outcome_message = $8, \
+                                 mandate_hash = $9, mandate_version = $10, mandate_standing = $11, \
+                                 pre_snapshot = $12, post_snapshot = $13, placed = $14, record_debug = $15, \
+                                 tickets = $17, plan_origin = $18, plan_id = $19, venue_environment = $20 \
+                                 WHERE account_id = $2 AND scheduled_for = $3 AND sleeve_set = $16 AND status = 'in_progress'",
+                            )
+                            .bind::<diesel::sql_types::Uuid, _>(tenant_id)
+                            .bind::<Text, _>(&account_id)
+                            .bind::<Timestamptz, _>(scheduled_for)
+                            .bind::<Text, _>(mode)
+                            .bind::<Timestamptz, _>(finished_at)
+                            .bind::<Text, _>(&outcome_kind)
+                            .bind::<Text, _>(&outcome_code)
+                            .bind::<Text, _>(&outcome_message)
+                            .bind::<Text, _>(&mandate_hash)
+                            .bind::<Nullable<Integer>, _>(mandate_version)
+                            .bind::<Text, _>(&mandate_standing)
+                            .bind::<Nullable<Jsonb>, _>(&pre_json)
+                            .bind::<Nullable<Jsonb>, _>(&post_json)
+                            .bind::<Jsonb, _>(&placed_json)
+                            .bind::<Text, _>(&record_debug)
+                            .bind::<Text, _>(&sleeve_set)
+                            .bind::<Jsonb, _>(&tickets_json)
+                            .bind::<Nullable<Text>, _>(&plan_origin)
+                            .bind::<Nullable<diesel::sql_types::Uuid>, _>(plan_id)
+                            .bind::<Nullable<Text>, _>(&venue_environment)
+                            .execute(conn)
+                            .await?;
+                            if updated != 1 {
+                                // Someone finished it in the tiny window between the existence check above and this
+                                // write (the WHERE clause's own atomicity decides the winner; this is the LOSER's
+                                // view). Roll back: nothing of this call may persist.
+                                return Err(FinishError::AlreadyFinished);
+                            }
+                            insert_equity_snapshots(conn, tenant_id, &record).await?;
+                            if !acted.is_empty() {
+                                match ledger::append_acted(conn, &acted_run, &acted).await? {
+                                    None => {}
+                                    Some(LedgerFault::Missing) => return Err(FinishError::LedgerMissing),
+                                    Some(LedgerFault::ForeignTenant) => return Err(FinishError::LedgerForeignTenant),
+                                }
+                            }
+                            Ok(())
+                        }
+                        .scope_boxed()
+                    })
+                    .await)
             })
             .map_err(unavailable)?;
 
-        if updated != 1 {
-            // Someone finished it in the tiny window between our existence check above and this write
-            // (another attempt of the SAME process, e.g. two threads racing a resumed lease -- the
-            // WHERE clause's own atomicity is what actually decides the winner; this branch is what the
-            // LOSER observes).
-            return Err(RunStoreError::AlreadyFinished(record.key.canonical()));
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(FinishError::AlreadyFinished) => Err(RunStoreError::AlreadyFinished(key_canonical)),
+            Err(FinishError::LedgerMissing) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::missing_message(&account_for_msg, &acted_sleeves))),
+            Err(FinishError::LedgerForeignTenant) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::foreign_tenant_message(&account_for_msg, &acted_sleeves))),
+            Err(FinishError::Db(e)) => Err(unavailable(format!("finish: {e}"))),
         }
-
-        self.record_equity_snapshots(&record)?;
-        Ok(())
     }
 
     fn last_snapshot(&self, account_id: &str) -> Result<Option<SnapshotSummary>, RunStoreError> {
@@ -766,18 +908,31 @@ impl RunStore for PgRunStore {
         }
     }
 
-    /// FAILS CLOSED, always. There is no structured decision ledger in Postgres yet (`rebalancer_runs` has no
-    /// decision-date column, `get` returns no targets, and the per-decision fields live only in the `record_debug`
-    /// text): the ledger and its append-only, monotone, tenant-scoped table are work item W6 and need the owner to
-    /// apply a migration. Until then this store cannot say which decision an account last acted on, and the only
-    /// two possible guesses are both wrong for the ETF sleeve: "nothing acted" would plan it on every run, and
-    /// "everything acted" would never plan it. So the pipeline gets `DecisionLedgerUnavailable`, the run fails
-    /// closed with `RUN_DECISION_LEDGER_UNAVAILABLE`, and NO `OnDecision` sleeve is planned. (Sleeves with a `Daily`
-    /// cadence never ask, so crypto-only accounts are unaffected.)
+    /// `D_acted` from the decision ledger: the newest acted decision date of (account, sleeve) since the last
+    /// `reset` row, or `None` when the account never acted on the sleeve (an entry).
+    ///
+    /// FAILS CLOSED, with `DecisionLedgerUnavailable`, whenever it cannot answer TRUSTWORTHILY: the ledger table is
+    /// missing (the migration was not applied), no tenant is registered for the account, or the ledger already
+    /// holds the account under another tenant. The two wrong guesses ("nothing acted" plans the ETF sleeve on
+    /// every run; "everything acted" never plans it) are never made. A database failure is `Unavailable`, which the
+    /// pipeline also treats as a fail-closed run.
     fn last_acted_decision(&self, account_id: &str, sleeve_id: &str) -> Result<Option<NaiveDate>, RunStoreError> {
-        Err(RunStoreError::DecisionLedgerUnavailable(format!(
-            "the Postgres run store has no decision ledger yet (account {account_id}, sleeve {sleeve_id}); the ETF sleeve cannot be planned until the ledger migration is applied"
-        )))
+        let tenant = self.tenants.get(account_id);
+        if tenant == UNKNOWN_TENANT {
+            return Err(RunStoreError::DecisionLedgerUnavailable(format!(
+                "no tenant is registered for account {account_id} (sleeve {sleeve_id}); the decision ledger is tenant-scoped, so it cannot be read"
+            )));
+        }
+        let (account, sleeve) = (account_id.to_string(), sleeve_id.to_string());
+        let outcome = self
+            .bridge
+            .block_on(move |mut conn| async move { ledger::read_d_acted(&mut conn, tenant, &account, &sleeve).await.map_err(|e| format!("last_acted_decision: {e}")) })
+            .map_err(unavailable)?;
+        match outcome {
+            ReadOutcome::Value(v) => Ok(v),
+            ReadOutcome::Fault(LedgerFault::Missing) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::missing_message(account_id, sleeve_id))),
+            ReadOutcome::Fault(LedgerFault::ForeignTenant) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::foreign_tenant_message(account_id, sleeve_id))),
+        }
     }
 }
 
