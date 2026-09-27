@@ -39,8 +39,45 @@
 //!     is looked up by tag, never blindly retried in the same run.
 //! 11. `reconcile_post` (Paper/Live): re-read the account and reconcile against the expected effect of our fills;
 //!     any mismatch halts and alerts.
-//! 12. `finish`: the record is written (immutable) and returned. A decision counts as ACTED (`D_acted` advances) only
-//!     when its sleeve was planned in a run that ended `Completed`.
+//! 12. `assess` + `finish`: the run decides whether it ACTED on its decision(s) (below), then the record is written
+//!     (immutable) and returned. A decision counts as ACTED (`D_acted` advances) only when its sleeve was planned in
+//!     a run that ended `Completed` with `RUN_COMPLETED`.
+//!
+//! 1b. `venue_policy` (runs first, before the kill flag): under `VenuePolicy::PaperOnly` a broker that does not
+//!     report `VenueEnvironment::Paper` (including one that does not say) is refused with `RUN_VENUE_NOT_PAPER` and a
+//!     Critical alert; nothing is read or sent. The default policy is unrestricted.
+//!
+//! # When a decision counts as acted (finding 3 of the paper-pilot plan: acted-but-not-placed)
+//! A `Completed` run used to mark every planned decision acted whether or not its orders reached the broker, so a
+//! month could be lost silently (market closed, buying power refused, account blocked). Now `D_acted` advances only
+//! if EVERY order the plan called for was carried out. Per order leg, in Live and Paper mode
+//! (`PlacedOrder::carried`):
+//!
+//! | leg outcome | carried? |
+//! |---|---|
+//! | `Filled`, `PartiallyFilled` | yes |
+//! | `Validated` (Paper: the venue checked it, created nothing) | yes |
+//! | `AdoptedExisting` (placed by an earlier attempt of this run) | yes iff it executed something |
+//! | `UnknownNotFound` (outcome unknown, look-up found nothing) | no, unless it turned up executed |
+//! | `NothingExecuted` (accepted, cancelled at settle with nothing executed) | no |
+//! | `Rejected`, `NotSent` (market closed, buying power, blocked account, tag look-up failed, ...) | no |
+//! | `Unsettled` | no (the run halts anyway) |
+//!
+//! Plan level: a guard DENIAL of an order, or a planner skip that is not sizing dust, is a gap too: the target could
+//! not be reached. Dust (not a gap) = below the trade filters (`BelowMinTradeAbs`/`BelowMinTradePct`), below the
+//! venue's size or cost minimum or rounding to zero, or a buy not fundable above the cash reserve. Gaps = no price,
+//! no venue rules, an instrument the venue does not know or will not trade, a short held in a long-only sleeve, an
+//! unplaced close leg. In Assisted mode the tickets are
+//! the plan's orders, so tickets that were written count as carried (unchanged: a person now holds the decision),
+//! but a denial or non-dust skip still blocks. A plan with NO orders, no denial and no material skip means the book
+//! is already at target: nothing to do, the decision counts as acted.
+//!
+//! Any gap ends the run as `Completed` with code `RUN_DECISION_NOT_ACTED` (the pipeline did run to its end, and
+//! orders that WERE sent stay sent), sets `acted = false` for every planned sleeve, and raises
+//! `ALERT_DECISION_NOT_ACTED`: Critical, or Warning when every gap is "market closed" (a wait for the next session,
+//! not a failure). Partial execution (some legs carried, some not) is a gap too: the decision stays pending and the
+//! next run re-plans from what the account really holds, so already-carried legs are not repeated. The run key is per
+//! slot, so the retry is the next scheduled run.
 //!
 //! The rebalancer never places an order when the account is halting: the status is checked before every send. The
 //! only orders sent in a halt are flatten's SELLs of held quantities.
@@ -61,14 +98,14 @@ use broker_adapters::{BrokerError, Dec, OrderReport, OrderRequest, OrderStatus, 
 use chrono::{DateTime, NaiveDate, Utc};
 use mandate_core::mandate::{self, MandateBody};
 use rebalancer_core::guard::{DayCounters, PricePoint};
-use rebalancer_core::planner::{OrderPlan, OrderPlanner, PlanConfig, PlannedOrder, SleeveTarget};
+use rebalancer_core::planner::{OrderPlan, OrderPlanner, PlanConfig, PlannedOrder, SkipReason, SleeveTarget};
 use rebalancer_core::policy::{DeploymentLimits, MandateEnvelope, MandateStatus, Policy, Standing};
-use rebalancer_core::venue::VenueRuleBook;
+use rebalancer_core::venue::{SizeRefusal, VenueRuleBook};
 use rebalancer_risk::overlay::{step, RiskAction, RiskPolicy};
 use rebalancer_risk::state::{AccountState, AccountStatus, HaltReason};
 use rebalancer_risk::store::{StateStore, StoreError};
 
-use crate::broker::Broker;
+use crate::broker::{Broker, VenueEnvironment};
 use crate::clock::Clock;
 use crate::data::{Cadence, DataSource, SleeveSpec};
 use crate::decision::{evaluate, EvalCache, EvalError, Evaluation};
@@ -103,10 +140,17 @@ pub enum RunCode {
     /// The run store cannot say which decisions were acted on (the Postgres store before the decision ledger): the
     /// run fails closed rather than act on every run or never.
     DecisionLedgerUnavailable,
+    /// The run reached its end (`OutcomeKind::Completed`) but at least one order its plan called for was not carried
+    /// out: never sent, refused, denied by the guard, outcome unknown, or cancelled with nothing executed. The
+    /// decision is NOT counted as acted and is planned again on the next run (with an `ALERT_DECISION_NOT_ACTED`).
+    DecisionNotActed,
+    /// The run's broker is not a paper connection while the paper-only policy is in force
+    /// ([`VenuePolicy::PaperOnly`]): refused before anything is read or sent.
+    VenueNotPaper,
 }
 
 impl RunCode {
-    pub const ALL: [RunCode; 18] = [
+    pub const ALL: [RunCode; 20] = [
         RunCode::Completed,
         RunCode::KillFlagSet,
         RunCode::NoActiveMandate,
@@ -125,6 +169,8 @@ impl RunCode {
         RunCode::PlanError,
         RunCode::NothingPending,
         RunCode::DecisionLedgerUnavailable,
+        RunCode::DecisionNotActed,
+        RunCode::VenueNotPaper,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -147,8 +193,25 @@ impl RunCode {
             RunCode::PlanError => "RUN_PLAN_ERROR",
             RunCode::NothingPending => "RUN_NOTHING_PENDING",
             RunCode::DecisionLedgerUnavailable => "RUN_DECISION_LEDGER_UNAVAILABLE",
+            RunCode::DecisionNotActed => "RUN_DECISION_NOT_ACTED",
+            RunCode::VenueNotPaper => "RUN_VENUE_NOT_PAPER",
         }
     }
+}
+
+/// Which venue connections a deployment lets the pipeline use. A DEPLOYMENT setting (like the rest of [`RunConfig`]),
+/// never a mandate field and never an account field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VenuePolicy {
+    /// No restriction (the historical behaviour; every existing caller).
+    #[default]
+    Unrestricted,
+    /// Only a broker that reports [`VenueEnvironment::Paper`] may be used, in EVERY execution mode. Anything else,
+    /// including a broker that does not say ([`VenueEnvironment::Unspecified`]), is refused with
+    /// `RUN_VENUE_NOT_PAPER` before the broker is read or an order is sent. The paper pilot sets this: it is what
+    /// lets `ExecutionMode::Live` (the only mode that places real Alpaca orders, since Alpaca has no validate-only)
+    /// exist in the pilot build without ever being able to touch a live account.
+    PaperOnly,
 }
 
 /// Tunables of a run. None of these is a mandate field; each is a documented default a deployment may change.
@@ -171,6 +234,8 @@ pub struct RunConfig {
     pub flatten_max_rounds: u32,
     /// The deployment's own limits; effective limit = min(mandate, deployment).
     pub deployment: Option<DeploymentLimits>,
+    /// Which venue connections may be used (default: unrestricted). See [`VenuePolicy`].
+    pub venue_policy: VenuePolicy,
 }
 
 impl Default for RunConfig {
@@ -188,6 +253,7 @@ impl Default for RunConfig {
             poll_secs: 1,
             flatten_max_rounds: 4,
             deployment: None,
+            venue_policy: VenuePolicy::Unrestricted,
         }
     }
 }
@@ -234,6 +300,9 @@ struct Run<'a> {
     applied_ids: BTreeSet<String>,
     /// The sleeves whose decision is pending in this run, as `(index into ctx.sleeves and rec.decisions, evaluation)`.
     pending: Vec<(usize, Arc<Evaluation>)>,
+    /// Set only by `step_assess` when every order the plan called for was carried out (or ticketed), or there was
+    /// nothing to do. `finish` counts a planned decision as acted only when this is true.
+    carried: bool,
 }
 
 fn summarize(s: &BrokerSnapshot) -> SnapshotSummary {
@@ -309,6 +378,7 @@ pub fn run_once(ctx: &RunContext<'_>) -> RunRecord {
         pre_baseline: None,
         applied_ids: BTreeSet::new(),
         pending: Vec::new(),
+        carried: false,
     };
 
     // 1. Acquire the run key.
@@ -378,12 +448,15 @@ impl Run<'_> {
     fn finish(mut self) -> RunRecord {
         self.rec.state_after = Some(self.state.status());
         self.rec.finished_at = self.now();
-        // A decision counts as ACTED only when its sleeve was planned in a run that completed. A run that failed
-        // closed (broker down, plan error, ...), was refused or halted acted on nothing, so the same decision is
-        // pending again on the next run.
+        // A decision counts as ACTED only when its sleeve was planned in a run that completed AND every order the
+        // plan called for was carried out or ticketed (`step_assess` sets `carried`). A run that failed closed
+        // (broker down, plan error, ...), was refused or halted, or whose orders were not sent / refused / denied /
+        // unknown / cancelled with nothing executed, acted on nothing, so the same decision is pending again on the
+        // next run.
         let completed = self.rec.outcome.kind == OutcomeKind::Completed;
+        let carried = self.carried;
         for d in &mut self.rec.decisions {
-            d.acted = d.planned && completed;
+            d.acted = d.planned && completed && carried;
         }
         if let Err(e) = self.ctx.runs.finish(self.rec.clone()) {
             // The record could not be written. Nothing more can be done about the trades already made; say so.
@@ -395,6 +468,7 @@ impl Run<'_> {
     }
 
     fn execute(&mut self) -> Result<(), Stop> {
+        self.step_venue_policy()?;
         self.step_kill_flag()?;
         self.step_mandate()?;
         self.step_decisions()?;
@@ -407,8 +481,118 @@ impl Run<'_> {
         let plan = self.step_plan(&targets)?;
         self.step_execute(&targets, plan)?;
         self.step_recon_post()?;
-        self.stop(OutcomeKind::Completed, RunCode::Completed.as_str(), format!("{} run completed", self.ctx.mode.as_str()));
+        self.step_assess();
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------------------------------------
+    // 1b. venue policy
+    // -------------------------------------------------------------------------------------------------------
+
+    /// Under [`VenuePolicy::PaperOnly`] only a broker that reports `VenueEnvironment::Paper` may run, in every mode.
+    /// Checked before the kill flag, the mandate, the broker read or any order: a refusal here touches nothing.
+    fn step_venue_policy(&mut self) -> Result<(), Stop> {
+        let policy = self.ctx.config.venue_policy;
+        if policy == VenuePolicy::Unrestricted {
+            return Ok(());
+        }
+        let env = self.ctx.broker.environment();
+        if env == VenueEnvironment::Paper {
+            self.note("venue_policy", format!("paper-only: {} is a paper connection", self.ctx.broker.venue()));
+            return Ok(());
+        }
+        self.note("venue_policy", format!("paper-only policy: the {} broker reports {}: refused", self.ctx.broker.venue(), env.as_str()));
+        Err(self.fail_closed(
+            RunCode::VenueNotPaper,
+            format!("the paper-only policy is in force and the {} broker connection is not a verified paper connection (it reports {})", self.ctx.broker.venue(), env.as_str()),
+        ))
+    }
+
+    // -------------------------------------------------------------------------------------------------------
+    // 12a. did the run act on its decision(s)?
+    // -------------------------------------------------------------------------------------------------------
+
+    /// Every way the plan's orders were NOT carried out, as `(description, refused because the market was closed)`.
+    /// Empty means the decision is complete: every order was carried out (or ticketed) or the book was already at
+    /// target. The rules (see the module docs, "When a decision counts as acted"):
+    /// * a guard denial is a gap (the target could not be reached);
+    /// * a planner skip is a gap unless it is dust (`BelowMinTradeAbs` / `BelowMinTradePct`, i.e. already at target);
+    /// * Live / Paper: every order actually sent must be `PlacedOrder::carried`;
+    /// * Assisted: the tickets are the plan's orders, so a ticketed order is carried by definition.
+    ///
+    /// In a Live run the sells come from the first plan and the buys from the re-plan made on the real cash after
+    /// the sells settled; when no re-plan was made (no buys) the first plan is authoritative.
+    fn shortfalls(&self) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let Some(plan) = &self.rec.plan else { return out };
+        let replan = self.rec.replan.as_ref();
+        let is_sell = |symbol: &str| plan.lines.iter().any(|l| l.symbol.eq_ignore_ascii_case(symbol) && l.target_notional < l.current_notional);
+        // A skip is a GAP unless it is sizing dust: below the trade filters, below the venue's size/cost minimums or
+        // rounding to zero at its precision, or a buy that could not be funded above the cash reserve (all of these
+        // describe an account that is at target to within the venue's granularity, and re-appear as noise on every
+        // run if they blocked D_acted). Everything else means the target could not be reached for a reason a person
+        // must look at: no price, no venue rules, an instrument the venue does not know or will not trade, a short
+        // held in a long-only sleeve, an unplaced close leg.
+        let material = |reason: &SkipReason| match reason {
+            SkipReason::BelowMinTradeAbs { .. } | SkipReason::BelowMinTradePct { .. } | SkipReason::CutBelowVenueMinimum | SkipReason::NoCashAvailable => false,
+            SkipReason::VenueRefused(refusal) => !matches!(refusal, SizeRefusal::RoundsToZero | SizeRefusal::BelowMinQuantity { .. } | SizeRefusal::BelowMinCost { .. }),
+            SkipReason::NoPrice | SkipReason::NoVenueRules | SkipReason::ShortPositionHeld | SkipReason::FlipCloseLegNotPlaced => true,
+        };
+        // Guard denials: sells from the first plan, buys from the re-plan when there is one.
+        for d in &plan.denied {
+            if replan.is_none() || d.order.side == Side::Sell {
+                out.push((format!("guard denied {} {} ({})", d.order.side.as_str(), d.order.symbol, d.codes.join(",")), false));
+            }
+        }
+        if let Some(r) = replan {
+            for d in r.denied.iter().filter(|d| d.order.side == Side::Buy) {
+                out.push((format!("guard denied {} {} ({})", d.order.side.as_str(), d.order.symbol, d.codes.join(",")), false));
+            }
+        }
+        // Planner skips other than dust.
+        for s in &plan.skipped {
+            if material(&s.reason) && (replan.is_none() || is_sell(&s.symbol)) {
+                out.push((format!("planner skipped {} ({:?})", s.symbol, s.reason), false));
+            }
+        }
+        if let Some(r) = replan {
+            for s in &r.skipped {
+                if material(&s.reason) && !is_sell(&s.symbol) {
+                    out.push((format!("planner skipped {} ({:?})", s.symbol, s.reason), false));
+                }
+            }
+        }
+        // Orders that were actually sent (Live / Paper).
+        for p in &self.rec.placed {
+            if !p.carried() {
+                out.push((format!("{} {} {:?}: {}", p.side.as_str(), p.symbol, p.outcome, p.detail), p.refused_market_closed()));
+            }
+        }
+        out
+    }
+
+    /// Decide whether the run acted on its decision(s) and end the run: `RUN_COMPLETED` when it did,
+    /// `RUN_DECISION_NOT_ACTED` (still `Completed`, with an `ALERT_DECISION_NOT_ACTED`) when it did not.
+    fn step_assess(&mut self) {
+        let gaps = self.shortfalls();
+        if gaps.is_empty() {
+            // No step note on the success path: the documented step list of a successful run is unchanged.
+            self.carried = true;
+            self.stop(OutcomeKind::Completed, RunCode::Completed.as_str(), format!("{} run completed", self.ctx.mode.as_str()));
+            return;
+        }
+        let market_closed_only = gaps.iter().all(|(_, closed)| *closed);
+        let list = gaps.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>().join(" | ");
+        let carried_any = self.rec.placed.iter().any(|p| p.carried());
+        let message = format!(
+            "{} of the plan's orders were not carried out{}: the decision is NOT counted as acted and is planned again on the next run: {list}",
+            gaps.len(),
+            if carried_any { " (other orders of this run WERE carried out, so the account is part-way to its target)" } else { "" }
+        );
+        self.note("assess", message.clone());
+        let severity = if market_closed_only { AlertSeverity::Warning } else { AlertSeverity::Critical };
+        self.alert(AlertCode::DecisionNotActed, severity, message.clone(), "decision_not_acted");
+        self.stop(OutcomeKind::Completed, RunCode::DecisionNotActed.as_str(), message);
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -1151,7 +1335,11 @@ impl Run<'_> {
             }
             Err(e) => {
                 placed.outcome = PlacedOutcome::NotSent;
-                placed.detail = format!("not sent: {e}");
+                placed.detail = if matches!(e, BrokerError::MarketClosed { .. }) {
+                    format!("not sent: {MARKET_CLOSED_MARKER}: {e}")
+                } else {
+                    format!("not sent: {e}")
+                };
             }
         }
         placed

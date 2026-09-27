@@ -56,11 +56,17 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "RUN_PLAN_ERROR",
             "RUN_NOTHING_PENDING",
             "RUN_DECISION_LEDGER_UNAVAILABLE",
+            // added by the paper-pilot slices S-3 and S-8 (appended, nothing renumbered)
+            "RUN_DECISION_NOT_ACTED",
+            "RUN_VENUE_NOT_PAPER",
         ]
     );
     assert_eq!(run.iter().collect::<std::collections::BTreeSet<_>>().len(), run.len());
     let alerts: Vec<&str> = AlertCode::ALL.iter().map(|c| c.as_str()).collect();
-    assert_eq!(alerts, ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ALERT_STILL_HALTED", "ALERT_MANDATE_UNUSABLE"]);
+    assert_eq!(
+        alerts,
+        ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ALERT_STILL_HALTED", "ALERT_MANDATE_UNUSABLE", "ALERT_DECISION_NOT_ACTED"]
+    );
     assert_eq!(
         [OutcomeKind::Completed, OutcomeKind::Refused, OutcomeKind::FailedClosed, OutcomeKind::Halted].map(|k| k.as_str()),
         ["COMPLETED", "REFUSED", "FAILED_CLOSED", "HALTED"]

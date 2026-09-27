@@ -47,8 +47,36 @@ impl SnapshotError {
     }
 }
 
+/// What kind of money a broker connection can move. Used ONLY by the pipeline's paper-only policy
+/// ([`crate::pipeline::VenuePolicy::PaperOnly`]); it says nothing about how orders are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VenueEnvironment {
+    /// The venue's own simulated-money environment (Alpaca paper), verified by the adapter's constructor guards.
+    Paper,
+    /// A venue connection that may move real money.
+    Live,
+    /// The implementation does not say (the default). Under the paper-only policy this is REFUSED: a broker that
+    /// cannot vouch for being paper is treated as not paper.
+    Unspecified,
+}
+
+impl VenueEnvironment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VenueEnvironment::Paper => "paper",
+            VenueEnvironment::Live => "live",
+            VenueEnvironment::Unspecified => "unspecified",
+        }
+    }
+}
+
 pub trait Broker {
     fn venue(&self) -> &'static str;
+    /// What this connection can move. The default is [`VenueEnvironment::Unspecified`] so that a new or wrapped broker
+    /// is never mistaken for paper by accident.
+    fn environment(&self) -> VenueEnvironment {
+        VenueEnvironment::Unspecified
+    }
     /// Read the whole account (balances, equity, holdings, open orders) as of `now`.
     fn snapshot(&self, now: DateTime<Utc>) -> Result<BrokerSnapshot, SnapshotError>;
     fn place(&self, req: &OrderRequest) -> Result<PlaceOutcome, BrokerError>;
@@ -93,6 +121,11 @@ impl<'a> KrakenBroker<'a> {
 impl Broker for KrakenBroker<'_> {
     fn venue(&self) -> &'static str {
         "kraken"
+    }
+
+    /// Kraken has no sandbox: even a validate-only run is signed with a real key.
+    fn environment(&self) -> VenueEnvironment {
+        VenueEnvironment::Live
     }
 
     fn snapshot(&self, now: DateTime<Utc>) -> Result<BrokerSnapshot, SnapshotError> {
@@ -169,6 +202,15 @@ impl<'a> AlpacaBroker<'a> {
 impl Broker for AlpacaBroker<'_> {
     fn venue(&self) -> &'static str {
         "alpaca"
+    }
+
+    /// The adapter's own (constructor-verified) environment. Anything that is not exactly Paper counts as Live, so a
+    /// future environment can never be mistaken for paper.
+    fn environment(&self) -> VenueEnvironment {
+        match self.adapter.environment() {
+            broker_adapters::alpaca::Environment::Paper => VenueEnvironment::Paper,
+            _ => VenueEnvironment::Live,
+        }
     }
 
     fn snapshot(&self, now: DateTime<Utc>) -> Result<BrokerSnapshot, SnapshotError> {

@@ -1,6 +1,6 @@
 //! Driver-level replay of a synthetic history through the REAL run machinery: `find_due_runs`, `run_all_due`,
 //! `run_once` (kill flag, mandate, decisions, broker read, reconciliation, risk overlay, targets, planner, guard,
-//! execution, reconciliation) over a `SimBroker`, in-memory stores and the assumed 00:10Z `Vendor`.
+//! execution, reconciliation) over a `SimBroker`, in-memory stores and the assumed `Vendor` (bars strictly before `as_of`).
 
 use std::collections::BTreeMap;
 
@@ -30,9 +30,11 @@ pub fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).expect("rfc3339").with_timezone(&Utc)
 }
 
-/// The driver's fixed daily slot, 00:10Z, of `day`.
+/// The driver's daily slot of an account with an ETF (market-hours) sleeve, 15:00Z, of `day` (slice S-4; it was a
+/// fixed 00:10Z before). Every account replayed here has an ETF sleeve, so every account runs at this slot. The slot
+/// does not change any decision: `as_of` is the slot's UTC DATE and the vendor drops every bar dated on or after it.
 pub fn slot(day: NaiveDate) -> DateTime<Utc> {
-    at(&format!("{day}T00:10:00Z"))
+    at(&format!("{day}T15:00:00Z"))
 }
 
 /// A mandate that lets the plan through (so the plan/target/filter/rounding arithmetic is what is compared, and the
@@ -159,7 +161,7 @@ impl<'w> Rig<'w> {
         self.broker.set_prices(px);
     }
 
-    /// One driver tick at the 00:10Z slot of `day`: the broker's prices are the closes the run may see, then
+    /// One driver tick at the 15:00Z slot of `day`: the broker's prices are the closes the run may see, then
     /// `find_due_runs` + `run_all_due`. Returns the single account's record.
     pub fn tick(&self, day: NaiveDate) -> RunRecord {
         let now = slot(day);

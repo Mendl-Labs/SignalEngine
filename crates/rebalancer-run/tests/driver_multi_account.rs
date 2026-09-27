@@ -120,17 +120,25 @@ fn b_an_account_is_excluded_before_the_days_slot_or_when_it_has_no_sleeve() {
     let source = InMemoryAccountSource::new().with_account(etf_account.clone());
 
     // The ETF sleeve is EVALUATED on every run slot (whether its decision is pending is the pipeline's question,
-    // answered from the data, not a calendar predicate): due on an ordinary day and on a month-end alike.
-    for slot in [slot_time(0), at("2021-01-31T00:10:00Z")] {
+    // answered from the data, not a calendar predicate): due on an ordinary day and on a month-end alike. Its slot is
+    // the MARKET-HOURS slot, 15:00:00Z (slice S-4): an ETF order can only work while the market is open.
+    for slot in [at("2021-01-01T15:00:00Z"), at("2021-01-31T15:00:00Z")] {
         let due = find_due_runs(&source, slot).unwrap();
         assert_eq!(due.len(), 1, "an ETF account is due on every day's slot: {slot}");
         assert_eq!(due[0].account_id, "acct-etf");
+        assert_eq!(due[0].scheduled_for, slot, "the run is scheduled for the 15:00Z slot itself");
         assert_eq!(due[0].sleeves.len(), 1, "the run carries the CONFIGURED sleeves");
     }
 
-    // Before the day's run time (00:10 UTC), nothing is due yet.
-    let too_early = at("2021-01-31T00:00:00Z");
-    assert!(find_due_runs(&source, too_early).unwrap().is_empty(), "not due until the day's anchor time");
+    // Before the day's run time (15:00 UTC for an ETF account), nothing is due yet: NOT at 00:10Z any more.
+    for too_early in [at("2021-01-31T00:10:00Z"), at("2021-01-31T14:59:59Z")] {
+        assert!(find_due_runs(&source, too_early).unwrap().is_empty(), "not due until the day's anchor time: {too_early}");
+    }
+
+    // A crypto-only account keeps the 00:10Z slot (and is not due before it).
+    let crypto = InMemoryAccountSource::new().with_account(crypto_account("acct-crypto", "tenant-a"));
+    assert!(find_due_runs(&crypto, at("2021-01-31T00:09:59Z")).unwrap().is_empty());
+    assert_eq!(find_due_runs(&crypto, at("2021-01-31T00:10:00Z")).unwrap()[0].scheduled_for, at("2021-01-31T00:10:00Z"));
 
     // An account with no sleeve at all has nothing to evaluate and is never enumerated.
     let mut empty = etf_account;

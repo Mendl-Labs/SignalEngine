@@ -3714,9 +3714,13 @@ dependencies = [
 name = "rebalancer-service"
 version = "0.0.1"
 dependencies = [
+ "broker-adapters",
  "chrono",
+ "mandate-core",
+ "rebalancer-core",
  "rebalancer-run",
  "rebalancer-store",
+ "serde_json",
  "uuid",
 ]
 

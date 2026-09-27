@@ -114,11 +114,54 @@ impl AccountSource for InMemoryAccountSource {
 // per-account, data-driven question the pipeline answers (`pipeline::step_decisions`), not a calendar predicate.
 // -------------------------------------------------------------------------------------------------------------
 
-/// The single daily UTC time every sleeve's run slot is anchored to, matching the existing test fixtures'
-/// convention (`00:10:00Z`, see `rebalancer-run/tests/common/harness.rs::slot_time`). Not a mandate field: a
-/// deployment setting, like `RunConfig`'s tunables.
+/// The daily UTC run slot of an account with only 24/7 sleeves (crypto trend): `00:10:00Z`, matching the existing test
+/// fixtures' convention (`rebalancer-run/tests/common/harness.rs::slot_time`). Not a mandate field: a deployment
+/// setting, like `RunConfig`'s tunables. (The names predate the per-kind slots and are kept: this IS the slot of
+/// every account that has no market-hours sleeve.)
 pub const DAILY_RUN_HOUR_UTC: u32 = 0;
 pub const DAILY_RUN_MINUTE_UTC: u32 = 10;
+
+/// The daily UTC run slot of an account that has a MARKET-HOURS sleeve (ETF trend): `15:00:00Z`.
+///
+/// Why 15:00Z: an ETF order can only work while the US market is open (the Alpaca adapter refuses a market order
+/// when the clock is closed, and the pipeline cancels any order still open after its polling window, so an order
+/// placed at 00:10Z could never execute). US regular hours are 09:30-16:00 America/New_York. That is 13:30-20:00Z
+/// while daylight saving time is in force (EDT, UTC-4) and 14:30-21:00Z otherwise (EST, UTC-5). 15:00Z is 11:00 EDT
+/// or 10:00 EST: at least 30 minutes after the open in BOTH regimes, and well before the earliest scheduled close
+/// (13:00 ET early closes are 17:00Z / 18:00Z). Weekends and market holidays are NOT special-cased here: the driver
+/// runs every calendar day (see [`sleeve_due_on`]); a run on a closed day either has no pending decision (nothing
+/// happens) or plans orders that the venue refuses ("market closed"), which the pipeline records as not acted with
+/// a Warning alert (`RUN_DECISION_NOT_ACTED`) so the decision is planned again on the next run.
+///
+/// The decision itself does not depend on the slot: `as_of` is the slot's UTC DATE and the data layer returns only
+/// bars dated strictly before it (closed bars only), so the run at 15:00Z on the 2nd sees the same bars as one at
+/// 00:10Z would.
+pub const MARKET_HOURS_RUN_HOUR_UTC: u32 = 15;
+pub const MARKET_HOURS_RUN_MINUTE_UTC: u32 = 0;
+
+/// The daily run slot of one sleeve kind, as `(hour, minute)` UTC. The `match` is exhaustive so a new kind forces a
+/// decision here.
+pub fn run_slot_utc(kind: SleeveKind) -> (u32, u32) {
+    match kind {
+        SleeveKind::CryptoTrend => (DAILY_RUN_HOUR_UTC, DAILY_RUN_MINUTE_UTC),
+        SleeveKind::EtfTrend => (MARKET_HOURS_RUN_HOUR_UTC, MARKET_HOURS_RUN_MINUTE_UTC),
+    }
+}
+
+/// The daily run slot of an ACCOUNT: one slot per account, never one per sleeve. The run key is over the account's
+/// CONFIGURED sleeves, and a `Daily` sleeve (crypto) is planned on every run, so two slots per day would plan the
+/// crypto sleeve twice. An account with any market-hours sleeve therefore runs at the LATEST of its sleeves' slots
+/// (the market-hours slot; a 24/7 sleeve is happy at any hour); an account with only 24/7 sleeves keeps `00:10Z`.
+/// `None` when the account has no sleeve.
+pub fn account_run_slot_utc(sleeves: &[SleeveSpec]) -> Option<(u32, u32)> {
+    sleeves.iter().map(|s| run_slot_utc(s.kind)).max()
+}
+
+/// The run slot of `sleeves` on calendar date `date` (UTC), if the account has any sleeve.
+pub fn run_slot_on(sleeves: &[SleeveSpec], date: NaiveDate) -> Option<DateTime<Utc>> {
+    let (h, m) = account_run_slot_utc(sleeves)?;
+    Some(date.and_hms_opt(h, m, 0)?.and_utc())
+}
 
 /// Is `kind`'s sleeve evaluated on the run slot of calendar date `date`? Every kind is, on every date.
 ///
@@ -144,7 +187,7 @@ fn sleeve_due_on(kind: SleeveKind, _date: NaiveDate) -> bool {
 /// told about missing in the first place.
 fn slot_for(sleeves: &[SleeveSpec], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let today = now.date_naive();
-    let slot = today.and_hms_opt(DAILY_RUN_HOUR_UTC, DAILY_RUN_MINUTE_UTC, 0)?.and_utc();
+    let slot = run_slot_on(sleeves, today)?;
     if now < slot {
         return None;
     }

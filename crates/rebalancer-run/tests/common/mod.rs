@@ -235,3 +235,63 @@ impl Broker for DistortingBroker<'_> {
         self.inner.quote(symbol)
     }
 }
+
+/// Wraps a broker and lets a test decide what `place` answers for chosen orders (a market that is closed, an
+/// account that is blocked, a refusal, ...). `hook` returns `Some(answer)` to override, `None` to pass the request
+/// through to the inner broker. Everything else is forwarded, INCLUDING `environment()` (or `forced_environment`).
+pub struct ScriptedPlaceBroker<'a> {
+    pub inner: &'a dyn Broker,
+    pub hook: Box<dyn Fn(&OrderRequest) -> Option<Result<PlaceOutcome, BrokerError>> + 'a>,
+    pub forced_environment: Option<rebalancer_run::broker::VenueEnvironment>,
+    /// Answer every tag look-up with "no such order" (for a broker whose real look-up needs a transport that the
+    /// test does not script).
+    pub empty_tag_lookup: bool,
+    pub place_calls: AtomicU32,
+}
+
+impl<'a> ScriptedPlaceBroker<'a> {
+    pub fn new(inner: &'a dyn Broker, hook: impl Fn(&OrderRequest) -> Option<Result<PlaceOutcome, BrokerError>> + 'a) -> Self {
+        Self { inner, hook: Box::new(hook), forced_environment: None, empty_tag_lookup: false, place_calls: AtomicU32::new(0) }
+    }
+
+    pub fn place_calls(&self) -> u32 {
+        self.place_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Broker for ScriptedPlaceBroker<'_> {
+    fn venue(&self) -> &'static str {
+        self.inner.venue()
+    }
+    fn environment(&self) -> rebalancer_run::broker::VenueEnvironment {
+        self.forced_environment.unwrap_or_else(|| self.inner.environment())
+    }
+    fn snapshot(&self, now: DateTime<Utc>) -> Result<BrokerSnapshot, SnapshotError> {
+        self.inner.snapshot(now)
+    }
+    fn place(&self, req: &OrderRequest) -> Result<PlaceOutcome, BrokerError> {
+        self.place_calls.fetch_add(1, Ordering::SeqCst);
+        match (self.hook)(req) {
+            Some(answer) => answer,
+            None => self.inner.place(req),
+        }
+    }
+    fn get_order(&self, id: &str) -> Result<OrderReport, BrokerError> {
+        self.inner.get_order(id)
+    }
+    fn open_orders(&self) -> Result<Vec<OrderReport>, BrokerError> {
+        self.inner.open_orders()
+    }
+    fn find_by_tag(&self, tag: &str) -> Result<Vec<OrderReport>, BrokerError> {
+        if self.empty_tag_lookup {
+            return Ok(Vec::new());
+        }
+        self.inner.find_by_tag(tag)
+    }
+    fn cancel_and_settle(&self, id: &str) -> Result<(CancelOutcome, OrderReport), BrokerError> {
+        self.inner.cancel_and_settle(id)
+    }
+    fn quote(&self, symbol: &str) -> Result<Quote, BrokerError> {
+        self.inner.quote(symbol)
+    }
+}
