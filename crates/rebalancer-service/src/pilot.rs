@@ -30,9 +30,11 @@ use std::sync::Arc;
 
 use broker_adapters::alpaca::PaperOnlyAlpaca;
 use broker_adapters::transport::HttpTransport;
+use broker_adapters::Dec;
 use rebalancer_run::broker::OWN_TAG_PREFIX;
 use rebalancer_run::driver::{AccountSource, ActiveAccount};
 use rebalancer_run::pipeline::{RunConfig, VenuePolicy};
+use rebalancer_run::recon::ReconTolerances;
 use rebalancer_run::record::ExecutionMode;
 use uuid::Uuid;
 
@@ -146,9 +148,27 @@ impl PilotConfig {
     }
 }
 
-/// The pipeline configuration of the pilot: the defaults plus `VenuePolicy::PaperOnly`.
+/// A sizing/valuation price is stale after this many seconds (slice S-6): the pilot's `DataSource` supplies the last
+/// COMPLETE daily close (`crate::runtime::LastClosePrices`), which can legitimately be a Friday close carried
+/// through a weekend, or a close from before a market holiday -- up to a few calendar days old, never "a few minutes
+/// old" the way a live quote feed would be. Four days covers a Friday close read on the following Monday or Tuesday
+/// (a weekend plus one holiday) without stretching so far that a genuinely missed run goes unnoticed.
+pub const PILOT_MAX_PRICE_AGE_SECS: i64 = 4 * 24 * 60 * 60;
+
+/// The reconciliation drift floor is raised for the pilot (slice S-6, plan section "Corporate actions and
+/// dividends"): a paper dividend can move cash between monthly runs by more than the platform's normal $1 floor
+/// (IEF pays monthly, VNQ quarterly), and `RunConfig::tolerances`'s default `BalanceDrift` would halt the account
+/// without flattening on the very first distribution. $15 is comfortably above a plausible single distribution on a
+/// $5,000 pilot account; any halt above that floor is a genuine finding to investigate, not a false alarm to raise
+/// past.
+pub const PILOT_RECON_VALUE_ABS: &str = "15";
+
+/// The pipeline configuration of the pilot: the defaults plus `VenuePolicy::PaperOnly`, a sizing-price staleness
+/// tolerance that matches a daily-close data source, and a reconciliation drift floor that tolerates a paper
+/// dividend (slice S-6; see the constants above for why each value is what it is).
 pub fn pilot_run_config() -> RunConfig {
-    RunConfig { venue_policy: VenuePolicy::PaperOnly, ..RunConfig::default() }
+    let tolerances = ReconTolerances { value_abs: Dec::parse(PILOT_RECON_VALUE_ABS).unwrap_or_else(|_| Dec::from_i64(15)), ..ReconTolerances::default() };
+    RunConfig { venue_policy: VenuePolicy::PaperOnly, max_price_age_secs: PILOT_MAX_PRICE_AGE_SECS, tolerances, ..RunConfig::default() }
 }
 
 fn same_id(a: &str, b: &str) -> bool {

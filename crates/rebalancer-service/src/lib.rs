@@ -2,3 +2,4 @@
 //! The tick loop itself is `main.rs`.
 
 pub mod pilot;
+pub mod runtime;
