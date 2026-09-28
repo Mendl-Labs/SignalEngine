@@ -122,7 +122,7 @@ impl KrakenTransport {
         }
 
         // Faults never apply to the test's own "other process" calls.
-        let fault = if origin == Origin::Adapter { w.faults.take(path) } else { None };
+        let fault = if origin == Origin::Adapter { w.faults.take(req.method, path) } else { None };
         rec.fault = fault.clone();
 
         if let Some((kind, timing @ (Timing::BeforeApply | Timing::Delayed))) = &fault {

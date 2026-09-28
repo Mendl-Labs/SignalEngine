@@ -408,7 +408,7 @@ impl OandaTransport {
             w.log.push(LogEntry::Request(rec));
             return Err(e);
         }
-        let fault = if origin == Origin::Adapter { w.faults.take(path) } else { None };
+        let fault = if origin == Origin::Adapter { w.faults.take(req.method, path) } else { None };
         rec.fault = fault.clone();
         if let Some((kind, timing @ (Timing::BeforeApply | Timing::Delayed))) = &fault {
             if *timing == Timing::Delayed {

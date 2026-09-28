@@ -42,6 +42,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alpaca;
+pub mod alpaca_rig;
 pub mod broker;
 pub mod clock;
 pub mod exchange;
