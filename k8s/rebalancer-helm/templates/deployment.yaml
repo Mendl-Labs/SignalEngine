@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rebalancer-helm.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "rebalancer-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rebalancer-pilot
+  annotations:
+    deployment.kubernetes.io/revision: "{{ .Release.Revision }}"
+spec:
+  # Fixed at 1, not a values knob. See values.yaml's own long comment (next to `resources`) for
+  # the full reasoning and the flagged decision behind it.
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate): guarantees the old pod is fully gone before the new one
+    # starts, so there is never a window with two rebalancer-service processes both ticking for
+    # this account. Matches the one existing precedent for a singleton driver-loop deployment in
+    # this monorepo family
+    # (BacktestingEngine/deployment/k8s/backtesting-engine-helm/templates/job-coordinator-deployment.yaml).
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rebalancer-helm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        deployment.kubernetes.io/revision: "{{ .Release.Revision }}"
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "rebalancer-helm.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        version: {{ include "rebalancer-helm.validatedImageTag" . | quote }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "rebalancer-helm.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ include "rebalancer-helm.validatedImageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No args: the image's default ENTRYPOINT with no argument runs the real service loop
+          # (run_service in main.rs). The image's other two subcommands (print-fingerprint,
+          # pilot-template) are read-only/print-only owner tools, run by hand
+          # (`kubectl run ... --command -- rebalancer-service print-fingerprint` or a local
+          # `docker run`), never wired into this Deployment.
+          env:
+            {{- include "rebalancer-helm.validatedExtraEnv" . }}
+            {{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+
+            # --- The paper-pilot interlock (S-8/S-9). Hardcoded, not a value -- see values.yaml's
+            # top-of-file safety note. rebalancer-service refuses to start unless this is exactly
+            # "true" (PilotConfig::from_lookup / ENV_PAPER_ONLY).
+            - name: REBALANCER_PAPER_ONLY
+              value: "true"
+
+            # --- The pilot's one (tenant, account) pair. Not secret -- read from the ConfigMap.
+            - name: PILOT_TENANT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "rebalancer-helm.fullname" . }}-config
+                  key: pilot-tenant-id
+            - name: PILOT_ACCOUNT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "rebalancer-helm.fullname" . }}-config
+                  key: pilot-account-id
+            - name: REBALANCER_TICK_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "rebalancer-helm.fullname" . }}-config
+                  key: tick-secs
+
+            # --- Database. rebalancer-store reads one DATABASE_URL (unlike k8s/signal-engine-helm,
+            # which reconstructs one from decomposed POSTGRES_* parts) -- see rebalancer_store::pg.
+            # Secret created out of band; see values.yaml's `secrets.database` comment.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.database.secretName }}
+                  key: {{ .Values.secrets.database.key }}
+
+            # --- Paper Alpaca credentials. Read directly by main.rs (ENV_ALPACA_KEY_ID /
+            # ENV_ALPACA_KEY_SECRET); connect_paper_alpaca verifies the fingerprint against the
+            # rebalancer_pilot_plans row before any order can be placed, and PaperOnlyAlpaca
+            # (S-8) cannot name a live Alpaca environment at all -- see
+            # crates/broker-adapters/src/alpaca/paper_only.rs.
+            - name: PILOT_ALPACA_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.alpaca.secretName }}
+                  key: {{ .Values.secrets.alpaca.keyIdKey }}
+            - name: PILOT_ALPACA_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.alpaca.secretName }}
+                  key: {{ .Values.secrets.alpaca.keySecretKey }}
+
+            # --- Massive market data. Required here (unlike k8s/signal-engine-helm's optional,
+            # warm-start-only use of this same key) -- market_data::EnvKeyProvider::from_env is
+            # called unconditionally by run_service().
+            - name: MASSIVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.massive.secretName }}
+                  key: {{ .Values.secrets.massive.key }}
+
+            # --- DELIBERATELY ABSENT: CREDENTIALS_ENCRYPTION_KEY is never defined here, in any
+            # form. rebalancer-service's own startup check refuses to run if this variable is
+            # present in its environment AT ALL (PilotConfig::from_lookup's FORBIDDEN_ENV) --
+            # unlike k8s/signal-engine-helm's main deployment.yaml, which deliberately DOES wire
+            # it (optional) for live multi-tenant trading. Do not add it here, ever; see
+            # templates/_helpers.tpl's rebalancer-helm.validatedExtraEnv, which also refuses it if
+            # supplied via extraEnv.
+
+            # System environment variables
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          {{- if .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rebalancer-helm.fullname" . }}-config
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "rebalancer-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: configuration
+data:
+  # Not secret (ordinary primary keys, not credentials) -- validated as real UUIDs at render time.
+  pilot-tenant-id: {{ include "rebalancer-helm.validatedUuid" (list "pilot.tenantId" .Values.pilot.tenantId) | quote }}
+  pilot-account-id: {{ include "rebalancer-helm.validatedUuid" (list "pilot.accountId" .Values.pilot.accountId) | quote }}
+  tick-secs: {{ .Values.pilot.tickSecs | toString | quote }}

@@ -1,0 +1,196 @@
+# ==============================================================================
+# rebalancer-helm - the paper-pilot rebalancer driver loop
+# ==============================================================================
+# S-10 of product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md. Deliberately NOT part of
+# k8s/signal-engine-helm -- see Chart.yaml's description for why. This chart deploys exactly ONE
+# pod, serving exactly ONE allow-listed (tenant, account) pair, paper-only, always.
+#
+# Recommended namespace: signalengine-rebalancer-pilot (a dedicated namespace, separate from
+# `signalengine`/`signalengine-qa`, so this pilot's RBAC/network/resource blast radius never
+# overlaps the multi-tenant SignalEngine deployment). Not hardcoded here -- pass
+# --namespace/--create-namespace at install time, matching how every other chart in this repo is
+# deployed (see .github/workflows/rebalancer-service-image.yml's own summary step for the exact
+# command).
+#
+# SAFETY NOTE (read before setting anything below): this chart has NO knob that can turn off
+# paper-only mode or point rebalancer-service at more than one account. REBALANCER_PAPER_ONLY is
+# hardcoded to "true" in templates/deployment.yaml, not a value here, on purpose. Do not try to
+# "make this chart more flexible" by exposing it -- open a new chart/slice instead if a
+# multi-account or live-capable deployment is ever wanted; conflating that with the pilot's chart
+# is exactly the blast-radius mixing this chart exists to avoid (see Chart.yaml).
+
+# ==============================================================================
+# Image
+# ==============================================================================
+
+image:
+  repository: ghcr.io/mendl-labs/signal-engine-rebalancer
+  pullPolicy: IfNotPresent
+  # No default on purpose: this must be an immutable tag actually pushed by
+  # .github/workflows/rebalancer-service-image.yml (a short git SHA). The chart FAILS to render
+  # with an empty tag (see templates/_helpers.tpl's rebalancer-helm.validatedImageTag) rather than
+  # silently falling back to :latest, which that workflow never pushes.
+  tag: ""
+
+imagePullSecrets: []
+  # - name: ghcr-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ==============================================================================
+# The pilot's one (tenant, account) pair
+# ==============================================================================
+# Both REQUIRED, both validated as real (non-nil) UUIDs at render time (see _helpers.tpl). These
+# are not secret (they are ordinary primary keys, not credentials) -- they are surfaced via a
+# ConfigMap, not a Secret. Real values must be supplied at install time
+# (--set pilot.tenantId=... --set pilot.accountId=...); the defaults below are deliberately the
+# nil UUID so an un-overridden `helm install` fails closed instead of silently deploying nothing
+# useful (PilotAllowList::parse refuses the nil UUID too -- the application would fail-closed
+# either way, but failing at render time is a faster, clearer signal).
+pilot:
+  tenantId: "00000000-0000-0000-0000-000000000000"
+  accountId: "00000000-0000-0000-0000-000000000000"
+  # REBALANCER_TICK_SECS. The binary's own default (used if this were ever unset) is 300.
+  # Spelled out here so it is visible/auditable in one place rather than only in Rust source.
+  tickSecs: 300
+
+# ==============================================================================
+# Secrets (names/keys only -- see below; never real values)
+# ==============================================================================
+# This chart never creates or contains a Secret with real data, and never will (a pilot's
+# broker keys / DB credentials do not belong in a Helm chart in a PUBLIC repository). Every
+# secretKeyRef below points at a Kubernetes Secret that must already exist in the release
+# namespace, created out of band by whoever runs the pilot (kubectl create secret generic ...,
+# the same pattern k8s/signal-engine-helm's own ci-cd.yml deploy job already uses for
+# signalengine-db-secret / signalengine-massive-secret). Only the NAMES and KEYS are chart
+# config; the values are never in git.
+secrets:
+  # DATABASE_URL, one key ("url"), e.g.:
+  #   kubectl create secret generic rebalancer-pilot-db -n <ns> --from-literal=url='postgres://...'
+  database:
+    secretName: rebalancer-pilot-db
+    key: url
+  # PILOT_ALPACA_KEY_ID / PILOT_ALPACA_KEY_SECRET, two keys ("keyId", "keySecret") in one
+  # Secret. Get the id/secret from Alpaca's own paper-trading dashboard; verify the fingerprint
+  # with `rebalancer-service print-fingerprint` (this same image, run with that one argument)
+  # BEFORE authoring the matching rebalancer_pilot_plans row's credential_fingerprint column --
+  # see crates/rebalancer-service/src/main.rs's own module doc.
+  alpaca:
+    secretName: rebalancer-pilot-alpaca
+    keyIdKey: keyId
+    keySecretKey: keySecret
+  # MASSIVE_API_KEY, one key ("apiKey"). Required (rebalancer-service's sizing data source has no
+  # optional/no-op path, unlike the main SignalEngine chart's warm-start-only use of this same
+  # key) -- see market_data::EnvKeyProvider::from_env, called unconditionally in run_service().
+  massive:
+    secretName: rebalancer-pilot-massive
+    key: apiKey
+
+# ==============================================================================
+# Extra environment variables (advanced; validated -- see below)
+# ==============================================================================
+# Same shape as k8s/signal-engine-helm's `env` list. CREDENTIALS_ENCRYPTION_KEY is refused at
+# render time regardless of what is set here (see templates/_helpers.tpl).
+extraEnv: []
+  # - name: RUST_LOG
+  #   value: "info"
+
+# ==============================================================================
+# Pod / container configuration
+# ==============================================================================
+
+# Single replica is not a values knob (see templates/deployment.yaml): rebalancer-service is a
+# stateful tick-and-sleep driver loop for one account, not a horizontally scalable service. A
+# per-account Postgres advisory lock (PgAccountLock) and the run store's own run-key uniqueness
+# are real, code-level backstops against two writers acting on the same account
+# (rebalancer_run::driver's own module doc), but nothing about this pilot NEEDS more than one
+# running copy, and a fixed replicaCount=1 + a Recreate deploy strategy is the simplest way to
+# avoid ever depending on those backstops in normal operation. This mirrors the ONLY existing
+# precedent for a singleton driver-loop-style deployment in this monorepo family
+# (BacktestingEngine/deployment/k8s/backtesting-engine-helm/templates/job-coordinator-deployment.yaml,
+# also `strategy: type: Recreate`).
+#
+# FLAGGED DECISION: the plan document itself (product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md)
+# was not available to read in this environment (see this slice's PR description for the full
+# account of where it was searched) -- this Recreate-strategy, fixed-single-replica design was
+# not read from the plan's own words but chosen as the safe, explicit default the task's own
+# instructions called for when the plan leaves a point open, and cross-checked against the one
+# real precedent this repo already has for the same kind of singleton workload.
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  capabilities:
+    drop:
+      - ALL
+
+# Modest by design: rebalancer-service is a periodic (default every 300s) tick-and-sleep loop for
+# ONE account against a handful of ETF/crypto sleeves, not the ultra-low-latency multi-tenant
+# SignalEngine binary k8s/signal-engine-helm's values.yaml sizes for (that chart requests 2 CPU /
+# 4Gi). These limits are a starting point, not measured under real pilot load -- revisit once the
+# pilot has run for a while.
+resources:
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+
+# No startup/liveness/readiness HTTP endpoints exist (rebalancer-service has no listener at all --
+# see crates/rebalancer-service/Dockerfile's own comment). Probes exec the same `pgrep` check as
+# the image's own HEALTHCHECK.
+startupProbe:
+  exec:
+    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 12
+  successThreshold: 1
+
+livenessProbe:
+  exec:
+    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  exec:
+    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# No graceful-shutdown/SIGTERM handling was found in crates/rebalancer-service/src/main.rs (a
+# plain std::thread::sleep loop, no signal-hook or tokio::signal usage) -- a restart mid-tick is
+# possible. Kept short on purpose: there is nothing productive to wait for.
+terminationGracePeriodSeconds: 15
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""

@@ -1,0 +1,27 @@
+apiVersion: v2
+name: rebalancer-helm
+description: >
+  The paper-pilot rebalancer driver loop (crates/rebalancer-service), packaged as its own chart
+  (S-10 of product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md). Deliberately NOT part of, and never
+  merged into, k8s/signal-engine-helm: it deploys a single-tenant, single-account, paper-only
+  process serving exactly the pilot's allow-listed (tenant, account) pair
+  (rebalancer_service::pilot::PilotAccountSource / rebalancer_store::PilotAllowList) -- a
+  different risk profile, lifecycle and blast radius than the multi-tenant SignalEngine service,
+  which is the whole reason this chart exists apart from that one rather than as a values
+  variation of it.
+type: application
+
+# Chart version, independent of k8s/signal-engine-helm's.
+version: 0.1.0
+
+# Tracks crates/rebalancer-service's own [package].version (currently 0.0.1, pre-pilot). Bump
+# alongside that crate; unrelated to k8s/signal-engine-helm's appVersion.
+appVersion: "0.0.1"
+
+maintainers:
+  - name: SignalEngine Team
+    email: engineering@nwagbara-group.com
+
+keywords:
+  - rebalancer
+  - paper-pilot
