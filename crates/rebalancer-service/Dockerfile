@@ -89,8 +89,16 @@ USER appuser
 # No EXPOSE: rebalancer-service has no HTTP/gRPC listener and no metrics port -- it is a plain
 # tick-and-sleep driver loop that only makes outbound calls (Postgres, Alpaca, Massive) and logs
 # to stdout (see crates/rebalancer-service/src/main.rs's own module doc).
+#
+# `-f` is required, not optional: Linux's process `comm` field is truncated to 15 characters, and
+# "rebalancer-service" is 19 -- `pgrep rebalancer-service` (no `-f`) NEVER matches, provably (it
+# refuses to even try, printing "pattern...longer than 15 characters will result in zero matches"
+# and exiting 1) -- confirmed against this exact built image and the exact real running binary,
+# not assumed from `program`'s own Dockerfile pattern (which this deliberately diverges from: its
+# process name, "signal-engine", is exactly 13 characters and works unmodified with plain pgrep).
+# `-f` matches the full command line instead, which does contain the whole binary name/path.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD pgrep rebalancer-service || exit 1
+  CMD pgrep -f rebalancer-service || exit 1
 
 # No argument = the real service loop (run_service in main.rs). The image's other two
 # subcommands (`print-fingerprint`, `pilot-template`) are read-only/print-only owner tools, run by

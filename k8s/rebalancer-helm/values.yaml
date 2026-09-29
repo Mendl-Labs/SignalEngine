@@ -151,11 +151,14 @@ resources:
     memory: "128Mi"
 
 # No startup/liveness/readiness HTTP endpoints exist (rebalancer-service has no listener at all --
-# see crates/rebalancer-service/Dockerfile's own comment). Probes exec the same `pgrep` check as
-# the image's own HEALTHCHECK.
+# see crates/rebalancer-service/Dockerfile's own comment). Probes exec the same `pgrep -f` check as
+# the image's own HEALTHCHECK -- `-f` (match the full command line) is required, not stylistic:
+# "rebalancer-service" is 19 characters, past Linux's 15-character process `comm` field, so plain
+# `pgrep rebalancer-service` never matches (confirmed against the real built image and the real
+# running binary: it prints its own "longer than 15 characters" warning and exits 1, every time).
 startupProbe:
   exec:
-    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+    command: ["/bin/sh", "-c", "pgrep -f rebalancer-service"]
   initialDelaySeconds: 5
   periodSeconds: 5
   timeoutSeconds: 3
@@ -164,7 +167,7 @@ startupProbe:
 
 livenessProbe:
   exec:
-    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+    command: ["/bin/sh", "-c", "pgrep -f rebalancer-service"]
   initialDelaySeconds: 10
   periodSeconds: 15
   timeoutSeconds: 5
@@ -173,7 +176,7 @@ livenessProbe:
 
 readinessProbe:
   exec:
-    command: ["/bin/sh", "-c", "pgrep rebalancer-service"]
+    command: ["/bin/sh", "-c", "pgrep -f rebalancer-service"]
   initialDelaySeconds: 5
   periodSeconds: 10
   timeoutSeconds: 3
