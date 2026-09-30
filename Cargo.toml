@@ -38,9 +38,11 @@ ultra-logger = { path = "../LoggingEngine/ultra-logger" }
 # implementation shared with the backtester, so the rebalancer and the backtest agree by construction
 # (product-mandate/BACKTESTER_TRUTH_DESIGN.md, stage T2). The crate moved there with its public API unchanged.
 #
-# TODO(T2, owner): replace the placeholder rev with the merged BacktestingCore commit, or with `tag = "vX.Y.Z"` once
-# the release tag exists. Until then this line is a PLACEHOLDER: the workspace does not resolve and CI cannot build.
-# Local verification used a temporary path override that was NOT committed.
+# `rev` pins BacktestingCore#f1a65a1 (PR #39, merged into that repo's `local-dev` trunk on 2026-09-24 -- NOT
+# `master`, which this repo does not track; see BacktestingCore's own local-dev-is-trunk convention). This was a
+# placeholder pointing at an unmerged commit until that PR landed; it no longer is -- `cargo check -p
+# reference-rules` and a full rebalancer-crate check both resolve and build clean against it. Replace with `tag =
+# "vX.Y.Z"` once BacktestingCore cuts a release tag for this crate; no functional reason to do so before then.
 reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "f1a65a168f9089edf6e7a963226cafc54c98a91e" }
 
 # Internal workspace crates

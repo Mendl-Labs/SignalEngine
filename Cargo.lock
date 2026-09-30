@@ -5929,15 +5929,7 @@ name = "backtest"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "config"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "data_prep"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "dataloader"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -5962,10 +5954,6 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "portfoliomanager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "quant-diagnostics"
 version = "0.1.0"
 
 [[patch.unused]]
