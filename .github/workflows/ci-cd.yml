@@ -92,7 +92,7 @@ jobs:
           repository: Nwagbara-Group-LLC/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
-          ref: v0.1.49
+          ref: v0.1.50
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingCore
 
@@ -264,7 +264,7 @@ jobs:
           repository: Nwagbara-Group-LLC/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
-          ref: v0.1.49
+          ref: v0.1.50
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingCore
           fetch-depth: 0

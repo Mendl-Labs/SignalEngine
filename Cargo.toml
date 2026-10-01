@@ -38,12 +38,10 @@ ultra-logger = { path = "../LoggingEngine/ultra-logger" }
 # implementation shared with the backtester, so the rebalancer and the backtest agree by construction
 # (product-mandate/BACKTESTER_TRUTH_DESIGN.md, stage T2). The crate moved there with its public API unchanged.
 #
-# `rev` pins BacktestingCore#f1a65a1 (PR #39, merged into that repo's `local-dev` trunk on 2026-09-24 -- NOT
-# `master`, which this repo does not track; see BacktestingCore's own local-dev-is-trunk convention). This was a
-# placeholder pointing at an unmerged commit until that PR landed; it no longer is -- `cargo check -p
-# reference-rules` and a full rebalancer-crate check both resolve and build clean against it. Replace with `tag =
-# "vX.Y.Z"` once BacktestingCore cuts a release tag for this crate; no functional reason to do so before then.
-reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "f1a65a168f9089edf6e7a963226cafc54c98a91e" }
+# Pinned to BacktestingCore's v0.1.50 release tag (cut 2026-10-01, the first tag after this crate's `rev` pin
+# landed). Previously pinned to a bare commit (BacktestingCore#f1a65a1, PR #39) with a note to switch to a tag
+# once one existed for this crate -- it now does.
+reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", tag = "v0.1.50" }
 
 # Internal workspace crates
 smartorderrouter = { path = "crates/smartorderrouter" }
