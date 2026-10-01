@@ -977,7 +977,7 @@ dependencies = [
  "spin_sleep",
  "subscriber",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "ultra_signal",
 ]
 
@@ -1003,7 +1003,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-retry",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
  "urlencoding",
  "uuid",
 ]
@@ -1337,7 +1337,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "uuid",
  "winapi",
  "zeroize",
@@ -1796,7 +1796,7 @@ dependencies = [
  "strategyhandler",
  "strategyloader",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "ultra_signal",
  "uuid",
 ]
@@ -3286,7 +3286,7 @@ dependencies = [
  "signalengine-core",
  "tokio",
  "tokio-test",
- "ultra-logger",
+ "ultra-logger 0.1.0",
 ]
 
 [[package]]
@@ -3353,7 +3353,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
  "uuid",
 ]
 
@@ -3375,7 +3375,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
  "winapi",
 ]
 
@@ -3775,7 +3775,7 @@ dependencies = [
 [[package]]
 name = "reference-rules"
 version = "0.0.1"
-source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=f1a65a168f9089edf6e7a963226cafc54c98a91e#f1a65a168f9089edf6e7a963226cafc54c98a91e"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?tag=v0.1.50#cd0f462f14a515ce313e30cfd22feb9d3dbc8e2e"
 dependencies = [
  "chrono",
  "hex",
@@ -4303,7 +4303,7 @@ dependencies = [
  "crossbeam",
  "signalengine-core",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "ultra_signal",
  "winapi",
 ]
@@ -4326,7 +4326,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "winapi",
 ]
 
@@ -4537,7 +4537,7 @@ dependencies = [
  "smartorderrouter",
  "tokio",
  "tracing",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "ultra_signal",
  "uuid",
 ]
@@ -4566,7 +4566,7 @@ dependencies = [
  "subscriber",
  "thiserror 1.0.69",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0",
  "uuid",
 ]
 
@@ -4605,7 +4605,7 @@ dependencies = [
  "protocol",
  "spin_sleep",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
 ]
 
 [[package]]
@@ -4717,7 +4717,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5201,6 +5201,21 @@ checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 [[package]]
 name = "ultra-logger"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flume",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ultra-logger"
+version = "0.1.0"
+source = "git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0#1fd99afd7faebd6643689842929454441c882013"
 dependencies = [
  "async-trait",
  "chrono",
