@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use ultra_signal::{ExchangeId, Signal, SignalAction};
 
-use crate::{OrderPriority, OrderType, PaperDeploymentMeta, SignalEngineUltraOrderManager};
+use crate::{OrderOrigin, OrderPriority, OrderType, PaperDeploymentMeta, SignalEngineUltraOrderManager};
 
 lazy_static! {
     /// Deployment id -> halt reason. A halted deployment's bridge loop stops
@@ -179,6 +179,7 @@ pub async fn execute_dual_venue_pair(
             leg1.price,
             leg1.strategy_id,
             OrderPriority::Critical,
+            Some(OrderOrigin { deployment_id: meta.deployment_id, tenant_id: meta.tenant_id }),
         )
         .await;
 
@@ -201,6 +202,7 @@ pub async fn execute_dual_venue_pair(
             leg2.price,
             leg2.strategy_id,
             OrderPriority::Critical,
+            Some(OrderOrigin { deployment_id: meta.deployment_id, tenant_id: meta.tenant_id }),
         )
         .await;
 
