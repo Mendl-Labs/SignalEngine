@@ -54,21 +54,21 @@ jobs:
       - name: Checkout LoggingEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
+          repository: Mendl-Labs/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: LoggingEngine
 
       - name: Checkout MessageBrokerEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          repository: Mendl-Labs/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: MessageBrokerEngine
 
       - name: Checkout databaseschema
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/databaseschema
+          repository: Mendl-Labs/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: databaseschema
 
@@ -82,14 +82,14 @@ jobs:
       - name: Checkout BacktestingEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/BacktestingEngine
+          repository: Mendl-Labs/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingEngine
 
       - name: Checkout BacktestingCore
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/BacktestingCore
+          repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
           ref: v0.1.50
@@ -221,7 +221,7 @@ jobs:
       - name: Checkout LoggingEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
+          repository: Mendl-Labs/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: LoggingEngine
           fetch-depth: 0
@@ -229,7 +229,7 @@ jobs:
       - name: Checkout MessageBrokerEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          repository: Mendl-Labs/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: MessageBrokerEngine
           fetch-depth: 0
@@ -237,7 +237,7 @@ jobs:
       - name: Checkout databaseschema
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/databaseschema
+          repository: Mendl-Labs/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: databaseschema
           fetch-depth: 0
@@ -253,7 +253,7 @@ jobs:
       - name: Checkout BacktestingEngine
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/BacktestingEngine
+          repository: Mendl-Labs/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingEngine
           fetch-depth: 0
@@ -261,7 +261,7 @@ jobs:
       - name: Checkout BacktestingCore
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/BacktestingCore
+          repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
           ref: v0.1.50
