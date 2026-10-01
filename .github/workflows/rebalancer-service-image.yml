@@ -1,0 +1,186 @@
+# Rebalancer Service - Image Build (manual only)
+#
+# S-10 of product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md. Builds and pushes the
+# `rebalancer-service` image (crates/rebalancer-service/Dockerfile) -- the paper-pilot's
+# driver-loop binary. Deliberately separate from `ci-cd.yml` (which builds/deploys the main
+# SignalEngine binary `program`): this workflow has NO `push`/`pull_request` trigger at all, only
+# `workflow_dispatch`. Nothing here ever deploys anything -- it only builds an image and, on
+# request, pushes it to the registry; k8s/rebalancer-helm is applied by hand, out of band, by
+# whoever is running the pilot.
+#
+# Why manual-only (not "build on push, deploy manual" like ci-cd.yml): ci-cd.yml's own image
+# still only reaches production behind a separate manual `deploy_prod` gate, but the IMAGE itself
+# builds and lands in the registry on every push to main. rebalancer-service talks to a real
+# (paper) broker and a real tenant's account; per this repo's own S-8/S-9 paper-only interlock
+# design (crates/rebalancer-service/src/pilot.rs, crates/fake-broker), the fewer automatic paths
+# that produce a runnable artifact of this binary, the better -- a push to main should never, by
+# itself, cause a new image of the pilot driver loop to exist anywhere.
+
+name: Rebalancer Service - Image Build (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push the built image to the registry. false = build and lint only, dry run (nothing is pushed, nothing changes).'
+        type: boolean
+        default: false
+      image_tag:
+        description: 'Optional image tag override. Leave empty to use the immutable short-SHA tag (the default and recommended choice, matching ci-cd.yml: :latest is never pushed).'
+        type: string
+        default: ''
+
+concurrency:
+  group: rebalancer-service-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/mendl-labs/signal-engine-rebalancer
+  HELM_CHART_PATH: k8s/rebalancer-helm
+  DOCKERFILE_PATH: SignalEngine/crates/rebalancer-service/Dockerfile
+
+jobs:
+  build:
+    name: Lint chart, build image, optionally push
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout SignalEngine
+        uses: actions/checkout@v4
+        with:
+          path: SignalEngine
+          fetch-depth: 0
+
+      # Same sibling checkouts as ci-cd.yml's build job. rebalancer-service itself has no path
+      # dependency on any of these (see crates/rebalancer-service/Dockerfile's own header comment
+      # for the verified reason they are still required: Cargo resolves every workspace member's
+      # manifest, including `program`'s, before it will build any one member).
+      - name: Checkout LoggingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: LoggingEngine
+          fetch-depth: 0
+
+      - name: Checkout MessageBrokerEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: MessageBrokerEngine
+          fetch-depth: 0
+
+      - name: Checkout databaseschema
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/databaseschema
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: databaseschema
+          fetch-depth: 0
+
+      - name: Checkout SimulationEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/SimulationEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: SimulationEngine
+          fetch-depth: 0
+
+      - name: Checkout BacktestingEngine
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingEngine
+          fetch-depth: 0
+
+      - name: Checkout BacktestingCore
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/BacktestingCore
+          ref: v0.1.49
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: BacktestingCore
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.3'
+
+      - name: Lint and render k8s/rebalancer-helm
+        run: |
+          cd SignalEngine
+          helm lint ${{ env.HELM_CHART_PATH }}
+          helm template rebalancer ${{ env.HELM_CHART_PATH }} \
+            --set image.repository=example/rebalancer-service --set image.tag=ci \
+            --set pilot.tenantId=00000000-0000-0000-0000-000000000001 \
+            --set pilot.accountId=00000000-0000-0000-0000-000000000002 > /dev/null
+          echo "[OK] chart renders"
+
+      - name: Login to GHCR
+        if: ${{ inputs.push_image == true }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA="${{ github.sha }}"
+            echo "tag=${SHORT_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image
+        run: |
+          set -e
+          echo "Building ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} from ${{ env.DOCKERFILE_PATH }} (context: workspace root)"
+          docker build \
+            --platform linux/amd64 \
+            --tag ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} \
+            --file ${{ env.DOCKERFILE_PATH }} \
+            --progress=plain \
+            .
+
+      - name: Push image
+        if: ${{ inputs.push_image == true }}
+        run: |
+          echo "[PUSH] pushing ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          # :latest intentionally NOT pushed, matching ci-cd.yml's own reasoning (stale-image /
+          # IfNotPresent incidents). Deploy by immutable tag only.
+          echo "[OK] pushed ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+
+      - name: Dry-run summary (image not pushed)
+        if: ${{ inputs.push_image != true }}
+        run: |
+          echo "push_image was not set to true: the image was built locally in this job and discarded, nothing was pushed."
+          echo "Re-run with push_image=true to publish ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}."
+
+      - name: Build summary
+        run: |
+          echo "=========================================="
+          echo "Rebalancer Service Image Build Summary"
+          echo "=========================================="
+          echo "Image: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+          echo "Pushed: ${{ inputs.push_image }}"
+          echo "Pull (if pushed): docker pull ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+          echo ""
+          echo "This workflow never deploys. k8s/rebalancer-helm is applied by hand, e.g.:"
+          echo "  helm upgrade --install rebalancer-pilot ./${{ env.HELM_CHART_PATH }} \\"
+          echo "    --namespace signalengine-rebalancer-pilot --create-namespace \\"
+          echo "    --set image.repository=${{ env.IMAGE_NAME }} --set image.tag=${{ steps.tag.outputs.tag }} \\"
+          echo "    --set pilot.tenantId=<pilot tenant UUID> --set pilot.accountId=<pilot account UUID>"
+          echo "  (plus imagePullSecrets and the Secrets k8s/rebalancer-helm/values.yaml's own"
+          echo "  'secrets' section names -- see that chart's NOTES.txt after install)"
+          echo "=========================================="

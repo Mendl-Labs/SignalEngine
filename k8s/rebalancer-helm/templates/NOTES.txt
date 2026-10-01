@@ -1,0 +1,44 @@
+rebalancer-helm deployed: {{ include "rebalancer-helm.fullname" . }} (namespace {{ .Release.Namespace }})
+
+This is the paper-pilot rebalancer driver loop (crates/rebalancer-service), NOT the main
+SignalEngine service. It serves exactly ONE allow-listed (tenant, account) pair:
+  tenant:  {{ .Values.pilot.tenantId }}
+  account: {{ .Values.pilot.accountId }}
+in paper-only mode, always (REBALANCER_PAPER_ONLY is hardcoded in this chart, not configurable).
+
+Check it's running and ticking:
+  kubectl -n {{ .Release.Namespace }} get pods -l {{ include "rebalancer-helm.selectorLabels" . }}
+  kubectl -n {{ .Release.Namespace }} logs -l {{ include "rebalancer-helm.selectorLabels" . }} -f
+
+Every log line is prefixed "rebalancer-service:" (main.rs's own log() helper) -- heartbeats print
+once per tick (default every {{ .Values.pilot.tickSecs }}s) even when nothing is due to run.
+
+Before this pair can ever be eligible, the owner-authored `rebalancer_pilot_plans` /
+`mandate_events` rows must already exist in Postgres. Print the SQL template (no network call, no
+database connection) with:
+  kubectl -n {{ .Release.Namespace }} run rebalancer-pilot-template --rm -it --restart=Never \
+    --image={{ .Values.image.repository }}:{{ .Values.image.tag }} \
+    --command -- rebalancer-service pilot-template
+
+And confirm the connected paper Alpaca key's fingerprint (never prints the key itself) BEFORE
+authoring that row's credential_fingerprint column, using the same Alpaca secret this Deployment
+uses:
+  kubectl -n {{ .Release.Namespace }} run rebalancer-pilot-fingerprint --rm -it --restart=Never \
+    --image={{ .Values.image.repository }}:{{ .Values.image.tag }} \
+    --env="PILOT_ALPACA_KEY_ID=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secrets.alpaca.secretName }} -o jsonpath='{.data.{{ .Values.secrets.alpaca.keyIdKey }}}' | base64 -d)" \
+    --env="PILOT_ALPACA_KEY_SECRET=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secrets.alpaca.secretName }} -o jsonpath='{.data.{{ .Values.secrets.alpaca.keySecretKey }}}' | base64 -d)" \
+    --command -- rebalancer-service print-fingerprint
+
+Required Secrets in this namespace (this chart never creates them -- see values.yaml's own
+`secrets` section for exactly which keys each one needs):
+  - {{ .Values.secrets.database.secretName }}
+  - {{ .Values.secrets.alpaca.secretName }}
+  - {{ .Values.secrets.massive.secretName }}
+{{- if .Values.imagePullSecrets }}
+  - {{ range .Values.imagePullSecrets }}{{ .name }} {{ end }}(image pull secret)
+{{- end }}
+
+This chart deploys nothing to a real cluster by itself -- it only renders manifests for whatever
+`helm install`/`helm upgrade` command you run it with. See
+.github/workflows/rebalancer-service-image.yml's own build-summary step for the exact
+`helm upgrade --install` invocation this pilot is meant to be deployed with.
