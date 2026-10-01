@@ -1,0 +1,28 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "transaction": {
+    "id": "6375",
+    "accountID": "101-001-1234567-001",
+    "userID": 1234567,
+    "batchID": "6372",
+    "requestID": "42",
+    "time": "1758463201.250000000",
+    "type": "ORDER_FILL",
+    "orderID": "6372",
+    "clientOrderID": "rb1:run1:EUR/USD:buy",
+    "instrument": "EUR_USD",
+    "units": "1500",
+    "gainQuoteHomeConversionFactor": "1",
+    "lossQuoteHomeConversionFactor": "1",
+    "price": "1.10052",
+    "fullVWAP": "1.10052",
+    "reason": "MARKET_ORDER",
+    "pl": "0.0000",
+    "financing": "0.0000",
+    "commission": "0.0000",
+    "guaranteedExecutionFee": "0.0000",
+    "accountBalance": "100000.0000",
+    "halfSpreadCost": "0.0500"
+  },
+  "lastTransactionID": "6400"
+}

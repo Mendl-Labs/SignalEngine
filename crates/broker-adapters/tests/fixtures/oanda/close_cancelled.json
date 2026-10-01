@@ -1,0 +1,32 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "longOrderCreateTransaction": {
+    "id": "6410",
+    "accountID": "101-001-1234567-001",
+    "userID": 1234567,
+    "batchID": "6410",
+    "requestID": "42",
+    "time": "1758463200.000000000",
+    "type": "MARKET_ORDER",
+    "instrument": "EUR_USD",
+    "units": "-10000",
+    "timeInForce": "FOK",
+    "positionFill": "DEFAULT",
+    "reason": "CLIENT_ORDER",
+    "clientExtensions": {
+      "id": "rb1:fl:20260921T150000Z:EURUSD:1:abc",
+      "tag": "mendl-rb"
+    }
+  },
+  "longOrderCancelTransaction": {
+    "id": "6411",
+    "type": "ORDER_CANCEL",
+    "orderID": "6410",
+    "reason": "MARKET_HALTED"
+  },
+  "relatedTransactionIDs": [
+    "6410",
+    "6411"
+  ],
+  "lastTransactionID": "6411"
+}

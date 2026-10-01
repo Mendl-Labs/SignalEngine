@@ -1,0 +1,30 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "position": {
+    "instrument": "GBP_USD",
+    "pl": "10.0000",
+    "unrealizedPL": "-40.0000",
+    "marginUsed": "127.0000",
+    "resettablePL": "10.0000",
+    "financing": "-0.4000",
+    "commission": "0.0000",
+    "guaranteedExecutionFees": "0.0000",
+    "long": {
+      "units": "0",
+      "pl": "10.0000",
+      "unrealizedPL": "0.0000",
+      "resettablePL": "10.0000"
+    },
+    "short": {
+      "units": "-5000",
+      "pl": "0.0000",
+      "unrealizedPL": "-40.0000",
+      "resettablePL": "0.0000",
+      "averagePrice": "1.27000",
+      "tradeIDs": [
+        "6302"
+      ]
+    }
+  },
+  "lastTransactionID": "6400"
+}

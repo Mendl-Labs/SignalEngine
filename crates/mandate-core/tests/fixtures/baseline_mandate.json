@@ -1,0 +1,37 @@
+{
+  "basis": {
+    "capital_source": "own",
+    "jurisdiction": "US-GA",
+    "acknowledgements": [
+      {"doc": "own_capital_attestation", "doc_version": "2026-10", "at": "2026-09-21T12:00:00Z", "by": "user_1"},
+      {"doc": "risk_disclosure", "doc_version": "2026-10", "at": "2026-09-21T12:00:00Z", "by": "user_1"}
+    ]
+  },
+  "capital": {"allocated": {"amount": "5000.00", "ccy": "USD"}, "min_cash_reserve": 0.05},
+  "universe": {
+    "venues": ["alpaca", "kraken"], "asset_classes": ["us_etf", "crypto_spot"],
+    "instrument_allow": ["SPY", "EFA", "BTC/USD", "ETH/USD"], "instrument_deny": [],
+    "shorting": false, "derivatives": false, "leverage_max_gross": 1.0
+  },
+  "exposure": {
+    "max_position": 0.25, "max_asset_class": {"crypto_spot": 0.6},
+    "max_gross": 1.0, "max_net": 1.0,
+    "max_order_notional": {"amount": "1500.00", "ccy": "USD"},
+    "max_orders_per_day": 20, "max_turnover_per_day": 0.5
+  },
+  "loss": {
+    "daily_loss_limit": 0.03,
+    "drawdown_ladder": [
+      {"at": 0.10, "action": "shrink", "scale": 0.5},
+      {"at": 0.20, "action": "halt_flatten"}
+    ],
+    "resume_after_halt": "human_only"
+  },
+  "autonomy": {
+    "level": "L3",
+    "may": ["place_orders", "cancel_orders", "resize_within_limits", "rebalance", "halt", "flatten"],
+    "needs_confirmation": ["add_strategy", "remove_strategy", "raise_target_risk"],
+    "never": ["change_limits", "resume_after_halt", "change_credentials", "withdraw"]
+  },
+  "reporting": {"digest": "daily", "alert_channels": ["email"]}
+}

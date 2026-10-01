@@ -1,0 +1,41 @@
+[
+  {
+    "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+    "class": "us_equity",
+    "exchange": "ARCA",
+    "symbol": "SPY",
+    "name": "SPY test asset",
+    "status": "active",
+    "tradable": true,
+    "marginable": true,
+    "shortable": true,
+    "easy_to_borrow": true,
+    "fractionable": true
+  },
+  {
+    "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+    "class": "us_equity",
+    "exchange": "ARCA",
+    "symbol": "BRK.A",
+    "name": "BRK.A test asset",
+    "status": "active",
+    "tradable": true,
+    "marginable": true,
+    "shortable": true,
+    "easy_to_borrow": true,
+    "fractionable": false
+  },
+  {
+    "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+    "class": "us_equity",
+    "exchange": "ARCA",
+    "symbol": "IEF",
+    "name": "IEF test asset",
+    "status": "active",
+    "tradable": true,
+    "marginable": true,
+    "shortable": true,
+    "easy_to_borrow": true,
+    "fractionable": true
+  }
+]

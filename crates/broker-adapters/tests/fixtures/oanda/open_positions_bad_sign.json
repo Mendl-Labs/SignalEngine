@@ -1,0 +1,28 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "positions": [
+    {
+      "instrument": "EUR_USD",
+      "pl": "10.0000",
+      "unrealizedPL": "0.0000",
+      "marginUsed": "0.0000",
+      "resettablePL": "10.0000",
+      "financing": "-0.4000",
+      "commission": "0.0000",
+      "guaranteedExecutionFees": "0.0000",
+      "long": {
+        "units": "-1000",
+        "pl": "10.0000",
+        "unrealizedPL": "0.0000",
+        "resettablePL": "10.0000"
+      },
+      "short": {
+        "units": "0",
+        "pl": "0.0000",
+        "unrealizedPL": "0.0000",
+        "resettablePL": "0.0000"
+      }
+    }
+  ],
+  "lastTransactionID": "6400"
+}

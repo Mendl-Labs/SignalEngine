@@ -23,6 +23,7 @@ pub mod state;
 pub mod strategy;
 pub mod manager;
 pub mod deployment_subscriber;
+pub mod live_rejection;
 
 #[cfg(feature = "postgres")]
 pub mod database_loader;
@@ -44,6 +45,10 @@ pub use manager::{StrategyManager, SignalStore, SignalInfo, SignalStatus, Manage
 pub use deployment_subscriber::{
     DeploymentSubscriber, DeployedStrategy, DeploymentEvent, DeploymentSubscriberError,
     topics as deployment_topics,
+};
+pub use live_rejection::{
+    reject_live_deployment, sanitize_reason, reason_no_provider, reason_credential_unavailable,
+    AckSender, AckSink, DeployedSet, LiveRejectionOutcome,
 };
 
 #[cfg(feature = "postgres")]

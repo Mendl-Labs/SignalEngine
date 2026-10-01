@@ -1,0 +1,20 @@
+{
+  "id": "904837e3-3b76-47ec-b432-046db621571b",
+  "account_number": "PA3TESTFIXT1",
+  "status": "ACTIVE",
+  "currency": "USD",
+  "cash": "52840.17",
+  "portfolio_value": "100210.55",
+  "equity": "100210.55",
+  "last_equity": "99870.10",
+  "buying_power": "152840.17",
+  "long_market_value": "47370.38",
+  "short_market_value": "0",
+  "trading_blocked": true,
+  "transfers_blocked": false,
+  "account_blocked": false,
+  "pattern_day_trader": false,
+  "shorting_enabled": true,
+  "multiplier": "2",
+  "daytrade_count": 0
+}

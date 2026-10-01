@@ -1,0 +1,71 @@
+{
+  "id": "etf_trend_faber",
+  "version": 1,
+  "name": "ETF trend (Faber 10-month moving average, 5 ETFs)",
+  "sources": [
+    "Faber, M., \"A Quantitative Approach to Tactical Asset Allocation\", 2007 (rule as stated in stage1-record replication brief, BRIEF_FOR_AGENT.md, Sleeve 1). Bibliographic details beyond title and year are not in the local files.",
+    "Reference implementation: stage1-record/tool/ticket.py, decide_s1 (independent pandas reimplementation)."
+  ],
+  "rule_text": "Universe: SPY, EFA, IEF, DBC, VNQ. At each month-end (the last available trading day of the calendar month), for each ETF: if its month-end close is above the simple average of its last 10 month-end closes, INCLUDING the current month-end close, hold that ETF for the next month at 20% of the sleeve's equity; otherwise hold cash in its place (zero return). Rebalance monthly at the month-end close. A position decided at the close of day t earns returns from the next trading day's close-to-close return onward; a decision uses only data available at the close of the decision day. Long only, no leverage: maximum gross exposure is 100% of sleeve equity (5 x 20%). The reference implementation uses price-only closes (dividends not included), which understates the returns of income-paying ETFs.",
+  "reference_implementation": "stage1-record/tool/ticket.py::decide_s1 (also shadow.py sleeve1). Version pin: none recorded in the local files.",
+  "instruments": ["SPY", "EFA", "IEF", "DBC", "VNQ"],
+  "requirements": {
+    "needs_shorting": false,
+    "min_leverage_gross": 1.0,
+    "needs_portfolio_vol_target": false,
+    "max_abs_weight_per_instrument": 0.2,
+    "cross_asset_rebalance": "preferred",
+    "asset_classes": ["us_etf"],
+    "venues_supported": ["alpaca"],
+    "min_history_years": 0.85,
+    "notes": [
+      "min_history_years is the history needed to compute the FIRST signal only (10 month-end closes); a meaningful backtest needs far more.",
+      "The published rule rebalances to fixed 20% weights. The platform runs each ETF as an independent sub-account, so weights drift between month-ends: an approximation of the rule, not a block (cross_asset_rebalance = preferred). In the raw-engine test (stage-1 SCORECARD Amendment 8) this sleeve's Sharpe was within 0.05 of the reference but its annualised return was 1.8 points lower.",
+      "Whether live trading is wired for Alpaca (today: no, paper only) is a PLATFORM fact kept in PlatformCapabilities, not in this entry.",
+      "The owner's own config for a $5,000 account noted this sleeve needs fractional shares on Alpaca at that size. No minimum-capital check is derived here."
+    ]
+  },
+  "rebalance": {
+    "kind": "monthly",
+    "detail": "At month-end close (last available trading day of the calendar month). Holidays are not modelled in the reference implementation; verify against the exchange calendar."
+  },
+  "parameters": {
+    "sma_month_ends": 10,
+    "sma_includes_current_month_end": true,
+    "weight_per_etf": 0.2,
+    "cash_return": 0.0,
+    "min_month_end_closes_required": 10
+  },
+  "expected_ranges": [
+    {
+      "metric": "sharpe_net",
+      "low": 0.2,
+      "high": 1.0,
+      "role": "performance_band",
+      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B: the author's deliberately wide sanity band (set 2026-09-20), NOT a published figure.",
+      "note": "Literature numbers are UNVERIFIED: they came from search summaries of secondary sources and were not checked against Faber (2007): Sharpe ~0.81 (1972-2005) and ~0.68 (2006-2025). Independent reimplementation (gross, zero cost, price-only closes from the platform's Massive candles, 2017-07-03 to 2026-08-31): Sharpe 0.645, CAGR 4.14%, vol 6.63%, max drawdown -8.97%; equal-weight buy-and-hold of the same five ETFs: Sharpe 0.562, max drawdown -26.68%. The band is for NET Sharpe; that run is gross, so a net figure is lower by trading costs. Price-only closes omit dividends (predicted 1.5-2.5 percentage points of CAGR understatement). Post-publication decay (McLean-Pontiff, ~58%, also unverified) means a positive result is an upper bound."
+    },
+    {
+      "metric": "max_drawdown",
+      "low": 0.0,
+      "high": 0.25,
+      "role": "performance_band",
+      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B (drawdown magnitude at most 25%, and shallower than equal-weight buy-and-hold of the same five ETFs).",
+      "note": "Drawdown is stated as a positive fraction. Independent reimplementation over 2017-07-03 to 2026-08-31: 8.97% versus 26.68% for buy-and-hold. One window; not a guarantee."
+    }
+  ],
+  "failure_regimes": [
+    "Sideways or choppy markets where prices repeatedly cross the 10-month average (whipsaw). GENERAL property of moving-average trend rules; NOT measured in the local files.",
+    "Income-heavy periods: price-only data omits dividends and understates the returns of IEF, VNQ and EFA, so backtest and live total return differ.",
+    "Post-publication decay: published edges tend to shrink after publication (McLean-Pontiff ~58%, UNVERIFIED secondary figure); read results as upper bounds."
+  ],
+  "cost_profile": {
+    "turnover_per_year_estimate": null,
+    "signal_flips_per_year_shadow": 10.8,
+    "note": "Turnover as a fraction of sleeve equity is NOT recorded in the local files. The independent reimplementation counted 99 asset-level signal flips over 9.16 years (2303 observations at 251.4 per year), about 10.8 per year across the five ETFs (arithmetic on shadow_summary.json). Monthly cadence keeps turnover low; ETF spreads on these five funds are small but were not measured here."
+  },
+  "evidence": "reference_only",
+  "last_verified": "2026-09-21",
+  "verification_note": "Rule text transcribed from ticket.py decide_s1 (code and docstring) and cross-read against BRIEF_FOR_AGENT.md on 2026-09-21. An independent reimplementation exists (ticket.py, shadow.py); the platform engine has NOT replicated it. Literature figures are UNVERIFIED against the original papers.",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window fall outside the expected ranges above. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here."
+}

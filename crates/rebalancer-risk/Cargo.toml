@@ -1,0 +1,25 @@
+[package]
+name = "rebalancer-risk"
+description = "Risk overlay and account state for the rebalancer: the drawdown ladder, the daily-loss limit, the Active/Shrunk/Flattening/Halted state machine, the human-only resume token and a compare-and-swap state store. Pure: no network, no DB, no async, no clock."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+mandate-core = { path = "../mandate-core" }
+rebalancer-core = { path = "../rebalancer-core" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+# Integration tests exercise the gated issuer exactly as the authenticated-human endpoint's crate would.
+rebalancer-risk = { path = ".", features = ["human-endpoint"] }
+
+[features]
+default = []
+# Exposes `approval::issue_human_approval`, the ONLY public way to mint a `HumanApproval` (the token that lets a
+# halted account resume). It must be enabled ONLY by the authenticated-human API endpoint's crate, never by the
+# rebalancer/agent/automation crates. See the `approval` module docs for why a feature and a runtime principal
+# check are both used.
+human-endpoint = []

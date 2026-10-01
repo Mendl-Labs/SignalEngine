@@ -1,0 +1,1 @@
+{"order":{"id":"34","createTime":"2026-09-23T21:14:08.745613410Z","type":"LIMIT","instrument":"EUR_USD","units":"1","timeInForce":"GTC","price":"0.50000","triggerCondition":"DEFAULT","partialFill":"DEFAULT_FILL","positionFill":"DEFAULT","state":"PENDING","clientExtensions":{"id":"limit-20260923T211402Z"}},"lastTransactionID":"34"}

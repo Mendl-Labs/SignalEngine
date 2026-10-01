@@ -1,0 +1,44 @@
+[
+  {
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "symbol": "SPY",
+    "exchange": "ARCA",
+    "asset_class": "us_equity",
+    "avg_entry_price": "512.10",
+    "qty": "12.345678901",
+    "qty_available": "12.345678901",
+    "side": "long",
+    "market_value": "6321.55",
+    "cost_basis": "6321.55",
+    "unrealized_pl": "12.34",
+    "current_price": "512.10"
+  },
+  {
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "symbol": "EFA",
+    "exchange": "ARCA",
+    "asset_class": "us_equity",
+    "avg_entry_price": "81.25",
+    "qty": "40",
+    "qty_available": "40",
+    "side": "long",
+    "market_value": "3300.00",
+    "cost_basis": "3300.00",
+    "unrealized_pl": "12.34",
+    "current_price": "81.25"
+  },
+  {
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "symbol": "IEF",
+    "exchange": "ARCA",
+    "asset_class": "us_equity",
+    "avg_entry_price": "95.40",
+    "qty": "1.5",
+    "qty_available": "1.5",
+    "side": "long",
+    "market_value": "143.10",
+    "cost_basis": "143.10",
+    "unrealized_pl": "12.34",
+    "current_price": "95.40"
+  }
+]

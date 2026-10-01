@@ -1,0 +1,33 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "orderCreateTransaction": {
+    "id": "6372",
+    "accountID": "101-001-1234567-001",
+    "userID": 1234567,
+    "batchID": "6372",
+    "requestID": "42",
+    "time": "1758463200.000000000",
+    "type": "MARKET_ORDER",
+    "instrument": "EUR_USD",
+    "units": "1000",
+    "timeInForce": "FOK",
+    "positionFill": "DEFAULT",
+    "reason": "CLIENT_ORDER",
+    "clientExtensions": {
+      "id": "rb1:run1:EUR/USD:buy",
+      "tag": "mendl-rb"
+    }
+  },
+  "orderCancelTransaction": {
+    "id": "6373",
+    "time": "1758463201.250000000",
+    "type": "ORDER_CANCEL",
+    "orderID": "6372",
+    "reason": "MARKET_HALTED"
+  },
+  "relatedTransactionIDs": [
+    "6372",
+    "6373"
+  ],
+  "lastTransactionID": "6373"
+}

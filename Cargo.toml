@@ -17,12 +17,31 @@ members = [
     "crates/signal",
     "crates/signaldispatcher",
     "crates/pythonbridge-worker",
+    "crates/broker-adapters",
+    "crates/fake-broker",
+    "crates/mandate-core",
+    "crates/rebalancer-core",
+    "crates/rebalancer-risk",
+    "crates/rebalancer-run",
+    "crates/rebalancer-store",
+    "crates/rebalancer-service",
+    "crates/portfolio-parity",
+    "crates/market-data",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # Ultra-low latency logging engine
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }
+
+# The decision rules (ETF trend, crypto trend, FX momentum) live in the public BacktestingCore repository: ONE
+# implementation shared with the backtester, so the rebalancer and the backtest agree by construction
+# (product-mandate/BACKTESTER_TRUTH_DESIGN.md, stage T2). The crate moved there with its public API unchanged.
+#
+# Pinned to BacktestingCore's v0.1.50 release tag (cut 2026-10-01, the first tag after this crate's `rev` pin
+# landed). Previously pinned to a bare commit (BacktestingCore#f1a65a1, PR #39) with a note to switch to a tag
+# once one existed for this crate -- it now does.
+reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", tag = "v0.1.50" }
 
 # Internal workspace crates
 smartorderrouter = { path = "crates/smartorderrouter" }
@@ -51,5 +70,5 @@ overflow-checks = false
 # BacktestingCore's dataloader (used by hostbuilder) declares ultra-logger as a git dependency on the private
 # LoggingEngine repository. Resolve it to the sibling checkout that this workspace already uses, so builds need no
 # git credentials (CI and the Docker build have none) and the graph contains a single copy of the logger.
-[patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+[patch."https://github.com/Mendl-Labs/LoggingEngine"]
 ultra-logger = { path = "../LoggingEngine/ultra-logger" }

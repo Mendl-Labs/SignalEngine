@@ -1,0 +1,9 @@
+{
+  "available": "5",
+  "code": 40310000,
+  "existing_qty": "5",
+  "held_for_orders": "0",
+  "message": "insufficient qty available for order (requested: 10, available: 5)",
+  "related_orders": [],
+  "symbol": "SPY"
+}

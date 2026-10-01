@@ -1,0 +1,10 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "transaction": {
+    "id": "6373",
+    "type": "ORDER_FILL",
+    "orderID": "6372",
+    "instrument": "EUR_USD",
+    "units": "1000"
+  }
+}

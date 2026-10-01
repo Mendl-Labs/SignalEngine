@@ -1,0 +1,16 @@
+{
+  "id": "b28f4066-5c6d-479b-a2af-85dc1a8f16fb",
+  "class": "us_equity",
+  "exchange": "ARCA",
+  "symbol": "MINO",
+  "name": "MINO test asset",
+  "status": "active",
+  "tradable": true,
+  "marginable": true,
+  "shortable": true,
+  "easy_to_borrow": true,
+  "fractionable": true,
+  "min_order_size": "5",
+  "min_trade_increment": "0.5",
+  "price_increment": "0.05"
+}

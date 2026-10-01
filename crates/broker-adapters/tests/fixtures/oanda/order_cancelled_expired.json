@@ -1,0 +1,21 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "order": {
+    "id": "6390",
+    "createTime": "1758463200.000000000",
+    "state": "CANCELLED",
+    "type": "LIMIT",
+    "instrument": "EUR_USD",
+    "units": "2000",
+    "timeInForce": "GTC",
+    "positionFill": "DEFAULT",
+    "clientExtensions": {
+      "id": "rb1:run1:EUR/USD:limit",
+      "tag": "mendl-rb"
+    },
+    "price": "1.09500",
+    "cancellingTransactionID": "6392",
+    "cancelledTime": "1758463201.250000000"
+  },
+  "lastTransactionID": "6400"
+}

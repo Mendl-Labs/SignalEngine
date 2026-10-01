@@ -1,0 +1,20 @@
+{
+  "_fixture_provenance": "authored from documentation, not recorded from a live account",
+  "order": {
+    "id": "6372",
+    "createTime": "1758463200.000000000",
+    "state": "FILLED",
+    "type": "MARKET",
+    "instrument": "EUR_USD",
+    "units": "1000",
+    "timeInForce": "FOK",
+    "positionFill": "DEFAULT",
+    "clientExtensions": {
+      "id": "rb1:run1:EUR/USD:buy",
+      "tag": "mendl-rb"
+    },
+    "fillingTransactionID": "6375",
+    "filledTime": "1758463201.250000000"
+  },
+  "lastTransactionID": "6400"
+}
