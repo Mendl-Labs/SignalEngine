@@ -15,11 +15,11 @@ use reference_rules::{completed_month_end_dates, data_fingerprint, Panel, PriceS
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::aggs::{bounded, parse_aggs_page};
+use crate::aggs::{bounded, parse_aggs_page, AggBar};
 use crate::error::{MassiveError, SleeveError};
 use crate::runtime::{Budget, BudgetConfig, Jitter, MarketClock, RetryPolicy, SystemClock, SystemJitter};
 use crate::secret::{scrub, KeyProvider, SecretString};
-use crate::time::{bar_date, is_complete, BarClock};
+use crate::time::{bar_date, is_complete, nominal_close_at, BarClock};
 use crate::url::{base_authority, record_of, sanitize_next_url};
 
 /// The source id every [`Provenance`] carries.
@@ -224,6 +224,41 @@ struct Plan {
     settle: Duration,
 }
 
+/// Every page of one instrument's range request after validation, BEFORE the completeness filter.
+struct RawFetch {
+    /// `(bar date, the vendor's values)`, strictly ascending.
+    bars: Vec<(NaiveDate, AggBar)>,
+    request_paths: Vec<String>,
+    request_ids: Vec<String>,
+    raw_sha256: Vec<String>,
+    scrubbed: bool,
+    fetched_at: DateTime<Utc>,
+}
+
+/// One bar as the vendor shows it right now (see `MassiveDataSource::observe_recent_bars`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservedBar {
+    pub date: NaiveDate,
+    /// The venue's nominal close of this bar's date ([`nominal_close_at`]).
+    pub nominal_close_at: DateTime<Utc>,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: f64,
+    pub volume: Option<f64>,
+}
+
+/// The unfiltered bars of one ticker plus what identifies the responses they came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedBars {
+    /// Oldest first; may include a forming bar.
+    pub bars: Vec<ObservedBar>,
+    /// SHA-256 (lowercase hex) of each raw response body, one per page.
+    pub raw_sha256: Vec<String>,
+    pub request_ids: Vec<String>,
+    pub fetched_at: DateTime<Utc>,
+}
+
 /// What one instrument's fetch produced, after validation and the completeness filter.
 struct InstrumentFetch {
     symbol: String,
@@ -372,13 +407,16 @@ impl MassiveDataSource {
         }
     }
 
-    fn fetch_instrument(&self, plan: &Plan, as_of: NaiveDate, key: &SecretString) -> Result<InstrumentFetch, MassiveError> {
+    /// Every page of one instrument's range request, parsed and date-validated (strictly ascending, by the clock's
+    /// convention), WITHOUT the completeness filter. `fetch_instrument` applies the filter for the rules;
+    /// `observe_recent_bars` deliberately does not (it exists to see a bar the moment the vendor shows it).
+    fn fetch_pages(&self, plan: &Plan, key: &SecretString) -> Result<RawFetch, MassiveError> {
         let malformed = |detail: String| MassiveError::Malformed { instrument: plan.symbol.clone(), detail: scrub(&detail, Some(key.expose())) };
         let path = format!("/v2/aggs/ticker/{}/range/1/day/{}/{}", plan.ticker, plan.from, plan.to);
         let mut url = format!("https://{}{path}?{QUERY}", self.authority);
         let mut record = record_of(&path, QUERY);
 
-        let mut raw: Vec<(i64, f64)> = Vec::new();
+        let mut raw: Vec<AggBar> = Vec::new();
         let mut request_paths = Vec::new();
         let mut request_ids: Vec<String> = Vec::new();
         let mut raw_sha256 = Vec::new();
@@ -420,28 +458,31 @@ impl MassiveDataSource {
         }
 
         // Dates by the documented convention; strictly ascending across ALL pages (a duplicate is not ascending).
-        let mut dates: Vec<NaiveDate> = Vec::with_capacity(raw.len());
-        let mut closes: Vec<f64> = Vec::with_capacity(raw.len());
-        for (t, c) in &raw {
-            let d = bar_date(plan.clock, *t).map_err(malformed)?;
-            if let Some(prev) = dates.last() {
+        let mut bars: Vec<(NaiveDate, AggBar)> = Vec::with_capacity(raw.len());
+        for b in raw {
+            let d = bar_date(plan.clock, b.t).map_err(malformed)?;
+            if let Some((prev, _)) = bars.last() {
                 if d <= *prev {
                     return Err(malformed(format!("bar dates are not strictly ascending: {prev} then {d}")));
                 }
             }
-            dates.push(d);
-            closes.push(*c);
+            bars.push((d, b));
         }
+        Ok(RawFetch { bars, request_paths, request_ids, raw_sha256, scrubbed, fetched_at: self.clock.now() })
+    }
+
+    fn fetch_instrument(&self, plan: &Plan, as_of: NaiveDate, key: &SecretString) -> Result<InstrumentFetch, MassiveError> {
+        let raw = self.fetch_pages(plan, key)?;
 
         // The completeness filter: only bars proven complete are kept.
         let now = self.clock.now();
-        let mut kept_dates = Vec::with_capacity(dates.len());
-        let mut kept_closes = Vec::with_capacity(dates.len());
+        let mut kept_dates = Vec::with_capacity(raw.bars.len());
+        let mut kept_closes = Vec::with_capacity(raw.bars.len());
         let mut dropped = Vec::new();
-        for (d, c) in dates.into_iter().zip(closes) {
+        for (d, b) in raw.bars {
             if is_complete(plan.clock, d, as_of, now, plan.settle) {
                 kept_dates.push(d);
-                kept_closes.push(c);
+                kept_closes.push(b.close);
             } else {
                 dropped.push(d);
             }
@@ -452,12 +493,36 @@ impl MassiveDataSource {
             dates: kept_dates,
             closes: kept_closes,
             dropped,
-            request_paths,
-            request_ids,
-            raw_sha256,
-            fetched_at: self.clock.now(),
-            scrubbed,
+            request_paths: raw.request_paths,
+            request_ids: raw.request_ids,
+            raw_sha256: raw.raw_sha256,
+            fetched_at: raw.fetched_at,
+            scrubbed: raw.scrubbed,
         })
+    }
+
+    /// The daily bars of ONE vendor ticker in `[from, to]` exactly as the vendor shows them RIGHT NOW: validated
+    /// (shape, ticker, adjusted flag, stamp convention, ascending dates) but NOT filtered for completeness, each with
+    /// its nominal close ([`nominal_close_at`]). For the first-seen-latency / revision recorder ONLY
+    /// (`rebalancer_run::latency`, W9.1): an observer must see a bar the moment the vendor publishes it, forming bar
+    /// included, and the recorder's own pre-registered policy decides what to sample. Nothing returned here may feed a
+    /// rule; `sleeve_data` / `fetch_daily_bars` keep the completeness rule. No provenance is remembered for these
+    /// fetches (the response hashes are returned instead), so an observer polling every tick cannot push a decision
+    /// fetch's provenance out of the bounded log.
+    pub fn observe_recent_bars(&self, ticker: &str, clock: BarClock, from: NaiveDate, to: NaiveDate) -> Result<ObservedBars, MassiveError> {
+        if ticker.is_empty() || !ticker.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '-') {
+            return Err(MassiveError::Unsupported { detail: format!("ticker {:?} is not a plain vendor ticker", bounded(ticker)) });
+        }
+        let key = self.key()?;
+        let plan = Plan { symbol: ticker.to_string(), ticker: ticker.to_string(), clock, from, to, settle: Duration::ZERO };
+        let raw = self.fetch_pages(&plan, &key)?;
+        let mut bars = Vec::with_capacity(raw.bars.len());
+        for (date, b) in raw.bars {
+            let nominal_close_at = nominal_close_at(clock, date)
+                .ok_or_else(|| MassiveError::Unsupported { detail: format!("{ticker}: no nominal close can be computed for a bar dated {date}") })?;
+            bars.push(ObservedBar { date, nominal_close_at, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+        }
+        Ok(ObservedBars { bars, raw_sha256: raw.raw_sha256, request_ids: raw.request_ids, fetched_at: raw.fetched_at })
     }
 
     fn window(&self, as_of: NaiveDate, days: i64) -> Result<(NaiveDate, NaiveDate), MassiveError> {

@@ -39,6 +39,7 @@
 //! no database).
 
 use std::collections::BTreeMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -50,10 +51,12 @@ use market_data::{EnvKeyProvider, MassiveDataSource};
 use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_run::clock::Clock;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource};
+use rebalancer_run::latency::LatencyRecorder;
 use rebalancer_run::pipeline::RunConfig;
+use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
 use rebalancer_service::runtime::{connect_paper_alpaca, connect_read_only, pilot_data_source, pilot_template_sql};
-use rebalancer_store::{AccountTenants, PgAccountLock, PgAccountSource, PgKillFlag, PgNotifier, PgRunStore, PgStateStore, PilotAllowList};
+use rebalancer_store::{AccountTenants, PgAccountLock, PgAccountSource, PgKillFlag, PgLatencyStore, PgNotifier, PgRunStore, PgStateStore, PilotAllowList};
 
 const DEFAULT_TICK_SECS: u64 = 300;
 /// Read by both the service and `print-fingerprint`, never logged and never read from a secrets file.
@@ -155,8 +158,18 @@ fn run_service() {
         eprintln!("rebalancer-service: DATABASE_URL is not set; refusing to start (fail closed, matching every store's own posture)");
         std::process::exit(1);
     });
+    // The latency recorder's flags (W9.1): read up front so a malformed value refuses the start, like every other
+    // setting of this binary.
+    let observer_cfg = match ObserverConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rebalancer-service: {e}");
+            std::process::exit(1);
+        }
+    };
     let tick_secs = tick_secs();
     log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY pilot for tenant {} account {}", pilot.tenant_id, pilot.account_id));
+    log(observer_cfg.describe());
 
     let tenants = Arc::new(AccountTenants::new());
     let pool = match rebalancer_store::pg::create_pool(&database_url, 10) {
@@ -216,6 +229,16 @@ fn run_service() {
             std::process::exit(1);
         }
     };
+    // --- The latency recorder's store (W9.1). Its tables may not exist yet (the migration is applied by the owner
+    // from databaseschema-internal); every call then fails with LATENCY_STORE_UNAVAILABLE, which the recorder logs
+    // and alerts once. Nothing here can stop the service from starting or a run from happening.
+    let latency_store = match PgLatencyStore::new(pool.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebalancer-service: could not build PgLatencyStore: {e}");
+            std::process::exit(1);
+        }
+    };
     let pg_source = match PgAccountSource::new(pool, allow) {
         Ok(s) => s,
         Err(e) => {
@@ -263,8 +286,20 @@ fn run_service() {
             std::process::exit(1);
         }
     };
-    let massive = MassiveDataSource::new(massive_key, transport);
+    let massive = MassiveDataSource::new(massive_key, transport.clone());
     let data_source = pilot_data_source(&massive);
+
+    // A SECOND Massive source for the latency recorder (same key, same transport): the per-tick request budget is per
+    // source instance, so the observer polling seven instruments every tick can never starve the decision fetch, and
+    // its unfiltered observations never touch the decision source's provenance log.
+    let observer_massive = match EnvKeyProvider::from_env() {
+        Ok(k) => MassiveDataSource::new(k, transport),
+        Err(e) => {
+            eprintln!("rebalancer-service: MASSIVE_API_KEY (observer): {e}");
+            std::process::exit(1);
+        }
+    };
+    let recorder = LatencyRecorder::new(&observer_massive, &latency_store);
 
     let broker = pilot_alpaca.broker();
     let rules = pilot_alpaca.rules();
@@ -287,6 +322,8 @@ fn run_service() {
             }
             Ok(false) => {
                 run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes);
+                // After the runs (and their data fetch), the observer; never before, never instead.
+                observe_tick(&observer_cfg, &recorder, &accounts, &notifier, &clock);
             }
             Err(e) => {
                 log(format!("kill flag unreadable ({e}): failing closed, skipping this tick"));
@@ -340,6 +377,32 @@ fn run_tick(
         match &o.result {
             Ok(record) => log(format!("  {}: {} ({})", o.spec.account_id, record.outcome.kind.as_str(), record.outcome.code)),
             Err(e) => log(format!("  {}: NOT ATTEMPTED -- {e}", o.spec.account_id)),
+        }
+    }
+}
+
+/// The first-seen-latency / revision recorder's observation for this tick (W9.1): every tick, whether or not an
+/// account was due (the bars appear around 20:00Z for ETFs and 00:00Z for crypto, inside and outside the run slots).
+/// Wrapped in `catch_unwind` like `run_all_due` wraps `run_once`: an observer bug can be logged, never abort the tick
+/// loop. It runs after `run_tick`, so it can never delay a run either.
+fn observe_tick(cfg: &ObserverConfig, recorder: &LatencyRecorder<'_>, accounts: &dyn AccountSource, notifier: &PgNotifier, clock: &SystemClock) {
+    if !cfg.enabled {
+        return;
+    }
+    let sleeves: Vec<rebalancer_run::data::SleeveSpec> = match accounts.active_accounts() {
+        Ok(active) => active.into_iter().flat_map(|a| a.sleeves).collect(),
+        Err(e) => {
+            log(format!("latency recorder: active_accounts failed ({e}); observing the baseline kinds only this tick"));
+            Vec::new()
+        }
+    };
+    let instruments = cfg.instruments(sleeves.iter());
+    let now = clock.now();
+    match panic::catch_unwind(AssertUnwindSafe(|| recorder.observe(&instruments, now, notifier))) {
+        Ok(report) => log(report.summary_line()),
+        Err(payload) => {
+            let msg = payload.downcast_ref::<&str>().map(|s| (*s).to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "non-string panic payload".into());
+            log(format!("latency recorder PANICKED (observer only, no run affected): {msg}"));
         }
     }
 }

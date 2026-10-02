@@ -44,6 +44,12 @@
 //! Settling, Deterministic, R19) instead of collapsing them into a `DataError` string. [`SleevesFrom`] adapts any
 //! fetcher to a `DataSource`, and [`WithPrices`] takes sizing prices from a different source.
 //!
+//! # The latency recorder's view ([`observe`]; W9.1, COUNCIL_DATA_GATE R25)
+//! `MassiveDataSource::observe_recent_bars` returns the newest bars of one ticker exactly as the vendor shows them,
+//! validated but NOT filtered for completeness, each with the venue's nominal close ([`time::nominal_close_at`]:
+//! 16:00 New York for ETFs, 00:00 UTC next day for crypto). It exists only for `rebalancer_run::latency`'s
+//! first-seen-latency / revision recorder (the [`observe`] module implements its `RecentBarsSource`), never for a rule.
+//!
 //! Deliberately NOT here: the two-source gate, the retry WINDOW across ticks (this source retries within one fetch
 //! only), readers for Alpaca/Kraken/OANDA, any exchange calendar (no holiday table, no early-close table), FX (a later
 //! `BarClock`), and sizing prices (`prices` refuses; see [`WithPrices`]).
@@ -52,6 +58,7 @@
 
 pub mod aggs;
 pub mod error;
+pub mod observe;
 pub mod runtime;
 pub mod secret;
 pub mod source;
@@ -63,6 +70,6 @@ pub use error::{ErrorKind, FailureClass, MassiveError, SleeveError};
 pub use runtime::{BudgetConfig, Jitter, MarketClock, RetryPolicy, SystemClock, SystemJitter};
 pub use secret::{EnvKeyProvider, KeyError, KeyProvider, SecretString, StaticKeyProvider};
 pub use source::{
-    Completeness, ConfigError, DailyBars, FetchedSleeve, MassiveConfig, MassiveDataSource, Provenance, SleeveFetcher, SleevesFrom, WithPrices, CRYPTO_HISTORY_DAYS, DEFAULT_BASE_URL,
-    ETF_HISTORY_DAYS, MAX_RESPONSE_AGE_SECS, SOURCE_ID,
+    Completeness, ConfigError, DailyBars, FetchedSleeve, MassiveConfig, MassiveDataSource, ObservedBar, ObservedBars, Provenance, SleeveFetcher, SleevesFrom, WithPrices,
+    CRYPTO_HISTORY_DAYS, DEFAULT_BASE_URL, ETF_HISTORY_DAYS, MAX_RESPONSE_AGE_SECS, SOURCE_ID,
 };

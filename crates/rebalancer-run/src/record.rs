@@ -131,16 +131,21 @@ pub enum AlertCode {
     /// venue, denied by the guard, unknown, or cancelled with nothing executed): the decision was NOT counted as
     /// acted and is planned again on the next run. Critical, except when every gap is "market closed" (Warning).
     DecisionNotActed,
+    /// The first-seen-latency / revision recorder (`crate::latency`, W9.1 / R25) could not observe or store on a
+    /// tick. Warning, raised once per distinct failure (not on every tick it persists); the recorder is an observer,
+    /// so this never means a run was affected.
+    LatencyRecorderFailed,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 6] = [
+    pub const ALL: [AlertCode; 7] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
         AlertCode::StillHalted,
         AlertCode::MandateUnusable,
         AlertCode::DecisionNotActed,
+        AlertCode::LatencyRecorderFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -151,6 +156,7 @@ impl AlertCode {
             AlertCode::StillHalted => "ALERT_STILL_HALTED",
             AlertCode::MandateUnusable => "ALERT_MANDATE_UNUSABLE",
             AlertCode::DecisionNotActed => "ALERT_DECISION_NOT_ACTED",
+            AlertCode::LatencyRecorderFailed => "ALERT_LATENCY_RECORDER_FAILED",
         }
     }
 }

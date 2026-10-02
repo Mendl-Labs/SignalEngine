@@ -42,3 +42,20 @@ shape; it has NOT been run against the real API (an env-gated live test, `tests/
 purpose: the two-source gate (a decorator over `market_data::SleeveFetcher`), the retry window across ticks, the
 Alpaca/Kraken/OANDA readers and any exchange calendar. See the crate docs for the completeness rule, the failure taxonomy
 and the decorator seam. `MassiveDataSource::prices` refuses: sizing prices come from a different source (`WithPrices`).
+
+## Latency recorder (W9.1: first-seen latency and revisions, COUNCIL_DATA_GATE R25)
+
+`rebalancer_run::latency` is an OBSERVER that runs after every service tick: it asks the vendor for the newest bars of
+every instrument the sleeves use (plus, by default, both sleeve kinds' instruments), records the FIRST sighting of each
+`(instrument, bar date)` with its latency from the venue's nominal close (ETF: 16:00 America/New_York of the session,
+DST-aware, vendor delay not subtracted, early closes not modelled; crypto: 00:00 UTC of the next day), and appends a
+revision row whenever a bar on file comes back with different values (exact equality on open/high/low/close/volume).
+Its policy (five newest closed bars per tick, exact-equality revisions, the 20-session evidence threshold) is
+pre-registered as data (`latency::policy`, `POLICY_VERSION`, fixed 2026-10-02 before any data) and stamped on every
+row; `latency::summary` is what the paper-cycle gate reads (per instrument: sessions, p50/p90/max latency, revisions,
+threshold met). A failure is logged and alerted once (`ALERT_LATENCY_RECORDER_FAILED`, Warning) and never affects a
+run. Flags: `LATENCY_RECORDER_ENABLED` (default `true`; it is read-only and the council said start now),
+`LATENCY_RECORDER_KINDS` (default `etf_trend,crypto_trend`). Storage: `rebalancer_store::PgLatencyStore` over two
+append-only, platform-level (no tenant) tables whose migration is kept in
+`crates/rebalancer-store/migrations/2026-10-02-000000_create_rebalancer_bar_observations` for the owner to copy into
+`databaseschema-internal` verbatim; until it is applied the recorder reports `LATENCY_STORE_UNAVAILABLE` every tick.
