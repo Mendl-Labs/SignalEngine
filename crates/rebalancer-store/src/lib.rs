@@ -10,6 +10,9 @@
 //!   concurrency-safety mechanism `run_all_due` uses.
 //! * [`account_source::PgAccountSource`] -- `rebalancer_run::driver::AccountSource` for the paper pilot: the allow-listed
 //!   tenant/account(s), their active signed mandate and owner-authored pilot plan, paper-only, no broker built.
+//! * [`delivery_ledger::PgDeliveryLedger`] -- `rebalancer_alerts::DeliveryLedger` (W6.1): alert DELIVERY rows over
+//!   `alert_channels` / `alert_deliveries` (`databaseschema-internal` `feat/w6-1-alert-channels`), the half
+//!   `PgNotifier` deliberately does not do.
 //! * [`ledger`] / `PgRunStore::last_acted_decision`: the append-only, tenant-scoped, monotone decision ledger
 //!   (`D_acted`), written in the same transaction as `PgRunStore::finish`.
 //! * [`latency_store::PgLatencyStore`] -- `rebalancer_run::latency::LatencyStore` (W9.1, the first-seen-latency /
@@ -29,6 +32,7 @@
 
 pub mod account_lock;
 pub mod account_source;
+pub mod delivery_ledger;
 pub mod json;
 pub mod kill_flag;
 pub mod latency_store;
@@ -42,6 +46,7 @@ pub mod tenants;
 
 pub use account_lock::PgAccountLock;
 pub use account_source::{AccountSourceError, Enumeration, Exclusion, ExclusionReason, PilotAccount, PilotAllowList, PgAccountSource, PlanExecution};
+pub use delivery_ledger::PgDeliveryLedger;
 pub use kill_flag::PgKillFlag;
 pub use latency_store::PgLatencyStore;
 pub use notifier::PgNotifier;

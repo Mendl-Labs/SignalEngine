@@ -59,3 +59,31 @@ run. Flags: `LATENCY_RECORDER_ENABLED` (default `true`; it is read-only and the 
 append-only, platform-level (no tenant) tables whose migration is kept in
 `crates/rebalancer-store/migrations/2026-10-02-000000_create_rebalancer_bar_observations` for the owner to copy into
 `databaseschema-internal` verbatim; until it is applied the recorder reports `LATENCY_STORE_UNAVAILABLE` every tick.
+
+## rebalancer-alerts (W6.1 alert delivery + W6.2 dead-man's heartbeat; dark behind `ALERTS_ENABLED` / `HEARTBEAT_URL`)
+
+`rebalancer_store::PgNotifier` only INSERTs into `rebalancer_alerts`. `crates/rebalancer-alerts` is the delivery half: a
+`DeliveryWorker` the service runs after every tick's runs. It reads the alerts raised since its watermark (first tick: the
+last 24 h) and, for each verified enabled channel that applies (the alert's tenant's channels for every severity, platform-scope
+channels for `warning`/`critical`), inserts one `alert_deliveries` row, insert-if-absent on `(channel_id, dedupe_key)` -- that
+unique key is the de-duplication (a halted account reminded every tick produces one e-mail) -- then sends each unsent,
+unerrored row through a `Sender` and marks it ONCE (`sent_at` + `provider_message_id`, or `error`). Subject
+`[Mendl Labs] <severity> <code> <account>`, plain text; the halt / flatten / failed-run / not-acted / heartbeat codes carry a
+one-line "what to do" footer. The Postgres ledger (`rebalancer_store::PgDeliveryLedger`, raw SQL like every other store) fails
+closed with `ALERT_STORE_UNAVAILABLE` when `alert_channels` / `alert_deliveries` are absent -- those tables are the
+`databaseschema-internal` migration `feat/w6-1-alert-channels` (not renamed here); the service role needs `SELECT` on
+`alert_channels` and `SELECT, INSERT, UPDATE` on `alert_deliveries`.
+
+Environment: `ALERTS_ENABLED` (exactly `true` to turn delivery on; default off), `RESEND_API_KEY` + `ALERT_FROM_EMAIL` (the
+Resend sender, `POST https://api.resend.com/emails`; with either unset the sender is DISABLED and every delivery is recorded
+with `error = 'sender_disabled'`, never dropped and never retried). The key is sent only as `Authorization: Bearer` and is
+never logged. Nothing in this crate can stop or change a run: a ledger or provider failure is logged in the tick summary.
+
+Heartbeat: with `HEARTBEAT_URL` set (healthchecks.io style), every tick that RAN -- including a tick with nothing due and a
+tick skipped by the kill flag -- POSTs the URL; a tick that could not run (kill flag unreadable, due scan failed) POSTs
+`<HEARTBEAT_URL><HEARTBEAT_FAIL_SUFFIX>` (default `/fail`). The ping uses its own transport with a 3 s connect / 5 s total
+timeout so it can never hold the loop; a failure is logged (URL redacted to host + last 4 characters) and raised once per
+failure streak as `ALERT_HEARTBEAT_FAILED` (warning, account `platform`) through the notifier, so it reaches the platform
+channels like any other alert. **Set the monitor's expected period to the tick interval (`REBALANCER_TICK_SECS`, default
+300 s) plus a grace that covers one slow tick (the runs plus the delivery pass); e.g. period 5 min, grace 5 min.** The
+monitor owns the alarm: if the pings stop, it pages; this process never decides anything from a ping's outcome.

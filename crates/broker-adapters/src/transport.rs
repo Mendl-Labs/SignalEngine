@@ -141,9 +141,15 @@ pub mod reqwest_transport {
 
     impl ReqwestTransport {
         pub fn new() -> Result<Self, TransportError> {
+            Self::with_timeouts(Duration::from_secs(10), Duration::from_secs(30))
+        }
+
+        /// A transport with its own connect / total timeouts. The rebalancer's dead-man's heartbeat uses a short
+        /// one (a few seconds) so a slow monitor can never hold the tick loop for the default 30 seconds.
+        pub fn with_timeouts(connect: Duration, total: Duration) -> Result<Self, TransportError> {
             let client = reqwest::blocking::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
+                .connect_timeout(connect)
+                .timeout(total)
                 .build()
                 .map_err(|e| TransportError::Io(e.to_string()))?;
             Ok(Self { client })
