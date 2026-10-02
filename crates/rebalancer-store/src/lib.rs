@@ -12,6 +12,10 @@
 //!   tenant/account(s), their active signed mandate and owner-authored pilot plan, paper-only, no broker built.
 //! * [`ledger`] / `PgRunStore::last_acted_decision`: the append-only, tenant-scoped, monotone decision ledger
 //!   (`D_acted`), written in the same transaction as `PgRunStore::finish`.
+//! * [`latency_store::PgLatencyStore`] -- `rebalancer_run::latency::LatencyStore` (W9.1, the first-seen-latency /
+//!   revision recorder; platform-level, no tenant: vendor bars are tenant-independent). Its migration lives in THIS
+//!   crate (`migrations/2026-10-02-000000_create_rebalancer_bar_observations`) for the owner to copy into
+//!   databaseschema-internal; see that file's header.
 //! * [`tenants::AccountTenants`] -- the in-memory account-id -> tenant-id registry every store above
 //!   shares, since none of the traits it implements carry a tenant id (see the migration's own file
 //!   header for the full reasoning).
@@ -27,6 +31,7 @@ pub mod account_lock;
 pub mod account_source;
 pub mod json;
 pub mod kill_flag;
+pub mod latency_store;
 pub mod ledger;
 pub mod notifier;
 pub mod pg;
@@ -38,6 +43,7 @@ pub mod tenants;
 pub use account_lock::PgAccountLock;
 pub use account_source::{AccountSourceError, Enumeration, Exclusion, ExclusionReason, PilotAccount, PilotAllowList, PgAccountSource, PlanExecution};
 pub use kill_flag::PgKillFlag;
+pub use latency_store::PgLatencyStore;
 pub use notifier::PgNotifier;
 pub use provenance::{PlanOrigin, PlanProvenance, PlanProvenanceRegistry, VenueEnvironment};
 pub use run_store::PgRunStore;

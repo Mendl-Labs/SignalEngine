@@ -12,20 +12,50 @@
 //! Checked here: JSON object; `status` is `OK` or `DELAYED` (the delayed stocks plan reports `DELAYED`); `ticker` is
 //! exactly the requested vendor ticker; `adjusted` is `true` (a split-unadjusted series would break the rules);
 //! `resultsCount`, when present, equals the number of results; every result has an integer `t` and a finite `c > 0`;
-//! `next_url`, when present, is a non-empty string. Dates, ordering and completeness are checked by the caller.
-//! An empty result set (`resultsCount: 0`, the `results` key absent or `[]`) is returned as zero bars.
+//! `o`, `h`, `l` (finite, positive) and `v` (finite, non-negative) are read WHEN PRESENT (the latency recorder records
+//! them; the rules read only `c`) and a present but malformed one is refused like a malformed close; `next_url`, when
+//! present, is a non-empty string. Dates, ordering and completeness are checked by the caller. An empty result set
+//! (`resultsCount: 0`, the `results` key absent or `[]`) is returned as zero bars.
 
 use serde_json::Value;
 
 use crate::secret::scrub;
 
+/// One result of a page: the stamp, the close (mandatory) and the other OHLCV fields when the vendor sent them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AggBar {
+    /// Milliseconds since the epoch.
+    pub t: i64,
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: f64,
+    pub volume: Option<f64>,
+}
+
 /// One validated page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggsPage {
-    /// `(t in ms since the epoch, close)` per result, in the vendor's order.
-    pub bars: Vec<(i64, f64)>,
+    /// One entry per result, in the vendor's order.
+    pub bars: Vec<AggBar>,
     pub next_url: Option<String>,
     pub request_id: Option<String>,
+}
+
+/// An optional numeric field of a result: absent (or null) is `None`; present must be a finite number, positive when
+/// `positive`, else non-negative.
+fn optional_number(r: &serde_json::Map<String, Value>, key: &str, positive: bool, i: usize) -> Result<Option<f64>, String> {
+    match r.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let x = v.as_f64().ok_or_else(|| format!("result {i}: `{key}` is present but not a number"))?;
+            let ok = x.is_finite() && if positive { x > 0.0 } else { x >= 0.0 };
+            if !ok {
+                return Err(format!("result {i}: `{key}` is not a finite {} number", if positive { "positive" } else { "non-negative" }));
+            }
+            Ok(Some(x))
+        }
+    }
 }
 
 /// Longest excerpt of vendor-supplied text that may enter an error message.
@@ -80,7 +110,14 @@ pub fn parse_aggs_page(body: &[u8], expected_ticker: &str, secret: Option<&str>)
         if !(c.is_finite() && c > 0.0) {
             return Err(format!("result {i}: the close is not a finite positive number"));
         }
-        bars.push((t, c));
+        bars.push(AggBar {
+            t,
+            open: optional_number(r, "o", true, i)?,
+            high: optional_number(r, "h", true, i)?,
+            low: optional_number(r, "l", true, i)?,
+            close: c,
+            volume: optional_number(r, "v", false, i)?,
+        });
     }
 
     let next_url = match obj.get("next_url") {
@@ -105,12 +142,37 @@ mod tests {
         format!(r#"{{"ticker":"SPY","queryCount":2,"resultsCount":2,"adjusted":true,"status":"OK","request_id":"abc-123","results":[{{"c":10.5,"t":1000}},{{"c":11,"t":2000}}]{extra}}}"#)
     }
 
+    fn t_and_close(p: &AggsPage) -> Vec<(i64, f64)> {
+        p.bars.iter().map(|b| (b.t, b.close)).collect()
+    }
+
     #[test]
     fn parses_the_documented_shape() {
         let p = parse_aggs_page(page("").as_bytes(), "SPY", None).unwrap();
-        assert_eq!(p.bars, vec![(1000, 10.5), (2000, 11.0)]);
+        assert_eq!(t_and_close(&p), vec![(1000, 10.5), (2000, 11.0)]);
+        assert!(p.bars.iter().all(|b| b.open.is_none() && b.high.is_none() && b.low.is_none() && b.volume.is_none()), "fields the vendor did not send are absent");
         assert_eq!(p.next_url, None);
         assert_eq!(p.request_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn reads_open_high_low_volume_when_present_and_refuses_them_when_malformed() {
+        let full = r#"{"ticker":"SPY","resultsCount":1,"adjusted":true,"status":"OK","results":[{"v":12345.5,"vw":10.2,"o":10.0,"c":10.5,"h":11.0,"l":9.5,"t":1000,"n":10}]}"#;
+        let p = parse_aggs_page(full.as_bytes(), "SPY", None).unwrap();
+        assert_eq!(p.bars, vec![AggBar { t: 1000, open: Some(10.0), high: Some(11.0), low: Some(9.5), close: 10.5, volume: Some(12345.5) }]);
+        // a zero volume is a legal value; a null field is absent
+        let zero_v = full.replace(r#""v":12345.5"#, r#""v":0"#).replace(r#""o":10.0"#, r#""o":null"#);
+        let p = parse_aggs_page(zero_v.as_bytes(), "SPY", None).unwrap();
+        assert_eq!((p.bars[0].volume, p.bars[0].open), (Some(0.0), None));
+        for (bad, why) in [
+            (full.replace(r#""v":12345.5"#, r#""v":-1"#), "negative volume"),
+            (full.replace(r#""v":12345.5"#, r#""v":"12"#), "string volume"),
+            (full.replace(r#""o":10.0"#, r#""o":0"#), "zero open"),
+            (full.replace(r#""h":11.0"#, r#""h":-11.0"#), "negative high"),
+            (full.replace(r#""l":9.5"#, r#""l":"9.5""#), "string low"),
+        ] {
+            assert!(parse_aggs_page(bad.as_bytes(), "SPY", None).is_err(), "should refuse: {why}");
+        }
     }
 
     #[test]
@@ -151,7 +213,7 @@ mod tests {
     #[test]
     fn empty_results_are_zero_bars() {
         let e = r#"{"ticker":"SPY","queryCount":0,"resultsCount":0,"adjusted":true,"status":"OK","request_id":"r","count":0}"#;
-        assert_eq!(parse_aggs_page(e.as_bytes(), "SPY", None).unwrap().bars, vec![]);
+        assert!(parse_aggs_page(e.as_bytes(), "SPY", None).unwrap().bars.is_empty());
         let e2 = r#"{"ticker":"SPY","resultsCount":0,"adjusted":true,"status":"OK","results":[]}"#;
         assert!(parse_aggs_page(e2.as_bytes(), "SPY", None).unwrap().bars.is_empty());
         let lie = r#"{"ticker":"SPY","resultsCount":4,"adjusted":true,"status":"OK"}"#;
