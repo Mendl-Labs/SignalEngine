@@ -33,6 +33,14 @@
 //! proves the startup gate itself refuses regardless of such a variable with a real call to the same function
 //! `main` calls, not just by reading the source.
 //!
+//! # The two-source data gate (W9.2, shadow only)
+//! `DATA_GATE_MODE=shadow` puts `market_data::TwoSourceGate` between the Massive fetch and the pipeline: every sleeve
+//! fetch is compared against its secondary (ETF: Alpaca daily bars on the platform DATA credentials
+//! `ALPACA_DATA_KEY_ID` / `ALPACA_DATA_KEY_SECRET`, feed `ALPACA_DATA_FEED`; crypto: Kraken public OHLC), the
+//! verdict and both sources' closes are recorded on the run record, and a refusal is raised as
+//! `ALERT_DATA_GATE_SHADOW_REFUSE`. The primary panel is ALWAYS what the pipeline decides on. `off` (default) adds
+//! nothing; `enforce` refuses to start.
+//!
 //! Two read-only/print-only subcommands exist for the owner to run BEFORE a pilot plan row exists:
 //! `print-fingerprint` (connects read-only and prints the connected key's fingerprint, never the key) and
 //! `pilot-template` (prints the `mandate_events` / `rebalancer_pilot_plans` insert template; touches no network,
@@ -46,13 +54,14 @@ use broker_adapters::alpaca::PAPER_BASE_URL;
 use broker_adapters::transport::reqwest_transport::ReqwestTransport;
 use broker_adapters::transport::HttpTransport;
 use chrono::{DateTime, Utc};
-use market_data::{EnvKeyProvider, MassiveDataSource};
+use market_data::{DataGateMode, EnvKeyProvider, MassiveDataSource, ENV_DATA_GATE_MODE};
 use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_run::clock::Clock;
+use rebalancer_run::data::DataSource;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource};
 use rebalancer_run::pipeline::RunConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
-use rebalancer_service::runtime::{connect_paper_alpaca, connect_read_only, pilot_data_source, pilot_template_sql};
+use rebalancer_service::runtime::{connect_paper_alpaca, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate};
 use rebalancer_store::{AccountTenants, PgAccountLock, PgAccountSource, PgKillFlag, PgNotifier, PgRunStore, PgStateStore, PilotAllowList};
 
 const DEFAULT_TICK_SECS: u64 = 300;
@@ -263,15 +272,45 @@ fn run_service() {
             std::process::exit(1);
         }
     };
-    let massive = MassiveDataSource::new(massive_key, transport);
-    let data_source = pilot_data_source(&massive);
+    let massive = MassiveDataSource::new(massive_key, transport.clone());
+
+    // --- The two-source data gate (W9.2): `DATA_GATE_MODE` off (default) or shadow; enforce is refused here, at
+    // startup, with the reason, so it cannot be turned on by accident in a build that only records.
+    let gate_mode = match DataGateMode::from_lookup(|k| std::env::var(k).ok()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rebalancer-service: refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ungated = pilot_data_source(&massive);
+    let shadowed = match gate_mode {
+        DataGateMode::Off => {
+            log(format!("{ENV_DATA_GATE_MODE}=off: no two-source data gate in the data path"));
+            None
+        }
+        DataGateMode::Shadow => match shadow_gate(&massive, |k| std::env::var(k).ok(), transport.clone()) {
+            Ok(gate) => {
+                log(format!("{ENV_DATA_GATE_MODE}=shadow: two-source data gate ON in SHADOW mode ({gate:?}); verdicts are recorded and alerted, the primary panel is always used"));
+                Some(pilot_data_source_shadow(&massive, gate))
+            }
+            Err(e) => {
+                eprintln!("rebalancer-service: refusing to start: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    let data_source: &dyn DataSource = match &shadowed {
+        Some(s) => s,
+        None => &ungated,
+    };
 
     let broker = pilot_alpaca.broker();
     let rules = pilot_alpaca.rules();
     let venue_rules = VenueRuleBook::new().with("alpaca", &rules);
 
     let mut runtimes: BTreeMap<String, AccountRuntime<'_>> = BTreeMap::new();
-    runtimes.insert(pilot_account.active.account_id.clone(), AccountRuntime { broker: &broker, data: &data_source, venue_rules: &venue_rules });
+    runtimes.insert(pilot_account.active.account_id.clone(), AccountRuntime { broker: &broker, data: data_source, venue_rules: &venue_rules });
 
     let clock = SystemClock;
     // Paper-only: the pipeline refuses any broker that does not report a paper connection (`VenuePolicy::PaperOnly`).

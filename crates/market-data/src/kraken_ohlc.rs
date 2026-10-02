@@ -38,6 +38,9 @@ pub fn kraken_pair(symbol: &str) -> Option<&'static str> {
     }
 }
 
+/// `(candles as (date, close), request record, raw-body hash)` of one pair.
+type PairCandles = (Vec<(NaiveDate, f64)>, String, String);
+
 pub struct KrakenOhlcSource {
     base_url: String,
     history_days: i64,
@@ -73,7 +76,7 @@ impl KrakenOhlcSource {
     }
 
     /// One pair's candles as `(date, close)`, ascending as the vendor sends them, plus the request record and hash.
-    fn fetch_pair(&self, symbol: &str, pair: &str) -> Result<(Vec<(NaiveDate, f64)>, String, String), MassiveError> {
+    fn fetch_pair(&self, symbol: &str, pair: &str) -> Result<PairCandles, MassiveError> {
         let path = format!("/0/public/OHLC?pair={pair}&interval={INTERVAL_MINUTES}");
         let req = HttpRequest {
             method: HttpMethod::Get,

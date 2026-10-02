@@ -40,6 +40,9 @@ const SECRET_HEADER: &str = "APCA-API-SECRET-KEY";
 const MAX_PAGES: u32 = 10;
 const PAGE_LIMIT: u32 = 10_000;
 
+/// `(bars by symbol, request records, raw-body hashes, fetched at)` of one multi-page request.
+type Pages = (Vec<(String, Vec<(NaiveDate, f64)>)>, Vec<String>, Vec<String>, DateTime<Utc>);
+
 pub struct AlpacaBarsSource {
     key_id: String,
     secret: String,
@@ -132,7 +135,7 @@ impl AlpacaBarsSource {
 
     /// Every page of the multi-symbol daily request: `symbol -> (bar date, close)` in the vendor's order, plus the
     /// request records and raw-body hashes.
-    fn fetch_pages(&self, from: NaiveDate, to: NaiveDate) -> Result<(Vec<(String, Vec<(NaiveDate, f64)>)>, Vec<String>, Vec<String>, DateTime<Utc>), MassiveError> {
+    fn fetch_pages(&self, from: NaiveDate, to: NaiveDate) -> Result<Pages, MassiveError> {
         let symbols = ETF_SYMBOLS.join(",");
         let path = format!("/v2/stocks/bars?symbols={symbols}&timeframe=1Day&start={from}&end={to}&adjustment=split&feed={}&limit={PAGE_LIMIT}&sort=asc", self.feed);
         let mut by_symbol: Vec<(String, Vec<(NaiveDate, f64)>)> = ETF_SYMBOLS.iter().map(|s| (s.to_string(), Vec::new())).collect();

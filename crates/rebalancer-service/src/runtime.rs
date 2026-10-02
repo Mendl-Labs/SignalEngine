@@ -58,12 +58,12 @@ use broker_adapters::transport::HttpTransport;
 use broker_adapters::BrokerError;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use market_data::time::{bar_complete_at, BarClock};
-use market_data::{MassiveDataSource, SleevesFrom, WithPrices};
+use market_data::{AlpacaBarsSource, KrakenOhlcSource, MassiveDataSource, SleevesFrom, TwoSourceGate, WithPrices};
 use rebalancer_core::guard::PricePoint;
 use rebalancer_core::venue::AlpacaRules;
 use rebalancer_core::Dec;
 use rebalancer_run::broker::AlpacaBroker;
-use rebalancer_run::data::{DataError, DataSource, SleeveData, SleeveSpec};
+use rebalancer_run::data::{DataError, DataSource, SleeveData, SleeveKind, SleeveSpec};
 
 use crate::pilot::{build_paper_alpaca, PilotRefusal};
 
@@ -245,6 +245,26 @@ impl DataSource for LastClosePrices<'_> {
 /// through `market_data`'s existing decorator seam (never a new one). This is what `AccountRuntime::data` borrows.
 pub fn pilot_data_source(massive: &MassiveDataSource) -> WithPrices<SleevesFrom<&MassiveDataSource>, LastClosePrices<'_>> {
     WithPrices { sleeves: SleevesFrom(massive), prices: LastClosePrices::new(massive) }
+}
+
+/// The pilot's `DataSource` with the two-source gate in SHADOW mode (W9.2, `DATA_GATE_MODE=shadow`): the same
+/// Massive panels and sizing prices as [`pilot_data_source`], with [`TwoSourceGate`] between the fetch and the
+/// pipeline so every sleeve fetch is compared against its secondary and the verdict travels on the run record. The
+/// primary panel is always what the pipeline sees; nothing refuses yet.
+pub fn pilot_data_source_shadow<'a>(massive: &'a MassiveDataSource, gate: TwoSourceGate<&'a MassiveDataSource>) -> WithPrices<SleevesFrom<TwoSourceGate<&'a MassiveDataSource>>, LastClosePrices<'a>> {
+    WithPrices { sleeves: SleevesFrom(gate), prices: LastClosePrices::new(massive) }
+}
+
+/// The shadow gate's secondaries for the pilot, from the process environment: Alpaca daily bars for ETF sleeves
+/// (platform DATA credentials `ALPACA_DATA_KEY_ID` / `ALPACA_DATA_KEY_SECRET`, never the pilot's brokerage key:
+/// R21b) and Kraken public OHLC for crypto sleeves (no credentials). Refuses (fail closed) when the Alpaca data
+/// credentials are absent: a shadow gate with no ETF secondary would record `REFUSE_SECONDARY_NOT_CONFIGURED` on
+/// every run, which is noise, not a measurement.
+pub fn shadow_gate(massive: &MassiveDataSource, lookup: impl Fn(&str) -> Option<String>, transport: Arc<dyn HttpTransport>) -> Result<TwoSourceGate<&MassiveDataSource>, String> {
+    let alpaca = AlpacaBarsSource::from_lookup(&lookup, transport.clone())
+        .map_err(|e| format!("DATA_GATE_SECONDARY_MISSING: the ETF secondary (Alpaca daily bars) needs {} and {}: {e}", market_data::alpaca_bars::ENV_KEY_ID, market_data::alpaca_bars::ENV_KEY_SECRET))?;
+    let kraken = KrakenOhlcSource::new(transport);
+    Ok(TwoSourceGate::shadow(massive).with_secondary(SleeveKind::EtfTrend, Arc::new(alpaca)).with_secondary(SleeveKind::CryptoTrend, Arc::new(kraken)))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
