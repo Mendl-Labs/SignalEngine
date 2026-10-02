@@ -102,8 +102,10 @@ mod tests {
             assert!(!r.body.contains("What to do:"), "{code} must not carry a footer:\n{}", r.body);
         }
         // every pipeline code either has a footer or is deliberately informational (listed here, so adding a code
-        // forces a decision)
-        let informational = ["ALERT_MANDATE_UNUSABLE"];
+        // forces a decision). ALERT_LATENCY_RECORDER_FAILED (W9.1) is a read-only observer failure that never
+        // affects a run -- there is no action for a person to take beyond checking the migration/logs, so it is
+        // informational like ALERT_MANDATE_UNUSABLE, not actionable.
+        let informational = ["ALERT_MANDATE_UNUSABLE", "ALERT_LATENCY_RECORDER_FAILED"];
         for c in AlertCode::ALL {
             assert!(what_to_do(c.as_str()).is_some() || informational.contains(&c.as_str()), "{} is neither actionable nor listed as informational", c.as_str());
         }
