@@ -1035,6 +1035,25 @@ impl Run<'_> {
                 Cadence::OnDecision => last_acted.is_none_or(|acted| eval.decision_date > acted),
             };
             let entry = cadence == Cadence::OnDecision && last_acted.is_none();
+            // The two-source gate, SHADOW mode (W9.2): the verdict is recorded on the decision and a refusal is
+            // alerted, one per (sleeve, instrument, date); the run goes on exactly as it would without a gate.
+            if let Some(gate) = &eval.data_gate {
+                self.note("decisions", format!("sleeve {}: {}", s.id, gate.summary()));
+                for r in gate.refusals() {
+                    let where_ = match (&r.symbol, r.date) {
+                        (Some(sym), Some(d)) => format!("{sym}@{d}"),
+                        (Some(sym), None) => sym.clone(),
+                        (None, Some(d)) => format!("@{d}"),
+                        (None, None) => "sleeve".to_string(),
+                    };
+                    let message = format!(
+                        "data gate (shadow) would have REFUSED sleeve {} ({} vs {}): {} {}: {}; the run proceeded on the primary panel",
+                        s.id, gate.primary_source, gate.secondary_source, r.code, where_, r.detail
+                    );
+                    let dedupe = format!("data_gate_shadow_refuse:{}:{}", s.id, where_);
+                    self.alert(AlertCode::DataGateShadowRefuse, AlertSeverity::Warning, message, &dedupe);
+                }
+            }
             self.rec.decisions.push(SleeveDecision {
                 sleeve: s.id.clone(),
                 kind: s.kind,
@@ -1049,6 +1068,7 @@ impl Run<'_> {
                 planned: false,
                 acted: false,
                 instruments: eval.instruments.clone(),
+                data_gate: eval.data_gate.clone(),
             });
             if pending {
                 self.pending.push((idx, eval));

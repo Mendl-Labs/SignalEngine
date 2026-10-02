@@ -44,14 +44,23 @@
 //! Settling, Deterministic, R19) instead of collapsing them into a `DataError` string. [`SleevesFrom`] adapts any
 //! fetcher to a `DataSource`, and [`WithPrices`] takes sizing prices from a different source.
 //!
-//! Deliberately NOT here: the two-source gate, the retry WINDOW across ticks (this source retries within one fetch
-//! only), readers for Alpaca/Kraken/OANDA, any exchange calendar (no holiday table, no early-close table), FX (a later
-//! `BarClock`), and sizing prices (`prices` refuses; see [`WithPrices`]).
+//! # The two-source gate, SHADOW mode (W9.2; built here, `gate`)
+//! [`TwoSourceGate`] is that decorator: Massive primary, [`AlpacaBarsSource`] (ETF) / [`KrakenOhlcSource`] (crypto)
+//! secondaries, the pure comparison in `gate::compare` under the R19 tolerances (`gate::policy`, versioned and
+//! hashed). In shadow mode the verdict is recorded on the fetched sleeve (`FetchedSleeve::gate`, through to the run
+//! record) and the primary panel is ALWAYS returned; `DATA_GATE_MODE=enforce` is rejected at startup.
+//!
+//! Deliberately NOT here: enforce mode, L2 decision-state agreement (KNIFE_EDGE_HOLD), the correction ledger, the
+//! retry WINDOW across ticks (this source retries within one fetch only), an OANDA reader / FX, any exchange calendar
+//! (no holiday table, no early-close table), and sizing prices (`prices` refuses; see [`WithPrices`]).
 
 #![forbid(unsafe_code)]
 
 pub mod aggs;
+pub mod alpaca_bars;
 pub mod error;
+pub mod gate;
+pub mod kraken_ohlc;
 pub mod runtime;
 pub mod secret;
 pub mod source;
@@ -59,7 +68,10 @@ pub mod testing;
 pub mod time;
 pub mod url;
 
+pub use alpaca_bars::AlpacaBarsSource;
 pub use error::{ErrorKind, FailureClass, MassiveError, SleeveError};
+pub use gate::{DataGateMode, Policy, TwoSourceGate, ENV_DATA_GATE_MODE, POLICY_VERSION};
+pub use kraken_ohlc::KrakenOhlcSource;
 pub use runtime::{BudgetConfig, Jitter, MarketClock, RetryPolicy, SystemClock, SystemJitter};
 pub use secret::{EnvKeyProvider, KeyError, KeyProvider, SecretString, StaticKeyProvider};
 pub use source::{

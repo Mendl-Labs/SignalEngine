@@ -10,7 +10,7 @@ use rebalancer_core::guard::PricePoint;
 use rebalancer_core::Dec;
 use reference_rules::Panel;
 
-use crate::data::{DataError, DataSource, SleeveData, SleeveSpec};
+use crate::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveSpec};
 use crate::driver::AccountLock;
 use crate::record::{Alert, RunKey, RunRecord, SnapshotSummary};
 use crate::stores::{Begin, InMemoryRunStore, JournalEntry, KillFlag, Notifier, RunStore, RunStoreError, RunSummary};
@@ -139,6 +139,8 @@ type PriceFn = Box<dyn Fn(&str) -> Option<Dec> + Send + Sync>;
 /// Panels by sleeve id plus a price function (for example one that reads the fake exchange's last prices).
 pub struct FixtureData {
     panels: Mutex<BTreeMap<String, Panel>>,
+    /// A two-source gate report to attach to a sleeve's panel (W9.2 shadow-mode tests).
+    gates: Mutex<BTreeMap<String, DataGateReport>>,
     price_fn: Mutex<Option<PriceFn>>,
     error: Mutex<Option<DataError>>,
     price_error: Mutex<Option<DataError>>,
@@ -156,6 +158,7 @@ impl FixtureData {
     pub fn new() -> Self {
         Self {
             panels: Mutex::new(BTreeMap::new()),
+            gates: Mutex::new(BTreeMap::new()),
             price_fn: Mutex::new(None),
             error: Mutex::new(None),
             price_error: Mutex::new(None),
@@ -175,6 +178,14 @@ impl FixtureData {
 
     pub fn set_panel(&self, sleeve_id: &str, panel: Panel) {
         lock(&self.panels).insert(sleeve_id.to_string(), panel);
+    }
+
+    /// Attach (or clear) a gate report to the sleeve's panel, as a gate decorator in the data path would.
+    pub fn set_gate(&self, sleeve_id: &str, gate: Option<DataGateReport>) {
+        match gate {
+            Some(g) => lock(&self.gates).insert(sleeve_id.to_string(), g),
+            None => lock(&self.gates).remove(sleeve_id),
+        };
     }
 
     /// Make every panel request fail.
@@ -247,10 +258,11 @@ impl DataSource for FixtureData {
         if let Some(e) = lock(&self.error).clone() {
             return Err(e);
         }
+        let gate = lock(&self.gates).get(&sleeve.id).cloned();
         lock(&self.panels)
             .get(&sleeve.id)
             .cloned()
-            .map(|panel| SleeveData { panel })
+            .map(|panel| SleeveData { panel, gate })
             .ok_or_else(|| DataError::new("DATA_UNAVAILABLE", &format!("no panel for sleeve {}", sleeve.id)))
     }
 

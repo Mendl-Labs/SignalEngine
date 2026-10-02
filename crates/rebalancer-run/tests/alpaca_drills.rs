@@ -98,7 +98,7 @@ impl DataSource for Vendor<'_> {
                 PriceSeries::new(s.symbol(), s.dates()[..hi].to_vec(), s.closes()[..hi].to_vec()).ok()
             })
             .collect();
-        Ok(SleeveData { panel: Panel::new(series).map_err(|e| DataError::new("DATA_UNAVAILABLE", &e.to_string()))? })
+        Ok(SleeveData::new(Panel::new(series).map_err(|e| DataError::new("DATA_UNAVAILABLE", &e.to_string()))?))
     }
 
     fn prices(&self, symbols: &[String], now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError> {

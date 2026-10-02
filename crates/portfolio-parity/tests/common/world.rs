@@ -224,7 +224,7 @@ impl DataSource for Vendor<'_> {
         }
         let series: Vec<PriceSeries> = syms.iter().enumerate().map(|(i, s)| slice_series(s, days, &cols[i], lo, hi)).collect();
         let panel = Panel::new(series).map_err(|e| DataError::new("DATA_UNAVAILABLE", &e.to_string()))?;
-        Ok(SleeveData { panel })
+        Ok(SleeveData::new(panel))
     }
 
     fn prices(&self, symbols: &[String], now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError> {

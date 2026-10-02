@@ -14,7 +14,7 @@ use rebalancer_core::planner::{InstrumentLine, PlannedOrder, SkippedTrade};
 use rebalancer_risk::overlay::RiskDecision;
 use rebalancer_risk::state::{AccountStatus, Transition};
 
-use crate::data::{Cadence, SleeveKind};
+use crate::data::{Cadence, DataGateReport, SleeveKind};
 use crate::flatten::{CancelRecord, FlattenReport};
 use crate::recon::{ReconBaseline, ReconReport};
 
@@ -131,16 +131,22 @@ pub enum AlertCode {
     /// venue, denied by the guard, unknown, or cancelled with nothing executed): the decision was NOT counted as
     /// acted and is planned again on the next run. Critical, except when every gap is "market closed" (Warning).
     DecisionNotActed,
+    /// The two-source data gate (W9.2, SHADOW mode) would have REFUSED this run's data: an input disagreed beyond the
+    /// R19 tolerance, a bar was missing on one source, the decision dates differed, a split showed on one source
+    /// only, or the secondary was unavailable. Warning; one per (sleeve, instrument, date) so the owner sees exactly
+    /// what enforce mode would do. The run itself proceeded on the primary panel.
+    DataGateShadowRefuse,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 6] = [
+    pub const ALL: [AlertCode; 7] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
         AlertCode::StillHalted,
         AlertCode::MandateUnusable,
         AlertCode::DecisionNotActed,
+        AlertCode::DataGateShadowRefuse,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -151,6 +157,7 @@ impl AlertCode {
             AlertCode::StillHalted => "ALERT_STILL_HALTED",
             AlertCode::MandateUnusable => "ALERT_MANDATE_UNUSABLE",
             AlertCode::DecisionNotActed => "ALERT_DECISION_NOT_ACTED",
+            AlertCode::DataGateShadowRefuse => "ALERT_DATA_GATE_SHADOW_REFUSE",
         }
     }
 }
@@ -244,6 +251,10 @@ pub struct SleeveDecision {
     /// refused or halted, or whose orders were not carried out, acts on nothing: the decision stays pending.
     pub acted: bool,
     pub instruments: Vec<InstrumentEvidence>,
+    /// The two-source data gate's report (R20 `data_provenance`, comparison half) for the panel this decision used:
+    /// both sources' closes, per-input differences, the verdict and its reasons. `None` without a gate in the path.
+    /// In shadow mode (W9.2) it is recorded only; the decision above was taken on the primary panel regardless.
+    pub data_gate: Option<DataGateReport>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

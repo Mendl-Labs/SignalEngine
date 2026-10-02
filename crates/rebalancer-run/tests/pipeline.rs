@@ -65,7 +65,16 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
     let alerts: Vec<&str> = AlertCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(
         alerts,
-        ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ALERT_STILL_HALTED", "ALERT_MANDATE_UNUSABLE", "ALERT_DECISION_NOT_ACTED"]
+        [
+            "ALERT_HALT",
+            "ALERT_FLATTEN_INCOMPLETE",
+            "ALERT_RUN_FAILED",
+            "ALERT_STILL_HALTED",
+            "ALERT_MANDATE_UNUSABLE",
+            "ALERT_DECISION_NOT_ACTED",
+            // added by W9.2 (the two-source data gate, shadow mode; appended, nothing renumbered)
+            "ALERT_DATA_GATE_SHADOW_REFUSE",
+        ]
     );
     assert_eq!(
         [OutcomeKind::Completed, OutcomeKind::Refused, OutcomeKind::FailedClosed, OutcomeKind::Halted].map(|k| k.as_str()),
