@@ -15,6 +15,7 @@ path = "src/main.rs"
 # tests/pilot_source_scan.rs, which asserts this on purpose and was updated in the same commit that adds it.
 broker-adapters = { path = "../broker-adapters", features = ["reqwest-transport"] }
 market-data = { path = "../market-data" }
+rebalancer-alerts = { path = "../rebalancer-alerts" }
 rebalancer-core = { path = "../rebalancer-core" }
 rebalancer-run = { path = "../rebalancer-run" }
 rebalancer-store = { path = "../rebalancer-store" }

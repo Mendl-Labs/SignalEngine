@@ -135,10 +135,14 @@ pub enum AlertCode {
     /// tick. Warning, raised once per distinct failure (not on every tick it persists); the recorder is an observer,
     /// so this never means a run was affected.
     LatencyRecorderFailed,
+    /// The dead-man's heartbeat (W6.2, `rebalancer-alerts::heartbeat`) could not reach the external monitor. Warning,
+    /// raised once per failure streak, about the platform (not an account); the monitor itself pages if the pings
+    /// stop, so this is the "the switch may be about to fire" notice, never a trading signal.
+    HeartbeatFailed,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 7] = [
+    pub const ALL: [AlertCode; 8] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
@@ -146,6 +150,7 @@ impl AlertCode {
         AlertCode::MandateUnusable,
         AlertCode::DecisionNotActed,
         AlertCode::LatencyRecorderFailed,
+        AlertCode::HeartbeatFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -157,6 +162,7 @@ impl AlertCode {
             AlertCode::MandateUnusable => "ALERT_MANDATE_UNUSABLE",
             AlertCode::DecisionNotActed => "ALERT_DECISION_NOT_ACTED",
             AlertCode::LatencyRecorderFailed => "ALERT_LATENCY_RECORDER_FAILED",
+            AlertCode::HeartbeatFailed => "ALERT_HEARTBEAT_FAILED",
         }
     }
 }

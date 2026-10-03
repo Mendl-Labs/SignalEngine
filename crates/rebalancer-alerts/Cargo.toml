@@ -1,0 +1,16 @@
+[package]
+name = "rebalancer-alerts"
+description = "W6.1/W6.2: alert DELIVERY (the half PgNotifier does not do) and the dead-man's heartbeat for the rebalancer service. Pure: the delivery ledger and the e-mail sender are traits; Postgres (rebalancer-store) and HTTP (broker-adapters' transport) plug in behind them, so every test here runs offline without libpq."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Dependency direction: this crate depends on rebalancer-run (the Alert vocabulary and the Notifier trait) and on
+# broker-adapters (HttpTransport only; no HTTP client is compiled here), never on rebalancer-store: the Postgres
+# ledger lives THERE (it implements this crate's `DeliveryLedger`), which keeps this crate free of libpq and lets its
+# whole test suite run on a machine that cannot link Postgres.
+[dependencies]
+broker-adapters = { path = "../broker-adapters" }
+rebalancer-run = { path = "../rebalancer-run" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde_json = "1"

@@ -74,6 +74,8 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "ALERT_DECISION_NOT_ACTED",
             // added by W9.1 (the latency recorder; appended, nothing renumbered)
             "ALERT_LATENCY_RECORDER_FAILED",
+            // added by W6.2 (the dead-man's heartbeat; appended, nothing renumbered)
+            "ALERT_HEARTBEAT_FAILED",
         ]
     );
     assert_eq!(
