@@ -72,6 +72,10 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "ALERT_STILL_HALTED",
             "ALERT_MANDATE_UNUSABLE",
             "ALERT_DECISION_NOT_ACTED",
+            // added by W9.1 (the latency recorder; appended, nothing renumbered)
+            "ALERT_LATENCY_RECORDER_FAILED",
+            // added by W6.2 (the dead-man's heartbeat; appended, nothing renumbered)
+            "ALERT_HEARTBEAT_FAILED",
             // added by W9.2 (the two-source data gate, shadow mode; appended, nothing renumbered)
             "ALERT_DATA_GATE_SHADOW_REFUSE",
         ]

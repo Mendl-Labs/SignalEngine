@@ -84,6 +84,24 @@ pub fn bar_date(clock: BarClock, t_ms: i64) -> Result<NaiveDate, String> {
     }
 }
 
+/// The NOMINAL close of the bar dated `date`: the venue convention the latency recorder measures first-seen latency
+/// from (`rebalancer_run::latency`, policy pre-registered 2026-10-02). It is NOT [`bar_complete_at`]: that one adds the
+/// vendor's delay, which is part of what the recorder is there to measure.
+/// * stocks / ETFs: 16:00 America/New_York of the session date (20:00 UTC in daylight time, 21:00 UTC in standard
+///   time, by [`new_york_midnight_utc_offset_hours`]). Early closes (13:00 ET) are NOT modelled (no exchange calendar
+///   in this crate): on such a day the measured latency is understated by three hours and the bar is sampled only
+///   from 16:00 New York on.
+/// * crypto: 00:00 UTC of the following day (the UTC-day bar ends at midnight).
+pub fn nominal_close_at(clock: BarClock, date: NaiveDate) -> Option<DateTime<Utc>> {
+    match clock {
+        BarClock::MidnightUtc => Some(date.checked_add_signed(Duration::days(1))?.and_time(NaiveTime::MIN).and_utc()),
+        BarClock::StockMidnightNewYork => {
+            let off = new_york_midnight_utc_offset_hours(date)?;
+            Some(date.and_hms_opt(STOCK_SESSION_END_HOUR_NY + off, 0, 0)?.and_utc())
+        }
+    }
+}
+
 /// The instant at which the bar dated `date` is over (before any settle margin); `None` if it cannot be computed.
 pub fn bar_complete_at(clock: BarClock, date: NaiveDate) -> Option<DateTime<Utc>> {
     match clock {
@@ -181,6 +199,27 @@ mod tests {
         // EST: 21:00 UTC plus 15 minutes
         assert_eq!(bar_complete_at(BarClock::StockMidnightNewYork, d(2026, 12, 15)), Some(DateTime::from_timestamp_millis(ms(d(2026, 12, 15), 21, 15)).unwrap()));
         assert_eq!(bar_complete_at(BarClock::MidnightUtc, NaiveDate::MAX), None);
+    }
+
+    #[test]
+    fn nominal_closes_are_the_venue_convention_without_the_vendor_delay() {
+        let t = |d: NaiveDate, h, m| DateTime::from_timestamp_millis(ms(d, h, m)).unwrap();
+        // crypto: the UTC day ends at midnight of the next day
+        assert_eq!(nominal_close_at(BarClock::MidnightUtc, d(2026, 9, 25)), Some(t(d(2026, 9, 26), 0, 0)));
+        // ETF in EDT: 16:00 New York = 20:00 UTC, no 15-minute delay added
+        assert_eq!(nominal_close_at(BarClock::StockMidnightNewYork, d(2026, 9, 25)), Some(t(d(2026, 9, 25), 20, 0)));
+        // ETF in EST: 21:00 UTC
+        assert_eq!(nominal_close_at(BarClock::StockMidnightNewYork, d(2026, 12, 15)), Some(t(d(2026, 12, 15), 21, 0)));
+        // the DST changeover days follow the midnight rule of the session date
+        assert_eq!(nominal_close_at(BarClock::StockMidnightNewYork, d(2026, 3, 9)), Some(t(d(2026, 3, 9), 20, 0)));
+        assert_eq!(nominal_close_at(BarClock::StockMidnightNewYork, d(2026, 11, 2)), Some(t(d(2026, 11, 2), 21, 0)));
+        // always strictly before the vendor-delayed completion instant for stocks, equal for crypto
+        for date in [d(2026, 1, 15), d(2026, 7, 15)] {
+            assert!(nominal_close_at(BarClock::StockMidnightNewYork, date) < bar_complete_at(BarClock::StockMidnightNewYork, date));
+            assert_eq!(nominal_close_at(BarClock::MidnightUtc, date), bar_complete_at(BarClock::MidnightUtc, date));
+        }
+        assert_eq!(nominal_close_at(BarClock::StockMidnightNewYork, d(2006, 6, 1)), None);
+        assert_eq!(nominal_close_at(BarClock::MidnightUtc, NaiveDate::MAX), None);
     }
 
     #[test]

@@ -131,6 +131,14 @@ pub enum AlertCode {
     /// venue, denied by the guard, unknown, or cancelled with nothing executed): the decision was NOT counted as
     /// acted and is planned again on the next run. Critical, except when every gap is "market closed" (Warning).
     DecisionNotActed,
+    /// The first-seen-latency / revision recorder (`crate::latency`, W9.1 / R25) could not observe or store on a
+    /// tick. Warning, raised once per distinct failure (not on every tick it persists); the recorder is an observer,
+    /// so this never means a run was affected.
+    LatencyRecorderFailed,
+    /// The dead-man's heartbeat (W6.2, `rebalancer-alerts::heartbeat`) could not reach the external monitor. Warning,
+    /// raised once per failure streak, about the platform (not an account); the monitor itself pages if the pings
+    /// stop, so this is the "the switch may be about to fire" notice, never a trading signal.
+    HeartbeatFailed,
     /// The two-source data gate (W9.2, SHADOW mode) would have REFUSED this run's data: an input disagreed beyond the
     /// R19 tolerance, a bar was missing on one source, the decision dates differed, a split showed on one source
     /// only, or the secondary was unavailable. Warning; one per (sleeve, instrument, date) so the owner sees exactly
@@ -139,13 +147,15 @@ pub enum AlertCode {
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 7] = [
+    pub const ALL: [AlertCode; 9] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
         AlertCode::StillHalted,
         AlertCode::MandateUnusable,
         AlertCode::DecisionNotActed,
+        AlertCode::LatencyRecorderFailed,
+        AlertCode::HeartbeatFailed,
         AlertCode::DataGateShadowRefuse,
     ];
 
@@ -157,6 +167,8 @@ impl AlertCode {
             AlertCode::StillHalted => "ALERT_STILL_HALTED",
             AlertCode::MandateUnusable => "ALERT_MANDATE_UNUSABLE",
             AlertCode::DecisionNotActed => "ALERT_DECISION_NOT_ACTED",
+            AlertCode::LatencyRecorderFailed => "ALERT_LATENCY_RECORDER_FAILED",
+            AlertCode::HeartbeatFailed => "ALERT_HEARTBEAT_FAILED",
             AlertCode::DataGateShadowRefuse => "ALERT_DATA_GATE_SHADOW_REFUSE",
         }
     }
