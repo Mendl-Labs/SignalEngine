@@ -41,7 +41,7 @@ impl DataSource for ClosedBarsOnly {
             }
             series.push(PriceSeries::new(sym, bars.iter().map(|b| b.0).collect(), bars.iter().map(|b| b.1).collect()).unwrap());
         }
-        Ok(SleeveData { panel: Panel::new(series).unwrap() })
+        Ok(SleeveData::new(Panel::new(series).unwrap()))
     }
 
     fn prices(&self, _symbols: &[String], _now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError> {

@@ -346,6 +346,7 @@ pub fn decision(sleeve: &str, decision_date: NaiveDate, acted: bool, entry: bool
         planned: true,
         acted,
         instruments: vec![],
+        data_gate: None,
     }
 }
 

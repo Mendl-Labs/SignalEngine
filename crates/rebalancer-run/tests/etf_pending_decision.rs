@@ -309,7 +309,7 @@ impl DataSource for Vendor {
         if let Some(first) = panel.iter().next() {
             self.newest.lock().unwrap().insert(sleeve.id.clone(), first.last_date());
         }
-        Ok(SleeveData { panel })
+        Ok(SleeveData::new(panel))
     }
 
     fn prices(&self, symbols: &[String], now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError> {

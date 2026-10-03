@@ -9,7 +9,7 @@ use std::time::Duration;
 use broker_adapters::transport::{HttpMethod, HttpRequest, HttpResponseDetailed, HttpTransport};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rebalancer_core::guard::PricePoint;
-use rebalancer_run::data::{DataError, DataSource, SleeveData, SleeveKind, SleeveSpec};
+use rebalancer_run::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveKind, SleeveSpec};
 use reference_rules::options::{CRYPTO_MAX_STALE_DAYS, ETF_MAX_STALE_DAYS};
 use reference_rules::{completed_month_end_dates, data_fingerprint, Panel, PriceSeries, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
 use serde_json::Value;
@@ -138,6 +138,8 @@ pub struct Provenance {
 pub struct FetchedSleeve {
     pub panel: Panel,
     pub provenance: Vec<Provenance>,
+    /// Set by the two-source gate (`crate::gate`) when one wrapped the fetch; `None` from a plain source.
+    pub gate: Option<DataGateReport>,
 }
 
 /// The complete bars of one ticker (see `MassiveDataSource::fetch_daily_bars`).
@@ -181,7 +183,7 @@ pub struct SleevesFrom<F: SleeveFetcher>(pub F);
 
 impl<F: SleeveFetcher> DataSource for SleevesFrom<F> {
     fn sleeve_data(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<SleeveData, DataError> {
-        self.0.fetch_sleeve(sleeve, as_of).map(|f| SleeveData { panel: f.panel }).map_err(DataError::from)
+        self.0.fetch_sleeve(sleeve, as_of).map(|f| SleeveData { panel: f.panel, gate: f.gate }).map_err(DataError::from)
     }
 
     fn prices(&self, _symbols: &[String], _now: DateTime<Utc>) -> Result<std::collections::BTreeMap<String, PricePoint>, DataError> {
@@ -577,7 +579,7 @@ impl MassiveDataSource {
         }
         let panel = Panel::new(series).map_err(|e| MassiveError::Malformed { instrument: String::new(), detail: e.to_string() })?;
         self.remember(&provenance);
-        Ok(FetchedSleeve { panel, provenance })
+        Ok(FetchedSleeve { panel, provenance, gate: None })
     }
 
     /// The complete daily bars of ONE vendor ticker in `[from, to]` (the same fetch, validation and completeness
@@ -705,7 +707,7 @@ impl SleeveFetcher for MassiveDataSource {
 
 impl DataSource for MassiveDataSource {
     fn sleeve_data(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<SleeveData, DataError> {
-        self.fetch_sleeve(sleeve, as_of).map(|f| SleeveData { panel: f.panel }).map_err(DataError::from)
+        self.fetch_sleeve(sleeve, as_of).map(|f| SleeveData { panel: f.panel, gate: f.gate }).map_err(DataError::from)
     }
 
     fn prices(&self, _symbols: &[String], _now: DateTime<Utc>) -> Result<std::collections::BTreeMap<String, PricePoint>, DataError> {

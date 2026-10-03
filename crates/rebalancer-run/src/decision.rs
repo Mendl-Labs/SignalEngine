@@ -32,7 +32,7 @@ use reference_rules::{
     RuleError, ETF_SYMBOLS,
 };
 
-use crate::data::{DataError, DataSource, SleeveData, SleeveKind, SleeveSpec};
+use crate::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveKind, SleeveSpec};
 use crate::record::InstrumentEvidence;
 
 /// The rule's own output, kept so a per-sleeve target can be built from it later (the target carries the sleeve's
@@ -57,6 +57,8 @@ pub struct Evaluation {
     pub lag_sessions: u32,
     pub instruments: Vec<InstrumentEvidence>,
     pub rule: RuleDecision,
+    /// The two-source gate's report on the panel this evaluation used (`None` without a gate in the path).
+    pub data_gate: Option<DataGateReport>,
 }
 
 impl Evaluation {
@@ -166,7 +168,17 @@ fn build(kind: SleeveKind, as_of: NaiveDate, fetched: &Fetched) -> Result<Evalua
         .unwrap_or(0);
     // The rule succeeded, so the panel has every instrument it needs and therefore at least one bar.
     let newest_bar_date = newest_bar(panel).unwrap_or(decision_date);
-    Ok(Evaluation { kind, as_of, fingerprint: fetched.fingerprint.clone(), decision_date, newest_bar_date, lag_sessions, instruments, rule })
+    Ok(Evaluation {
+        kind,
+        as_of,
+        fingerprint: fetched.fingerprint.clone(),
+        decision_date,
+        newest_bar_date,
+        lag_sessions,
+        instruments,
+        rule,
+        data_gate: fetched.data.gate.clone(),
+    })
 }
 
 /// Fetch the sleeve's panel and run its rule as of `as_of`, through `cache` when one is given.

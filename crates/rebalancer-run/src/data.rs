@@ -69,6 +69,153 @@ pub struct SleeveSpec {
 #[derive(Debug, Clone)]
 pub struct SleeveData {
     pub panel: Panel,
+    /// What the two-source data gate (W9.2, COUNCIL_DATA_GATE R18-R20) found about this panel, when a gate was in
+    /// the path. `None` = no gate (mode `off`, or a source that is not a gate). In SHADOW mode the report is
+    /// recorded and `panel` is the primary's, unchanged, whatever the verdict.
+    pub gate: Option<DataGateReport>,
+}
+
+impl SleeveData {
+    pub fn new(panel: Panel) -> Self {
+        Self { panel, gate: None }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The two-source gate's report (R20 `data_provenance`, the comparison half). Pure data: the gate itself lives in
+// `market-data`; the pipeline only records this on the sleeve decision and alerts on a shadow refusal.
+// ---------------------------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// The verdict is computed and recorded; the primary panel is always returned (nothing refuses yet).
+    Shadow,
+}
+
+impl GateMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateMode::Shadow => "shadow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GateVerdict {
+    Pass,
+    /// Recorded and (in enforce, later) continued: an input above the FLAG tolerance, or an informational finding.
+    Flag,
+    /// Would have refused in enforce mode: no orders, alert.
+    Refuse,
+}
+
+impl GateVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateVerdict::Pass => "PASS",
+            GateVerdict::Flag => "FLAG",
+            GateVerdict::Refuse => "REFUSE",
+        }
+    }
+}
+
+/// Which R19 tolerance row a compared bar falls under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarPosition {
+    /// ETF: one of the month-end closes the rule reads.
+    MonthEnd,
+    /// Crypto: yesterday's close (weight 1 in the rule).
+    DecisionDay,
+    /// Crypto: one of the other SMA inputs (weight 1/100).
+    Window,
+}
+
+impl BarPosition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BarPosition::MonthEnd => "month_end",
+            BarPosition::DecisionDay => "decision_day",
+            BarPosition::Window => "window",
+        }
+    }
+}
+
+/// One finding of the gate. `code` is stable (`REFUSE_*` / `FLAG_*`); `symbol` and `date` are set when the finding is
+/// about one bar, which is what the shadow alert de-duplicates on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateReason {
+    pub code: String,
+    pub verdict: GateVerdict,
+    pub symbol: Option<String>,
+    pub date: Option<NaiveDate>,
+    pub detail: String,
+}
+
+/// Both closes of one compared bar and their difference. `None` closes mean the bar is missing on that side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateComparison {
+    pub symbol: String,
+    pub date: NaiveDate,
+    pub position: BarPosition,
+    pub primary_close: Option<f64>,
+    pub secondary_close: Option<f64>,
+    /// `|primary - secondary| / min(primary, secondary) * 10_000` (symmetric under a source swap), rounded to 1e-6.
+    pub diff_bps: Option<f64>,
+    pub verdict: GateVerdict,
+}
+
+/// Per instrument: the verdict and the comparisons behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateInstrument {
+    pub symbol: String,
+    pub verdict: GateVerdict,
+    pub max_diff_bps: Option<f64>,
+    pub comparisons: Vec<GateComparison>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataGateReport {
+    pub mode: GateMode,
+    pub kind: SleeveKind,
+    pub as_of: NaiveDate,
+    pub primary_source: String,
+    pub secondary_source: String,
+    pub policy_version: String,
+    pub policy_hash: String,
+    pub primary_fingerprint: String,
+    /// `None` when the secondary could not be fetched (the report then carries the refusal reason).
+    pub secondary_fingerprint: Option<String>,
+    pub primary_decision_date: Option<NaiveDate>,
+    pub secondary_decision_date: Option<NaiveDate>,
+    pub verdict: GateVerdict,
+    pub reasons: Vec<GateReason>,
+    pub instruments: Vec<GateInstrument>,
+}
+
+impl DataGateReport {
+    /// The refusals, one per `(symbol, date)` at most (sleeve-level reasons have no symbol), in order: what the shadow
+    /// alert is raised for.
+    pub fn refusals(&self) -> Vec<&GateReason> {
+        let mut seen: std::collections::BTreeSet<(Option<String>, Option<NaiveDate>)> = std::collections::BTreeSet::new();
+        self.reasons.iter().filter(|r| r.verdict == GateVerdict::Refuse).filter(|r| seen.insert((r.symbol.clone(), r.date))).collect()
+    }
+
+    pub fn summary(&self) -> String {
+        let reasons: Vec<String> = self.reasons.iter().take(8).map(|r| match (&r.symbol, r.date) {
+            (Some(s), Some(d)) => format!("{}({s}@{d})", r.code),
+            (Some(s), None) => format!("{}({s})", r.code),
+            (None, Some(d)) => format!("{}(@{d})", r.code),
+            (None, None) => r.code.clone(),
+        }).collect();
+        format!(
+            "{} gate {} vs {}: {}{}",
+            self.mode.as_str(),
+            self.primary_source,
+            self.secondary_source,
+            self.verdict.as_str(),
+            if reasons.is_empty() { String::new() } else { format!(" [{}{}]", reasons.join(", "), if self.reasons.len() > 8 { ", ..." } else { "" }) }
+        )
+    }
 }
 
 /// A data problem. `code` is stable (`DATA_UNAVAILABLE`, `DATA_STALE`, ...); the pipeline maps any error to

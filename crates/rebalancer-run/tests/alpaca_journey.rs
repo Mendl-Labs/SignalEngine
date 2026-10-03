@@ -180,7 +180,7 @@ impl DataSource for Vendor {
         if series.is_empty() {
             return Err(DataError::new("DATA_UNAVAILABLE", "empty panel"));
         }
-        Ok(SleeveData { panel: Panel::new(series).map_err(|e| DataError::new("DATA_UNAVAILABLE", &e.to_string()))? })
+        Ok(SleeveData::new(Panel::new(series).map_err(|e| DataError::new("DATA_UNAVAILABLE", &e.to_string()))?))
     }
 
     fn prices(&self, symbols: &[String], now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError> {

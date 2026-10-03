@@ -76,6 +76,8 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "ALERT_LATENCY_RECORDER_FAILED",
             // added by W6.2 (the dead-man's heartbeat; appended, nothing renumbered)
             "ALERT_HEARTBEAT_FAILED",
+            // added by W9.2 (the two-source data gate, shadow mode; appended, nothing renumbered)
+            "ALERT_DATA_GATE_SHADOW_REFUSE",
         ]
     );
     assert_eq!(
@@ -499,6 +501,80 @@ fn a_data_error_or_a_rule_refusal_means_no_trade_and_an_alert() {
     let end = run_day().pred_opt().unwrap();
     h.data.set_panel("crypto", Panel::new(vec![synth_series("BTC", end, true, 60000.0)]).unwrap());
     assert_eq!(h.live(0).outcome.code, "RUN_RULE_ERROR");
+}
+
+#[test]
+fn a_shadow_data_gate_refusal_is_recorded_and_alerted_once_per_instrument_and_date_but_never_stops_the_run() {
+    use rebalancer_run::data::{BarPosition, DataGateReport, GateComparison, GateInstrument, GateMode, GateReason, GateVerdict, SleeveKind};
+    let h = Harness::new();
+    let yesterday = run_day().pred_opt().unwrap();
+    let refuse = |symbol: &str, date: NaiveDate, code: &str| GateReason {
+        code: code.into(),
+        verdict: GateVerdict::Refuse,
+        symbol: Some(symbol.into()),
+        date: Some(date),
+        detail: "decision_day close differs by 200 bp".into(),
+    };
+    let report = DataGateReport {
+        mode: GateMode::Shadow,
+        kind: SleeveKind::CryptoTrend,
+        as_of: run_day(),
+        primary_source: "massive".into(),
+        secondary_source: "kraken".into(),
+        policy_version: "R19-test".into(),
+        policy_hash: "abc".into(),
+        primary_fingerprint: "fp-primary".into(),
+        secondary_fingerprint: Some("fp-secondary".into()),
+        primary_decision_date: Some(yesterday),
+        secondary_decision_date: Some(yesterday),
+        verdict: GateVerdict::Refuse,
+        reasons: vec![
+            // two reasons about the same (instrument, date): one alert
+            refuse("BTC", yesterday, "REFUSE_L1_OVER_TOLERANCE"),
+            refuse("BTC", yesterday, "REFUSE_SPLIT_ONE_SOURCE"),
+            // a different date: a second alert
+            refuse("ETH", yesterday - chrono::Duration::days(3), "REFUSE_MISSING_BAR"),
+            // a flag never alerts
+            GateReason { code: "FLAG_L1_OVER_FLAG".into(), verdict: GateVerdict::Flag, symbol: Some("ETH".into()), date: Some(yesterday), detail: "30 bp".into() },
+        ],
+        instruments: vec![GateInstrument {
+            symbol: "BTC".into(),
+            verdict: GateVerdict::Refuse,
+            max_diff_bps: Some(200.0),
+            comparisons: vec![GateComparison { symbol: "BTC".into(), date: yesterday, position: BarPosition::DecisionDay, primary_close: Some(60000.0), secondary_close: Some(61200.0), diff_bps: Some(200.0), verdict: GateVerdict::Refuse }],
+        }],
+    };
+    h.data.set_gate("crypto", Some(report.clone()));
+
+    let r = h.live(0);
+    // SHADOW: the run is exactly what it would be without a gate
+    assert_eq!((r.outcome.kind, r.outcome.code.as_str()), (OutcomeKind::Completed, "RUN_COMPLETED"), "{:?}", r.outcome);
+    assert!(h.env.order_requests() > 0, "orders were placed on the primary panel");
+    // ... the report is on the decision (and therefore in the record) ...
+    assert_eq!(r.decisions.len(), 1);
+    assert_eq!(r.decisions[0].data_gate.as_ref(), Some(&report));
+    assert!(r.steps.iter().any(|s| s.step == "decisions" && s.note.contains("shadow gate massive vs kraken: REFUSE")), "{:?}", r.steps);
+    // ... and the owner is told once per (instrument, date), as a warning, with a stable dedupe key
+    let alerts: Vec<_> = r.alerts.iter().filter(|a| a.code == AlertCode::DataGateShadowRefuse).collect();
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(alerts.iter().all(|a| a.severity == rebalancer_run::record::AlertSeverity::Warning));
+    let keys: Vec<&str> = alerts.iter().map(|a| a.dedupe_key.as_str()).collect();
+    assert_eq!(keys, [format!("{}:data_gate_shadow_refuse:crypto:BTC@{yesterday}", r.key.account_id), format!("{}:data_gate_shadow_refuse:crypto:ETH@{}", r.key.account_id, yesterday - chrono::Duration::days(3))]);
+    assert!(alerts[0].message.contains("would have REFUSED") && alerts[0].message.contains("REFUSE_L1_OVER_TOLERANCE") && alerts[0].message.contains("proceeded on the primary panel"), "{}", alerts[0].message);
+    assert_eq!(h.notifier.codes().iter().filter(|c| **c == "ALERT_DATA_GATE_SHADOW_REFUSE").count(), 2);
+
+    // a PASS report: recorded, no alert
+    let pass = DataGateReport { verdict: GateVerdict::Pass, reasons: vec![], ..report.clone() };
+    h.data.set_gate("crypto", Some(pass.clone()));
+    let r = h.live(1);
+    assert_eq!(r.outcome.code, "RUN_COMPLETED");
+    assert_eq!(r.decisions[0].data_gate.as_ref().map(|g| g.verdict), Some(GateVerdict::Pass));
+    assert!(!r.alerts.iter().any(|a| a.code == AlertCode::DataGateShadowRefuse));
+
+    // no gate in the path: nothing recorded
+    h.data.set_gate("crypto", None);
+    let r = h.live(2);
+    assert_eq!(r.decisions[0].data_gate, None);
 }
 
 #[test]

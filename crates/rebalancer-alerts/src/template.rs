@@ -104,8 +104,10 @@ mod tests {
         // every pipeline code either has a footer or is deliberately informational (listed here, so adding a code
         // forces a decision). ALERT_LATENCY_RECORDER_FAILED (W9.1) is a read-only observer failure that never
         // affects a run -- there is no action for a person to take beyond checking the migration/logs, so it is
-        // informational like ALERT_MANDATE_UNUSABLE, not actionable.
-        let informational = ["ALERT_MANDATE_UNUSABLE", "ALERT_LATENCY_RECORDER_FAILED"];
+        // informational like ALERT_MANDATE_UNUSABLE, not actionable. ALERT_DATA_GATE_SHADOW_REFUSE (W9.2) is the
+        // same kind of disclosure: shadow mode ALWAYS decides on the primary panel regardless of the gate's
+        // verdict, so there is nothing for a person to act on beyond knowing what enforce mode would have done.
+        let informational = ["ALERT_MANDATE_UNUSABLE", "ALERT_LATENCY_RECORDER_FAILED", "ALERT_DATA_GATE_SHADOW_REFUSE"];
         for c in AlertCode::ALL {
             assert!(what_to_do(c.as_str()).is_some() || informational.contains(&c.as_str()), "{} is neither actionable nor listed as informational", c.as_str());
         }
