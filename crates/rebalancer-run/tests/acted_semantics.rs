@@ -131,7 +131,8 @@ fn per_leg_rule_is_pinned_for_every_outcome() {
         PlacedOutcome::Unsettled,
     ];
     for o in covered {
-        let _ = match o {
+        // Exhaustive on purpose: a new PlacedOutcome variant must fail to compile here.
+        match o {
             PlacedOutcome::Filled
             | PlacedOutcome::PartiallyFilled
             | PlacedOutcome::NothingExecuted
@@ -141,7 +142,7 @@ fn per_leg_rule_is_pinned_for_every_outcome() {
             | PlacedOutcome::AdoptedExisting
             | PlacedOutcome::UnknownNotFound
             | PlacedOutcome::Unsettled => (),
-        };
+        }
     }
 }
 
