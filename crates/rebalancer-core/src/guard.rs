@@ -42,6 +42,7 @@
 //!     broker's live buying power.
 //!   - A venue `max_position_units` (OANDA `maximumPositionSize`) REFUSES an order that would take the position
 //!     above it (`MAX_POSITION`); it never shrinks the order.
+//!
 //!   `check_margin` is `check_signed` with NO venue facts, so every short is denied by it. Every cap above (position,
 //!   asset class, gross, net, notional, turnover, reserve) still applies to signed plans unchanged.
 //!
