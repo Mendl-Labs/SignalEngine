@@ -221,6 +221,9 @@ impl TestDb {
     }
 
     /// A mandate row. `level` patches the fixture's autonomy level; `signed = false` leaves the grant metadata NULL.
+    // Test-only seeding helper: each argument is one column of the row it inserts, and a
+    // parameter struct would only move the same list into every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_mandate(&self, tenant: Uuid, account: Uuid, version: i32, status: &str, level: &str, signed: bool, extra_may_place_orders: bool) -> (Uuid, MandateBody) {
         let mut body = mandate_json(level);
         if !extra_may_place_orders {
@@ -255,6 +258,9 @@ impl TestDb {
 
     /// A plan inserted with every trigger switched off for the statement (superuser), to build rows the guard triggers
     /// would refuse, so the ACCOUNT SOURCE's own refusals are tested independently of them. CHECK constraints stay on.
+    // Test-only seeding helper: each argument is one column of the row it inserts, and a
+    // parameter struct would only move the same list into every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_plan_bypassing_triggers(&self, tenant: Uuid, account: Uuid, mandate: Uuid, version: i32, execution: &str, venue: &str, kind: &str, entry_hash_override: Option<&str>) -> Uuid {
         let id = Uuid::new_v4();
         let (entry_hash, body) = pilot_plan_body(venue, kind);
