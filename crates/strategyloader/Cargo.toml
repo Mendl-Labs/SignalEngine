@@ -14,8 +14,8 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Database (optional) - versions aligned with databaseschema
-diesel = { version = "2.2.2", features = ["postgres", "uuid", "chrono", "numeric", "serde_json"], optional = true }
-diesel-async = { version = "0.5.0", features = ["postgres", "deadpool"], optional = true }
+diesel = { version = "2.3", features = ["postgres", "uuid", "chrono", "numeric", "serde_json"], optional = true }
+diesel-async = { version = "0.7", features = ["postgres", "deadpool"], optional = true }
 deadpool = { version = "0.12.1", optional = true }
 bigdecimal = { version = "0.4", features = ["serde"], optional = true }
 
