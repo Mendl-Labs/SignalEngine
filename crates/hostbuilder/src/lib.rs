@@ -1279,7 +1279,7 @@ impl HostedObject {
                         }
                     }
 
-                    if tick_count % 50 == 0 {
+                    if tick_count.is_multiple_of(50) {
                         ultra_logger::ultra_info!(format!(
                             "🔗 Bridge stats: ticks={} signals_emitted={}",
                             tick_count, signals_emitted
@@ -1442,7 +1442,7 @@ impl HostedObject {
                             }
                             
                             // Log ultra-fast performance every 100 orders
-                            if signal_count % 100 == 0 {
+                            if signal_count.is_multiple_of(100) {
                                 ultra_logger::ultra_info!(format!("⚡ Phase 2 ultra-fast order {}: {}ns ({:.3}μs) - Success: {}", 
                                       signal_count, 
                                       result.processing_time_ns,
@@ -1451,7 +1451,7 @@ impl HostedObject {
                             }
                             
                             // Log performance metrics every 1000 orders
-                            if signal_count % 1000 == 0 {
+                            if signal_count.is_multiple_of(1000) {
                                 let metrics = ultra_order_manager.get_ultra_performance_metrics();
                                 ultra_logger::ultra_info!(format!("📊 Phase 2 metrics: {} processed, {:.2}μs avg, {:.1}% success, {} orders/sec peak",
                                       metrics.processed_count, 
