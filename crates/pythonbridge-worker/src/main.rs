@@ -37,7 +37,7 @@ fn main() {
         };
 
         let response = handle_request(request, &mut runner);
-        let is_shutdown = matches!(response, None);
+        let is_shutdown = response.is_none();
         if let Some(resp) = response {
             write_response(&mut stdout, &resp);
         }
