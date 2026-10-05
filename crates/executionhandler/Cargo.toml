@@ -91,7 +91,7 @@ exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 
 # Database (for portfolio snapshotter — off-hot-path only)
 databaseschema = { path = "../../../databaseschema", optional = true }
-diesel-async = { version = "0.5.0", features = ["deadpool", "postgres"], optional = true }
+diesel-async = { version = "0.7", features = ["deadpool", "postgres"], optional = true }
 bigdecimal = { version = "0.4", features = ["serde"], optional = true }
 
 # SimulationEngine (for paper trading connector)
