@@ -30,6 +30,7 @@ pub use system_logging::{
     LogEntry,
     LogMetrics,
     LOG_METRICS,
+    TradeExecutionParams,
 };
 
 // Re-export RDTSC timing utilities
