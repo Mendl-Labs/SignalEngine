@@ -5,7 +5,6 @@ use crate::core::types::ExecutionError;
 pub fn set_cpu_affinity(core_id: usize) -> Result<(), ExecutionError> {
     use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
     use std::mem;
-    use std::os::unix::thread::JoinHandleExt;
 
     // Validate core_id is within reasonable bounds (0-255 cores should be sufficient)
     if core_id >= 256 {
@@ -220,12 +219,10 @@ pub fn disable_cpu_scaling() -> Result<(), ExecutionError> {
 #[cfg(target_os = "linux")]
 pub fn enable_realtime_scheduling() -> Result<(), ExecutionError> {
     use libc::{sched_param, sched_setscheduler, SCHED_FIFO};
-    use std::mem;
     
     unsafe {
         let param = sched_param {
             sched_priority: 50, // Real-time priority
-            ..mem::zeroed()
         };
         
         let result = sched_setscheduler(0, SCHED_FIFO, &param);
