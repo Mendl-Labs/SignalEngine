@@ -1,6 +1,4 @@
 use serde::{Serialize, Deserialize};
-use serde_yaml;
-use serde_json;
 use std::fs;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -10,18 +8,13 @@ use anyhow::{
 };
 
 /// Environment types for configuration
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum Environment {
+    #[default]
     Development,
     Testing,
     Staging,
     Production,
-}
-
-impl Default for Environment {
-    fn default() -> Self {
-        Environment::Development
-    }
 }
 
 /// Enhanced configuration with validation and environment support
