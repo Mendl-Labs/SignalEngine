@@ -560,7 +560,7 @@ fn buying_power_replaces_the_cash_test_and_missing_buying_power_denies_margin_us
     assert_eq!(cm(&p, &poor, &buy("SPY", "1", "500"), None).codes(), vec![DenialCode::CashReserve]);
     // With a buying power figure cash no longer limits: cash is 1000 but 50000 of buying power covers the buy
     // (the buy itself borrows: cash goes to -1000, which the 3x mandate allows).
-    assert!(cm(&p, &poor, &buy("SPY", "4", "500"), Some("50000")).has(DenialCode::CashReserve) == false);
+    assert!(!cm(&p, &poor, &buy("SPY", "4", "500"), Some("50000")).has(DenialCode::CashReserve));
     // A reduction is exempt from the funding test whatever the figure.
     let long_book = acct("18000", vec![pos("SPY", "4", "2000")]);
     assert!(cm(&p, &long_book, &sell("SPY", "4", "500"), Some("0")).allow);
