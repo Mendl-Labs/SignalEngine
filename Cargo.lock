@@ -871,9 +871,9 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
+checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
 dependencies = [
  "darling_core",
  "darling_macro",
@@ -881,9 +881,9 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
+checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
 dependencies = [
  "fnv",
  "ident_case",
@@ -895,9 +895,9 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
 dependencies = [
  "darling_core",
  "quote",
@@ -977,7 +977,7 @@ dependencies = [
  "spin_sleep",
  "subscriber",
  "tokio",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "ultra_signal",
 ]
 
@@ -1003,7 +1003,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-retry",
- "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
+ "ultra-logger",
  "urlencoding",
  "uuid",
 ]
@@ -1051,15 +1051,16 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.2.12"
+version = "2.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "229850a212cd9b84d4f0290ad9d294afc0ae70fccaa8949dbe8b43ffafa1e20c"
+checksum = "e3b934ddbdcb2abb9f9fc9c30bd47bcc5618b615eea1d334cda5fdf8ff9b072a"
 dependencies = [
  "bigdecimal 0.4.10",
  "bitflags 2.13.1",
  "byteorder",
  "chrono",
  "diesel_derives",
+ "downcast-rs",
  "itoa",
  "num-bigint",
  "num-integer",
@@ -1071,13 +1072,13 @@ dependencies = [
 
 [[package]]
 name = "diesel-async"
-version = "0.5.2"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51a307ac00f7c23f526a04a77761a0519b9f0eb2838ebf5b905a58580095bdcb"
+checksum = "13096fb8dae53f2d411c4b523bec85f45552ed3044a2ab4d85fb2092d9cb4f34"
 dependencies = [
- "async-trait",
  "deadpool 0.12.3",
  "diesel",
+ "futures-core",
  "futures-util",
  "scoped-futures",
  "tokio",
@@ -1086,9 +1087,9 @@ dependencies = [
 
 [[package]]
 name = "diesel_derives"
-version = "2.2.7"
+version = "2.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b96984c469425cb577bf6f17121ecb3e4fe1e81de5d8f780dd372802858d756"
+checksum = "ecbd51fb6c020672543641167efa4e6417ff7ad76849ed556ace3595e72de03a"
 dependencies = [
  "diesel_table_macro_syntax",
  "dsl_auto_type",
@@ -1099,9 +1100,9 @@ dependencies = [
 
 [[package]]
 name = "diesel_table_macro_syntax"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "209c735641a413bc68c4923a9d6ad4bcb3ca306b794edaa7eb0b3228a99ffb25"
+checksum = "fe2444076b48641147115697648dc743c2c00b61adade0f01ce67133c7babe8c"
 dependencies = [
  "syn 2.0.119",
 ]
@@ -1172,10 +1173,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
-name = "dsl_auto_type"
-version = "0.1.3"
+name = "downcast-rs"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "139ae9aca7527f85f26dd76483eb38533fd84bd571065da1739656ef71c5ff5b"
+checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
+
+[[package]]
+name = "dsl_auto_type"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd122633e4bef06db27737f21d3738fb89c8f6d5360d6d9d7635dda142a7757e"
 dependencies = [
  "darling",
  "either",
@@ -1337,7 +1344,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "uuid",
  "winapi",
  "zeroize",
@@ -1796,7 +1803,7 @@ dependencies = [
  "strategyhandler",
  "strategyloader",
  "tokio",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "ultra_signal",
  "uuid",
 ]
@@ -3286,7 +3293,7 @@ dependencies = [
  "signalengine-core",
  "tokio",
  "tokio-test",
- "ultra-logger 0.1.0",
+ "ultra-logger",
 ]
 
 [[package]]
@@ -3353,7 +3360,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
+ "ultra-logger",
  "uuid",
 ]
 
@@ -3375,7 +3382,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
+ "ultra-logger",
  "winapi",
 ]
 
@@ -3684,6 +3691,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rebalancer-alerts"
+version = "0.0.1"
+dependencies = [
+ "broker-adapters",
+ "chrono",
+ "rebalancer-run",
+ "serde_json",
+]
+
+[[package]]
 name = "rebalancer-core"
 version = "0.0.1"
 dependencies = [
@@ -3734,6 +3751,7 @@ dependencies = [
  "chrono",
  "mandate-core",
  "market-data",
+ "rebalancer-alerts",
  "rebalancer-core",
  "rebalancer-risk",
  "rebalancer-run",
@@ -3754,6 +3772,7 @@ dependencies = [
  "fake-broker",
  "futures-util",
  "mandate-core",
+ "rebalancer-alerts",
  "rebalancer-core",
  "rebalancer-risk",
  "rebalancer-run",
@@ -4303,7 +4322,7 @@ dependencies = [
  "crossbeam",
  "signalengine-core",
  "tokio",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "ultra_signal",
  "winapi",
 ]
@@ -4326,7 +4345,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "winapi",
 ]
 
@@ -4537,7 +4556,7 @@ dependencies = [
  "smartorderrouter",
  "tokio",
  "tracing",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "ultra_signal",
  "uuid",
 ]
@@ -4566,7 +4585,7 @@ dependencies = [
  "subscriber",
  "thiserror 1.0.69",
  "tokio",
- "ultra-logger 0.1.0",
+ "ultra-logger",
  "uuid",
 ]
 
@@ -4605,7 +4624,7 @@ dependencies = [
  "protocol",
  "spin_sleep",
  "tokio",
- "ultra-logger 0.1.0 (git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0)",
+ "ultra-logger",
 ]
 
 [[package]]
@@ -4717,7 +4736,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5201,21 +5220,6 @@ checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 [[package]]
 name = "ultra-logger"
 version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "flume",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "ultra-logger"
-version = "0.1.0"
-source = "git+https://github.com/Mendl-Labs/LoggingEngine?tag=v0.1.0#1fd99afd7faebd6643689842929454441c882013"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5938,55 +5942,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "backtest"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "data_prep"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "derivatives"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "genetic"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "greeks"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "metrics"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "orderbook"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "portfoliomanager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "riskmanager"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "signal"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "smartrouter"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "strategy"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "walkforward"
-version = "0.1.0"
