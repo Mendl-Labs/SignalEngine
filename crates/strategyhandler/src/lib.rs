@@ -1867,7 +1867,7 @@ mod tests {
             50000.0,
         );
         
-        assert!(store.store(signal.clone()).is_ok());
+        assert!(store.store(signal).is_ok());
         let retrieved = store.get(&signal.id.to_string()).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().signal.id, signal.id);

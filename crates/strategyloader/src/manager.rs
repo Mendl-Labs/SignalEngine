@@ -735,7 +735,7 @@ mod tests {
         let (_, state) = &states[0];
         let asset_state = state.get_asset("BTC/USD", "kraken");
         assert!(asset_state.is_some());
-        assert!(asset_state.unwrap().price_history.len() > 0);
+        assert!(!asset_state.unwrap().price_history.is_empty());
     }
 
     fn test_bar_event(symbol: &str, exchange: &str, close: f64) -> BarEvent {
@@ -767,7 +767,8 @@ mod tests {
         let loader = MockLoader { strategies: vec![] };
         let manager = StrategyManager::new(Arc::new(loader)).await;
 
-        let received: Arc<parking_lot::Mutex<Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)>>> =
+        type BookCapture = Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)>;
+        let received: Arc<parking_lot::Mutex<BookCapture>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let received_clone = received.clone();
         manager.register_paper_book_sink(
