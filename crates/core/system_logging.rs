@@ -222,6 +222,22 @@ pub struct LogStats {
     pub error: u64,
 }
 
+/// Parameters for `SystemLogger::trade_execution`.
+///
+/// Grouped into a struct (rather than nine positional arguments) to satisfy
+/// `clippy::too_many_arguments`; this is a cold logging call site, not a hot
+/// path, so the extra struct has no meaningful performance cost.
+pub struct TradeExecutionParams<'a> {
+    pub order_id: &'a str,
+    pub symbol: &'a str,
+    pub exchange: &'a str,
+    pub side: &'a str,
+    pub quantity: f64,
+    pub price: f64,
+    pub fees: f64,
+    pub latency_ns: u64,
+}
+
 /// System-wide logger with component context
 pub struct SystemLogger {
     component: String,
@@ -318,26 +334,16 @@ impl SystemLogger {
     }
     
     /// Log trade execution
-    pub fn trade_execution(
-        &self,
-        order_id: &str,
-        symbol: &str,
-        exchange: &str,
-        side: &str,
-        quantity: f64,
-        price: f64,
-        fees: f64,
-        latency_ns: u64,
-    ) {
+    pub fn trade_execution(&self, params: TradeExecutionParams) {
         self.info(LogCategory::Execution, "Trade executed", &[
-            ("order_id", order_id),
-            ("symbol", symbol),
-            ("exchange", exchange),
-            ("side", side),
-            ("quantity", &format!("{:.8}", quantity)),
-            ("price", &format!("{:.8}", price)),
-            ("fees", &format!("{:.8}", fees)),
-            ("latency_ns", &latency_ns.to_string()),
+            ("order_id", params.order_id),
+            ("symbol", params.symbol),
+            ("exchange", params.exchange),
+            ("side", params.side),
+            ("quantity", &format!("{:.8}", params.quantity)),
+            ("price", &format!("{:.8}", params.price)),
+            ("fees", &format!("{:.8}", params.fees)),
+            ("latency_ns", &params.latency_ns.to_string()),
         ]);
     }
     
@@ -640,7 +646,16 @@ mod tests {
         logger.startup("System starting");
         logger.market_data("BTC/USD", "kraken", 50000.0, 100);
         logger.signal_generated("sig-1", "strat-1", "BTC/USD", "BUY", "HIGH", 1.0);
-        logger.trade_execution("ord-1", "BTC/USD", "kraken", "BUY", 1.0, 50000.0, 25.0, 1500);
+        logger.trade_execution(TradeExecutionParams {
+            order_id: "ord-1",
+            symbol: "BTC/USD",
+            exchange: "kraken",
+            side: "BUY",
+            quantity: 1.0,
+            price: 50000.0,
+            fees: 25.0,
+            latency_ns: 1500,
+        });
         logger.risk_check("BTC/USD", "position_limit", 5.0, 10.0, true);
         logger.portfolio_update("kraken", 100000.0, 50000.0, 5, 5000.0);
         logger.shutdown("System stopped");

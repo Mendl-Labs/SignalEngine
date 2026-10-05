@@ -89,31 +89,30 @@ pub unsafe fn sma_avx2(prices: &[f64], window: usize, output: &mut [f64]) {
     assert_eq!(output.len(), prices.len() - window + 1);
     
     let window_f64 = window as f64;
-    let divisor = _mm256_set1_pd(window_f64);
-    
-    for i in 0..output.len() {
+
+    for (i, item) in output.iter_mut().enumerate() {
         let mut sum = _mm256_setzero_pd();
         let mut j = i;
-        
+
         // Sum window elements using SIMD
         while j + 4 <= i + window {
             let values = _mm256_loadu_pd(prices.as_ptr().add(j));
             sum = _mm256_add_pd(sum, values);
             j += 4;
         }
-        
+
         // Extract horizontal sum from SIMD register
         let mut arr = [0.0; 4];
         _mm256_storeu_pd(arr.as_mut_ptr(), sum);
         let mut scalar_sum = arr[0] + arr[1] + arr[2] + arr[3];
-        
+
         // Add remaining elements
         while j < i + window {
             scalar_sum += prices[j];
             j += 1;
         }
-        
-        output[i] = scalar_sum / window_f64;
+
+        *item = scalar_sum / window_f64;
     }
 }
 
