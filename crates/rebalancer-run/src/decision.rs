@@ -18,6 +18,7 @@
 //!   `DataSource` returns, plus the run date. (A fetch cannot be keyed by the data fingerprint: it is only known once
 //!   the data has been fetched.) `DataSource` implementations must not vary the panel by sleeve id or tenant.
 //! * decisions by `(kind, as_of, data fingerprint)`: two panels that differ by a single bar never share a decision.
+//!
 //! Errors are cached for the tick as well (a vendor that returned 429 is not asked again by every account); the next
 //! tick starts with an empty cache, so a corrected bar is always re-fetched.
 
