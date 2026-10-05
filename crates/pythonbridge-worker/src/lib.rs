@@ -291,7 +291,6 @@ pub fn validate_source(source_code: &str) -> Result<(), String> {
 /// reproduce this constraint deliberately (`on_python_thread`) rather than
 /// relying on Rust's default per-test-function threading, since that's what
 /// caught this in the first place.
-
 pub struct PythonStrategyRunner {
     source_code: String,
     py_strategy: Mutex<Option<PyObject>>,
