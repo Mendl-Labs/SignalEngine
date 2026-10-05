@@ -39,7 +39,7 @@ pub fn set_thread_affinity(_cpu_cores: usize) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn set_thread_affinity(cpu_cores: usize) -> Result<(), String> {
+pub fn set_thread_affinity(_cpu_cores: usize) -> Result<(), String> {
     // Linux implementation would use sched_setaffinity
     // For now, return a placeholder
     Err("Linux CPU affinity not yet implemented".to_string())
@@ -77,7 +77,7 @@ pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
+pub fn set_thread_priority(_priority: ThreadPriority) -> Result<(), String> {
     // Linux implementation would use pthread_setschedparam
     Err("Linux thread priority not yet implemented".to_string())
 }
