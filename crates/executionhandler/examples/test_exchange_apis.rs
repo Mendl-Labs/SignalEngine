@@ -19,7 +19,9 @@ struct KrakenTimeResponse {
     result: Option<KrakenTimeResult>,
 }
 
+// Deserialization targets: fields define the expected response shape and are not read.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct KrakenTimeResult {
     unixtime: i64,
     rfc1123: String,
@@ -32,6 +34,7 @@ struct KrakenSystemStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct KrakenSystemStatus {
     status: String,
     timestamp: String,
@@ -44,6 +47,7 @@ struct KrakenTickerResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(non_snake_case)] // field name matches Binance's JSON key
 struct BinanceTimeResponse {
     serverTime: i64,
 }

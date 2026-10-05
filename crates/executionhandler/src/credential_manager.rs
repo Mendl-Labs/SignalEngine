@@ -9,7 +9,6 @@
 //! All secrets are zeroized from memory after use.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -334,13 +333,14 @@ impl SecretsManager {
             .ok_or_else(|| anyhow!("Field {} not found in Vault secret", field))
     }
 
-    async fn get_from_aws(&self, key: &str) -> Result<SecretString> {
+    async fn get_from_aws(&self, _key: &str) -> Result<SecretString> {
         let region = self.config.aws_region.as_ref()
             .ok_or_else(|| anyhow!("AWS region not configured"))?;
 
         // AWS Secrets Manager HTTP API
         // In production, use aws-sdk-secretsmanager crate
-        let url = format!(
+        // Request URL for the real SigV4 call (not wired yet).
+        let _url = format!(
             "https://secretsmanager.{}.amazonaws.com/",
             region
         );

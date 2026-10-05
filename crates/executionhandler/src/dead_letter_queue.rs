@@ -195,6 +195,8 @@ impl DeadLetterQueue {
     }
 
     /// Create and enqueue a failed order
+    // Public API: one argument per failed-order field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_failed_order(
         &self,
         order_id: &str,
@@ -322,8 +324,10 @@ impl DeadLetterQueue {
     pub async fn stats(&self) -> DlqStats {
         let entries = self.entries.read().await;
         
-        let mut stats = DlqStats::default();
-        stats.total_entries = entries.len();
+        let mut stats = DlqStats {
+            total_entries: entries.len(),
+            ..Default::default()
+        };
         
         for entry in entries.iter() {
             match entry.status {

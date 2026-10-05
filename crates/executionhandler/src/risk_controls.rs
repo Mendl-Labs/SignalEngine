@@ -60,6 +60,12 @@ impl From<u64> for KillReason {
     }
 }
 
+impl Default for KillSwitch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KillSwitch {
     /// Create new kill switch (not triggered)
     pub const fn new() -> Self {
@@ -247,11 +253,16 @@ impl Default for PositionLimits {
     }
 }
 
+/// Current positions keyed by (symbol, exchange): (quantity, value).
+type PositionMap = HashMap<(String, String), (f64, f64)>;
+/// Pair links keyed by (symbol, exchange) to the sibling leg's key.
+type PairLinkMap = HashMap<(String, String), (String, String)>;
+
 /// Position limit checker with current state tracking
 pub struct PositionLimitChecker {
     limits: PositionLimits,
     /// Current positions: (symbol, exchange) -> (quantity, value)
-    positions: Arc<RwLock<HashMap<(String, String), (f64, f64)>>>,
+    positions: Arc<RwLock<PositionMap>>,
     /// Pairs-trading support: maps a leg's `(symbol, exchange)` key to its
     /// sibling leg's key when the two are registered as one hedged pair (see
     /// `register_pair_link`). A pair's two legs are opposite-signed by
@@ -260,7 +271,7 @@ pub struct PositionLimitChecker {
     /// as two independent gross exposures (the default behavior for any
     /// unregistered position) would double-count a hedge as risk instead of
     /// recognizing it reduces risk, which is backwards for a pairs strategy.
-    pair_links: Arc<RwLock<HashMap<(String, String), (String, String)>>>,
+    pair_links: Arc<RwLock<PairLinkMap>>,
 }
 
 impl PositionLimitChecker {
@@ -613,7 +624,7 @@ impl CircuitBreaker {
         // Check if circuit breaker is tripped
         if self.is_tripped.load(Ordering::Acquire) {
             let reason = self.trip_reason.load(Ordering::Acquire);
-            return Err(unsafe { std::mem::transmute(reason) });
+            return Err(unsafe { std::mem::transmute::<u64, CircuitBreakerTrip>(reason) });
         }
 
         // Check if in failure pause
@@ -743,7 +754,7 @@ impl CircuitBreaker {
         CircuitBreakerStatus {
             is_tripped: self.is_tripped.load(Ordering::Acquire),
             trip_reason: if self.is_tripped.load(Ordering::Acquire) {
-                Some(unsafe { std::mem::transmute(self.trip_reason.load(Ordering::Acquire)) })
+                Some(unsafe { std::mem::transmute::<u64, CircuitBreakerTrip>(self.trip_reason.load(Ordering::Acquire)) })
             } else {
                 None
             },

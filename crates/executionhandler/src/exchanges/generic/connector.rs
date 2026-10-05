@@ -2271,7 +2271,7 @@ impl ExchangeConnector for GenericConnector {
             }
         }
         
-        let response = self.execute_request(
+        let _response = self.execute_request(
             "POST",
             &self.definition.endpoints.cancel_order_path,
             params,

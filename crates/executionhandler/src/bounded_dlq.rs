@@ -219,6 +219,8 @@ impl BoundedDeadLetterQueue {
     }
 
     /// Add a failed order to the queue
+    // Public API: one argument per failed-order field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_failed_order(
         &self,
         order_id: &str,
@@ -331,8 +333,10 @@ impl BoundedDeadLetterQueue {
         let entries = self.entries.read().await;
         let overflow = self.overflow_entries.read().await;
         
-        let mut base_stats = DlqStats::default();
-        base_stats.total_entries = entries.len();
+        let mut base_stats = DlqStats {
+            total_entries: entries.len(),
+            ..Default::default()
+        };
         
         for entry in entries.iter() {
             match entry.status {

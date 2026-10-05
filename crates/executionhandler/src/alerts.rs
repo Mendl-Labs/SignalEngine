@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -558,7 +559,7 @@ impl Default for AlertManagerConfig {
 /// Alert manager for routing alerts to providers
 pub struct AlertManager {
     config: RwLock<AlertManagerConfig>,
-    providers: RwLock<Vec<Box<dyn AlertProvider>>>,
+    providers: RwLock<Vec<Arc<dyn AlertProvider>>>,
     dedup_cache: DashMap<String, DedupEntry>,
     rate_counters: DashMap<String, (Instant, AtomicU64)>,
     stats: AlertStats,
@@ -595,7 +596,7 @@ impl AlertManager {
     
     /// Add an alert provider
     pub fn add_provider(&self, provider: Box<dyn AlertProvider>) {
-        self.providers.write().push(provider);
+        self.providers.write().push(Arc::from(provider));
     }
     
     /// Send an alert (non-blocking, queues for async delivery)
@@ -652,9 +653,10 @@ impl AlertManager {
         
         // Check rate limit
         let severity_key = format!("{:?}", alert.severity).to_lowercase();
-        let config = self.config.read();
-        let limit = config.rate_limits.get(&severity_key).copied().unwrap_or(60);
-        drop(config);
+        let limit = {
+            let config = self.config.read();
+            config.rate_limits.get(&severity_key).copied().unwrap_or(60)
+        };
         
         let now = Instant::now();
         let mut counter = self.rate_counters.entry(severity_key.clone())
@@ -681,13 +683,14 @@ impl AlertManager {
     
     /// Process alerts from queue (run in background task)
     pub async fn process_alerts(&self, mut receiver: mpsc::Receiver<Alert>) {
-        let config = self.config.read();
-        let max_retries = config.max_retries;
-        let retry_delay = Duration::from_millis(config.retry_delay_ms);
-        drop(config);
+        let (max_retries, retry_delay) = {
+            let config = self.config.read();
+            (config.max_retries, Duration::from_millis(config.retry_delay_ms))
+        };
         
         while let Some(alert) = receiver.recv().await {
-            let providers = self.providers.read();
+            // Snapshot the provider list: no lock may be held across the awaits below.
+            let providers: Vec<Arc<dyn AlertProvider>> = self.providers.read().clone();
             
             for provider in providers.iter() {
                 let mut attempts = 0;

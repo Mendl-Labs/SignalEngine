@@ -20,7 +20,7 @@ async fn main() {
     use rand::RngCore;
     let mut secret_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
-    let private_key_hex = hex::encode(&secret_bytes);
+    let private_key_hex = hex::encode(secret_bytes);
     
     println!("\n📝 Test Configuration");
     println!("   Network: SUI Devnet");

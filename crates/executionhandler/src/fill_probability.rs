@@ -205,7 +205,6 @@ pub struct FillProbabilityModel {
 /// Per-exchange fill statistics
 #[derive(Debug, Default)]
 struct ExchangeFillStats {
-    avg_latency_ms: f64,
     fill_rate: f64,
     reject_rate: f64,
     samples: usize,
@@ -276,7 +275,7 @@ impl FillProbabilityModel {
             order_size,
             available_depth,
             spread_bps,
-            &orderbook,
+            orderbook,
         );
 
         // Calculate confidence based on data quality
@@ -295,6 +294,8 @@ impl FillProbabilityModel {
     }
 
     /// Record a fill observation for model learning
+    // Public API: one argument per observed fill field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_fill(
         &self,
         symbol: &str,
@@ -783,7 +784,7 @@ mod tests {
         let model = FillProbabilityModel::new(FillProbabilityConfig::default());
         
         // Record some fills
-        for i in 0..30 {
+        for _ in 0..30 {
             model.record_fill(
                 "BTC-USD",
                 "test",
@@ -796,7 +797,7 @@ mod tests {
             );
         }
         
-        let (fill_rate, fill_time, slippage, samples) = model.get_symbol_stats("BTC-USD").unwrap();
+        let (fill_rate, _fill_time, _slippage, samples) = model.get_symbol_stats("BTC-USD").unwrap();
         
         assert!(fill_rate > 0.9, "Fill rate should be high after good fills");
         assert!(samples >= 30);

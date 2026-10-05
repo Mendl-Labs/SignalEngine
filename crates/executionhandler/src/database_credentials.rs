@@ -7,13 +7,11 @@
 //! to the SignalEngine execution handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::RwLock;
 use uuid::Uuid;
-use anyhow::{Result, Context, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-use super::credential_manager::{ApiCredentials, SecretString};
+use super::credential_manager::{ApiCredentials};
 
 /// Decrypted credential entry
 #[derive(Debug, Clone)]
@@ -60,7 +58,7 @@ impl DatabaseCredentialProvider {
         
         for cred in credentials {
             cache.entry(cred.exchange.to_lowercase())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(cred);
         }
     }
@@ -69,7 +67,7 @@ impl DatabaseCredentialProvider {
     pub fn add_credential(&self, cred: DecryptedCredential) {
         let mut cache = self.credentials.write();
         cache.entry(cred.exchange.to_lowercase())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(cred);
     }
 

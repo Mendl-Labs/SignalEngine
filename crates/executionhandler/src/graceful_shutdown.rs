@@ -503,7 +503,8 @@ impl ShutdownManager {
         let phase_start = Instant::now();
         
         // Flush and shutdown Order WAL before exit
-        if let Some(wal) = self.order_wal.read().clone() {
+        let order_wal = self.order_wal.read().clone();
+        if let Some(wal) = order_wal {
             info!("[SHUTDOWN] Flushing Order WAL...");
             
             // Get incomplete orders for logging

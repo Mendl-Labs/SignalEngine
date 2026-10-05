@@ -259,7 +259,7 @@ pub struct CompletedSpan {
 impl Span {
     /// Create a new span with parent context
     pub fn new(name: impl Into<String>, parent: Option<&TraceContext>, kind: SpanKind) -> Self {
-        let context = parent.map(|p| p.child()).unwrap_or_else(TraceContext::new);
+        let context = parent.map(|p| p.child()).unwrap_or_default();
         let now_ns = crate::optimizations::timestamp::nano_timestamp() as u64;
         
         Self {
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_tracer_with_sampling() {
-        let exporter = std::sync::Arc::new(InMemoryExporter::new(100));
+        let _exporter = std::sync::Arc::new(InMemoryExporter::new(100));
         let tracer = Tracer::new("test_service")
             .with_sampling_rate(0.5);
         

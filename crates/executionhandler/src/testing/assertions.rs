@@ -2,7 +2,7 @@
 //!
 //! Provides fluent assertion helpers for validating execution outcomes.
 
-use crate::core::types::{ExecutionResult, ExecutionStatus, ExecutionFill, OrderSide};
+use crate::core::types::{ExecutionResult, ExecutionStatus, OrderSide};
 
 /// Assertion helpers for execution results
 pub struct ExecutionAssertions;
@@ -132,11 +132,11 @@ impl<'a> ResultAssertion<'a> {
 
 /// Extension trait for ExecutionResult
 pub trait ExecutionResultExt {
-    fn assert(&self) -> ResultAssertion;
+    fn assert(&self) -> ResultAssertion<'_>;
 }
 
 impl ExecutionResultExt for ExecutionResult {
-    fn assert(&self) -> ResultAssertion {
+    fn assert(&self) -> ResultAssertion<'_> {
         ResultAssertion::new(self)
     }
 }

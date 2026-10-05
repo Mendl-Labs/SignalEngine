@@ -366,8 +366,8 @@ mod tests {
         // The impl uses sorted[(len * pct) as usize], so for 100 elements:
         // p50 = sorted[50] = 51, p95 = sorted[95] = 96, p99 = sorted[99] = 100
         assert_eq!(p50, 51);
-        assert!(p95 >= 95 && p95 <= 96);
-        assert!(p99 >= 99 && p99 <= 100);
+        assert!((95..=96).contains(&p95));
+        assert!((99..=100).contains(&p99));
         assert_eq!(p999, 100);
     }
 

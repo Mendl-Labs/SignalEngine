@@ -111,7 +111,7 @@ async fn main() {
             println!("{}", "=".repeat(80));
             test_deepbook(&wallet, &private_key, &mut test_results).await;
         }
-        "both" | _ => {
+        _ => {
             println!("\n{}", "=".repeat(80));
             println!("🔵 Testing CETUS (AMM)");
             println!("{}", "=".repeat(80));

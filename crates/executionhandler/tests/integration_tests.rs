@@ -2,7 +2,6 @@
 //!
 //! End-to-end tests using MockExchange to validate the complete execution pipeline.
 
-use executionhandler::core::types::ExecutionStatus;
 
 #[cfg(feature = "testing")]
 use executionhandler::testing::{
