@@ -1,3 +1,39 @@
+/// Calibrated TSC frequency (cycles per nanosecond)
+/// Lazily initialized on first use
+#[cfg(target_arch = "x86_64")]
+static TSC_FREQ_GHZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Get calibrated TSC frequency, or default to 3.0 GHz
+#[cfg(target_arch = "x86_64")]
+fn get_tsc_freq_ghz() -> f64 {
+    *TSC_FREQ_GHZ.get_or_init(|| {
+        // Try to calibrate by measuring TSC over a known time period
+        {
+            let start_tsc = unsafe { std::arch::x86_64::_rdtsc() };
+            let start_time = std::time::Instant::now();
+            
+            // Spin for ~10ms to get a reasonable sample
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            
+            let end_tsc = unsafe { std::arch::x86_64::_rdtsc() };
+            let elapsed_ns = start_time.elapsed().as_nanos() as f64;
+            
+            if elapsed_ns > 0.0 {
+                let tsc_diff = (end_tsc - start_tsc) as f64;
+                let freq = tsc_diff / elapsed_ns;
+                // Sanity check: should be between 1-6 GHz
+                if freq > 0.5 && freq < 8.0 {
+                    eprintln!("[timestamp] Calibrated TSC frequency: {:.2} GHz", freq);
+                    return freq;
+                }
+            }
+        }
+        // Fallback to typical frequency
+        eprintln!("[timestamp] Using default TSC frequency: 3.0 GHz");
+        3.0
+    })
+}
+
 /// Get nanosecond precision timestamp using the fastest available method
 #[inline(always)]
 pub fn nano_timestamp() -> u128 {
