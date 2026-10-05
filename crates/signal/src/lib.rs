@@ -7,7 +7,7 @@ use std::time::Instant;
 pub fn high_precision_timestamp_ns() -> u64 {
     // Use Instant for high-precision timing (monotonic, no system call overhead)
     static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let start = START_TIME.get_or_init(|| Instant::now());
+    let start = START_TIME.get_or_init(Instant::now);
     start.elapsed().as_nanos() as u64
 }
 
@@ -254,6 +254,12 @@ impl SymbolHashTable {
     }
 }
 
+impl Default for SymbolHashTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Compile-time hash function for symbols
 pub const fn hash_symbol(symbol: &str) -> u64 {
     // FNV-1a hash - very fast for short strings
@@ -367,6 +373,12 @@ impl UltraFastSignalQueue {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Relaxed);
         (tail.wrapping_sub(head) & (self.capacity as u64 - 1)) as usize
+    }
+
+    /// True when the queue holds no signals (approximate, like `len`)
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
