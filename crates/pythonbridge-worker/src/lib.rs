@@ -34,6 +34,11 @@ pub mod client;
 pub mod protocol;
 
 use pyo3::prelude::*;
+
+/// pyo3 0.29 takes C strings for source code; Python sources here never contain NUL bytes.
+fn code_cstr(code: &str) -> std::ffi::CString {
+    std::ffi::CString::new(code).expect("python source must not contain NUL bytes")
+}
 use pyo3::types::{PyDict, PyList, PyModule};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -174,13 +179,13 @@ del _name, _src, _sub, _k
 /// sandbox is installed but before user code. Ported from
 /// `python_strategy.rs::inject_sdk`.
 fn inject_sdk(py: Python<'_>) -> Result<(), PythonBridgeError> {
-    let locals = PyDict::new_bound(py);
+    let locals = PyDict::new(py);
     locals.set_item("_sdk_types_src", PYTHON_SDK_TYPES).ok();
     locals.set_item("_sdk_strategy_src", PYTHON_SDK_STRATEGY).ok();
     locals.set_item("_sdk_indicators_src", PYTHON_SDK_INDICATORS).ok();
     locals.set_item("_sdk_init_src", PYTHON_SDK_INIT).ok();
 
-    py.run_bound(&sdk_injection_code(), None, Some(&locals))
+    py.run(&code_cstr(&sdk_injection_code()), None, Some(&locals))
         .map_err(|e| PythonBridgeError::Setup(format!("SDK injection error: {}", e)))?;
     Ok(())
 }
@@ -188,11 +193,11 @@ fn inject_sdk(py: Python<'_>) -> Result<(), PythonBridgeError> {
 /// Static AST security scan -- rejects dangerous Python patterns before
 /// execution. Ported verbatim from `python_strategy.rs::ast_security_scan`.
 fn ast_security_scan(py: Python<'_>, source_code: &str) -> Result<(), String> {
-    let globals = PyDict::new_bound(py);
+    let globals = PyDict::new(py);
     globals
         .set_item(
             "__builtins__",
-            py.import_bound("builtins")
+            py.import("builtins")
                 .map_err(|e| format!("AST scan setup error: {}", e))?,
         )
         .map_err(|e| format!("AST scan setup error: {}", e))?;
@@ -200,7 +205,7 @@ fn ast_security_scan(py: Python<'_>, source_code: &str) -> Result<(), String> {
         .set_item("_source_code", source_code)
         .map_err(|e| format!("AST scan setup error: {}", e))?;
 
-    py.run_bound(AST_SCAN_CODE, Some(&globals), None)
+    py.run(&code_cstr(AST_SCAN_CODE), Some(&globals), None)
         .map_err(|e| format!("AST scan internal error: {}", e))?;
 
     let result = globals
@@ -236,18 +241,18 @@ pub enum PythonBridgeError {
 /// with the required `compute_signals` method. Ported from
 /// `python_strategy.rs::validate_source`.
 pub fn validate_source(source_code: &str) -> Result<(), String> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         ast_security_scan(py, source_code)?;
 
         inject_sdk(py).map_err(|e| e.to_string())?;
 
-        py.run_bound(PRE_IMPORT_ALLOWED_LIBS, None, None)
+        py.run(&code_cstr(PRE_IMPORT_ALLOWED_LIBS), None, None)
             .map_err(|e| format!("Pre-import error: {}", e))?;
 
-        py.run_bound(SANDBOX_IMPORT_HOOK, None, None)
+        py.run(&code_cstr(SANDBOX_IMPORT_HOOK), None, None)
             .map_err(|e| format!("Sandbox setup error: {}", e))?;
 
-        let module = PyModule::from_code_bound(py, source_code, "strategy.py", "user_strategy")
+        let module = PyModule::from_code(py, &code_cstr(source_code), c"strategy.py", c"user_strategy")
             .map_err(|e| format!("Syntax error: {}", e))?;
 
         let strategy_class = module.getattr("Strategy").map_err(|_| {
@@ -293,7 +298,7 @@ pub fn validate_source(source_code: &str) -> Result<(), String> {
 /// caught this in the first place.
 pub struct PythonStrategyRunner {
     source_code: String,
-    py_strategy: Mutex<Option<PyObject>>,
+    py_strategy: Mutex<Option<Py<PyAny>>>,
     cached_name: String,
     initialized: bool,
     timeout_secs: u64,
@@ -363,12 +368,12 @@ impl PythonStrategyRunner {
         &mut self,
         parameters: &std::collections::HashMap<String, f64>,
     ) -> Result<std::collections::HashMap<String, f64>, PythonBridgeError> {
-        let (py_obj, resolved_params) = Python::with_gil(|py| -> Result<(PyObject, std::collections::HashMap<String, f64>), PythonBridgeError> {
+        let (py_obj, resolved_params) = Python::attach(|py| -> Result<(Py<PyAny>, std::collections::HashMap<String, f64>), PythonBridgeError> {
             ast_security_scan(py, &self.source_code).map_err(PythonBridgeError::Setup)?;
 
             inject_sdk(py)?;
 
-            py.run_bound(PRE_IMPORT_ALLOWED_LIBS, None, None)
+            py.run(&code_cstr(PRE_IMPORT_ALLOWED_LIBS), None, None)
                 .map_err(|e| PythonBridgeError::Setup(format!("Pre-import error: {}", e)))?;
 
             // NOTE: RLIMIT_AS memory sandboxing is intentionally NOT applied
@@ -376,10 +381,10 @@ impl PythonStrategyRunner {
             // whole process's virtual address space (breaking thread
             // creation), not just Python, and the container cgroup memory
             // limit is the real boundary.
-            py.run_bound(SANDBOX_IMPORT_HOOK, None, None)
+            py.run(&code_cstr(SANDBOX_IMPORT_HOOK), None, None)
                 .map_err(|e| PythonBridgeError::Setup(format!("Sandbox setup error: {}", e)))?;
 
-            let module = PyModule::from_code_bound(py, &self.source_code, "strategy.py", "user_strategy")
+            let module = PyModule::from_code(py, &code_cstr(&self.source_code), c"strategy.py", c"user_strategy")
                 .map_err(|e| PythonBridgeError::Setup(format!("Python compilation error: {}", e)))?;
 
             let strategy_class = module.getattr("Strategy").map_err(|_| {
@@ -396,7 +401,7 @@ impl PythonStrategyRunner {
                 }
             }
 
-            let params_dict = PyDict::new_bound(py);
+            let params_dict = PyDict::new(py);
             for (k, v) in parameters {
                 params_dict.set_item(k, v).ok();
             }
@@ -409,7 +414,7 @@ impl PythonStrategyRunner {
             // strategy's actual, final parameter values.
             let mut resolved_params = std::collections::HashMap::new();
             if let Ok(params_attr) = instance.getattr("params") {
-                if let Ok(dict) = params_attr.downcast::<PyDict>() {
+                if let Ok(dict) = params_attr.cast::<PyDict>() {
                     for (k, v) in dict.iter() {
                         let Ok(key) = k.extract::<String>() else { continue };
                         if let Ok(val) = v.extract::<f64>() {
@@ -428,7 +433,7 @@ impl PythonStrategyRunner {
         // Single persistent watchdog thread (started once, not per-call) --
         // ported verbatim from python_strategy.rs::initialize. Avoids
         // spawning an OS thread per tick, which exhausts threads under load.
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let watchdog_init = r#"
 import _thread, time as _wd_time
 _wd_deadline = [0.0]
@@ -441,7 +446,7 @@ def _persistent_watchdog():
             _thread.interrupt_main()
 _thread.start_new_thread(_persistent_watchdog, ())
 "#;
-            let _ = py.run_bound(watchdog_init, None, None);
+            let _ = py.run(&code_cstr(watchdog_init), None, None);
         });
 
         *self.py_strategy.lock().expect("py_strategy mutex poisoned") = Some(py_obj);
@@ -490,14 +495,14 @@ _thread.start_new_thread(_persistent_watchdog, ())
         let volumes_vec: Vec<f64> = self.volumes.iter().copied().collect();
         let timestamps_vec: Vec<i64> = self.timestamps.iter().copied().collect();
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let strategy = py_strategy.bind(py);
 
             let arm_code = format!(
                 "_wd_deadline[0] = __import__('time').time() + {}",
                 timeout.as_secs_f64()
             );
-            let _ = py.run_bound(&arm_code, None, None);
+            let _ = py.run(&code_cstr(&arm_code), None, None);
 
             // Plain Python lists, not numpy zero-copy arrays: pandas/numpy
             // operations inside user strategies accept list-likes directly,
@@ -505,14 +510,17 @@ _thread.start_new_thread(_persistent_watchdog, ())
             // once per chromosome-evaluation loop like the GA path in the
             // source), so the zero-copy optimization isn't worth the extra
             // marshaling complexity here.
-            let prices_arr = PyList::new_bound(py, prices_vec.iter().copied());
-            let volumes_arr = PyList::new_bound(py, volumes_vec.iter().copied());
-            let timestamps_arr = PyList::new_bound(py, timestamps_vec.iter().copied());
+            let prices_arr = PyList::new(py, prices_vec.iter().copied())
+                .map_err(|e| PythonBridgeError::Execution(format!("building prices list: {}", e)))?;
+            let volumes_arr = PyList::new(py, volumes_vec.iter().copied())
+                .map_err(|e| PythonBridgeError::Execution(format!("building volumes list: {}", e)))?;
+            let timestamps_arr = PyList::new(py, timestamps_vec.iter().copied())
+                .map_err(|e| PythonBridgeError::Execution(format!("building timestamps list: {}", e)))?;
 
             let result = strategy
                 .call_method1("compute_signals", (prices_arr, volumes_arr, timestamps_arr))
                 .map_err(|e| {
-                    let _ = py.run_bound("_wd_deadline[0] = 0.0", None, None);
+                    let _ = py.run(&code_cstr("_wd_deadline[0] = 0.0"), None, None);
                     let msg = format!("{}", e);
                     if msg.contains("KeyboardInterrupt") {
                         PythonBridgeError::Timeout(timeout.as_secs())
@@ -521,13 +529,13 @@ _thread.start_new_thread(_persistent_watchdog, ())
                     }
                 })?;
 
-            let _ = py.run_bound("_wd_deadline[0] = 0.0", None, None);
+            let _ = py.run(&code_cstr("_wd_deadline[0] = 0.0"), None, None);
 
             let py_list = result.call_method0("tolist").or_else(|_| Ok::<_, pyo3::PyErr>(result.clone()))
                 .map_err(|e| PythonBridgeError::Execution(format!("failed to convert output: {}", e)))?;
 
             let items: Vec<Bound<'_, PyAny>> = py_list
-                .downcast::<PyList>()
+                .cast::<PyList>()
                 .map_err(|_| {
                     PythonBridgeError::Execution(
                         "compute_signals() must return an ndarray or list of int8".to_string(),
@@ -661,12 +669,12 @@ class Strategy(BaseStrategy):
         // the import hook blocks it at execution time instead. Confirm the
         // sandboxed import actually raises when the module runs.
         let result = on_python_thread(|| {
-            Python::with_gil(|py| -> Result<(), String> {
+            Python::attach(|py| -> Result<(), String> {
                 ast_security_scan(py, MALICIOUS_OS_IMPORT)?;
                 inject_sdk(py).map_err(|e| e.to_string())?;
-                py.run_bound(PRE_IMPORT_ALLOWED_LIBS, None, None).map_err(|e| e.to_string())?;
-                py.run_bound(SANDBOX_IMPORT_HOOK, None, None).map_err(|e| e.to_string())?;
-                PyModule::from_code_bound(py, MALICIOUS_OS_IMPORT, "strategy.py", "user_strategy")
+                py.run(&code_cstr(PRE_IMPORT_ALLOWED_LIBS), None, None).map_err(|e| e.to_string())?;
+                py.run(&code_cstr(SANDBOX_IMPORT_HOOK), None, None).map_err(|e| e.to_string())?;
+                PyModule::from_code(py, &code_cstr(MALICIOUS_OS_IMPORT), c"strategy.py", c"user_strategy")
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             })
@@ -676,7 +684,7 @@ class Strategy(BaseStrategy):
 
     #[test]
     fn validate_source_rejects_eval_via_ast_scan() {
-        let err = on_python_thread(|| Python::with_gil(|py| ast_security_scan(py, MALICIOUS_EVAL)));
+        let err = on_python_thread(|| Python::attach(|py| ast_security_scan(py, MALICIOUS_EVAL)));
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("Forbidden call"));
     }
