@@ -70,12 +70,15 @@ fn envelope() -> MandateEnvelope {
     MandateEnvelope { version: 1, status: MandateStatus::Active, effective_from: at("2019-01-01T00:00:00Z"), review_by: at("2099-01-01T00:00:00Z") }
 }
 
+/// Mark price lookup by symbol, read from the fake exchange's current state.
+type PriceOf<'a> = Box<dyn Fn(&str) -> Option<broker_adapters::Dec> + 'a>;
+
 /// The panel data source: bars strictly before `as_of` (the forming-bar rule), same shape as `FixtureData` but
 /// backed by a fixed panel and a price function reading the fake exchange's OWN current mark (so a drill that
 /// changes the exchange's price is reflected in sizing too).
 struct Vendor<'a> {
     panel: Panel,
-    price_of: Box<dyn Fn(&str) -> Option<broker_adapters::Dec> + 'a>,
+    price_of: PriceOf<'a>,
 }
 
 impl<'a> Vendor<'a> {
@@ -322,7 +325,7 @@ fn a_lost_order_response_is_adopted_by_tag_never_placed_twice() {
     }
     let unique: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
     assert_eq!(unique.len(), tags.len());
-    assert_eq!(env.runs.last_acted_decision(ACCOUNT_ID, "etf").unwrap().is_some(), true);
+    assert!(env.runs.last_acted_decision(ACCOUNT_ID, "etf").unwrap().is_some());
 }
 
 #[test]
@@ -374,7 +377,7 @@ fn a_partially_filled_leg_is_still_carried_and_counts_toward_acted() {
     assert!(leg.executed_quantity.is_positive() && leg.executed_quantity < leg.planned_quantity, "{leg:?}");
     assert!(leg.carried(), "a partially filled leg still counts as carried");
     assert!(r.decisions.iter().find(|dd| dd.sleeve == "etf").unwrap().acted, "the decision is acted even though one leg partially filled");
-    assert_eq!(env.runs.last_acted_decision(ACCOUNT_ID, "etf").unwrap().is_some(), true);
+    assert!(env.runs.last_acted_decision(ACCOUNT_ID, "etf").unwrap().is_some());
     env.rig.handle.assert_invariants();
 }
 
