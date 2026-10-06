@@ -158,7 +158,7 @@ async fn test_single_exchange(exchange_name: &str) {
     
     // Test 1: Public endpoint
     println!("1. Testing public endpoint (health check)...");
-    let (public_ok, public_msg) = test_public_endpoint(exchange_name).await;
+    let (public_ok, _public_msg) = test_public_endpoint(exchange_name).await;
     
     if !public_ok {
         println!("\n❌ Public endpoint test failed. Cannot proceed with authenticated tests.");

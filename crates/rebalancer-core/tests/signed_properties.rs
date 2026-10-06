@@ -168,7 +168,7 @@ fn generate(seed: u64, kind: Kind) -> Case {
     cfg.buying_power = match kind {
         Kind::Random => match rng.range(0, 9) {
             0 | 1 => None,
-            2 | 3 | 4 => Some(Dec::new(i128::from(rng.range(0, 3 * cb_units(cb))), 0).unwrap()),
+            2..=4 => Some(Dec::new(i128::from(rng.range(0, 3 * cb_units(cb))), 0).unwrap()),
             _ => Some(d(HUGE_BP)),
         },
         _ => Some(d(HUGE_BP)),
@@ -434,15 +434,13 @@ fn signed_plans_respect_every_limit_and_never_trade_the_wrong_way() {
             continue;
         }
         // Buying power: required exactly when the targets need margin.
-        if c.cfg.buying_power.is_none() {
-            if needs_margin(&c) {
-                match result {
-                    Err(PlanError::BuyingPowerRequired { .. }) => {
-                        cov.bp_refused += 1;
-                        continue;
-                    }
-                    other => panic!("seed {seed}: a margin plan without buying power must be refused, got {other:?}"),
+        if c.cfg.buying_power.is_none() && needs_margin(&c) {
+            match result {
+                Err(PlanError::BuyingPowerRequired { .. }) => {
+                    cov.bp_refused += 1;
+                    continue;
                 }
+                other => panic!("seed {seed}: a margin plan without buying power must be refused, got {other:?}"),
             }
         }
         let plan = result.unwrap_or_else(|e| panic!("seed {seed}: unexpected refusal {e:?}"));

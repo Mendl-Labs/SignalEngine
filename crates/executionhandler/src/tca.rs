@@ -48,7 +48,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use parking_lot::RwLock;
 
 use crate::core::types::OrderSide;
 
@@ -466,41 +465,6 @@ impl MarketDataCache {
         }
     }
     
-    fn calculate_vwap(&self, symbol: &str, start_ns: u128, end_ns: u128) -> Option<f64> {
-        let data = self.vwap_data.get(symbol)?;
-        
-        let mut sum_pv = 0.0;
-        let mut sum_v = 0.0;
-        
-        for (ts, price, volume) in data.iter() {
-            if *ts >= start_ns && *ts <= end_ns {
-                sum_pv += price * volume;
-                sum_v += volume;
-            }
-        }
-        
-        if sum_v > 0.0 {
-            Some(sum_pv / sum_v)
-        } else {
-            None
-        }
-    }
-    
-    fn calculate_twap(&self, symbol: &str, start_ns: u128, end_ns: u128) -> Option<f64> {
-        let data = self.twap_data.get(symbol)?;
-        
-        let prices: Vec<f64> = data.iter()
-            .filter(|(ts, _)| *ts >= start_ns && *ts <= end_ns)
-            .map(|(_, p)| *p)
-            .collect();
-        
-        if prices.is_empty() {
-            None
-        } else {
-            Some(prices.iter().sum::<f64>() / prices.len() as f64)
-        }
-    }
-    
     /// Prune old data from market data cache
     fn prune(&self, retention_ns: u128, max_per_symbol: usize) {
         let cutoff = TcaEngine::now_ns().saturating_sub(retention_ns);
@@ -714,8 +678,8 @@ impl TcaEngine {
         // Calculate spread cost
         let spread_cost_bps = if let Some((bid, ask, _)) = self.market_data.quotes.get(&record.symbol).map(|q| *q) {
             let mid = (bid + ask) / 2.0;
-            let half_spread = (ask - bid) / 2.0 / mid * 10000.0;
-            half_spread // We typically cross half the spread
+            // We typically cross half the spread
+            (ask - bid) / 2.0 / mid * 10000.0
         } else {
             0.0
         };
@@ -907,14 +871,14 @@ impl TcaEngine {
             // Update by_symbol
             let symbol_stats = stats.by_symbol
                 .entry(record.symbol.clone())
-                .or_insert_with(SymbolTcaStats::default);
+                .or_default();
             symbol_stats.executions += 1;
             symbol_stats.total_value += record.executed_value;
             
             // Update by_exchange
             let exchange_stats = stats.by_exchange
                 .entry(record.exchange.clone())
-                .or_insert_with(ExchangeTcaStats::default);
+                .or_default();
             exchange_stats.executions += 1;
             exchange_stats.total_value += record.executed_value;
             
@@ -922,7 +886,7 @@ impl TcaEngine {
             if let Some(ref algo) = record.algorithm {
                 let algo_stats = stats.by_algorithm
                     .entry(algo.clone())
-                    .or_insert_with(AlgorithmTcaStats::default);
+                    .or_default();
                 algo_stats.executions += 1;
                 algo_stats.total_value += record.executed_value;
                 algo_stats.avg_fill_rate = (algo_stats.avg_fill_rate * (algo_stats.executions - 1) as f64 
@@ -963,7 +927,7 @@ impl TcaEngine {
         stats
     }
     
-    fn calculate_percentiles(values: &mut Vec<f64>) -> Percentiles {
+    fn calculate_percentiles(values: &mut [f64]) -> Percentiles {
         if values.is_empty() {
             return Percentiles::default();
         }

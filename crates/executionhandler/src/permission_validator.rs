@@ -11,16 +11,10 @@
 //! - Some require checking account info
 //! - Some we infer from error responses
 
-use std::collections::HashMap;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use anyhow::{Result, anyhow, bail};
 use reqwest::Client;
-
-use crate::exchanges::generic::{
-    GenericConnector, ExchangePreset, ExchangeDefinition,
-    AuthStrategy, create_auth_strategy, AuthHeaders,
-};
 
 /// Result of API key permission validation
 #[derive(Debug, Clone, Serialize)]

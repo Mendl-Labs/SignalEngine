@@ -85,7 +85,7 @@ impl OrderDatabasePersistence {
                 .unwrap_or_else(|_| BigDecimal::from(0)),
             remaining_quantity: BigDecimal::try_from(route.total_quantity - route.total_filled_quantity)
                 .unwrap_or_else(|_| BigDecimal::from(0)),
-            price: route.benchmark_price.map(|p| BigDecimal::try_from(p).ok()).flatten(),
+            price: route.benchmark_price.and_then(|p| BigDecimal::try_from(p).ok()),
             stop_price: None,
             status: convert_route_status(route.status),
             urgency: Some(convert_urgency(route.urgency)),
@@ -144,7 +144,7 @@ impl OrderDatabasePersistence {
                 .unwrap_or_else(|_| BigDecimal::from(0)),
             remaining_quantity: BigDecimal::try_from(child.remaining_quantity())
                 .unwrap_or_else(|_| BigDecimal::from(0)),
-            price: child.price.map(|p| BigDecimal::try_from(p).ok()).flatten(),
+            price: child.price.and_then(|p| BigDecimal::try_from(p).ok()),
             stop_price: None,
             status: convert_route_status(child.status),
             urgency: None,
@@ -209,6 +209,9 @@ impl OrderDatabasePersistence {
 
     /// Record a fill for an order AND persist to trade_history table
     /// This is the preferred method for live trading as it updates both tables
+    // Public entry point with one argument per fill column; no in-repo callers to migrate, so
+    // a parameter struct would be a breaking API change for the live path.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_fill_with_trade_history(
         &self,
         order_unique_id: &str,
@@ -569,7 +572,10 @@ async fn unscoped_load_all_enabled_credentials(
             exchange_credentials::is_enabled,
         ));
 
-    let rows: Vec<(Uuid, String, String, String, String, Option<String>, bool, bool)> =
+    // Row shape of the credential query above: id, exchange, label, api key, api secret,
+    // nullable passphrase, and the two flags.
+    type CredentialRow = (Uuid, String, String, String, String, Option<String>, bool, bool);
+    let rows: Vec<CredentialRow> =
         RunQueryDsl::load(query, &mut conn)
             .await
             .context("Failed to load exchange credentials")?;

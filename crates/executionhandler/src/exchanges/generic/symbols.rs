@@ -36,7 +36,7 @@ impl SymbolConverter {
     /// Convert standard symbol (e.g., "BTC/USD") to exchange format
     pub fn to_exchange_format(&self, symbol: &str) -> String {
         // Split on common separators
-        let parts: Vec<&str> = symbol.split(|c| c == '/' || c == '-' || c == '_').collect();
+        let parts: Vec<&str> = symbol.split(['/', '-', '_']).collect();
         
         if parts.len() != 2 {
             // Return as-is if not a pair

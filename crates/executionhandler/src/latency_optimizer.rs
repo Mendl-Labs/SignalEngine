@@ -9,7 +9,7 @@
 //! - Network condition adaptation
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
@@ -199,8 +199,6 @@ pub struct LatencyOptimizer {
     settlement_configs: DashMap<String, SettlementConfig>,
     /// Global system load indicator
     system_load: AtomicU64,
-    /// Is optimizer active
-    active: AtomicBool,
 }
 
 impl LatencyOptimizer {
@@ -212,7 +210,6 @@ impl LatencyOptimizer {
             exchange_health: DashMap::new(),
             settlement_configs: DashMap::new(),
             system_load: AtomicU64::new(0),
-            active: AtomicBool::new(true),
         }
     }
 
@@ -378,9 +375,7 @@ impl LatencyOptimizer {
 
         let timing_adj = self.calculate_timing_adjustment(&best.0);
 
-        let reason = if best.3 != ExchangeHealth::Healthy {
-            RoutingReason::OnlyHealthy
-        } else if scored.len() == 1 {
+        let reason = if best.3 != ExchangeHealth::Healthy || scored.len() == 1 {
             RoutingReason::OnlyHealthy
         } else {
             RoutingReason::BestScore

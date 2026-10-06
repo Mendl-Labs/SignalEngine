@@ -140,6 +140,9 @@ pub struct WalEntry {
 
 impl WalEntry {
     /// Create a new WAL entry
+    // Constructor takes each WAL setting explicitly so call sites stay readable; a builder would
+    // change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sequence: u64,
         order_id: String,
@@ -299,7 +302,7 @@ pub enum WalError {
 
 /// Write command for async writer
 enum WriteCommand {
-    Append(WalEntry),
+    Append(Box<WalEntry>),
     Checkpoint,
     Flush,
     Shutdown(tokio::sync::oneshot::Sender<()>),
@@ -422,7 +425,7 @@ impl OrderWal {
                         Some(WriteCommand::Append(entry)) => {
                             trace!("[WAL] Append: order_id={}, state={:?}, seq={}", 
                                 entry.order_id, entry.state, entry.sequence);
-                            buffer.push(entry);
+                            buffer.push(*entry);
                             
                             // Flush if buffer full or sync mode requires it
                             if buffer.len() >= self.config.buffer_size 
@@ -674,6 +677,8 @@ impl OrderWal {
     }
 
     /// Log a pending order (before submission)
+    // Public API: one argument per pending-order field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_pending(
         &self,
         order_id: &str,
@@ -698,7 +703,7 @@ impl OrderWal {
 
         self.apply_entry(entry.clone());
         self.write_tx
-            .send(WriteCommand::Append(entry))
+            .send(WriteCommand::Append(Box::new(entry)))
             .await
             .map_err(|_| WalError::ChannelClosed)?;
 
@@ -800,7 +805,7 @@ impl OrderWal {
 
         self.apply_entry(entry.clone());
         self.write_tx
-            .send(WriteCommand::Append(entry))
+            .send(WriteCommand::Append(Box::new(entry)))
             .await
             .map_err(|_| WalError::ChannelClosed)?;
 

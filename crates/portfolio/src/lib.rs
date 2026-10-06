@@ -69,6 +69,12 @@ pub struct BalanceData {
     pub sequence: u64,
 }
 
+impl Default for CryptoWallet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CryptoWallet {
     /// Create a new empty wallet
     pub fn new() -> Self {

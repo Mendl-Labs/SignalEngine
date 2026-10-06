@@ -577,7 +577,7 @@ impl DataHandler {
         
         // Log performance periodically (every 10000 updates)
         let total = self.updates_processed.fetch_add(1, Ordering::Relaxed);
-        if total > 0 && total % 10000 == 0 {
+        if total > 0 && total.is_multiple_of(10000) {
             ultra_info!(format!(
                 "Performance: {} updates, avg_latency={}ns, msgs={}, errors={}",
                 total,
@@ -1132,9 +1132,10 @@ mod tests {
         let stats = data_handler.get_performance_stats();
         
         // Stats should be valid (other tests may have created orderbooks)
-        // Just verify the struct is populated correctly
-        assert!(stats.active_orderbooks >= 0); // Always true, but validates the field exists
-        assert!(stats.total_updates >= 0); // Validates the field exists
+        // Just verify the struct is populated correctly. Both fields are unsigned, so a
+        // `>= 0` assertion is tautological (clippy unused_comparisons); reading them is
+        // what checks the fields exist and are readable.
+        let _ = (stats.active_orderbooks, stats.total_updates);
     }
 
     #[test]

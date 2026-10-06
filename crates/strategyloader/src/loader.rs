@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chained_loader_dedup_by_id() {
-        let mut s1 = MockLoader::make_strategy("dup", true);
+        let s1 = MockLoader::make_strategy("dup", true);
         let id = s1.id;
         let s2 = StrategyInstance { id, ..s1.clone() };
 

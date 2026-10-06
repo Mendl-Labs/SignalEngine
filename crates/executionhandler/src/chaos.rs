@@ -118,7 +118,6 @@ pub struct ChaosStats {
 pub struct ChaosMonkey {
     config: RwLock<ChaosConfig>,
     enabled: AtomicBool,
-    stats: ChaosStats,
     operation_count: AtomicU64,
     network_failures: AtomicU64,
     messages_dropped: AtomicU64,
@@ -136,7 +135,6 @@ impl ChaosMonkey {
         Self {
             config: RwLock::new(config),
             enabled: AtomicBool::new(enabled),
-            stats: ChaosStats::default(),
             operation_count: AtomicU64::new(0),
             network_failures: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
@@ -181,7 +179,7 @@ impl ChaosMonkey {
         if config.target_exchanges.is_empty() {
             return true;
         }
-        exchange.map_or(false, |e| config.target_exchanges.contains(&e.to_string()))
+        exchange.is_some_and(|e| config.target_exchanges.contains(&e.to_string()))
     }
 
     /// Apply chaos to an operation

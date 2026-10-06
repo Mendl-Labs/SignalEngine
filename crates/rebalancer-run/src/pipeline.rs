@@ -9,6 +9,7 @@
 //! 3. `mandate`: no mandate, not active, or invalid means refuse with no order of any kind. An EXPIRED mandate
 //!    continues, and the guard then admits only reducing orders (SPEC B3). Assisted and Paper runs may rehearse
 //!    against a DRAFT mandate; Live never does.
+//!
 //! 3b. `decisions` (pre-flight, BEFORE the broker is read): every CONFIGURED sleeve is evaluated (data fetch,
 //!    fingerprint, reference rule) and classified. A `Daily` sleeve (crypto) is pending on every run; an `OnDecision`
 //!    sleeve (ETF) is pending iff its computable decision is newer than the last decision this account ACTED on

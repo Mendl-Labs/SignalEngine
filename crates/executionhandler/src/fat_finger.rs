@@ -96,10 +96,6 @@ pub struct SymbolOverride {
 /// Market price data for a symbol
 #[derive(Debug, Clone)]
 struct MarketPrice {
-    /// Best bid price
-    bid: f64,
-    /// Best ask price
-    ask: f64,
     /// Mid-price
     mid: f64,
     /// Last trade price
@@ -137,12 +133,8 @@ impl OrderVelocity {
 /// Position tracking for concentration limits
 #[derive(Debug, Clone, Default)]
 struct PositionInfo {
-    /// Current position quantity
-    quantity: f64,
     /// Current position notional value (USD)
     notional_usd: f64,
-    /// Average entry price
-    avg_price: f64,
 }
 
 /// Fat-finger protection result
@@ -286,7 +278,7 @@ impl FatFingerGuard {
             market_prices: DashMap::new(),
             velocity: DashMap::new(),
             positions: DashMap::new(),
-            total_portfolio_value: AtomicU64::new(100_000_00), // $100k default
+            total_portfolio_value: AtomicU64::new(10_000_000), // $100k default
             stats: FatFingerStats::default(),
         }
     }
@@ -295,8 +287,6 @@ impl FatFingerGuard {
     pub fn update_market_price(&self, symbol: &str, bid: f64, ask: f64) {
         let mid = (bid + ask) / 2.0;
         self.market_prices.insert(symbol.to_string(), MarketPrice {
-            bid,
-            ask,
             mid,
             last: None,
             updated_at: Instant::now(),
@@ -307,8 +297,6 @@ impl FatFingerGuard {
     pub fn update_market_price_with_last(&self, symbol: &str, bid: f64, ask: f64, last: f64) {
         let mid = (bid + ask) / 2.0;
         self.market_prices.insert(symbol.to_string(), MarketPrice {
-            bid,
-            ask,
             mid,
             last: Some(last),
             updated_at: Instant::now(),
@@ -319,9 +307,7 @@ impl FatFingerGuard {
     pub fn update_position(&self, symbol: &str, quantity: f64, avg_price: f64) {
         let notional = quantity.abs() * avg_price;
         self.positions.insert(symbol.to_string(), PositionInfo {
-            quantity,
             notional_usd: notional,
-            avg_price,
         });
     }
     

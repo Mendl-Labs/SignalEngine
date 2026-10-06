@@ -208,7 +208,7 @@ impl MetricsRegistry {
     // Labeled counter operations
     pub fn register_labeled_counter(&self, name: &str) {
         let mut labeled = self.labeled_counters.write();
-        labeled.entry(name.to_string()).or_insert_with(HashMap::new);
+        labeled.entry(name.to_string()).or_default();
     }
 
     pub fn inc_labeled_counter(&self, name: &str, label: &str) {
@@ -223,7 +223,7 @@ impl MetricsRegistry {
     // Labeled gauge operations
     pub fn register_labeled_gauge(&self, name: &str) {
         let mut labeled = self.labeled_gauges.write();
-        labeled.entry(name.to_string()).or_insert_with(HashMap::new);
+        labeled.entry(name.to_string()).or_default();
     }
 
     pub fn set_labeled_gauge(&self, name: &str, label: &str, value: u64) {

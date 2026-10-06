@@ -312,7 +312,7 @@ impl MockExchange {
     /// Parse symbol into base/quote assets
     fn parse_symbol(&self, symbol: &str) -> (String, String) {
         // Handle common formats: BTC/USD, BTCUSD, BTC-USD
-        let parts: Vec<&str> = symbol.split(|c| c == '/' || c == '-').collect();
+        let parts: Vec<&str> = symbol.split(['/', '-']).collect();
         if parts.len() == 2 {
             (parts[0].to_string(), parts[1].to_string())
         } else if symbol.len() >= 6 {
@@ -342,7 +342,7 @@ pub struct MockExchangeMetrics {
 impl MockExchange {
     /// Execute a signal (standalone method, not trait impl)
     pub async fn execute_signal(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
-        let start_time = nano_timestamp() as u128;
+        let start_time = nano_timestamp();
         
         // Check connection
         if !self.connected.load(Ordering::SeqCst) {
@@ -371,7 +371,7 @@ impl MockExchange {
             SignalAction::Sell | SignalAction::SellLimit | SignalAction::SellStop => OrderSide::Sell,
         };
         
-        let now = nano_timestamp() as u128;
+        let now = nano_timestamp();
         let latency = (now - start_time) as u64;
         
         let result = match outcome {
@@ -540,14 +540,14 @@ impl MockExchange {
                 order_id: order_id.to_string(),
                 exchange_order_id: Some(order.client_order_id.clone()),
                 status: CancelStatus::Cancelled,
-                cancelled_at: nano_timestamp() as u128,
+                cancelled_at: nano_timestamp(),
             })
         } else {
             Ok(CancelResult {
                 order_id: order_id.to_string(),
                 exchange_order_id: None,
                 status: CancelStatus::NotFound,
-                cancelled_at: nano_timestamp() as u128,
+                cancelled_at: nano_timestamp(),
             })
         }
     }
@@ -564,16 +564,16 @@ impl MockExchange {
         let mut results = Vec::new();
         
         for (id, order) in orders.iter_mut() {
-            if symbol.is_none() || symbol == Some(&order.symbol) {
-                if matches!(order.status, ExecutionStatus::Pending | ExecutionStatus::Submitted | ExecutionStatus::PartiallyFilled) {
-                    order.status = ExecutionStatus::Cancelled;
-                    results.push(CancelResult {
-                        order_id: id.clone(),
-                        exchange_order_id: Some(order.client_order_id.clone()),
-                        status: CancelStatus::Cancelled,
-                        cancelled_at: nano_timestamp() as u128,
-                    });
-                }
+            if (symbol.is_none() || symbol == Some(&order.symbol))
+                && matches!(order.status, ExecutionStatus::Pending | ExecutionStatus::Submitted | ExecutionStatus::PartiallyFilled)
+            {
+                order.status = ExecutionStatus::Cancelled;
+                results.push(CancelResult {
+                    order_id: id.clone(),
+                    exchange_order_id: Some(order.client_order_id.clone()),
+                    status: CancelStatus::Cancelled,
+                    cancelled_at: nano_timestamp(),
+                });
             }
         }
         
@@ -598,7 +598,7 @@ impl MockExchange {
                 order.price = Some(price);
             }
             
-            let now = nano_timestamp() as u128;
+            let now = nano_timestamp();
             
             Ok(ExecutionResult {
                 order_id: params.order_id.clone(),

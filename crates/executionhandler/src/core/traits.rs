@@ -222,7 +222,7 @@ mod tests {
         async fn initialize(&mut self, _config: ExchangeConfig) -> Result<(), ExecutionError> { Ok(()) }
         async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
             let id_num: u64 = signal.id.parse().unwrap_or(0);
-            if id_num % 2 == 0 {
+            if id_num.is_multiple_of(2) {
                 Ok(ExecutionResult {
                     order_id: signal.id.clone(),
                     exchange_order_id: Some(format!("exch_{}", signal.id)),

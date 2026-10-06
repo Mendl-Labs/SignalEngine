@@ -22,7 +22,7 @@ async fn main() {
     
     let mut secret_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut secret_bytes);
-    let private_key_hex = hex::encode(&secret_bytes);
+    let private_key_hex = hex::encode(secret_bytes);
     
     println!("   Generated private key: {}...", &private_key_hex[..16]);
     

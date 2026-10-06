@@ -42,12 +42,15 @@
 //! }
 //! ```
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+
+/// Listener invoked for reconciliation events.
+type ReconciliationEventHandler = Box<dyn Fn(ReconciliationEvent) + Send + Sync>;
 
 /// Configuration for orderbook reconciliation
 #[derive(Debug, Clone)]
@@ -323,7 +326,7 @@ pub struct OrderbookReconciler {
     /// Per-symbol state
     states: DashMap<String, SymbolState>,
     /// Event callback
-    event_handler: RwLock<Option<Box<dyn Fn(ReconciliationEvent) + Send + Sync>>>,
+    event_handler: RwLock<Option<ReconciliationEventHandler>>,
     /// Global statistics
     global_stats: GlobalStats,
 }
@@ -374,22 +377,6 @@ impl OrderbookReconciler {
         format!("{}:{}", exchange, symbol)
     }
     
-    /// Get or create state for a symbol
-    fn get_or_create_state(&self, symbol: &str, exchange: &str) -> dashmap::mapref::one::Ref<'_, String, SymbolState> {
-        let key = Self::make_key(symbol, exchange);
-        // Use entry API - this returns a reference that keeps the entry alive
-        self.states.entry(key.clone()).or_insert_with(SymbolState::new);
-        // Under normal DashMap operation this cannot fail after entry() above.
-        // Loop to handle extremely rare race conditions under high contention.
-        loop {
-            if let Some(state) = self.states.get(&key) {
-                return state;
-            }
-            // Re-insert if somehow missing (should never happen)
-            self.states.entry(key.clone()).or_insert_with(SymbolState::new);
-        }
-    }
-    
     /// Process an orderbook update
     pub fn process_update(&self, update: &OrderbookUpdate) -> ReconciliationResult {
         let start = Instant::now();
@@ -422,7 +409,7 @@ impl OrderbookReconciler {
         // Handle based on update type
         match update.update_type {
             UpdateType::Snapshot => {
-                return self.apply_snapshot(&state, update, start);
+                self.apply_snapshot(&state, update, start)
             }
             UpdateType::Delta | UpdateType::Trade => {
                 // Check if we have a valid book
@@ -445,7 +432,7 @@ impl OrderbookReconciler {
                 }
                 
                 // Process delta update
-                return self.process_delta(&state, update, start);
+                self.process_delta(&state, update, start)
             }
         }
     }
@@ -784,11 +771,7 @@ impl OrderbookReconciler {
                 let mut buffer = state.buffered_updates.lock();
                 
                 // Find and remove the next expected update
-                if let Some(pos) = buffer.iter().position(|u| u.sequence == expected_seq) {
-                    Some(buffer.remove(pos).unwrap())
-                } else {
-                    None
-                }
+                buffer.iter().position(|u| u.sequence == expected_seq).map(|pos| buffer.remove(pos).unwrap())
             };
             
             if let Some(update) = update {

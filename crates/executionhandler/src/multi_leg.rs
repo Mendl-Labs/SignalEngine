@@ -36,13 +36,13 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use parking_lot::RwLock;
 
-use crate::core::types::{OrderSide, OrderType, TimeInForce, ExecutionStatus, ExecutionFill};
+use crate::core::types::{OrderSide, OrderType, TimeInForce, ExecutionFill};
 
 /// Unique identifier for a multi-leg order group
 pub type GroupId = String;
@@ -463,6 +463,9 @@ impl Default for MultiLegConfig {
     }
 }
 
+/// Listener invoked for every multi-leg event.
+type MultiLegEventHandler = Box<dyn Fn(MultiLegEvent) + Send + Sync>;
+
 /// Multi-leg order manager
 /// 
 /// Thread-safe manager for creating, tracking, and managing multi-leg orders.
@@ -474,7 +477,7 @@ pub struct MultiLegOrderManager {
     /// Exchange order ID to leg mapping
     exchange_order_to_leg: DashMap<String, LegId>,
     /// Event listeners
-    event_handlers: RwLock<Vec<Box<dyn Fn(MultiLegEvent) + Send + Sync>>>,
+    event_handlers: RwLock<Vec<MultiLegEventHandler>>,
     /// Configuration
     config: MultiLegConfig,
     /// Group ID counter
@@ -853,7 +856,7 @@ impl MultiLegOrderManager {
             .ok_or_else(|| MultiLegError::GroupNotFound(group_id.clone()))?;
         
         let previous_state = group.state;
-        let order_type = group.order_type.clone();
+        let order_type = group.order_type;
         let group_state = group.state;
         
         // Find the leg index and update it

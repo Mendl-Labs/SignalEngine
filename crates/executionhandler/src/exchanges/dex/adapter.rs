@@ -148,13 +148,13 @@ impl ExchangeConnector for DexToExchangeAdapter {
             successful_orders: 0,
             failed_orders: 0,
             cancelled_orders: 0,
-            avg_latency_ns: self.network.finality_time_ms() as u64 * 1_000_000,
+            avg_latency_ns: self.network.finality_time_ms() * 1_000_000,
             min_latency_ns: 200_000_000,
             max_latency_ns: 2_000_000_000,
-            p50_latency_ns: self.network.finality_time_ms() as u64 * 1_000_000,
-            p95_latency_ns: self.network.finality_time_ms() as u64 * 1_500_000,
-            p99_latency_ns: self.network.finality_time_ms() as u64 * 2_000_000,
-            p999_latency_ns: self.network.finality_time_ms() as u64 * 3_000_000,
+            p50_latency_ns: self.network.finality_time_ms() * 1_000_000,
+            p95_latency_ns: self.network.finality_time_ms() * 1_500_000,
+            p99_latency_ns: self.network.finality_time_ms() * 2_000_000,
+            p999_latency_ns: self.network.finality_time_ms() * 3_000_000,
             total_volume: 0.0,
             total_fees: 0.0,
             fill_rate: 0.0,
@@ -175,7 +175,7 @@ impl ExchangeConnector for DexToExchangeAdapter {
         Ok(HealthStatus {
             exchange: self.exchange_name.clone(),
             status: if self.initialized { HealthState::Healthy } else { HealthState::Unhealthy },
-            latency_ns: self.network.finality_time_ms() as u64 * 1_000_000,
+            latency_ns: self.network.finality_time_ms() * 1_000_000,
             last_check: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

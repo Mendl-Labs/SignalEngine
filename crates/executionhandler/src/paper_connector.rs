@@ -91,6 +91,9 @@ impl Default for PaperRealismConfig {
     }
 }
 
+/// Callback invoked with each simulated order update.
+type UpdateCallback = Arc<dyn Fn(OrderUpdate) + Send + Sync>;
+
 /// Paper trading connector wrapping SimulationEngine's MockExchangeConnector
 pub struct PaperTradingConnector {
     mock: MockExchangeConnector,
@@ -98,7 +101,7 @@ pub struct PaperTradingConnector {
     total_orders: AtomicU64,
     successful_orders: AtomicU64,
     failed_orders: AtomicU64,
-    update_callback: Mutex<Option<Arc<dyn Fn(OrderUpdate) + Send + Sync>>>,
+    update_callback: Mutex<Option<UpdateCallback>>,
     book_initialized: AtomicBool,
     last_mid_price: Mutex<HashMap<String, f64>>,
     last_spread_bps: Mutex<HashMap<String, f64>>,

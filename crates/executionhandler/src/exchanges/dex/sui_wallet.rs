@@ -85,7 +85,7 @@ impl SuiWallet {
         let mut hasher = Blake2b512::new();
         
         // Add scheme flag (0x00 for ed25519)
-        hasher.update(&[0x00]);
+        hasher.update([0x00u8]);
         
         // Add public key bytes
         hasher.update(verifying_key.as_bytes());

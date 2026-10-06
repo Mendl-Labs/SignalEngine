@@ -430,7 +430,7 @@ impl AuditBackend for InMemoryAuditBackend {
 
     async fn query(&self, query: AuditQuery) -> Result<Vec<AuditEntry>> {
         let entries = self.entries.read().await;
-        let mut results: Vec<AuditEntry> = entries
+        let results: Vec<AuditEntry> = entries
             .iter()
             .filter(|e| {
                 if let Some(ref types) = query.event_types {
@@ -556,6 +556,8 @@ impl AuditLogger {
     }
 
     /// Log an execution event
+    // Public API: one argument per execution field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_execution(
         &self,
         event_type: AuditEventType,
@@ -675,10 +677,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_audit_logger() {
-        let backend = InMemoryAuditBackend::new(100);
-        let backend = std::sync::Arc::new(backend);
-        let backend_ref = backend.clone();
-        
         let logger = AuditLogger::new(
             InMemoryAuditBackend::new(100), // Use fresh backend for logger
             100,

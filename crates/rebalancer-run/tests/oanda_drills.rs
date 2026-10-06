@@ -123,7 +123,7 @@ fn flatten_cancels_our_resting_orders_and_leaves_foreign_ones_alone() {
     assert_eq!(r.verdict, FlattenVerdict::Flat, "{}", r.summary());
     assert_eq!(r.cancels.len(), 1);
     assert_eq!(r.cancels[0].tag.as_deref(), Some("rb1:rest"));
-    assert_eq!(r.foreign_open_orders, [foreign.clone()]);
+    assert_eq!(r.foreign_open_orders, std::slice::from_ref(&foreign));
     let pending = env.rig.handle.pending_orders();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, foreign, "only the foreign order is still resting");

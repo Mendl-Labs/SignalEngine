@@ -5,7 +5,6 @@
 
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use dashmap::DashMap;
 
 /// Configuration for rate limiter

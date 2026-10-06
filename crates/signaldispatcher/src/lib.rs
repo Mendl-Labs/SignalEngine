@@ -273,7 +273,7 @@ impl UltraFastSignalDispatcher {
         use std::sync::atomic::AtomicU64;
         static BYPASS_COUNT: AtomicU64 = AtomicU64::new(0);
         let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n % 100 == 0 {
+        if n.is_multiple_of(100) {
             ultra_logger::ultra_warn!(format!(
                 "⚠️ RISK BYPASS: signal routed directly to execution without risk checks \
                  (strategy_id={}, symbol_hash={:#x}, action={:?}, qty={}, total_bypasses={})",

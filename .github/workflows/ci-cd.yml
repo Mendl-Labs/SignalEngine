@@ -92,7 +92,7 @@ jobs:
           repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
-          ref: v0.1.50
+          ref: v0.1.51
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingCore
 
@@ -100,6 +100,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.90.0
+          components: clippy
 
       - name: Install System Dependencies
         run: |
@@ -145,6 +146,21 @@ jobs:
           cd SignalEngine
           cargo build --workspace
           echo "[OK] Build passed!"
+
+      - name: Clippy
+        run: |
+          cd SignalEngine
+          cargo clippy --all-targets --workspace -- -D warnings
+          echo "[OK] Clippy passed!"
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: Audit Dependencies
+        run: |
+          cd SignalEngine
+          cargo audit --file Cargo.lock
+          echo "[OK] Dependency audit passed!"
 
       - name: Run Tests
         if: steps.check-skip.outputs.skip != 'true' && github.event.inputs.skip_tests != 'true'
@@ -264,7 +280,7 @@ jobs:
           repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
           # quant-diagnostics crates; pin a tag so CI is reproducible.
-          ref: v0.1.50
+          ref: v0.1.51
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingCore
           fetch-depth: 0

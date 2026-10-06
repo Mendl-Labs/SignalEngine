@@ -1,15 +1,13 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::OnceLock;
-
 /// Calibrated TSC frequency (cycles per nanosecond)
 /// Lazily initialized on first use
-static TSC_FREQ_GHZ: OnceLock<f64> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static TSC_FREQ_GHZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
 /// Get calibrated TSC frequency, or default to 3.0 GHz
+#[cfg(target_arch = "x86_64")]
 fn get_tsc_freq_ghz() -> f64 {
     *TSC_FREQ_GHZ.get_or_init(|| {
         // Try to calibrate by measuring TSC over a known time period
-        #[cfg(target_arch = "x86_64")]
         {
             let start_tsc = unsafe { std::arch::x86_64::_rdtsc() };
             let start_time = std::time::Instant::now();
@@ -45,7 +43,7 @@ pub fn nano_timestamp() -> u128 {
     use std::sync::OnceLock;
     
     static START_INSTANT: OnceLock<Instant> = OnceLock::new();
-    let start = START_INSTANT.get_or_init(|| Instant::now());
+    let start = START_INSTANT.get_or_init(Instant::now);
     start.elapsed().as_nanos()
 }
 

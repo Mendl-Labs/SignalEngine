@@ -581,11 +581,11 @@ fn generate(seed: u64) -> Case {
     let account = AccountView { account_id: format!("acct-{seed}"), ccy: "USD".into(), equity: equity_dec, cash, positions, halted: false, now: now() };
     let mut weights = Vec::new();
     for s in ETFS {
-        let mag = d(*rng.pick(&["0", "0", "0.1", "0.3", "0.5", "0.8"]));
+        let mag = d(rng.pick::<&str>(&["0", "0", "0.1", "0.3", "0.5", "0.8"]));
         weights.push(TargetWeight { symbol: s.to_string(), weight: if rng.chance(45) { neg(mag).unwrap() } else { mag } });
     }
     let targets = vec![SleeveTarget { sleeve: "ls".into(), share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), weights }];
-    let mut cfg = PlanConfig::new(at("2026-10-01T14:00:00Z"), d(*rng.pick(&["1", "0.5"])), d("0"), d("0"), d("0.001")).with_signed_sleeve("ls", d("1"));
+    let mut cfg = PlanConfig::new(at("2026-10-01T14:00:00Z"), d(rng.pick::<&str>(&["1", "0.5"])), d("0"), d("0"), d("0.001")).with_signed_sleeve("ls", d("1"));
     cfg.buying_power = Some(d(HUGE_BP));
     let tight = rng.chance(30);
     let specs = random_specs(&mut rng, tight);
@@ -743,9 +743,9 @@ fn the_long_only_path_ignores_venue_facts_entirely() {
         let equity_dec = d(&equity.to_string());
         let cash = std::cmp::max(sub(equity_dec, invested).unwrap(), Dec::ZERO);
         let account = AccountView { account_id: format!("acct-{seed}"), ccy: "USD".into(), equity: equity_dec, cash, positions, halted: false, now: now() };
-        let weights: Vec<TargetWeight> = ETFS.iter().map(|s| TargetWeight { symbol: s.to_string(), weight: d(*rng.pick(&["0", "0", "0.1", "0.2"])) }).collect();
+        let weights: Vec<TargetWeight> = ETFS.iter().map(|s| TargetWeight { symbol: s.to_string(), weight: d(rng.pick::<&str>(&["0", "0", "0.1", "0.2"])) }).collect();
         let targets = vec![SleeveTarget { sleeve: "etf".into(), share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), weights }];
-        let plain = PlanConfig::new(at("2026-10-01T14:00:00Z"), d(*rng.pick(&["1", "0.5"])), d("5"), d("0.02"), d("0.001"));
+        let plain = PlanConfig::new(at("2026-10-01T14:00:00Z"), d(rng.pick::<&str>(&["1", "0.5"])), d("5"), d("0.02"), d("0.001"));
         let specs = random_specs(&mut rng, true);
         let kraken = KrakenRules { pairs: &env.pairs };
         let alpaca = AlpacaRules { assets: &env.assets, options: &env.opts };

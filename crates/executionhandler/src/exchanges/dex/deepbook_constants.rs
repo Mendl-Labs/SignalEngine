@@ -107,6 +107,10 @@ pub mod lot_sizes {
     pub const SUI_USDC_TICK: u64 = 1000; // 0.000001 USDC
 }
 
+// Compile-time guard: a zero lot size or tick fails the build. (The package-id and
+// function-name constants are string literals, so their non-emptiness is not a runtime check.)
+const _: () = assert!(lot_sizes::SUI_USDC_LOT > 0 && lot_sizes::SUI_USDC_TICK > 0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,30 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn test_package_addresses_non_empty() {
-        assert!(!packages::MAINNET_V2.is_empty());
-        assert!(!packages::TESTNET_V2.is_empty());
-        assert!(!packages::DEVNET_V2.is_empty());
-    }
-
-    #[test]
     fn test_get_deepbook_package() {
         assert_eq!(get_deepbook_package(true, false), packages::MAINNET_V2);
         assert_eq!(get_deepbook_package(false, true), packages::DEVNET_V2);
         assert_eq!(get_deepbook_package(false, false), packages::TESTNET_V2);
     }
 
-    #[test]
-    fn test_function_names_non_empty() {
-        assert!(!functions::PLACE_LIMIT_ORDER.is_empty());
-        assert!(!functions::PLACE_MARKET_ORDER.is_empty());
-        assert!(!functions::CANCEL_ORDER.is_empty());
-        assert!(!functions::CANCEL_ALL_ORDERS.is_empty());
-    }
-
-    #[test]
-    fn test_lot_sizes_positive() {
-        assert!(lot_sizes::SUI_USDC_LOT > 0);
-        assert!(lot_sizes::SUI_USDC_TICK > 0);
-    }
 }

@@ -72,7 +72,11 @@ FROM debian:bookworm-slim AS runtime
 # libraries: libpython3.11.so.1.0: cannot open shared object file`).
 # numpy/pandas need to actually be installed here too (imported by user
 # strategies at runtime), not just linkable at build time.
-RUN apt-get update && apt-get install -y \
+# Apply Debian security fixes published after the base image was built. Trivy on
+# debian:bookworm-slim (2026-10-05) reported CRITICAL perl-base CVE-2026-13221 /
+# CVE-2026-42496 / CVE-2026-8376 with a fixed version (5.36.0-7+deb12u4); the base
+# tag itself still ships u3, so an upgrade is needed to pick them up.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     libc6 \
     net-tools \
     procps \

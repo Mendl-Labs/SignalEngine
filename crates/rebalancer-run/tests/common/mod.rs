@@ -236,12 +236,15 @@ impl Broker for DistortingBroker<'_> {
     }
 }
 
+/// Per-order override for `ScriptedPlaceBroker::place`: `Some(answer)` overrides, `None` passes through.
+pub type PlaceHook<'a> = Box<dyn Fn(&OrderRequest) -> Option<Result<PlaceOutcome, BrokerError>> + 'a>;
+
 /// Wraps a broker and lets a test decide what `place` answers for chosen orders (a market that is closed, an
 /// account that is blocked, a refusal, ...). `hook` returns `Some(answer)` to override, `None` to pass the request
 /// through to the inner broker. Everything else is forwarded, INCLUDING `environment()` (or `forced_environment`).
 pub struct ScriptedPlaceBroker<'a> {
     pub inner: &'a dyn Broker,
-    pub hook: Box<dyn Fn(&OrderRequest) -> Option<Result<PlaceOutcome, BrokerError>> + 'a>,
+    pub hook: PlaceHook<'a>,
     pub forced_environment: Option<rebalancer_run::broker::VenueEnvironment>,
     /// Answer every tag look-up with "no such order" (for a broker whose real look-up needs a transport that the
     /// test does not script).

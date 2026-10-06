@@ -674,6 +674,8 @@ impl SaasCredentialVault {
     /// 4. If probe is INCONCLUSIVE → require user confirmation + flag for review
     /// 
     /// This ensures users cannot lie their way past detected withdrawal permissions.
+    // Public API with one argument per stored-credential field; a params struct would change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_credentials(
         &self,
         user_id: &str,
@@ -940,7 +942,7 @@ impl SaasCredentialVault {
 
         // Decrypt
         let nonces: Vec<&str> = encrypted.nonce.split(':').collect();
-        let key_nonce = nonces.get(0).ok_or_else(|| anyhow!("Invalid nonce format"))?;
+        let key_nonce = nonces.first().ok_or_else(|| anyhow!("Invalid nonce format"))?;
         let secret_nonce = nonces.get(1).ok_or_else(|| anyhow!("Invalid nonce format"))?;
 
         let api_key_bytes = BASE64.decode(&encrypted.encrypted_api_key)?;
@@ -1062,6 +1064,8 @@ pub struct ConnectedExchange {
 // ============================================================================
 
 /// AWS KMS provider implementation
+/// Placeholder KMS provider: `region` is kept for the future aws-sdk client and is not read yet.
+#[allow(dead_code)]
 pub struct AwsKmsProvider {
     // In production: aws_sdk_kms::Client
     region: String,
@@ -1097,7 +1101,7 @@ impl KmsProvider for AwsKmsProvider {
         Ok((ciphertext, key_id, nonce))
     }
 
-    async fn decrypt(&self, user_id: &str, ciphertext: &[u8], key_id: &str, _nonce: &str) -> Result<Vec<u8>> {
+    async fn decrypt(&self, _user_id: &str, ciphertext: &[u8], _key_id: &str, _nonce: &str) -> Result<Vec<u8>> {
         // In production, use aws-sdk-kms:
         // let output = kms_client.decrypt()
         //     .key_id(key_id)
@@ -1125,6 +1129,9 @@ impl KmsProvider for AwsKmsProvider {
 // ============================================================================
 
 /// PostgreSQL credential storage
+/// Placeholder storage: the SQL statements are documented inline and the real pool is not wired yet,
+/// so `connection_string` is stored but not read.
+#[allow(dead_code)]
 pub struct PostgresCredentialStorage {
     // In production: diesel or sqlx pool
     connection_string: String,
@@ -1140,28 +1147,28 @@ impl PostgresCredentialStorage {
 
 #[async_trait::async_trait]
 impl CredentialStorage for PostgresCredentialStorage {
-    async fn store(&self, credential: &EncryptedCredential) -> Result<()> {
+    async fn store(&self, _credential: &EncryptedCredential) -> Result<()> {
         // SQL: INSERT INTO user_credentials (...) ON CONFLICT (user_id, exchange) DO UPDATE
         // Store the EncryptedCredential fields
         Ok(())
     }
 
-    async fn load(&self, user_id: &str, exchange: &str) -> Result<Option<EncryptedCredential>> {
+    async fn load(&self, _user_id: &str, _exchange: &str) -> Result<Option<EncryptedCredential>> {
         // SQL: SELECT * FROM user_credentials WHERE user_id = $1 AND exchange = $2
         Ok(None)
     }
 
-    async fn delete(&self, user_id: &str, exchange: &str) -> Result<()> {
+    async fn delete(&self, _user_id: &str, _exchange: &str) -> Result<()> {
         // SQL: DELETE FROM user_credentials WHERE user_id = $1 AND exchange = $2
         Ok(())
     }
 
-    async fn list_for_user(&self, user_id: &str) -> Result<Vec<EncryptedCredential>> {
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<EncryptedCredential>> {
         // SQL: SELECT * FROM user_credentials WHERE user_id = $1
         Ok(vec![])
     }
 
-    async fn record_audit(&self, event: CredentialAuditEvent) -> Result<()> {
+    async fn record_audit(&self, _event: CredentialAuditEvent) -> Result<()> {
         // SQL: INSERT INTO credential_audit_log (...)
         Ok(())
     }

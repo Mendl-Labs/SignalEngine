@@ -358,8 +358,6 @@ pub struct FairScheduler {
     weights: DashMap<Uuid, u32>,
     /// Current credits per tenant (replenished based on weight)
     credits: DashMap<Uuid, u32>,
-    /// Round-robin index for tie-breaking
-    round_robin_index: AtomicU64,
 }
 
 impl FairScheduler {
@@ -367,7 +365,6 @@ impl FairScheduler {
         Self {
             weights: DashMap::new(),
             credits: DashMap::new(),
-            round_robin_index: AtomicU64::new(0),
         }
     }
 

@@ -94,6 +94,9 @@ impl SignalEngineUltraOrderManager {
     
     /// Process a signal order with ultra-low latency
     #[inline]
+    // Public signal-routing entry point; one argument per routing field. A params struct would
+    // change every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_signal_order(
         &self,
         symbol: &str,
@@ -185,7 +188,7 @@ impl SignalEngineUltraOrderManager {
             quantity: signal.quantity,
             price: Some(signal.price),
             confidence: signal.confidence as f64,
-            timestamp: signal.timestamp_ns as u64,
+            timestamp: signal.timestamp_ns,
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -723,7 +726,7 @@ impl LiveRejector {
         self.registry.remove(&strategy.instance_id);
         self.strategies.remove(&strategy.instance_id);
         strategyloader::reject_live_deployment(
-            &*self.subscriber_map,
+            &self.subscriber_map,
             self.ack.as_ref(),
             self.database_url.as_deref(),
             &strategy.strategy_id.to_string(),
@@ -1095,9 +1098,9 @@ impl HostedObject {
             }
         };
         #[cfg(not(feature = "postgres"))]
-        let paper_fill_tx: Option<()> = None;
+        let _paper_fill_tx: Option<()> = None;
         #[cfg(not(feature = "postgres"))]
-        let deploy_db_pool: Option<()> = None;
+        let _deploy_db_pool: Option<()> = None;
 
         // ======================================================================
         // Bridge: market_data_receiver -> deployed strategies -> signal_tx
@@ -1130,7 +1133,8 @@ impl HostedObject {
                     // deployments (a prior dual-venue partial fill requiring human
                     // intervention -- see cross_venue_coordinator) stop generating
                     // signals entirely, not just stop having them executed.
-                    let matches: Vec<(uuid::Uuid, u16, String, Vec<String>, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>)> = bridge_registry
+                    type BridgeMatch = (uuid::Uuid, u16, String, Vec<String>, Arc<tokio::sync::Mutex<Box<dyn Strategy>>>);
+                    let matches: Vec<BridgeMatch> = bridge_registry
                         .iter()
                         .filter(|e| !cross_venue_coordinator::HALTED_DEPLOYMENTS.contains_key(e.key()))
                         .filter_map(|e| {
@@ -1279,7 +1283,7 @@ impl HostedObject {
                         }
                     }
 
-                    if tick_count % 50 == 0 {
+                    if tick_count.is_multiple_of(50) {
                         ultra_logger::ultra_info!(format!(
                             "🔗 Bridge stats: ticks={} signals_emitted={}",
                             tick_count, signals_emitted
@@ -1333,6 +1337,8 @@ impl HostedObject {
                 return Ok(());
             };
             let signal_paper_registry = paper_registry.clone();
+            // Only the postgres build persists paper fills; the other build has no fill sink.
+            #[cfg(feature = "postgres")]
             let signal_fill_tx = paper_fill_tx.clone();
             tokio::spawn(async move {
                 ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
@@ -1442,7 +1448,7 @@ impl HostedObject {
                             }
                             
                             // Log ultra-fast performance every 100 orders
-                            if signal_count % 100 == 0 {
+                            if signal_count.is_multiple_of(100) {
                                 ultra_logger::ultra_info!(format!("⚡ Phase 2 ultra-fast order {}: {}ns ({:.3}μs) - Success: {}", 
                                       signal_count, 
                                       result.processing_time_ns,
@@ -1451,7 +1457,7 @@ impl HostedObject {
                             }
                             
                             // Log performance metrics every 1000 orders
-                            if signal_count % 1000 == 0 {
+                            if signal_count.is_multiple_of(1000) {
                                 let metrics = ultra_order_manager.get_ultra_performance_metrics();
                                 ultra_logger::ultra_info!(format!("📊 Phase 2 metrics: {} processed, {:.2}μs avg, {:.1}% success, {} orders/sec peak",
                                       metrics.processed_count, 
@@ -2113,7 +2119,8 @@ impl HostedObject {
                             // Find the orderbook by canonical match — DataHandler may
                             // have stored it under a slightly different symbol/exchange
                             // string than the deployment metadata uses.
-                            let maybe_levels: Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> = {
+                            type Levels = (Vec<(f64, f64)>, Vec<(f64, f64)>);
+                            let maybe_levels: Option<Levels> = {
                                 let mut found = None;
                                 for entry in datahandler::ORDERBOOKS.iter() {
                                     let (sym, exch) = entry.key();

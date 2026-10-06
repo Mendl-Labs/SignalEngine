@@ -130,11 +130,12 @@ pub struct DeploymentPythonConfig {
 /// symbol/exchange for a multi-symbol deployment (e.g. hostbuilder's
 /// warm-start fetch and its live-mode credential loading).
 ///
-/// Deliberately NOT gated behind `#[cfg(feature = "postgres")]` -- despite
-/// living alongside DB-querying code in this file, this function is pure
-/// (`serde_json::Value` in, `Option<String>` out) and both its call sites
-/// are themselves already postgres-gated, so it must stay buildable in a
-/// non-postgres build for its own unit tests below.
+/// Gated to postgres or test builds: this function is pure
+/// (`serde_json::Value` in, `Option<String>` out), but both of its non-test
+/// call sites are postgres-gated, so a plain build would otherwise report it as
+/// dead code, which the `-D warnings` gate denies. It stays compiled for the
+/// unit tests below in non-postgres test builds.
+#[cfg(any(feature = "postgres", test))]
 fn resolve_asset_class(params_json: &serde_json::Value) -> Option<String> {
     if let Some(s) = params_json.get("asset_class").and_then(|v| v.as_str()) {
         return Some(s.to_string());

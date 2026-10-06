@@ -191,9 +191,14 @@ impl StrategyManager {
     
     /// Register a signal handler for routing signals to execution
     pub async fn add_signal_handler(&self, handler: Sender<Signal>) {
-        let mut handlers = self.signal_handlers.write();
-        handlers.push(handler);
-        self.logger.info(&format!("Added signal handler (total: {})", handlers.len())).await;
+        // Release the lock before awaiting the logger (holding a sync lock across an await
+        // blocks the executor thread and can deadlock with the routing loop below).
+        let total = {
+            let mut handlers = self.signal_handlers.write();
+            handlers.push(handler);
+            handlers.len()
+        };
+        self.logger.info(&format!("Added signal handler (total: {})", total)).await;
     }
 
     /// Register a paper connector to receive book updates for a specific symbol/exchange pair
@@ -511,19 +516,26 @@ impl StrategyManager {
             // Store signal
             self.signal_store.store(signal.clone());
             
-            // Route to all handlers
-            let handlers = self.signal_handlers.read();
-            for handler in handlers.iter() {
-                if let Err(e) = handler.try_send(signal.clone()) {
-                    self.logger.warn(&format!(
-                        "Failed to route signal {} to handler: {}",
-                        signal.strategy_id, e
-                    )).await;
-                    route_errors += 1;
-                } else {
-                    self.signals_routed.fetch_add(1, Ordering::Relaxed);
-                    routed_count += 1;
+            // Route to all handlers. The read guard is dropped before any await so the
+            // logger calls below never run while a sync lock is held.
+            let mut route_failures: Vec<String> = Vec::new();
+            {
+                let handlers = self.signal_handlers.read();
+                for handler in handlers.iter() {
+                    if let Err(e) = handler.try_send(signal.clone()) {
+                        route_failures.push(format!(
+                            "Failed to route signal {} to handler: {}",
+                            signal.strategy_id, e
+                        ));
+                        route_errors += 1;
+                    } else {
+                        self.signals_routed.fetch_add(1, Ordering::Relaxed);
+                        routed_count += 1;
+                    }
                 }
+            }
+            for msg in route_failures {
+                self.logger.warn(&msg).await;
             }
         }
         
@@ -723,7 +735,7 @@ mod tests {
         let (_, state) = &states[0];
         let asset_state = state.get_asset("BTC/USD", "kraken");
         assert!(asset_state.is_some());
-        assert!(asset_state.unwrap().price_history.len() > 0);
+        assert!(!asset_state.unwrap().price_history.is_empty());
     }
 
     fn test_bar_event(symbol: &str, exchange: &str, close: f64) -> BarEvent {
@@ -755,7 +767,8 @@ mod tests {
         let loader = MockLoader { strategies: vec![] };
         let manager = StrategyManager::new(Arc::new(loader)).await;
 
-        let received: Arc<parking_lot::Mutex<Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)>>> =
+        type BookCapture = Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)>;
+        let received: Arc<parking_lot::Mutex<BookCapture>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let received_clone = received.clone();
         manager.register_paper_book_sink(
