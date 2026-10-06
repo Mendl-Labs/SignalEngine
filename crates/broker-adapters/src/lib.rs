@@ -13,6 +13,7 @@
 pub mod alpaca;
 pub mod decimal;
 pub mod error;
+pub mod key_permissions;
 pub mod kraken;
 pub mod nonce;
 pub mod oanda;

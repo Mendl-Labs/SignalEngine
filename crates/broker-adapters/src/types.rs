@@ -233,4 +233,12 @@ pub trait BrokerAdapter {
     /// Cancel one order. Always follow with `get_order`: the order may have executed part of its
     /// quantity before the cancel took effect.
     fn cancel_order(&self, broker_order_id: &str) -> Result<CancelOutcome, BrokerError>;
+    /// Read-only: what the venue reports about this key's trading and withdrawal permissions.
+    /// The default refuses (fail closed); a venue overrides it only with a real read-only endpoint.
+    fn read_key_permissions(&self) -> Result<crate::key_permissions::KeyPermissions, BrokerError> {
+        Err(BrokerError::Unsupported(format!(
+            "{} has no read-only key-permission endpoint in this adapter",
+            self.broker_name()
+        )))
+    }
 }
