@@ -7,10 +7,12 @@
 //!
 //! Currently implemented: Kraken (see [`kraken`]), Alpaca equities (see [`alpaca`]) and OANDA FX
 //! (see [`oanda`]; offline-verified only, never run against a real OANDA server).
+//! Bitstamp spot (see [`bitstamp`]): offline-verified only, live-only, order placement disabled.
 
 #![forbid(unsafe_code)]
 
 pub mod alpaca;
+pub mod bitstamp;
 pub mod decimal;
 pub mod error;
 pub mod kraken;

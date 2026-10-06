@@ -143,3 +143,25 @@ fn scanner_catches_planted_violations_and_ignores_comments() {
     assert!(scan("VenueEnvironment::Live => \"live\",", LIVE_ALPACA).is_empty(), "the pipeline's own label is not the adapter's live environment");
     assert_eq!(scan("broker_adapters::alpaca::Environment::Live", LIVE_ALPACA).len(), 1, "a path-qualified use IS caught");
 }
+
+/// Bitstamp is not wired into the pilot, which stays Alpaca-only. The pilot path is the service and the pipeline
+/// crate. Neither may name the Bitstamp adapter, its market-data source or its module. Wiring one in is a deliberate
+/// decision that must change this list in the same PR.
+const BITSTAMP: &[&str] = &["Bitstamp", "bitstamp", "BITSTAMP"];
+
+#[test]
+fn the_pilot_path_does_not_reference_bitstamp() {
+    for rel in ["rebalancer-service/src", "rebalancer-run/src"] {
+        let (files, hits) = scan_tree(rel, BITSTAMP);
+        assert!(files >= 3, "the scan saw the sources of {rel} ({files} files)");
+        assert!(hits.is_empty(), "the pilot path must not reference Bitstamp (the pilot stays Alpaca-only):
+{}", hits.join("
+"));
+    }
+}
+
+#[test]
+fn the_bitstamp_scanner_catches_a_planted_reference() {
+    assert!(!scan("let b = broker_adapters::bitstamp::BitstampAdapter::new(c, t, g);", BITSTAMP).is_empty());
+    assert!(!scan("let s = BitstampTickerSource::new(t);", BITSTAMP).is_empty());
+}

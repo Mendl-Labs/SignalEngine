@@ -63,6 +63,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aggs;
+pub mod bitstamp_ticker;
 pub mod alpaca_bars;
 pub mod error;
 pub mod gate;
@@ -76,6 +77,7 @@ pub mod time;
 pub mod url;
 
 pub use alpaca_bars::AlpacaBarsSource;
+pub use bitstamp_ticker::BitstampTickerSource;
 pub use error::{ErrorKind, FailureClass, MassiveError, SleeveError};
 pub use gate::{DataGateMode, Policy, TwoSourceGate, ENV_DATA_GATE_MODE, POLICY_VERSION};
 pub use kraken_ohlc::KrakenOhlcSource;
