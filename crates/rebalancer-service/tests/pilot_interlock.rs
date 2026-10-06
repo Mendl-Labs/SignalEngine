@@ -252,7 +252,7 @@ fn the_validate_only_paper_mode_is_not_a_pilot_mode() {
 
 #[test]
 fn a_non_alpaca_sleeve_or_mandate_venue_or_an_account_without_sleeves_is_refused() {
-    for venue in ["kraken", "oanda", "", "alpaca_live"] {
+    for venue in ["kraken", "oanda", "bitstamp", "", "alpaca_live"] {
         let mut a = account(TENANT, ACCOUNT, ExecutionMode::Assisted);
         a.sleeves = vec![sleeve("alpaca"), sleeve(venue)];
         assert_eq!(err_code(&source(vec![a])), "PILOT_VENUE_NOT_ALLOWED", "sleeve venue {venue:?}");
@@ -263,6 +263,33 @@ fn a_non_alpaca_sleeve_or_mandate_venue_or_an_account_without_sleeves_is_refused
     let mut a = account(TENANT, ACCOUNT, ExecutionMode::Assisted);
     a.sleeves = vec![];
     assert_eq!(err_code(&source(vec![a])), "PILOT_NO_SLEEVES");
+}
+
+fn sleeve_with_class(venue: &str, asset_class: &str) -> SleeveSpec {
+    SleeveSpec { asset_class: asset_class.into(), ..sleeve(venue) }
+}
+
+#[test]
+fn the_pilot_serves_alpaca_crypto_sleeves_and_refuses_other_alpaca_asset_classes() {
+    for class in ["us_etf", "crypto_spot", "CRYPTO_SPOT"] {
+        let mut a = account(TENANT, ACCOUNT, ExecutionMode::Live);
+        a.sleeves = vec![sleeve_with_class("alpaca", class)];
+        assert!(source(vec![a]).active_accounts().is_ok(), "asset class {class:?} must be on the pilot allow-list");
+    }
+    for class in ["us_equity", "crypto", "futures", "fx_spot", ""] {
+        let mut a = account(TENANT, ACCOUNT, ExecutionMode::Live);
+        a.sleeves = vec![sleeve_with_class("alpaca", class)];
+        assert_eq!(err_code(&source(vec![a])), "PILOT_ASSET_CLASS_NOT_ALLOWED", "asset class {class:?}");
+    }
+}
+
+#[test]
+fn the_pilot_refuses_crypto_on_every_non_alpaca_venue() {
+    for venue in ["kraken", "oanda", "bitstamp"] {
+        let mut a = account(TENANT, ACCOUNT, ExecutionMode::Live);
+        a.sleeves = vec![sleeve_with_class(venue, "crypto_spot")];
+        assert_eq!(err_code(&source(vec![a])), "PILOT_VENUE_NOT_ALLOWED", "crypto sleeve on {venue:?}");
+    }
 }
 
 #[test]

@@ -14,7 +14,7 @@ use broker_adapters::testing::FakeTransport;
 use broker_adapters::transport::{HttpResponse, TransportError};
 use broker_adapters::{BalanceEntry, BalanceKind, Balances};
 use common::*;
-use rebalancer_run::broker::{AlpacaBroker, Broker, SnapshotError};
+use rebalancer_run::broker::{alpaca_asset_classes, AlpacaBroker, Broker, SnapshotError};
 use rebalancer_run::view::{alpaca_snapshot, kraken_snapshot, KrakenViewInput, ViewError};
 
 macro_rules! alpaca_fixture {
@@ -174,6 +174,20 @@ fn an_alpaca_short_position_has_a_negative_quantity_and_value() {
     let dbc = s.holding("DBC").unwrap();
     assert_eq!((dbc.quantity, dbc.market_value), (d("-10"), d("-221.00")));
     assert_eq!(s.account_view("a", false, t0()).positions[0].quantity, d("-10"));
+}
+
+#[test]
+fn alpaca_crypto_positions_are_crypto_spot_and_equities_keep_the_equities_class() {
+    let account = parse_account(alpaca_fixture!("account_ok.json")).unwrap();
+    let body = r#"[{"symbol":"BTCUSD","asset_class":"crypto","side":"long","qty":"0.25","avg_entry_price":"60000","market_value":"15000","current_price":"60000"},
+        {"symbol":"SPY","asset_class":"us_equity","side":"long","qty":"3","avg_entry_price":"500","market_value":"1500","current_price":"500"}]"#;
+    let positions = parse_positions(body).unwrap();
+    let classes = alpaca_asset_classes(&positions, "us_etf");
+    let class_of = move |sym: &str| classes.get(sym).cloned().unwrap_or_else(|| "us_etf".to_string());
+    let s = alpaca_snapshot(&account, &positions, vec![], &class_of, t0()).unwrap();
+    assert_eq!(s.holding("BTC/USD").unwrap().asset_class, "crypto_spot");
+    assert_eq!(s.holding("BTC/USD").unwrap().quantity, d("0.25"));
+    assert_eq!(s.holding("SPY").unwrap().asset_class, "us_etf");
 }
 
 #[test]

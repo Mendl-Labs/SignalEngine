@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use broker_adapters::alpaca::AlpacaAdapter;
+use broker_adapters::alpaca::{AlpacaAdapter, PositionInfo};
 use broker_adapters::kraken::KrakenAdapter;
 use broker_adapters::oanda::{OandaAdapter, Pricing};
 use broker_adapters::{
@@ -186,10 +186,27 @@ impl Broker for KrakenBroker<'_> {
 // Alpaca
 // ------------------------------------------------------------------------------------------------------------
 
-/// The Alpaca equities account. Configure the adapter with `own_tag_prefix: Some(OWN_TAG_PREFIX)` so foreign orders
-/// come back with `tag: None`.
+/// The mandate asset-class name of an Alpaca crypto pair (the same name the Kraken crypto sleeves use).
+pub const CRYPTO_ASSET_CLASS: &str = "crypto_spot";
+
+/// The mandate asset class of every position on an Alpaca account: a crypto position (Alpaca `asset_class` `crypto`)
+/// is [`CRYPTO_ASSET_CLASS`]; every other position is `equities_class`. Keyed by the canonical symbol the position
+/// carries, which is what the snapshot looks up.
+pub fn alpaca_asset_classes(positions: &[PositionInfo], equities_class: &str) -> BTreeMap<String, String> {
+    positions
+        .iter()
+        .map(|p| {
+            let class = if p.asset_class.as_deref() == Some("crypto") { CRYPTO_ASSET_CLASS } else { equities_class };
+            (p.symbol.clone(), class.to_string())
+        })
+        .collect()
+}
+
+/// The Alpaca account (equities, and crypto pairs on the paper environment). Configure the adapter with
+/// `own_tag_prefix: Some(OWN_TAG_PREFIX)` so foreign orders come back with `tag: None`.
 pub struct AlpacaBroker<'a> {
     pub adapter: &'a AlpacaAdapter,
+    /// The mandate asset class of the equities positions.
     pub asset_class: String,
 }
 
@@ -217,8 +234,9 @@ impl Broker for AlpacaBroker<'_> {
         let account = self.adapter.get_account()?;
         let positions = self.adapter.get_positions()?;
         let open_orders = self.adapter.open_orders()?;
-        let class = self.asset_class.clone();
-        Ok(alpaca_snapshot(&account, &positions, open_orders, &move |_| class.clone(), now)?)
+        let classes = alpaca_asset_classes(&positions, &self.asset_class);
+        let equities = self.asset_class.clone();
+        Ok(alpaca_snapshot(&account, &positions, open_orders, &move |sym: &str| classes.get(sym).cloned().unwrap_or_else(|| equities.clone()), now)?)
     }
 
     fn place(&self, req: &OrderRequest) -> Result<PlaceOutcome, BrokerError> {
