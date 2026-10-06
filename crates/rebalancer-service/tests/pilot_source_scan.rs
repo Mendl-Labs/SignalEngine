@@ -63,7 +63,22 @@ const LIVE_ALPACA: &[&str] = &["Environment::Live", "LIVE_BASE_URL", "LIVE_HOST"
 #[test]
 fn the_service_source_names_no_live_venue_no_kraken_adapter_and_never_reads_the_master_key() {
     let mut tokens: Vec<&str> = LIVE_ALPACA.to_vec();
-    tokens.extend(["KrakenAdapter", "KrakenBroker", "KrakenConfig", "OandaConfig", "OandaAdapter", "smartorderrouter", "MultiTenantDbProvider", "hostbuilder"]);
+    // Kraken, OANDA and Bitstamp are not pilot venues (the pilot serves Alpaca only, see `pilot::PILOT_VENUE`).
+    tokens.extend([
+        "KrakenAdapter",
+        "KrakenBroker",
+        "KrakenConfig",
+        "OandaConfig",
+        "OandaAdapter",
+        "OandaBroker",
+        "BitstampAdapter",
+        "BitstampBroker",
+        "BitstampConfig",
+        "bitstamp",
+        "smartorderrouter",
+        "MultiTenantDbProvider",
+        "hostbuilder",
+    ]);
     let (files, hits) = scan_tree("rebalancer-service/src", &tokens);
     assert!(files >= 3, "the scan saw the service sources ({files} files)");
     assert!(hits.is_empty(), "the pilot service must not reach a live venue:\n{}", hits.join("\n"));

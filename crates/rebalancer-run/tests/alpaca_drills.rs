@@ -148,7 +148,7 @@ impl Drill {
         self.rig.clock.set_nanos(scheduled_for.timestamp_nanos_opt().unwrap() as u64);
         let sleeves = [etf_sleeve()];
         let assets = AssetTable::builtin();
-        let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false };
+        let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false, allow_crypto: false };
         let rules = AlpacaRules { assets: &assets, options: &opts };
         let book = VenueRuleBook::new().with("alpaca", &rules);
         let mandate = mandate();

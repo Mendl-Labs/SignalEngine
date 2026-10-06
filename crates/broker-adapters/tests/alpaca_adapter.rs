@@ -723,6 +723,77 @@ fn blocked_or_inactive_accounts_are_refused_before_any_order_is_sent() {
     assert_eq!(t.request_count(), 1);
 }
 
+// ---------------------------------------------------------------- crypto pairs: paper only, 24/7
+
+const LIVE_KEY: &str = "AKTESTFIXTUREKEY0002";
+
+fn btc_asset() -> AssetInfo {
+    AssetInfo::parse_json(
+        r#"{"symbol":"BTC/USD","tradable":true,"fractionable":true,"min_order_size":"0","min_trade_increment":"0.0000001","price_increment":"0.01","status":"active"}"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_crypto_market_order_on_paper_is_not_held_to_the_equities_clock() {
+    let (a, t) = setup();
+    a.upsert_asset(btc_asset());
+    t.enqueue_json(200, fixture!("account_ok.json"));
+    // The equities clock says closed (a weekend). An equity market order would stop here with MarketClosed.
+    t.enqueue_json(200, fixture!("clock_closed.json"));
+    t.enqueue_json(200, fixture!("order_accepted_market.json"));
+    let res = a.place_order(&OrderRequest::market(TAG, "BTC/USD", Side::Buy, d("0.5")));
+    assert!(!matches!(res, Err(BrokerError::MarketClosed { .. })), "{res:?}");
+    let reqs = t.requests();
+    assert!(reqs.iter().all(|r| !r.url.contains("/v2/clock")), "crypto must not read the equities clock: {:?}", lines(&t));
+    let posts: Vec<&HttpRequest> = reqs.iter().filter(|r| matches!(r.method, HttpMethod::Post)).collect();
+    assert_eq!(posts.len(), 1, "the order must reach the POST: {:?}", lines(&t));
+    let body = body_json(posts[0]);
+    assert_eq!(body["symbol"], "BTC/USD");
+    assert_eq!(body["time_in_force"], "gtc");
+    assert_eq!(body["qty"], "0.5");
+}
+
+#[test]
+fn a_crypto_pair_is_refused_on_a_live_connection_before_any_request() {
+    let t = Arc::new(FakeTransport::new());
+    let cfg = AlpacaConfig::new(Environment::Live, broker_adapters::alpaca::config::LIVE_BASE_URL).unwrap();
+    let creds = AlpacaCredentials::new(Environment::Live, LIVE_KEY, SECRET).unwrap();
+    let a = AlpacaAdapter::new(cfg, creds, t.clone()).unwrap();
+    a.upsert_asset(btc_asset());
+    let req = OrderRequest::market(TAG, "BTC/USD", Side::Buy, d("0.5"));
+    assert!(matches!(a.place_order(&req), Err(BrokerError::Unsupported(_))));
+    assert!(matches!(a.prepare(&req), Err(BrokerError::Unsupported(_))));
+    assert!(matches!(a.refresh_asset("BTC/USD"), Err(BrokerError::Unsupported(_))));
+    assert!(matches!(a.list_orders(OrderListFilter::Open, 10, &["BTC/USD"]), Err(BrokerError::Unsupported(_))));
+    assert_eq!(t.request_count(), 0, "a live connection must not send a crypto request");
+}
+
+#[test]
+fn crypto_positions_come_back_in_the_order_form_and_equity_positions_are_unchanged() {
+    let (a, t) = setup();
+    t.enqueue_json(
+        200,
+        r#"[{"symbol":"BTCUSD","asset_class":"crypto","side":"long","qty":"0.25","avg_entry_price":"60000","market_value":"15000","current_price":"60000"},
+            {"symbol":"SPY","asset_class":"us_equity","side":"long","qty":"3","avg_entry_price":"500","market_value":"1500","current_price":"500"}]"#,
+    );
+    let pos = a.get_positions().unwrap();
+    assert_eq!(pos[0].symbol, "BTC/USD");
+    assert_eq!(pos[0].asset_class.as_deref(), Some("crypto"));
+    assert_eq!(pos[1].symbol, "SPY");
+    assert_eq!(pos[1].asset_class.as_deref(), Some("us_equity"));
+}
+
+#[test]
+fn a_crypto_position_without_a_usd_quote_is_refused_not_guessed() {
+    let (a, t) = setup();
+    t.enqueue_json(
+        200,
+        r#"[{"symbol":"ETHUSDT","asset_class":"crypto","side":"long","qty":"1","avg_entry_price":"3000","market_value":"3000"}]"#,
+    );
+    assert!(matches!(a.get_positions(), Err(BrokerError::Malformed(_))));
+}
+
 #[test]
 fn a_market_order_while_the_market_is_closed_returns_a_specific_wait_error() {
     let (a, t) = setup();

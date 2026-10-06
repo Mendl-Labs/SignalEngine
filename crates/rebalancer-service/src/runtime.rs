@@ -179,6 +179,7 @@ pub fn connect_paper_alpaca(
         min_notional: cfg.min_notional,
         own_tag_prefix: cfg.own_tag_prefix.clone(),
         refuse_builtin_assets: cfg.refuse_builtin_assets,
+        allow_crypto: adapter.adapter().environment() == broker_adapters::alpaca::Environment::Paper,
     };
     Ok(PilotAlpaca { adapter, assets, options })
 }

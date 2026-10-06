@@ -90,6 +90,7 @@ impl Env {
                 min_notional: d("1"),
                 own_tag_prefix: None,
                 refuse_builtin_assets: false,
+                allow_crypto: false,
             },
         }
     }

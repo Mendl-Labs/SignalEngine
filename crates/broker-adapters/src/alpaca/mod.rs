@@ -199,7 +199,7 @@ impl AlpacaAdapter {
 
     /// `GET /v2/assets/{symbol}`; stores the parsed row (replacing a built-in one) and returns it.
     pub fn refresh_asset(&self, symbol: &str) -> Result<AssetInfo, BrokerError> {
-        let sym = order::normalize_symbol(symbol)?;
+        let sym = self.order_symbol(symbol)?;
         let resp = match self.call(HttpMethod::Get, &format!("{}/{}", paths::ASSETS, enc(&sym)), None) {
             Ok(r) => r,
             Err(CallError::Failure(HttpFailure::NotFound { .. })) => return Err(BrokerError::UnknownSymbol(sym)),
@@ -263,6 +263,26 @@ impl AlpacaAdapter {
         self.config.own_tag_prefix.as_deref()
     }
 
+    /// Crypto pairs are served only on the paper environment. A live connection refuses them here, before any
+    /// request is made.
+    fn allow_crypto(&self) -> bool {
+        self.config.environment == Environment::Paper
+    }
+
+    /// The symbol an order or lookup names: an equity, or a crypto pair when [`Self::allow_crypto`] holds.
+    fn order_symbol(&self, symbol: &str) -> Result<String, BrokerError> {
+        if order::is_crypto_pair(symbol) {
+            if !self.allow_crypto() {
+                return Err(BrokerError::Unsupported(format!(
+                    "{}: crypto pairs are not enabled on this Alpaca connection (paper only)",
+                    symbol.trim()
+                )));
+            }
+            return order::normalize_crypto_pair(symbol);
+        }
+        order::normalize_symbol(symbol)
+    }
+
     // ------------------------------------------------------------ account / positions / clock
 
     pub fn get_account(&self) -> Result<AccountInfo, BrokerError> {
@@ -323,7 +343,7 @@ impl AlpacaAdapter {
 
     /// Pure: validate and round a request into the exact order that would be sent. Sends nothing.
     pub fn prepare(&self, req: &OrderRequest) -> Result<PreparedOrder, BrokerError> {
-        let sym = order::normalize_symbol(&req.symbol)?;
+        let sym = self.order_symbol(&req.symbol)?;
         let asset = self.asset(&sym).ok_or_else(|| BrokerError::UnknownSymbol(sym.clone()))?;
         order::prepare_order(
             req,
@@ -333,6 +353,7 @@ impl AlpacaAdapter {
                 min_notional: self.config.min_notional,
                 own_tag_prefix: self.config.own_tag_prefix.clone(),
                 refuse_builtin_assets: self.config.refuse_builtin_assets,
+                allow_crypto: self.allow_crypto(),
             },
         )
     }
@@ -342,7 +363,9 @@ impl AlpacaAdapter {
         let body = self.call(HttpMethod::Get, paths::ACCOUNT, None).map_err(Self::preflight_error)?.body;
         let acct = parse::parse_account(&body).map_err(|e| BrokerError::Preflight(format!("account response unusable: {e}")))?;
         self.check_account(&acct)?;
-        if prepared.is_market() && !self.config.allow_extended_hours {
+        // The equities market clock governs equities only. Crypto trades 24/7, so a weekend or overnight crypto market
+        // order is not checked against it.
+        if prepared.is_market() && !self.config.allow_extended_hours && !order::is_crypto_pair(&prepared.symbol) {
             let body = self.call(HttpMethod::Get, paths::CLOCK, None).map_err(Self::preflight_error)?.body;
             let clock = parse::parse_clock(&body).map_err(|e| BrokerError::Preflight(format!("clock response unusable: {e}")))?;
             if !clock.is_open {
@@ -359,7 +382,7 @@ impl AlpacaAdapter {
         }
         let mut pq = format!("{}?status={}&limit={limit}&direction=desc&nested=false", paths::ORDERS, filter.as_str());
         if !symbols.is_empty() {
-            let syms: Result<Vec<String>, BrokerError> = symbols.iter().map(|s| order::normalize_symbol(s)).collect();
+            let syms: Result<Vec<String>, BrokerError> = symbols.iter().map(|s| self.order_symbol(s)).collect();
             pq.push_str(&format!("&symbols={}", enc(&syms?.join(","))));
         }
         let orders = parse::parse_orders(&self.read(HttpMethod::Get, &pq)?.body, self.own_prefix())?;

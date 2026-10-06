@@ -14,7 +14,11 @@
 //! * `validate_only`, `reduce_only`, `post_only` are refused as `Unsupported`: Alpaca has no
 //!   validate-only endpoint, and equities have neither reduce-only nor post-only. Silently
 //!   dropping a safety flag is worse than an error.
-//! * Symbols containing `/` (crypto pairs) are refused: this adapter is for equities.
+//! * Symbols containing `/` (crypto pairs, `BTC/USD`) are refused unless [`PrepareOptions::allow_crypto`] is set. The
+//!   adapter sets it only on the PAPER environment: a live connection refuses crypto before any request is made.
+//! * Crypto trades 24/7 and takes no `day` time-in-force, so a crypto order is sent as `gtc` (or `ioc` when asked for),
+//!   may be fractional, is never extended-hours, and is not subject to the equities market-hours check. Those rules
+//!   are FROM-MEMORY-OF-DOCS and UNVERIFIED against Alpaca's crypto endpoint until a paper run.
 
 use crate::alpaca::assets::{AssetInfo, AssetSource};
 use crate::decimal::{Dec, Rounding};
@@ -31,6 +35,8 @@ pub struct PrepareOptions {
     pub min_notional: Dec,
     pub own_tag_prefix: Option<String>,
     pub refuse_builtin_assets: bool,
+    /// Accept crypto pairs (`BTC/USD`). Set only for the paper environment; `false` refuses them as `Unsupported`.
+    pub allow_crypto: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +81,22 @@ pub fn normalize_symbol(symbol: &str) -> Result<String, BrokerError> {
     Ok(up)
 }
 
+/// Is `symbol` a crypto pair (`BASE/QUOTE`)? Equity symbols never contain `/`.
+pub fn is_crypto_pair(symbol: &str) -> bool {
+    symbol.trim().contains('/')
+}
+
+/// Normalise a crypto pair to uppercase `BASE/QUOTE`; each side must be ASCII alphanumeric. Pure: it does not
+/// decide whether crypto is allowed on a connection (that is [`PrepareOptions::allow_crypto`]).
+pub fn normalize_crypto_pair(symbol: &str) -> Result<String, BrokerError> {
+    let up = symbol.trim().to_ascii_uppercase();
+    let part_ok = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric());
+    match up.split_once('/') {
+        Some((base, quote)) if part_ok(base) && part_ok(quote) && !quote.contains('/') => Ok(format!("{base}/{quote}")),
+        _ => Err(BrokerError::InvalidRequest(format!("invalid crypto pair {symbol:?}"))),
+    }
+}
+
 fn validate_tag(tag: &str, opts: &PrepareOptions) -> Result<(), BrokerError> {
     if tag.is_empty() {
         return Err(BrokerError::InvalidRequest("order tag (client_order_id) must not be empty".into()));
@@ -103,7 +125,18 @@ fn map_dec(e: crate::decimal::DecError) -> BrokerError {
 }
 
 pub fn prepare_order(req: &OrderRequest, asset: &AssetInfo, opts: &PrepareOptions) -> Result<PreparedOrder, BrokerError> {
-    let symbol = normalize_symbol(&req.symbol)?;
+    let crypto = is_crypto_pair(&req.symbol);
+    let symbol = if crypto {
+        if !opts.allow_crypto {
+            return Err(BrokerError::Unsupported(format!(
+                "{}: crypto pairs are not enabled on this Alpaca connection (paper only)",
+                req.symbol.trim()
+            )));
+        }
+        normalize_crypto_pair(&req.symbol)?
+    } else {
+        normalize_symbol(&req.symbol)?
+    };
     if symbol != asset.symbol {
         return Err(BrokerError::InvalidRequest(format!("asset row {} does not match order symbol {symbol}", asset.symbol)));
     }
@@ -143,12 +176,16 @@ pub fn prepare_order(req: &OrderRequest, asset: &AssetInfo, opts: &PrepareOption
                 "time_in_force is only configurable on limit orders; market orders are sent as `day`".into(),
             ))
         }
+        (OrderKind::Market, None) if crypto => "gtc",
         (OrderKind::Market, None) => "day",
+        (OrderKind::Limit { .. }, None) if crypto => "gtc",
         (OrderKind::Limit { .. }, None) => "day",
         (OrderKind::Limit { .. }, Some(TimeInForce::Gtc)) => "gtc",
         (OrderKind::Limit { .. }, Some(TimeInForce::Ioc)) => "ioc",
     };
-    if fractional && time_in_force != "day" {
+    // Equities: a fractional share needs `day`. Crypto is fractional by nature and takes gtc/ioc, so the rule is
+    // equities-only.
+    if fractional && !crypto && time_in_force != "day" {
         return Err(BrokerError::InvalidRequest(format!(
             "{symbol}: a fractional quantity ({quantity}) requires time_in_force `day`, not `{time_in_force}`"
         )));

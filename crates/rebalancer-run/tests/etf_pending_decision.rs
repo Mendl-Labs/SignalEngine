@@ -461,7 +461,7 @@ fn with_alpaca<R>(holdings: bool, f: impl FnOnce(&Rig<'_>) -> R) -> R {
     let adapter = AlpacaAdapter::new(cfg, creds, transport.clone()).unwrap();
     let broker = AlpacaBroker::us_etf(&adapter);
     let assets = AssetTable::builtin();
-    let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false };
+    let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false, allow_crypto: false };
     let rules = EtfAndCryptoRules { etf: AlpacaRules { assets: &assets, options: &opts } };
     let book = VenueRuleBook::new().with("alpaca", &rules);
     f(&Rig { broker: &broker, book: &book, transport, down })

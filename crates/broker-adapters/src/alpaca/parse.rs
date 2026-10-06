@@ -131,7 +131,10 @@ pub enum PositionSide {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionInfo {
+    /// Canonical symbol: an equity ticker, or a crypto pair in `BASE/QUOTE` form (see [`canonical_crypto_position_symbol`]).
     pub symbol: String,
+    /// Alpaca's `asset_class` (`us_equity`, `crypto`) when the response carries it.
+    pub asset_class: Option<String>,
     /// Absolute quantity (fractional allowed); the direction is in `side`.
     pub qty: Dec,
     pub side: PositionSide,
@@ -152,6 +155,19 @@ impl PositionInfo {
     }
 }
 
+/// A crypto position is reported as `BTCUSD` while its orders and asset rows use `BTC/USD` (FROM-MEMORY-OF-DOCS,
+/// UNVERIFIED until a paper run). Only the USD quote is recognised; any other form is refused, never guessed, so that a
+/// holding cannot silently fail to match its target.
+pub fn canonical_crypto_position_symbol(sym: &str) -> Result<String, BrokerError> {
+    if sym.contains('/') {
+        return Ok(sym.to_string());
+    }
+    match sym.strip_suffix("USD") {
+        Some(base) if !base.is_empty() && base.bytes().all(|b| b.is_ascii_alphanumeric()) => Ok(format!("{base}/USD")),
+        _ => Err(BrokerError::Malformed(format!("crypto position {sym:?} has no recognised USD quote"))),
+    }
+}
+
 fn parse_position_value(v: &Value) -> Result<PositionInfo, BrokerError> {
     let side = match req_str(v, "side")? {
         "long" => PositionSide::Long,
@@ -162,8 +178,12 @@ fn parse_position_value(v: &Value) -> Result<PositionInfo, BrokerError> {
     if qty.is_negative() {
         return Err(BrokerError::Malformed("position qty is negative (direction belongs in `side`)".into()));
     }
+    let asset_class = opt_str(v, "asset_class").map(|c| c.to_ascii_lowercase());
+    let raw_symbol = req_str(v, "symbol")?.to_ascii_uppercase();
+    let symbol = if asset_class.as_deref() == Some("crypto") { canonical_crypto_position_symbol(&raw_symbol)? } else { raw_symbol };
     Ok(PositionInfo {
-        symbol: req_str(v, "symbol")?.to_ascii_uppercase(),
+        symbol,
+        asset_class,
         qty,
         side,
         avg_entry_price: req_dec(v, "avg_entry_price")?,

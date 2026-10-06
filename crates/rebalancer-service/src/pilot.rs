@@ -46,6 +46,9 @@ pub const ENV_ACCOUNT: &str = "PILOT_ACCOUNT_ID";
 pub const FORBIDDEN_ENV: [&str; 1] = ["CREDENTIALS_ENCRYPTION_KEY"];
 /// The only venue the pilot may serve.
 pub const PILOT_VENUE: &str = "alpaca";
+/// The asset classes a pilot sleeve on [`PILOT_VENUE`] may name: US ETFs, and Alpaca crypto pairs on the paper
+/// environment (`crypto_spot`, the mandate name the Alpaca crypto path reports). Anything else on Alpaca is refused.
+pub const PILOT_ALPACA_ASSET_CLASSES: [&str; 2] = ["us_etf", "crypto_spot"];
 
 /// Why the pilot interlock refused. Every variant has a stable code (`PILOT_...`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +62,7 @@ pub enum PilotRefusal {
     AmbiguousAccount { count: usize },
     ModeNotAllowed { account_id: String, mode: &'static str },
     VenueNotAllowed { what: &'static str, venue: String },
+    AssetClassNotAllowed { asset_class: String },
     NoSleeves { account_id: String },
     NotPaperEnvironment { venue: String, environment: String },
     Adapter(String),
@@ -76,6 +80,7 @@ impl PilotRefusal {
             PilotRefusal::AmbiguousAccount { .. } => "PILOT_ACCOUNT_AMBIGUOUS",
             PilotRefusal::ModeNotAllowed { .. } => "PILOT_MODE_NOT_ALLOWED",
             PilotRefusal::VenueNotAllowed { .. } => "PILOT_VENUE_NOT_ALLOWED",
+            PilotRefusal::AssetClassNotAllowed { .. } => "PILOT_ASSET_CLASS_NOT_ALLOWED",
             PilotRefusal::NoSleeves { .. } => "PILOT_NO_SLEEVES",
             PilotRefusal::NotPaperEnvironment { .. } => "PILOT_NOT_PAPER_ENVIRONMENT",
             PilotRefusal::Adapter(_) => "PILOT_ADAPTER_REFUSED",
@@ -100,6 +105,9 @@ impl std::fmt::Display for PilotRefusal {
                 write!(f, "account {account_id} has execution mode {mode}; the pilot serves only assisted and live-on-paper")
             }
             PilotRefusal::VenueNotAllowed { what, venue } => write!(f, "{what} names venue {venue:?}; the pilot serves only {PILOT_VENUE:?}"),
+            PilotRefusal::AssetClassNotAllowed { asset_class } => {
+                write!(f, "a sleeve on {PILOT_VENUE:?} names asset class {asset_class:?}; the pilot serves only {PILOT_ALPACA_ASSET_CLASSES:?}")
+            }
             PilotRefusal::NoSleeves { account_id } => write!(f, "account {account_id} has no sleeves"),
             PilotRefusal::NotPaperEnvironment { venue, environment } => {
                 write!(f, "venue {venue:?} in environment {environment:?} is not on the pilot allow-list (only \"alpaca\" in \"paper\")")
@@ -207,6 +215,9 @@ impl<S: AccountSource> PilotAccountSource<S> {
         for s in &a.sleeves {
             if !s.venue.trim().eq_ignore_ascii_case(PILOT_VENUE) {
                 return Err(PilotRefusal::VenueNotAllowed { what: "a sleeve", venue: s.venue.clone() });
+            }
+            if !PILOT_ALPACA_ASSET_CLASSES.iter().any(|c| s.asset_class.trim().eq_ignore_ascii_case(c)) {
+                return Err(PilotRefusal::AssetClassNotAllowed { asset_class: s.asset_class.clone() });
             }
         }
         for v in &a.mandate.universe.venues {

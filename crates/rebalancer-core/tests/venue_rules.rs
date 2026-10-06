@@ -318,7 +318,7 @@ impl Env {
         Env {
             pairs: PairTable::builtin(),
             assets: AssetTable::builtin(),
-            opts: alpaca::PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: None, refuse_builtin_assets: false },
+            opts: alpaca::PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: None, refuse_builtin_assets: false, allow_crypto: false },
         }
     }
 

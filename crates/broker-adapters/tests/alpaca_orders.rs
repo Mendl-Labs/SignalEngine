@@ -2,7 +2,7 @@
 //! the asset table and its built-in fallback. Nothing here touches a transport.
 
 use broker_adapters::alpaca::assets::{AssetInfo, AssetSource, AssetTable};
-use broker_adapters::alpaca::order::{normalize_symbol, prepare_order, PrepareOptions};
+use broker_adapters::alpaca::order::{normalize_crypto_pair, normalize_symbol, prepare_order, PrepareOptions};
 use broker_adapters::types::{OrderRequest, Side, TimeInForce};
 use broker_adapters::{BrokerError, Dec};
 
@@ -17,7 +17,7 @@ fn d(s: &str) -> Dec {
 }
 
 fn opts() -> PrepareOptions {
-    PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: None, refuse_builtin_assets: false }
+    PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: None, refuse_builtin_assets: false, allow_crypto: false }
 }
 
 fn spy() -> AssetInfo {
@@ -263,6 +263,67 @@ fn symbols_are_normalised_and_crypto_pairs_are_refused() {
     assert!(matches!(normalize_symbol("BTC/USD"), Err(BrokerError::Unsupported(_))));
     for bad in ["", "S PY", "SPY;DROP", "../etc", "-SPY", "WAYTOOLONGSYMBOL123"] {
         assert!(matches!(normalize_symbol(bad), Err(BrokerError::InvalidRequest(_))), "{bad:?}");
+    }
+}
+
+// ---------------------------------------------------------------- crypto pairs (paper only)
+
+fn btc() -> AssetInfo {
+    AssetInfo::parse_json(
+        r#"{"symbol":"BTC/USD","tradable":true,"fractionable":true,"min_order_size":"0","min_trade_increment":"0.0000001","price_increment":"0.01","status":"active"}"#,
+    )
+    .unwrap()
+}
+
+fn crypto_opts() -> PrepareOptions {
+    PrepareOptions { allow_crypto: true, ..opts() }
+}
+
+#[test]
+fn a_crypto_pair_is_accepted_when_crypto_is_enabled_and_refused_when_it_is_not() {
+    let req = mkt("rb1:run:BTC/USD:buy", " btc/usd ", Side::Buy, "0.12345678912");
+    let p = prepare_order(&req, &btc(), &crypto_opts()).unwrap();
+    assert_eq!(p.symbol, "BTC/USD");
+    assert!(p.fractional);
+    assert!(!p.extended_hours);
+    assert_eq!(p.to_json()["symbol"], "BTC/USD");
+    // The live connection does not enable crypto: refused as Unsupported, whatever the asset row says.
+    assert!(matches!(prepare_order(&req, &btc(), &opts()), Err(BrokerError::Unsupported(_))));
+}
+
+#[test]
+fn crypto_orders_are_gtc_or_ioc_and_never_day() {
+    let limit = |tif: Option<TimeInForce>| {
+        let mut r = OrderRequest::limit("rb1:run:BTC/USD:buy", "BTC/USD", Side::Buy, d("0.5"), d("60000.005"));
+        r.time_in_force = tif;
+        r
+    };
+    assert_eq!(prepare_order(&limit(None), &btc(), &crypto_opts()).unwrap().time_in_force, "gtc");
+    assert_eq!(prepare_order(&limit(Some(TimeInForce::Gtc)), &btc(), &crypto_opts()).unwrap().time_in_force, "gtc");
+    assert_eq!(prepare_order(&limit(Some(TimeInForce::Ioc)), &btc(), &crypto_opts()).unwrap().time_in_force, "ioc");
+    let m = mkt("rb1:run:BTC/USD:buy", "BTC/USD", Side::Buy, "0.5");
+    assert_eq!(prepare_order(&m, &btc(), &crypto_opts()).unwrap().time_in_force, "gtc");
+}
+
+#[test]
+fn equities_are_unchanged_by_crypto_support() {
+    // SPY keeps `day` on market orders even when crypto is enabled, and never gets a crypto symbol.
+    let p = prepare_order(&mkt("rb1:run:SPY:buy", "SPY", Side::Buy, "1.5"), &spy(), &crypto_opts()).unwrap();
+    assert_eq!(p.time_in_force, "day");
+    assert_eq!(p.symbol, "SPY");
+    // A fractional equity with gtc is still refused: that rule is equities-only.
+    let mut r = OrderRequest::limit("rb1:run:SPY:buy", "SPY", Side::Buy, d("1.5"), d("400"));
+    r.time_in_force = Some(TimeInForce::Gtc);
+    assert!(matches!(prepare_order(&r, &spy(), &crypto_opts()), Err(BrokerError::InvalidRequest(_))));
+    // The equities normaliser still refuses a pair.
+    assert!(matches!(normalize_symbol("BTC/USD"), Err(BrokerError::Unsupported(_))));
+}
+
+#[test]
+fn crypto_pair_normalisation_is_strict() {
+    assert_eq!(normalize_crypto_pair(" btc/usd ").unwrap(), "BTC/USD");
+    for bad in ["BTC", "/USD", "BTC/", "BTC/US D", "BTC/USD/X", "BTC;/USD"] {
+        assert!(matches!(normalize_crypto_pair(bad), Err(BrokerError::InvalidRequest(_))), "{bad:?}");
     }
 }
 

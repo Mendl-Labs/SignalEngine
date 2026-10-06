@@ -376,7 +376,7 @@ fn t1_direct_to_paper_orders_journey_entry_then_two_boundaries_tenant_b_never_to
     let exchange_b = fake_broker::alpaca::FakeAlpaca::standard();
     let handle_b = exchange_b.handle();
     let assets = AssetTable::builtin();
-    let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false };
+    let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false, allow_crypto: false };
     let rules = AlpacaRules { assets: &assets, options: &opts };
     let book_a = book(&rules);
     let broker_a = tenant_a.broker();
