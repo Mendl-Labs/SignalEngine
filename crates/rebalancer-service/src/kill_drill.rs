@@ -1042,7 +1042,7 @@ mod tests {
         assert!(check_target(PAPER_BASE_URL, VenueEnvironment::Paper).is_ok());
         assert!(check_target("http://127.0.0.1:9", VenueEnvironment::Paper).is_ok());
         assert!(matches!(
-            check_target("https://api.alpaca.markets", VenueEnvironment::Paper),
+            check_target("https://not-the-paper-host.example.invalid", VenueEnvironment::Paper),
             Err(Refusal::NotPaperUrl(_))
         ));
         assert!(matches!(
