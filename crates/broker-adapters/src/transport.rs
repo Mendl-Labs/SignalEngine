@@ -28,8 +28,8 @@ impl HttpRequest {
 }
 
 /// Header names whose values must never appear in logs.
-const SENSITIVE_HEADERS: [&str; 5] =
-    ["api-key", "api-sign", "authorization", "apca-api-key-id", "apca-api-secret-key"];
+const SENSITIVE_HEADERS: [&str; 7] =
+    ["api-key", "api-sign", "authorization", "apca-api-key-id", "apca-api-secret-key", "x-auth", "x-auth-signature"];
 
 impl fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -1,0 +1,4 @@
+[
+  { "_provenance": "DOCUMENTED SHAPE from https://www.bitstamp.net/api/ (fetched 2026-10-06 via page summary). NOT RECORDED FROM A LIVE SERVER.", "currency": "usd", "total": "100.00", "available": "90.00", "reserved": "10.00" },
+  { "currency": "btc", "total": "0.50000000", "available": "0.50000000", "reserved": "0.00000000" }
+]
