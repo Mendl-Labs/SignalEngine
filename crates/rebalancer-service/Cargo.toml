@@ -4,10 +4,16 @@ description = "The rebalancer's multi-account driver-loop binary (WP4.8): ticks 
 version = "0.0.1"
 edition = "2021"
 publish = false
+# Targets are listed explicitly below (the service and the paper kill drill); nothing is auto-discovered.
+autobins = false
 
 [[bin]]
 name = "rebalancer-service"
 path = "src/main.rs"
+
+[[bin]]
+name = "kill-drill"
+path = "src/bin/kill_drill.rs"
 
 [dependencies]
 # reqwest-transport (slice S-6): the pilot builder is the first thing in this workspace that needs a REAL HTTP
@@ -15,17 +21,18 @@ path = "src/main.rs"
 # tests/pilot_source_scan.rs, which asserts this on purpose and was updated in the same commit that adds it.
 broker-adapters = { path = "../broker-adapters", features = ["reqwest-transport"] }
 market-data = { path = "../market-data" }
+mandate-core = { path = "../mandate-core" }
 rebalancer-alerts = { path = "../rebalancer-alerts" }
 rebalancer-core = { path = "../rebalancer-core" }
+rebalancer-risk = { path = "../rebalancer-risk" }
 rebalancer-run = { path = "../rebalancer-run" }
 rebalancer-store = { path = "../rebalancer-store" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde_json = "1"
 uuid = { version = "1" }
 
 [dev-dependencies]
-mandate-core = { path = "../mandate-core" }
-rebalancer-risk = { path = "../rebalancer-risk" }
-serde_json = "1"
+fake-broker = { path = "../fake-broker" }
 
 # Deliberately NOT tokio at the top level: rebalancer-run's pipeline (and therefore run_all_due) is
 # synchronous end to end ("no async runtime" -- rebalancer-run/src/lib.rs's own module doc); this
