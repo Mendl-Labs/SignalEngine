@@ -249,6 +249,14 @@ impl BrokerAdapter for KrakenAdapter {
         "kraken"
     }
 
+    /// Kraken has no read-only key-permission endpoint in this adapter (Balance and TradeBalance do
+    /// not report what a key may do). Refuses without any request; nothing is guessed.
+    fn read_key_permissions(&self) -> Result<crate::key_permissions::KeyPermissions, BrokerError> {
+        Err(BrokerError::Unsupported(
+            "kraken exposes no read-only key-permission endpoint in this adapter; key permissions cannot be verified".into(),
+        ))
+    }
+
     fn get_balances(&self) -> Result<Balances, BrokerError> {
         let env = self.private_call(paths::BALANCE, &[])?;
         parse::parse_balances(&env)

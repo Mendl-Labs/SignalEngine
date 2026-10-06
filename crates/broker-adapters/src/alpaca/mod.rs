@@ -449,6 +449,17 @@ impl BrokerAdapter for AlpacaAdapter {
         "alpaca"
     }
 
+    /// Read-only `GET /v2/account`. Trading is reported from the account's block flags. Alpaca's
+    /// account object has no key-withdrawal field, so withdrawal is reported as unknown and the
+    /// check refuses. `transfers_blocked` is an account-level flag and is NOT used as evidence.
+    fn read_key_permissions(&self) -> Result<crate::key_permissions::KeyPermissions, BrokerError> {
+        let acct = self.get_account()?;
+        Ok(crate::key_permissions::KeyPermissions {
+            trading_enabled: Some(acct.blocked_reason().is_none()),
+            withdrawal_enabled: None,
+        })
+    }
+
     /// Cash (as `USD`, or the account currency) plus one `Spot` entry per position with its signed
     /// quantity (negative for a short). Two requests: account and positions.
     fn get_balances(&self) -> Result<Balances, BrokerError> {

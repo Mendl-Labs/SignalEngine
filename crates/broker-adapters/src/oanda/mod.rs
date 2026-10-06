@@ -933,6 +933,14 @@ impl BrokerAdapter for OandaAdapter {
 
     /// The account currency (its realised `balance`) plus one `Spot` entry per position with its
     /// NET signed units (negative for a short), named by canonical symbol (`EUR/USD`). Two requests.
+    /// Read-only `GET /v3/accounts/{id}/summary`. The summary carries no trading or withdrawal
+    /// permission field, so both are reported as unknown and the check refuses. The read still
+    /// confirms the token reaches the configured account.
+    fn read_key_permissions(&self) -> Result<crate::key_permissions::KeyPermissions, BrokerError> {
+        self.verify_account()?;
+        Ok(crate::key_permissions::KeyPermissions { trading_enabled: None, withdrawal_enabled: None })
+    }
+
     fn get_balances(&self) -> Result<Balances, BrokerError> {
         let s = self.verify_account()?;
         let positions = self.get_open_positions()?;
