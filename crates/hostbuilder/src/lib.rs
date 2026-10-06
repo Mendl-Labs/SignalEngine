@@ -1337,6 +1337,9 @@ impl HostedObject {
                 return Ok(());
             };
             let signal_paper_registry = paper_registry.clone();
+            // Only the postgres build persists paper fills; the other build has no fill sink.
+            #[cfg(feature = "postgres")]
+            let signal_fill_tx = paper_fill_tx.clone();
             tokio::spawn(async move {
                 ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
                 let mut signal_count = 0u64;
