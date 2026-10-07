@@ -379,7 +379,7 @@ jobs:
           path: SignalEngine
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: 'v3.15.3'
 
@@ -491,7 +491,7 @@ jobs:
           path: SignalEngine
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: 'v3.15.3'
 
