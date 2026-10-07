@@ -47,47 +47,47 @@ jobs:
       tests-passed: ${{ steps.test-result.outputs.passed || steps.skip-test-result.outputs.passed }}
     steps:
       - name: Checkout SignalEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: SignalEngine
 
       - name: Checkout LoggingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: LoggingEngine
 
       - name: Checkout MessageBrokerEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: MessageBrokerEngine
 
       - name: Checkout databaseschema
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: databaseschema
 
       - name: Checkout SimulationEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/SimulationEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: SimulationEngine
 
       - name: Checkout BacktestingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingEngine
 
       - name: Checkout BacktestingCore
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
@@ -229,13 +229,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout SignalEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: SignalEngine
           fetch-depth: 0
 
       - name: Checkout LoggingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -243,7 +243,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout MessageBrokerEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -251,7 +251,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout databaseschema
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -259,7 +259,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout SimulationEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/SimulationEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -267,7 +267,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout BacktestingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -275,7 +275,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout BacktestingCore
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Mendl-Labs/BacktestingCore
           # hostbuilder and strategyhandler use path dependencies on this repo's dataloader and
@@ -374,7 +374,7 @@ jobs:
       RELEASE_NAME: signal-engine
     steps:
       - name: Checkout SignalEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: SignalEngine
 
@@ -486,7 +486,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout SignalEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: SignalEngine
 
