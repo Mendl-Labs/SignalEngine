@@ -43,6 +43,17 @@ fn req_bool(obj: &Value, field: &str) -> Result<bool, BrokerError> {
         .ok_or_else(|| BrokerError::Malformed(format!("missing or non-boolean field `{field}`")))
 }
 
+/// A boolean field some Alpaca accounts omit entirely (seen live: a fresh paper account's
+/// `/v2/account` response had no `pattern_day_trader` key at all, not even `null`). Missing or
+/// `null` falls back to `default`; a field that IS present but not a boolean is still `Malformed`
+/// -- this is a narrower exception to the fail-closed stance above, not a general escape hatch.
+fn opt_bool_or(obj: &Value, field: &str, default: bool) -> Result<bool, BrokerError> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| BrokerError::Malformed(format!("field `{field}` is not a boolean"))),
+    }
+}
+
 fn req_str<'a>(obj: &'a Value, field: &str) -> Result<&'a str, BrokerError> {
     obj.get(field)
         .and_then(Value::as_str)
@@ -115,7 +126,9 @@ pub fn parse_account(body: &str) -> Result<AccountInfo, BrokerError> {
         last_equity: opt_dec(&v, "last_equity")?,
         trading_blocked: req_bool(&v, "trading_blocked")?,
         account_blocked: req_bool(&v, "account_blocked")?,
-        pattern_day_trader: req_bool(&v, "pattern_day_trader")?,
+        // Defaults to false (not a day trader) when Alpaca omits the field, rather than refusing
+        // the account read outright; see opt_bool_or's doc comment.
+        pattern_day_trader: opt_bool_or(&v, "pattern_day_trader", false)?,
         transfers_blocked: v.get("transfers_blocked").and_then(Value::as_bool),
         shorting_enabled: v.get("shorting_enabled").and_then(Value::as_bool),
     })

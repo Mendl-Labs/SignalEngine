@@ -103,6 +103,19 @@ fn pattern_day_trader_is_reported_but_does_not_block() {
     assert!(acct.pattern_day_trader);
 }
 
+/// Seen live on a fresh paper account: Alpaca's `/v2/account` omitted `pattern_day_trader`
+/// entirely, which used to make the whole read Malformed and refuse the kill-drill's preflight
+/// before any order was placed. Missing (or null) now defaults to false, same as a real account
+/// that has never pattern-day-traded; a field that IS present but not a boolean is still an error.
+#[test]
+fn missing_pattern_day_trader_field_defaults_to_false_not_an_error() {
+    let (a, t) = setup();
+    t.enqueue_json(200, fixture!("account_missing_pdt_field.json"));
+    let acct = a.get_account().unwrap();
+    assert!(!acct.pattern_day_trader);
+    assert_eq!(acct.status, "ACTIVE");
+}
+
 #[test]
 fn positions_are_parsed_with_exact_fractional_quantities_and_sides() {
     let (a, t) = setup();

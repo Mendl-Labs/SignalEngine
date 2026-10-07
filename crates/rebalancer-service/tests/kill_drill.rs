@@ -55,6 +55,7 @@ fn run_with(
 ) -> Result<kill_drill::Report, Refusal> {
     let assets = AssetTable::builtin();
     let opts = PrepareOptions {
+        allow_crypto: false,
         allow_extended_hours: false,
         min_notional: d("1"),
         own_tag_prefix: Some("rb1:".to_string()),
@@ -241,6 +242,7 @@ fn a_dry_run_prints_the_plan_and_places_nothing() {
     let dry = parse_args(&["--dry-run", ACK_FLAG]).unwrap();
     let assets = AssetTable::builtin();
     let opts = PrepareOptions {
+        allow_crypto: false,
         allow_extended_hours: false,
         min_notional: d("1"),
         own_tag_prefix: Some("rb1:".to_string()),
