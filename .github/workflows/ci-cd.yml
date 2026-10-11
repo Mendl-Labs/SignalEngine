@@ -364,7 +364,7 @@ jobs:
   # Until then production is a manual, explicitly triggered deploy and QA is not a gate that proves the app works.
   deploy-qa:
     name: Deploy to QA & Smoke Test
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, Linux, X64]
     needs: build
     if: github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
@@ -480,7 +480,7 @@ jobs:
 
   deploy:
     name: Deploy to Kubernetes (Prod)
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, Linux, X64]
     needs: deploy-qa
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
