@@ -401,6 +401,75 @@ impl PositionLimitChecker {
         Ok(())
     }
 
+    /// Check order limits that don't require a reference price: kill switch,
+    /// `max_order_size`, `max_position_size`, and `max_open_positions`.
+    ///
+    /// Used when no reference price can be resolved for an order (no
+    /// signal price, no recorded market tick, no existing position to infer
+    /// one from) -- deliberately skips the three dollar-denominated checks
+    /// (`max_order_value`, `max_position_value`, `max_portfolio_value`)
+    /// that `check_order` runs, rather than computing them against a
+    /// fabricated price. Mirrors `check_order`'s quantity-based logic
+    /// exactly, just without the `order_price`-dependent branches.
+    pub async fn check_order_quantity_only(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        order_quantity: f64,
+        is_buy: bool,
+    ) -> Result<(), PositionLimitError> {
+        // Check kill switch first
+        if KILL_SWITCH.is_triggered() {
+            return Err(PositionLimitError::KillSwitchActive);
+        }
+
+        // Check single order size limit (quantity only -- no price to value it)
+        if order_quantity.abs() > self.limits.max_order_size {
+            return Err(PositionLimitError::OrderSizeTooLarge {
+                requested: order_quantity.abs(),
+                limit: self.limits.max_order_size,
+            });
+        }
+
+        let positions = self.positions.read().await;
+        let key = (symbol.to_string(), exchange.to_string());
+
+        let (current_qty, _current_value) = positions.get(&key).copied().unwrap_or((0.0, 0.0));
+
+        // Calculate new position after order
+        let new_qty = if is_buy {
+            current_qty + order_quantity
+        } else {
+            current_qty - order_quantity
+        };
+
+        // Check position size limit
+        if new_qty.abs() > self.limits.max_position_size {
+            return Err(PositionLimitError::PositionSizeTooLarge {
+                symbol: symbol.to_string(),
+                current: current_qty,
+                requested_change: if is_buy { order_quantity } else { -order_quantity },
+                limit: self.limits.max_position_size,
+            });
+        }
+
+        // Check max open positions
+        let open_count = positions.iter()
+            .filter(|(_, (qty, _))| qty.abs() > f64::EPSILON)
+            .count();
+
+        let would_open_new = current_qty.abs() < f64::EPSILON && new_qty.abs() > f64::EPSILON;
+
+        if would_open_new && open_count >= self.limits.max_open_positions {
+            return Err(PositionLimitError::TooManyPositions {
+                current: open_count,
+                limit: self.limits.max_open_positions,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Update position after a fill
     pub async fn update_position(&self, symbol: &str, exchange: &str, quantity: f64, price: f64) {
         let mut positions = self.positions.write().await;
@@ -788,6 +857,51 @@ pub struct CircuitBreakerStatus {
 }
 
 // ============================================================================
+// PRE-TRADE GATE ENFORCE FLAG
+// ============================================================================
+
+/// Env var that switches the live pre-trade risk gate (`RiskManager::pre_trade_check`,
+/// wired in at `execute_order_on_exchange`) from observing to acting.
+pub const PRE_TRADE_GATE_ENFORCE_ENV: &str = "PRE_TRADE_RISK_GATE_ENFORCE";
+
+/// Whether the pre-trade risk gate actually blocks an order.
+///
+/// Mirrors BacktestingEngine's `deployment_lifecycle_scheduler::LifecycleMode`
+/// two-flag dark-by-default convention exactly.
+///
+/// `DryRun` (the default) runs `pre_trade_check` exactly as `Enforce` would,
+/// logs what it WOULD do on a rejection, and increments a metric -- but
+/// always lets the order through to the connector unchanged. It exists
+/// because this is the first time any live order at this platform has ever
+/// been risk-checked before submission; the dry-run window is where
+/// `PositionLimits`/`CircuitBreakerConfig`'s placeholder defaults get
+/// sanity-checked against real signal volume before they can ever block a
+/// real order.
+///
+/// Only an explicit `true`/`1` (any case) enforces. Unset, empty, or
+/// anything unparseable is `DryRun`, so a typo or a missing env var can only
+/// ever make the gate MORE permissive, never less -- the safer failure mode
+/// for a brand-new safety control with zero production history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreTradeGateMode {
+    DryRun,
+    Enforce,
+}
+
+impl PreTradeGateMode {
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("true") | Some("1") => Self::Enforce,
+            _ => Self::DryRun,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var(PRE_TRADE_GATE_ENFORCE_ENV).ok().as_deref())
+    }
+}
+
+// ============================================================================
 // UNIFIED RISK MANAGER
 // ============================================================================
 
@@ -835,6 +949,46 @@ impl RiskManager {
 
         // 4. Check position limits
         self.position_limits.check_order(symbol, exchange, quantity, price, is_buy).await
+            .map_err(RiskCheckError::PositionLimit)?;
+
+        Ok(())
+    }
+
+    /// Pre-trade check for an order with no resolvable reference price
+    /// (e.g. a market order with no signal price, no recorded market tick,
+    /// and no existing position to infer a price from). Runs the kill
+    /// switch, circuit breaker (including rate limiting), and the
+    /// quantity-only position checks (`max_order_size`, `max_position_size`,
+    /// `max_open_positions`, via `PositionLimitChecker::check_order_quantity_only`)
+    /// -- deliberately skips the three dollar-denominated checks
+    /// (`max_order_value`, `max_position_value`, `max_portfolio_value`)
+    /// rather than inventing a fake price to compute them with. Callers
+    /// should log a warning when taking this path instead of
+    /// `pre_trade_check`.
+    pub async fn pre_trade_check_no_price(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        quantity: f64,
+        is_buy: bool,
+    ) -> Result<(), RiskCheckError> {
+        // 1. Check kill switch
+        if KILL_SWITCH.is_triggered() {
+            return Err(RiskCheckError::KillSwitch(
+                KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual)
+            ));
+        }
+
+        // 2. Check circuit breaker
+        self.circuit_breaker.check_allowed()
+            .map_err(RiskCheckError::CircuitBreaker)?;
+
+        // 3. Record order attempt (rate limiting)
+        self.circuit_breaker.record_order_attempt()
+            .map_err(RiskCheckError::CircuitBreaker)?;
+
+        // 4. Check quantity-only position limits (no price available)
+        self.position_limits.check_order_quantity_only(symbol, exchange, quantity, is_buy).await
             .map_err(RiskCheckError::PositionLimit)?;
 
         Ok(())
@@ -1021,5 +1175,58 @@ mod tests {
         // still be allowed.
         let result = checker.check_order("BBB", "kraken", 100.0, 100.0, false).await;
         assert!(result.is_ok(), "expected hedged pair leg to be allowed, got {:?}", result);
+    }
+
+    #[test]
+    fn pre_trade_gate_mode_defaults_to_dry_run() {
+        assert_eq!(PreTradeGateMode::from_env_value(None), PreTradeGateMode::DryRun);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("")), PreTradeGateMode::DryRun);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("nonsense")), PreTradeGateMode::DryRun);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("false")), PreTradeGateMode::DryRun);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("0")), PreTradeGateMode::DryRun);
+    }
+
+    #[test]
+    fn pre_trade_gate_mode_enforces_only_on_explicit_true_or_one() {
+        assert_eq!(PreTradeGateMode::from_env_value(Some("true")), PreTradeGateMode::Enforce);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("TRUE")), PreTradeGateMode::Enforce);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("True")), PreTradeGateMode::Enforce);
+        assert_eq!(PreTradeGateMode::from_env_value(Some("1")), PreTradeGateMode::Enforce);
+        assert_eq!(PreTradeGateMode::from_env_value(Some(" true ")), PreTradeGateMode::Enforce);
+    }
+
+    #[tokio::test]
+    async fn check_order_quantity_only_skips_dollar_checks_but_enforces_quantity_limits() {
+        let limits = PositionLimits {
+            max_order_size: 1.0,
+            // Deliberately tiny -- if the dollar checks were NOT skipped,
+            // this order (quantity 1.0 at an implied huge notional) would
+            // need a price to even evaluate, let alone pass.
+            max_order_value: 1.0,
+            max_position_value: 1.0,
+            max_portfolio_value: 1.0,
+            max_position_size: 5.0,
+            max_open_positions: 20,
+        };
+        let checker = PositionLimitChecker::new(limits);
+        KILL_SWITCH.reset();
+
+        // Within max_order_size/max_position_size -- should pass even though
+        // the (skipped) dollar limits are absurdly low.
+        assert!(checker.check_order_quantity_only("BTC", "kraken", 1.0, true).await.is_ok());
+
+        // Exceeds max_order_size -- still enforced.
+        assert!(checker.check_order_quantity_only("BTC", "kraken", 2.0, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pre_trade_check_no_price_still_enforces_kill_switch() {
+        let manager = RiskManager::with_defaults();
+        KILL_SWITCH.trigger(KillReason::Manual);
+
+        let result = manager.pre_trade_check_no_price("BTC", "kraken", 0.1, true).await;
+        assert!(matches!(result, Err(RiskCheckError::KillSwitch(_))));
+
+        KILL_SWITCH.reset();
     }
 }
