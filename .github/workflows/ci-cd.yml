@@ -366,7 +366,7 @@ jobs:
     name: Deploy to QA & Smoke Test
     runs-on: [self-hosted, Linux, X64]
     needs: build
-    if: github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
+    if: always() && github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
     env:
       TARGET_NAMESPACE: signalengine-qa
@@ -390,6 +390,30 @@ jobs:
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
+
+      - name: Check Cluster Connectivity
+        shell: bash
+        run: |
+          echo "Verifying Kubernetes connection..."
+          # cluster-info/get nodes need cluster-wide read access the CI
+          # service account deliberately doesn't have (it's scoped to just
+          # the signalengine-qa namespace). Use a get on that one
+          # namespace instead -- NotFound still proves the cluster is
+          # reachable and the token is valid; only a real connection/auth
+          # failure should fail this step.
+          set +e
+          OUTPUT=$(kubectl get namespace "$TARGET_NAMESPACE" --request-timeout=10s 2>&1)
+          STATUS=$?
+          set -e
+          if [ $STATUS -eq 0 ]; then
+            echo "Kubernetes connection verified (namespace exists)"
+          elif echo "$OUTPUT" | grep -q "NotFound"; then
+            echo "Kubernetes connection verified (namespace not yet created)"
+          else
+            echo "$OUTPUT" >&2
+            echo "Kubernetes connection check failed" >&2
+            exit 1
+          fi
 
       - name: Deploy to QA
         run: |
@@ -482,7 +506,7 @@ jobs:
     name: Deploy to Kubernetes (Prod)
     runs-on: [self-hosted, Linux, X64]
     needs: deploy-qa
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout SignalEngine
