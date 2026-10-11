@@ -213,6 +213,14 @@ impl PositionTracker {
         Ok(())
     }
 
+    /// Get the last known market price recorded for a symbol via
+    /// `update_market_price`, if any. Used as a reference-price fallback
+    /// for the pre-trade risk gate (`execute_order_on_exchange`) when a
+    /// signal has no explicit `price` (e.g. a market order).
+    pub fn get_market_price(&self, symbol: &str) -> Option<f64> {
+        self.market_prices.read().ok()?.get(symbol).copied()
+    }
+
     /// Get position for specific symbol and exchange
     pub fn get_position(&self, symbol: &str, exchange: &str) -> Result<Option<Position>, String> {
         let key = (symbol.to_string(), exchange.to_string());
@@ -365,5 +373,17 @@ mod tests {
         assert_eq!(portfolio_pnl.unrealized_pnl, 2000.0); // BTC: 1000, ETH: 1000
         assert_eq!(portfolio_pnl.total_fees, 40.0);
         assert_eq!(portfolio_pnl.position_count, 2);
+    }
+
+    #[test]
+    fn get_market_price_reads_back_what_update_market_price_wrote() {
+        let tracker = PositionTracker::new();
+        assert_eq!(tracker.get_market_price("BTC/USD"), None);
+
+        tracker.update_market_price("BTC/USD", 51000.0).unwrap();
+        assert_eq!(tracker.get_market_price("BTC/USD"), Some(51000.0));
+
+        // A different symbol stays unresolved.
+        assert_eq!(tracker.get_market_price("ETH/USD"), None);
     }
 }

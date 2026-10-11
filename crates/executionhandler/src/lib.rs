@@ -72,10 +72,11 @@ pub use optimizations::{
 
 // Risk management and production safety exports
 pub use risk_controls::{
-    KILL_SWITCH, KillSwitch, KillReason, 
+    KILL_SWITCH, KillSwitch, KillReason,
     PositionLimits, PositionLimitChecker,
     CircuitBreaker as RiskCircuitBreaker, CircuitBreakerConfig,
-    RiskManager,
+    RiskManager, RiskCheckError,
+    PreTradeGateMode, PRE_TRADE_GATE_ENFORCE_ENV,
 };
 pub use reconciliation::{
     ReconciliationEngine, ExchangeReconciliation, ExchangePosition, 
@@ -308,6 +309,14 @@ pub struct UltraLowLatencyExecutionHandler {
     /// Tracks how many executions were dropped due to a full channel.
     execution_log_overflow: Arc<std::sync::atomic::AtomicU64>,
     _logger: Arc<SignalEngineLogger>,
+    /// Platform-wide pre-trade risk gate (Phase 1: dry-run wiring).
+    /// Shared, process-level instance by default -- see `with_risk_manager`
+    /// for overriding it (tests, or future mandate-specific injection).
+    risk_manager: Arc<risk_controls::RiskManager>,
+    /// Whether `risk_manager`'s `pre_trade_check` rejection actually blocks
+    /// an order (`Enforce`) or only logs/counts it (`DryRun`, the default).
+    /// Read once here at construction, not per-order.
+    pre_trade_gate_mode: risk_controls::PreTradeGateMode,
 }
 
 /// Configuration for the background execution writer.
@@ -348,7 +357,18 @@ impl UltraLowLatencyExecutionHandler {
             execution_log_sender: None,
             execution_log_overflow: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             _logger: logger,
+            risk_manager: Arc::new(risk_controls::RiskManager::with_defaults()),
+            pre_trade_gate_mode: risk_controls::PreTradeGateMode::from_env(),
         }
+    }
+
+    /// Override the default platform-wide `RiskManager` (e.g. for tests
+    /// that need a tighter/looser `PositionLimits`, or future
+    /// mandate-specific injection) without touching `new()`'s call sites.
+    /// Consumes and returns `Self` so it chains onto any constructor.
+    pub fn with_risk_manager(mut self, risk_manager: Arc<risk_controls::RiskManager>) -> Self {
+        self.risk_manager = risk_manager;
+        self
     }
 
     /// Create a new execution handler with database integration.
@@ -782,6 +802,29 @@ impl UltraLowLatencyExecutionHandler {
         self.default_exchange = Some(exchange_name);
     }
 
+    /// Resolve a reference price for the pre-trade risk gate's dollar-
+    /// denominated checks, in order: the signal's own price (set for limit
+    /// orders, often `None` for market orders) -> the position tracker's
+    /// last recorded market tick for the symbol -> the symbol's existing
+    /// position's average price on this exchange. Returns `None` if none
+    /// of the three resolve -- callers then fall back to the quantity-only
+    /// risk checks (`RiskManager::pre_trade_check_no_price`) instead of
+    /// guessing a price.
+    fn resolve_reference_price(&self, signal: &Signal, exchange_name: &str) -> Option<f64> {
+        if let Some(price) = signal.price {
+            return Some(price);
+        }
+        if let Some(price) = self.position_tracker.get_market_price(&signal.symbol) {
+            return Some(price);
+        }
+        self.position_tracker
+            .get_position(&signal.symbol, exchange_name)
+            .ok()
+            .flatten()
+            .map(|p| p.average_price)
+            .filter(|price| *price > 0.0)
+    }
+
     /// Execute order on specified exchange
     pub async fn execute_order_on_exchange(&self, signal: &Signal, exchange_name: &str) -> Result<ExecutionResult, ExecutionError> {
         // P0 Safety: Check kill switch before any order execution
@@ -791,7 +834,53 @@ impl UltraLowLatencyExecutionHandler {
                 "Kill switch triggered: {:?}. All trading halted.", reason
             )));
         }
-        
+
+        // P1 live pre-trade risk gate (platform-wide limits; plan "Priority
+        // 1 -- Live pre-trade risk gate", Phase 1). Dark by default
+        // (`risk_controls::PreTradeGateMode::DryRun`): a would-be rejection
+        // is logged and counted, then the order falls through to the
+        // connector exactly as before -- zero behavior change until
+        // `PRE_TRADE_RISK_GATE_ENFORCE=true` is set. A single order's
+        // rejection here is deliberately NOT escalated to `KILL_SWITCH` --
+        // that's reserved for systemic, all-tenant halts.
+        let is_buy = matches!(signal.action, SignalAction::Buy | SignalAction::BuyLimit | SignalAction::BuyStop);
+        let reference_price = self.resolve_reference_price(signal, exchange_name);
+
+        let risk_check = match reference_price {
+            Some(price) => self.risk_manager
+                .pre_trade_check(&signal.symbol, exchange_name, signal.quantity, price, is_buy)
+                .await,
+            None => {
+                log::warn!(
+                    "[pre-trade-risk-gate] no resolvable reference price for order {} ({} qty {} on {}); skipping the 3 dollar-denominated checks (max_order_value/max_position_value/max_portfolio_value), still enforcing kill-switch/circuit-breaker/rate-limit/max_order_size/max_position_size/max_open_positions",
+                    signal.id, signal.symbol, signal.quantity, exchange_name
+                );
+                self.risk_manager
+                    .pre_trade_check_no_price(&signal.symbol, exchange_name, signal.quantity, is_buy)
+                    .await
+            }
+        };
+
+        if let Err(e) = risk_check {
+            prometheus_metrics::inc_orders_rejected();
+            match self.pre_trade_gate_mode {
+                risk_controls::PreTradeGateMode::Enforce => {
+                    log::warn!(
+                        "[pre-trade-risk-gate] ENFORCE: rejecting order {} ({} on {}): {}",
+                        signal.id, signal.symbol, exchange_name, e
+                    );
+                    return Err(ExecutionError::Rejected(format!("Pre-trade risk check failed: {}", e)));
+                }
+                risk_controls::PreTradeGateMode::DryRun => {
+                    log::warn!(
+                        "[pre-trade-risk-gate] DRY-RUN would-reject order {} ({} on {}): {} -- order still placed (dry-run, zero behavior change)",
+                        signal.id, signal.symbol, exchange_name, e
+                    );
+                    // Fall through: proceed exactly as today.
+                }
+            }
+        }
+
         let connectors = self.connectors.read().await;
         let connector = connectors.get(exchange_name)
             .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
@@ -876,12 +965,29 @@ impl UltraLowLatencyExecutionHandler {
                                 0.0 // Realized PnL would be calculated in position tracker
                             );
                         }
+
+                        // Pre-trade risk gate (Phase 1) post-fill wiring:
+                        // mirror this fill into the risk manager's own
+                        // position-limit state so subsequent orders'
+                        // `pre_trade_check` sees accumulated exposure, and
+                        // record the order as a circuit-breaker success.
+                        // Deliberately does NOT call
+                        // `circuit_breaker.update_equity(...)` /
+                        // `RiskManager::post_trade_update`'s equity path --
+                        // live equity/drawdown wiring is explicit future
+                        // work (plan Phase 1b) given a bad equity read's
+                        // platform-wide kill-switch blast radius.
+                        self.risk_manager.position_limits
+                            .update_position(&signal.symbol, exchange_name, fill_quantity, fill.price)
+                            .await;
+                        self.risk_manager.circuit_breaker.record_success();
                     }
                 }
             }
             Err(error) => {
                 self.global_metrics.record_failure();
-                
+                self.risk_manager.circuit_breaker.record_failure();
+
                 // Log error and record monitoring metric
                 let error_msg = format!("{error:?}");
                 TradingLogger::log_error("execution", "order_placement", &error_msg, Some(&signal.symbol));
@@ -1414,10 +1520,317 @@ mod tests {
     fn test_metrics_calculation() {
         let latencies = vec![100.0, 200.0, 300.0, 400.0, 500.0];
         let metrics = optimizations::simd_calculate_percentiles(&latencies);
-        
+
         assert_eq!(metrics.count, 5);
         assert_eq!(metrics.min_ns, 100);
         assert_eq!(metrics.max_ns, 500);
     }
 
+    // ========================================================================
+    // Pre-trade risk gate (Phase 1 dry-run wiring) tests
+    // ========================================================================
+    //
+    // `PaperTradingConnector` has no public call/fill counter, so these use a
+    // small local `CountingConnector` (same shape as `core::traits::tests`'
+    // existing `MockConnector`) instead -- it lets every order through
+    // unconditionally and exposes an `Arc<AtomicU64>` call counter, so
+    // "the connector was never touched" can be asserted directly rather than
+    // inferred. `pre_trade_gate_mode` and `risk_manager` are private fields
+    // set directly here (this test module is a descendant of the crate root,
+    // so it has access) instead of through the `PRE_TRADE_RISK_GATE_ENFORCE`
+    // env var, since env vars are process-global and would race against
+    // other tests running in parallel in the same process.
+    mod pre_trade_risk_gate_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::core::types::*;
+
+        struct CountingConnector {
+            calls: Arc<AtomicU64>,
+            fill_price: f64,
+        }
+
+        #[async_trait::async_trait]
+        impl core::traits::ExchangeConnector for CountingConnector {
+            fn exchange_name(&self) -> &str { "counting" }
+
+            async fn initialize(&mut self, _config: ExchangeConfig) -> Result<(), ExecutionError> { Ok(()) }
+
+            async fn execute_order(&self, signal: &Signal) -> Result<ExecutionResult, ExecutionError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let side = if signal.action == SignalAction::Buy { OrderSide::Buy } else { OrderSide::Sell };
+                Ok(ExecutionResult {
+                    order_id: signal.id.clone(),
+                    exchange_order_id: Some(format!("exch_{}", signal.id)),
+                    exchange: "counting".into(),
+                    status: ExecutionStatus::Filled,
+                    filled_quantity: signal.quantity,
+                    remaining_quantity: 0.0,
+                    avg_fill_price: self.fill_price,
+                    total_fees: 0.0,
+                    fills: vec![ExecutionFill {
+                        fill_id: format!("fill_{}", signal.id),
+                        order_id: signal.id.clone(),
+                        exchange_order_id: format!("exch_{}", signal.id),
+                        symbol: signal.symbol.clone(),
+                        side,
+                        quantity: signal.quantity,
+                        price: self.fill_price,
+                        fee: 0.0,
+                        fee_asset: "USD".into(),
+                        timestamp: now,
+                        trade_id: format!("trade_{}", signal.id),
+                        is_maker: false,
+                        exchange_timestamp_ns: None,
+                        exchange_sequence: None,
+                    }],
+                    reject_reason: None,
+                    submitted_at: now,
+                    updated_at: now,
+                    latency_ns: 0,
+                    exchange_timestamp_ns: None,
+                    exchange_sequence: None,
+                })
+            }
+
+            async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
+                self.execute_batch_orders_sequential(signals).await
+            }
+            async fn cancel_order(&self, _id: &str) -> Result<CancelResult, ExecutionError> { unimplemented!() }
+            async fn cancel_all_orders(&self) -> Result<Vec<CancelResult>, ExecutionError> { unimplemented!() }
+            async fn edit_order(&self, _p: EditOrderParams) -> Result<EditResult, ExecutionError> { unimplemented!() }
+            async fn get_order_status(&self, _id: &str) -> Result<Option<OrderStatus>, ExecutionError> { unimplemented!() }
+            fn get_metrics(&self) -> ExecutionMetrics { unimplemented!() }
+            async fn subscribe_to_updates(&self, _cb: Box<dyn Fn(OrderUpdate) + Send + Sync>) {}
+            async fn health_check(&self) -> Result<HealthStatus, ExecutionError> { unimplemented!() }
+            fn get_limits(&self) -> ExchangeLimits { unimplemented!() }
+            fn validate_order(&self, _s: &Signal) -> Result<(), ExecutionError> { Ok(()) }
+            fn convert_signal(&self, _s: &Signal) -> Result<ExchangeOrder, ExecutionError> { unimplemented!() }
+        }
+
+        fn make_signal(id: &str, symbol: &str, exchange: &str, quantity: f64, price: Option<f64>) -> Signal {
+            Signal {
+                id: id.to_string(),
+                strategy_id: "test-strategy".to_string(),
+                symbol: symbol.to_string(),
+                exchange: exchange.to_string(),
+                action: SignalAction::Buy,
+                quantity,
+                price,
+                confidence: 1.0,
+                timestamp: 0,
+                metadata: std::collections::HashMap::new(),
+            }
+        }
+
+        async fn handler_with_counting_connector(
+            risk_manager: Arc<RiskManager>,
+            mode: PreTradeGateMode,
+        ) -> (UltraLowLatencyExecutionHandler, Arc<AtomicU64>) {
+            let mut handler = UltraLowLatencyExecutionHandler::new().await
+                .with_risk_manager(risk_manager);
+            handler.pre_trade_gate_mode = mode;
+
+            let call_counter = Arc::new(AtomicU64::new(0));
+            let connector = Box::new(CountingConnector {
+                calls: call_counter.clone(),
+                fill_price: 50_000.0,
+            }) as Box<dyn core::traits::ExchangeConnector>;
+            handler.connectors.write().await.insert("counting".to_string(), connector);
+            (handler, call_counter)
+        }
+
+        /// DryRun: an order that violates `PositionLimits::default()`'s
+        /// `max_order_size` (1.0) is still placed -- the connector is still
+        /// called and a fill is still registered -- while the rejection is
+        /// logged and counted. Zero behavior change is the whole point of
+        /// Phase 1.
+        #[tokio::test]
+        async fn dry_run_lets_over_limit_order_through_and_counts_rejection() {
+            KILL_SWITCH.reset();
+            let (handler, call_counter) = handler_with_counting_connector(
+                Arc::new(RiskManager::with_defaults()),
+                PreTradeGateMode::DryRun,
+            ).await;
+
+            let rejected_before = prometheus_metrics::METRICS.get_counter("trading_orders_rejected_total");
+
+            // max_order_size is 1.0 BTC -- 2.0 violates it.
+            let signal = make_signal("dry-run-1", "BTC/USD", "counting", 2.0, Some(50_000.0));
+            let result = handler.execute_order_on_exchange(&signal, "counting").await;
+
+            assert!(result.is_ok(), "dry-run must let the order through, got {:?}", result);
+            assert_eq!(call_counter.load(Ordering::SeqCst), 1, "connector should still be called in dry-run");
+
+            let rejected_after = prometheus_metrics::METRICS.get_counter("trading_orders_rejected_total");
+            assert!(rejected_after > rejected_before, "a would-be rejection should still be counted in dry-run");
+
+            let position = handler.position_tracker.get_position("BTC/USD", "counting").unwrap();
+            assert!(position.is_some(), "the order should have actually filled in dry-run");
+        }
+
+        /// Enforce: the same over-limit order is rejected with
+        /// `ExecutionError::Rejected`, and the connector is never called --
+        /// the gate short-circuits before `execute_order_on_exchange` ever
+        /// reaches the connector lookup.
+        #[tokio::test]
+        async fn enforce_blocks_over_limit_order_with_zero_connector_calls() {
+            KILL_SWITCH.reset();
+            let (handler, call_counter) = handler_with_counting_connector(
+                Arc::new(RiskManager::with_defaults()),
+                PreTradeGateMode::Enforce,
+            ).await;
+
+            let signal = make_signal("enforce-1", "BTC/USD", "counting", 2.0, Some(50_000.0));
+            let result = handler.execute_order_on_exchange(&signal, "counting").await;
+
+            match result {
+                Err(ExecutionError::Rejected(msg)) => {
+                    assert!(msg.contains("Pre-trade risk check failed"), "unexpected message: {msg}");
+                }
+                other => panic!("expected ExecutionError::Rejected, got {:?}", other),
+            }
+            assert_eq!(call_counter.load(Ordering::SeqCst), 0, "connector must never be called when enforced");
+
+            let position = handler.position_tracker.get_position("BTC/USD", "counting").unwrap();
+            assert!(position.is_none(), "a rejected order must not register a fill");
+        }
+
+        /// Regression: the pre-existing kill-switch short-circuit still
+        /// fires before the new pre-trade gate code is ever reached,
+        /// regardless of gate mode, and the connector is never touched.
+        #[tokio::test]
+        async fn kill_switch_precedence_unchanged() {
+            KILL_SWITCH.reset();
+            let (handler, call_counter) = handler_with_counting_connector(
+                Arc::new(RiskManager::with_defaults()),
+                PreTradeGateMode::DryRun,
+            ).await;
+
+            KILL_SWITCH.trigger(KillReason::Manual);
+
+            // A perfectly ordinary, within-limits order.
+            let signal = make_signal("kill-switch-1", "BTC/USD", "counting", 0.1, Some(50_000.0));
+            let result = handler.execute_order_on_exchange(&signal, "counting").await;
+
+            match result {
+                Err(ExecutionError::Rejected(msg)) => {
+                    assert!(msg.contains("Kill switch"), "unexpected message: {msg}");
+                }
+                other => panic!("expected kill-switch Rejected, got {:?}", other),
+            }
+            assert_eq!(call_counter.load(Ordering::SeqCst), 0, "kill switch must short-circuit before the connector");
+
+            KILL_SWITCH.reset();
+        }
+
+        /// Reference-price fallback: with no signal price, no recorded
+        /// market tick, and no existing position, the order still gets its
+        /// quantity-based checks (and kill-switch/rate-limit) enforced --
+        /// only the 3 dollar-denominated checks are skipped. A within-limits
+        /// order with no price still succeeds; an over-`max_order_size`
+        /// order with no price is still caught.
+        #[tokio::test]
+        async fn no_resolvable_price_still_enforces_quantity_checks() {
+            KILL_SWITCH.reset();
+            let (handler, call_counter) = handler_with_counting_connector(
+                Arc::new(RiskManager::with_defaults()),
+                PreTradeGateMode::Enforce,
+            ).await;
+
+            // Within max_order_size (1.0), no price anywhere -- should pass
+            // straight through the quantity-only path.
+            let ok_signal = make_signal("no-price-ok", "ETH/USD", "counting", 0.5, None);
+            let ok_result = handler.execute_order_on_exchange(&ok_signal, "counting").await;
+            assert!(ok_result.is_ok(), "within-limits order with no price should still succeed, got {:?}", ok_result);
+            assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+
+            // Exceeds max_order_size (1.0), still no price anywhere --
+            // quantity check must still catch it even though no dollar
+            // value could be computed.
+            let bad_signal = make_signal("no-price-bad", "ETH/USD", "counting", 2.0, None);
+            let bad_result = handler.execute_order_on_exchange(&bad_signal, "counting").await;
+            match bad_result {
+                Err(ExecutionError::Rejected(msg)) => {
+                    assert!(msg.contains("Pre-trade risk check failed"), "unexpected message: {msg}");
+                }
+                other => panic!("expected ExecutionError::Rejected, got {:?}", other),
+            }
+            // Still 1 -- the second (over-limit) order never reached the connector.
+            assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        }
+
+        /// Position-limit state accumulates across sequential orders: two
+        /// orders that are each individually within `max_position_size`,
+        /// but whose SUM exceeds it, must have the second one caught --
+        /// this exercises the post-fill wiring (`position_limits.update_position`)
+        /// from step 5, not just stateless per-order logic.
+        #[tokio::test]
+        async fn position_limit_accumulates_across_sequential_orders() {
+            KILL_SWITCH.reset();
+            let limits = PositionLimits {
+                max_order_size: 10.0,
+                max_order_value: 1_000_000.0,
+                max_position_size: 1.5, // two 1.0-unit buys sum to 2.0 > 1.5
+                max_position_value: 1_000_000.0,
+                max_portfolio_value: 1_000_000.0,
+                max_open_positions: 20,
+            };
+            let risk_manager = Arc::new(RiskManager::new(limits, CircuitBreakerConfig::default()));
+            let (handler, call_counter) = handler_with_counting_connector(
+                risk_manager,
+                PreTradeGateMode::Enforce,
+            ).await;
+
+            let signal_1 = make_signal("accum-1", "BTC/USD", "counting", 1.0, Some(50_000.0));
+            let result_1 = handler.execute_order_on_exchange(&signal_1, "counting").await;
+            assert!(result_1.is_ok(), "first order alone should be within the limit, got {:?}", result_1);
+            assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+
+            // Individually identical to the first order, but the SUM (2.0)
+            // now exceeds max_position_size (1.5) given the first order's
+            // fill already accumulated into risk_manager.position_limits.
+            let signal_2 = make_signal("accum-2", "BTC/USD", "counting", 1.0, Some(50_000.0));
+            let result_2 = handler.execute_order_on_exchange(&signal_2, "counting").await;
+            match result_2 {
+                Err(ExecutionError::Rejected(msg)) => {
+                    assert!(msg.contains("Pre-trade risk check failed"), "unexpected message: {msg}");
+                }
+                other => panic!("expected the second, sum-violating order to be rejected, got {:?}", other),
+            }
+            // Call count stays at 1 -- the second order never reached the connector.
+            assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        }
+
+        /// Resolver order: signal.price -> position_tracker's last market
+        /// tick -> the symbol's existing position's average_price -> None.
+        #[tokio::test]
+        async fn resolve_reference_price_follows_documented_fallback_order() {
+            let handler = UltraLowLatencyExecutionHandler::new().await;
+
+            // 1. Signal's own price wins outright.
+            let s1 = make_signal("r1", "AAA/USD", "ex", 1.0, Some(123.0));
+            assert_eq!(handler.resolve_reference_price(&s1, "ex"), Some(123.0));
+
+            // 2. No signal price -> falls back to the position tracker's
+            //    last recorded market tick for the symbol.
+            handler.position_tracker.update_market_price("BBB/USD", 456.0).unwrap();
+            let s2 = make_signal("r2", "BBB/USD", "ex", 1.0, None);
+            assert_eq!(handler.resolve_reference_price(&s2, "ex"), Some(456.0));
+
+            // 3. No signal price, no market tick -> falls back to the
+            //    symbol's existing position's average_price on this exchange.
+            handler.position_tracker.update_fill("CCC/USD", "ex", 1.0, 789.0, 0.0).unwrap();
+            let s3 = make_signal("r3", "CCC/USD", "ex", 1.0, None);
+            assert_eq!(handler.resolve_reference_price(&s3, "ex"), Some(789.0));
+
+            // 4. None of the three resolve -> None.
+            let s4 = make_signal("r4", "DDD/USD", "ex", 1.0, None);
+            assert_eq!(handler.resolve_reference_price(&s4, "ex"), None);
+        }
+    }
 }
