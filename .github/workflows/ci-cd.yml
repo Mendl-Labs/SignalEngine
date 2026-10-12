@@ -555,8 +555,12 @@ jobs:
       - name: Check Kubernetes Connection
         run: |
           echo "Verifying Kubernetes connection..."
-          kubectl cluster-info
-          kubectl get nodes
+          # cluster-info/get nodes need cluster-wide read access the CI
+          # service account deliberately doesn't have (it's scoped to just
+          # the signalengine namespace). Use a get on that one namespace
+          # instead -- it existing and being reachable is enough to prove
+          # the connection and credentials are good.
+          kubectl get namespace signalengine --request-timeout=10s
           echo "[OK] Kubernetes connection verified"
 
       - name: Read secrets from the cluster
