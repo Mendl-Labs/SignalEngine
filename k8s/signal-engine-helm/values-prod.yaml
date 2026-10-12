@@ -213,3 +213,12 @@ env:
     value: "UTC"
   - name: CONFIG_PATH
     value: "/etc/signal-engine/signal-engine-config.yaml"
+  # The real connect paths in datahandler and MessageBrokerEngine's
+  # subscriber crate both resolve the broker address straight from these
+  # two env vars (defaulting to localhost:8080 if unset) -- they never read
+  # CONFIG_PATH's message_broker.address field above, which is otherwise
+  # unused dead code. Must match the real in-cluster Service/port exactly.
+  - name: MESSAGE_BROKER_HOST
+    value: "message-broker-engine.messagebroker.svc.cluster.local"
+  - name: MESSAGE_BROKER_PORT
+    value: "8081"

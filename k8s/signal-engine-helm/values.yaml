@@ -293,6 +293,16 @@ env:
     value: "{{ .Values.global.timezone }}"
   - name: OTEL_EXPORTER_OTLP_ENDPOINT
     value: "http://jaeger-collector:14268"
+  # The real connect paths in datahandler and MessageBrokerEngine's
+  # subscriber crate resolve the broker address straight from these two env
+  # vars (defaulting to localhost:8080 if unset), never from a mounted
+  # config file's message_broker.address field. values-prod.yaml overrides
+  # this entire env list with its own copy of these -- kept here too for
+  # dev/self-host parity so this base chart isn't silently broken on its own.
+  - name: MESSAGE_BROKER_HOST
+    value: "message-broker-engine.messagebroker.svc.cluster.local"
+  - name: MESSAGE_BROKER_PORT
+    value: "8081"
 
 # ConfigMap data
 configMap:
