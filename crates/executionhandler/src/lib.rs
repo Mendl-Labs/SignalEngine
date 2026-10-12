@@ -1544,6 +1544,10 @@ mod tests {
         use super::*;
         use std::sync::atomic::{AtomicU64, Ordering};
         use crate::core::types::*;
+        // KILL_SWITCH is a process-wide global static -- these tests must
+        // never run concurrently with each other (or they'll race on it),
+        // but can still run in parallel with every other, unrelated test.
+        use serial_test::serial;
 
         struct CountingConnector {
             calls: Arc<AtomicU64>,
@@ -1650,6 +1654,7 @@ mod tests {
         /// logged and counted. Zero behavior change is the whole point of
         /// Phase 1.
         #[tokio::test]
+        #[serial]
         async fn dry_run_lets_over_limit_order_through_and_counts_rejection() {
             KILL_SWITCH.reset();
             let (handler, call_counter) = handler_with_counting_connector(
@@ -1678,6 +1683,7 @@ mod tests {
         /// the gate short-circuits before `execute_order_on_exchange` ever
         /// reaches the connector lookup.
         #[tokio::test]
+        #[serial]
         async fn enforce_blocks_over_limit_order_with_zero_connector_calls() {
             KILL_SWITCH.reset();
             let (handler, call_counter) = handler_with_counting_connector(
@@ -1704,6 +1710,7 @@ mod tests {
         /// fires before the new pre-trade gate code is ever reached,
         /// regardless of gate mode, and the connector is never touched.
         #[tokio::test]
+        #[serial]
         async fn kill_switch_precedence_unchanged() {
             KILL_SWITCH.reset();
             let (handler, call_counter) = handler_with_counting_connector(
@@ -1735,6 +1742,7 @@ mod tests {
         /// order with no price still succeeds; an over-`max_order_size`
         /// order with no price is still caught.
         #[tokio::test]
+        #[serial]
         async fn no_resolvable_price_still_enforces_quantity_checks() {
             KILL_SWITCH.reset();
             let (handler, call_counter) = handler_with_counting_connector(
@@ -1770,6 +1778,7 @@ mod tests {
         /// this exercises the post-fill wiring (`position_limits.update_position`)
         /// from step 5, not just stateless per-order logic.
         #[tokio::test]
+        #[serial]
         async fn position_limit_accumulates_across_sequential_orders() {
             KILL_SWITCH.reset();
             let limits = PositionLimits {
