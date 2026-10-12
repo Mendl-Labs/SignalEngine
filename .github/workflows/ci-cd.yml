@@ -15,7 +15,7 @@ on:
         type: boolean
         default: false
       deploy_prod:
-        description: 'Deploy to production (manual only; production never deploys automatically)'
+        description: 'Force a manual production deploy on this run (production also deploys automatically on every push to main once deploy-qa passes)'
         type: boolean
         default: false
       enable_live_credentials:
@@ -530,7 +530,10 @@ jobs:
     name: Deploy to Kubernetes (Prod)
     runs-on: [self-hosted, Linux, X64]
     needs: deploy-qa
-    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
+    # Deploys automatically on every push to main once deploy-qa passes --
+    # also still runnable manually via workflow_dispatch with
+    # deploy_prod=true (e.g. to redeploy without a new commit).
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true)) && needs.deploy-qa.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout SignalEngine
