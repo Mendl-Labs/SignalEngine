@@ -426,6 +426,29 @@ jobs:
 
           kubectl create namespace "$TARGET_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
+          echo "[QA] Granting CI service account (ci-system/qa-ci) admin rights in this namespace..."
+          # kubectl apply is idempotent, so reapplying this every run is
+          # cheap and self-healing (e.g. the very first run, when the
+          # namespace/binding don't exist yet at all) -- unlike
+          # BacktestingEngine's equivalent step, this namespace is never torn
+          # down between runs, so this isn't compensating for deletion, just
+          # not assuming the binding is already there.
+          cat <<RBAC | kubectl apply --validate=false -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: qa-ci-admin
+            namespace: $TARGET_NAMESPACE
+          subjects:
+          - kind: ServiceAccount
+            name: qa-ci
+            namespace: ci-system
+          roleRef:
+            kind: ClusterRole
+            name: admin
+            apiGroup: rbac.authorization.k8s.io
+          RBAC
+
           kubectl create secret docker-registry ghcr-secret \
             --docker-server=ghcr.io \
             --docker-username="${{ github.actor }}" \
