@@ -289,6 +289,11 @@ env:
     value: "signal-engine-broker"
   - name: MESSAGE_BROKER_PORT
     value: "8081"
+  # Matches this pod's resources.limits.cpu (1000m, above) -- see
+  # program/src/main.rs's doc comment on why this must track the real CPU
+  # limit rather than defaulting to the host's full core count.
+  - name: TOKIO_WORKER_THREADS
+    value: "1"
 
 podDisruptionBudget:
   enabled: false

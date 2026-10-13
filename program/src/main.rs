@@ -10,8 +10,40 @@ use std::time::Instant;
 #[cfg(test)]
 mod performance_tests;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// `#[tokio::main]`'s worker-thread count is a compile-time constant, but
+/// this process runs under wildly different CPU limits across environments
+/// (QA: 1 CPU, prod: 4 CPU -- see k8s/signal-engine-helm/values-{qa,prod}.yaml).
+/// Tokio's default multi-threaded runtime sizes its worker pool from
+/// `std::thread::available_parallelism()`, which reads the HOST's core
+/// count via `sched_getaffinity`, not the container's cgroup CPU quota --
+/// on a shared multi-core node this spawns far more OS threads than a
+/// 1-CPU-limited pod's CFS bandwidth supports. Under that degree of
+/// oversubscription, once the cgroup exhausts its quota within an
+/// accounting period, the kernel can freeze every thread in it -- including
+/// whichever one would otherwise service Tokio's timer wheel -- which
+/// explains a real, confirmed production symptom: a `tokio::time::timeout`
+/// wrapped around a hung call (SignalEngine's DeploymentSubscriber ->
+/// MessageBrokerEngine publisher handshake) never firing even after its
+/// deadline passed, because the whole runtime was stalled, not just the one
+/// task. Reading the worker count at runtime (env-driven, matching each
+/// environment's actual CPU limit) instead of relying on the host-wide
+/// default fixes this class of bug without needing a different binary per
+/// environment.
+fn main() -> Result<()> {
+    let worker_threads: usize = env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let startup_time = Instant::now();
     
     // Initialize the global logger from environment variables
