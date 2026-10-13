@@ -1037,6 +1037,20 @@ impl std::fmt::Display for RiskCheckError {
     }
 }
 
+impl RiskCheckError {
+    /// Stable, low-cardinality label for the `risk_gate_rejections_total`
+    /// metric -- deliberately coarser than `Display` (which embeds the
+    /// specific trip/limit detail), so it stays a fixed, queryable set of
+    /// values instead of growing a new label per symbol/trip variant.
+    pub fn reason_label(&self) -> &'static str {
+        match self {
+            Self::KillSwitch(_) => "kill_switch",
+            Self::CircuitBreaker(_) => "circuit_breaker",
+            Self::PositionLimit(_) => "position_limit",
+        }
+    }
+}
+
 impl std::error::Error for RiskCheckError {}
 
 #[cfg(test)]
