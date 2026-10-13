@@ -636,12 +636,19 @@ impl DeploymentSubscriber {
 
     /// Start the deployment subscriber
     pub async fn start(&mut self) -> Result<(), DeploymentSubscriberError> {
+        // TEMPORARY step-by-step instrumentation: start() was observed hanging
+        // indefinitely in a real QA run (90s+, no resolution) despite every
+        // individual await on this path being bounded by a timeout per static
+        // analysis. These markers pin down exactly which call never returns
+        // before removing them once the real culprit is confirmed.
+        ultra_info!("🔍 [DeploymentSubscriber] start(): connecting publisher...");
         // Connect publisher for acknowledgments
         let pub_config = PublisherConfig::new(&self.broker_address);
         let publisher = UltraFastPublisher::new(pub_config);
         publisher.connect().await.map_err(|e| {
             DeploymentSubscriberError::ConnectionError(format!("Publisher: {:?}", e))
         })?;
+        ultra_info!("🔍 [DeploymentSubscriber] start(): publisher connected");
         self.publisher = Some(Arc::new(publisher));
 
         // Create subscriber (ID from node_id hash)
@@ -654,18 +661,23 @@ impl DeploymentSubscriber {
         let subscriber = Arc::new(UltraFastSubscriber::new(subscriber_id));
 
         // Subscribe to deployment topics
+        ultra_info!("🔍 [DeploymentSubscriber] start(): subscribing to STRATEGY_DEPLOYMENT...");
         subscriber.subscribe_to_topic(topics::STRATEGY_DEPLOYMENT).await.map_err(|e| {
             DeploymentSubscriberError::SubscriptionError(format!("{:?}", e))
         })?;
+        ultra_info!("🔍 [DeploymentSubscriber] start(): subscribing to STRATEGY_DEACTIVATION...");
         subscriber.subscribe_to_topic(topics::STRATEGY_DEACTIVATION).await.map_err(|e| {
             DeploymentSubscriberError::SubscriptionError(format!("{:?}", e))
         })?;
+        ultra_info!("🔍 [DeploymentSubscriber] start(): subscribing to STRATEGY_STATUS_REQUEST...");
         subscriber.subscribe_to_topic(topics::STRATEGY_STATUS_REQUEST).await.map_err(|e| {
             DeploymentSubscriberError::SubscriptionError(format!("{:?}", e))
         })?;
+        ultra_info!("🔍 [DeploymentSubscriber] start(): all topics subscribed, starting receive loop...");
 
         // Start the subscriber receive loop after all SUBSCRIBE_ACKs are received.
         subscriber.start();
+        ultra_info!("🔍 [DeploymentSubscriber] start(): receive loop started");
 
         self.is_running.store(true, Ordering::SeqCst);
 
