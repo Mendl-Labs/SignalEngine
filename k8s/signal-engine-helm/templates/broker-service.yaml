@@ -1,0 +1,27 @@
+{{/*
+ClusterIP Service for the QA-only hand-rolled message broker. The Deployment
+name must be deterministic for MESSAGE_BROKER_HOST (the chart's env: block
+renders values as literal strings, not through tpl, so values-qa.yaml pins
+fullnameOverride so this Service resolves to the literal name
+"signal-engine-broker").
+*/}}
+{{- if .Values.messageBroker.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-broker
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: message-broker
+spec:
+  type: ClusterIP
+  ports:
+    - name: tcp-broker
+      port: {{ .Values.messageBroker.port | default 8081 }}
+      targetPort: tcp-broker
+      protocol: TCP
+  selector:
+    {{- include "signal-engine-helm.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: message-broker
+{{- end }}

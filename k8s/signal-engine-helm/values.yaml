@@ -251,6 +251,55 @@ podDisruptionBudget:
   # maxUnavailable: 25%
 
 # ==============================================================================
+# Isolated, in-chart message broker (QA only)
+# ==============================================================================
+# Hand-rolled Deployment/Service/ConfigMap for a true per-run isolated
+# MessageBrokerEngine instance (owner-confirmed: not MessageBrokerEngine's own
+# `messagebroker-qa` namespace, to avoid cross-repo pipeline coupling and
+# shared mutable broker state between unrelated CI runs). Disabled by default;
+# values-qa.yaml turns it on. Image tag is resolved at CI time from
+# MessageBrokerEngine's own last-validated QA image (see ci-cd.yml) and passed
+# via --set messageBroker.image.tag.
+messageBroker:
+  enabled: false
+  image:
+    repository: ghcr.io/mendl-labs/messagebroker-engine
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 8081
+  logLevel: "INFO"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+
+# ==============================================================================
+# Isolated, in-cluster PostgreSQL (Bitnami subchart) — QA only
+# ==============================================================================
+# Disabled by default; values-qa.yaml enables it with ephemeral, no-persistence
+# QA credentials. SignalEngine needs its OWN instance, not BacktestingEngine's
+# QA Postgres — the two repos' QA passes are independently triggered with no
+# reliable shared-lifetime window.
+postgresql:
+  enabled: false
+
+externalDatabase:
+  enabled: false
+
+# Diesel migration Helm hook against the bundled subchart Postgres — included
+# for forward-compatibility even though today's QA smoke test doesn't yet
+# exercise DB-writing paths. Disabled by default; values-qa.yaml enables it.
+databaseMigration:
+  enabled: false
+  image:
+    repository: ghcr.io/nwagbara-group-llc/databaseschema
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# ==============================================================================
 # Storage Configuration
 # ==============================================================================
 

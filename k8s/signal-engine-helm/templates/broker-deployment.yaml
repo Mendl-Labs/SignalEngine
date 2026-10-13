@@ -1,0 +1,89 @@
+{{/*
+QA-only, hand-rolled, single-replica MessageBrokerEngine instance — true
+per-run isolation (owner-confirmed: not MessageBrokerEngine's own
+`messagebroker-qa` namespace, to avoid cross-repo pipeline coupling and
+shared mutable broker state between unrelated CI runs). No Postgres
+dependency (the real binary never reads DATABASE_URL/POSTGRES_*). Mirrors
+the hand-rolled-Deployment pattern already proven by
+BacktestingEngine's templates/redis-deployment.yaml (labels, selector
+conventions, resource shape) and the real image's expected config mount
+confirmed against MessageBrokerEngine's own chart
+(k8s/message-broker-engine/templates/deployment.yaml): config.yaml mounted
+at /app/config/config.yaml, TCP wire port 8081 (the same port SignalEngine's
+production deployment already connects to successfully — see
+values-prod.yaml's message_broker.port).
+*/}}
+{{- if .Values.messageBroker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-broker
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: message-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "signal-engine-helm.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: message-broker
+  template:
+    metadata:
+      labels:
+        {{- include "signal-engine-helm.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: message-broker
+      annotations:
+        checksum/broker-config: {{ include (print $.Template.BasePath "/broker-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: message-broker
+          image: "{{ .Values.messageBroker.image.repository }}:{{ .Values.messageBroker.image.tag }}"
+          imagePullPolicy: {{ .Values.messageBroker.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: tcp-broker
+              containerPort: {{ .Values.messageBroker.port | default 8081 }}
+              protocol: TCP
+          env:
+            - name: BROKER_PORT
+              value: {{ .Values.messageBroker.port | default 8081 | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.messageBroker.logLevel | default "INFO" | quote }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pgrep -x server || exit 1
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pgrep -x server || exit 1
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.messageBroker.resources | nindent 12 }}
+          volumeMounts:
+            - name: broker-config
+              mountPath: /app/config/config.yaml
+              subPath: config.yaml
+              readOnly: true
+      volumes:
+        - name: broker-config
+          configMap:
+            name: {{ include "signal-engine-helm.fullname" . }}-broker-config
+{{- end }}

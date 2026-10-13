@@ -29,3 +29,10 @@ keywords:
   - signal-engine
   - ultra-low-latency
   - fintech
+
+dependencies:
+  - name: postgresql
+    version: 18.5.17
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+    alias: postgresql

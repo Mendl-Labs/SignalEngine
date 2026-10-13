@@ -1,0 +1,140 @@
+{{/*
+Database migration job — runs `diesel migration run` against the configured
+database. Cloned from BacktestingEngine's equivalent
+(deployment/k8s/backtesting-engine-helm/templates/db-migration-job.yaml),
+adjusted for SignalEngine's naming and dependency on only the OSS-core
+`databaseschema` crate (unlike BacktestingEngine, SignalEngine never depends
+on the private `databaseschema-internal` crate — confirmed via Cargo.toml —
+so this runs a single `diesel migration run`, not two ordered ones).
+
+Executes as a Helm post-install / post-upgrade hook (weight 0), matching
+BacktestingEngine's convention: the bundled Postgres subchart and the
+signalengine-db-secret (created by CI before `helm upgrade --install`) must
+already exist, which post-install/post-upgrade guarantees. The wait-for-
+postgres init container handles the brief window before the postgres pod
+accepts TCP connections; the main container then retries pg_isready before
+ever invoking diesel (bare TCP reachability during Postgres's own startup/
+recovery window is not the same as being ready for real SQL connections).
+
+Included now for forward-compatibility even though today's QA smoke test
+doesn't yet exercise DB-writing paths. Disable via
+`databaseMigration.enabled=false`.
+*/}}
+{{- if .Values.databaseMigration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-db-migrate
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-migrate
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: {{ .Values.databaseMigration.ttlSecondsAfterFinished | default 300 }}
+  backoffLimit: {{ .Values.databaseMigration.backoffLimit | default 3 }}
+  activeDeadlineSeconds: {{ .Values.databaseMigration.activeDeadlineSeconds | default 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "signal-engine-helm.labels" . | nindent 8 }}
+        app.kubernetes.io/component: db-migrate
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for postgres at ${DB_HOST}:${DB_PORT}..."
+              for i in $(seq 1 180); do
+                if nc -z "${DB_HOST}" "${DB_PORT}" 2>/dev/null; then
+                  echo "Postgres is reachable"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "Timed out waiting for postgres" >&2
+              exit 1
+          env:
+            - name: DB_HOST
+              value: {{ .Values.databaseMigration.dbHost | default (printf "%s-postgresql" (include "signal-engine-helm.fullname" .)) | quote }}
+            - name: DB_PORT
+              value: {{ .Values.databaseMigration.dbPort | default 5432 | quote }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.databaseMigration.image.repository }}:{{ .Values.databaseMigration.image.tag }}"
+          imagePullPolicy: {{ .Values.databaseMigration.image.pullPolicy | default "IfNotPresent" }}
+          # The generic databaseschema image (unlike BacktestingEngine's custom
+          # combined-schema migration image) bundles its migrations directly at
+          # /app (its own Dockerfile's WORKDIR), so the default CMD
+          # `diesel migration run` would already work as-is -- this override
+          # only adds the same proven pg_isready retry BacktestingEngine's job
+          # uses (the wait-for-postgres init container above only checks bare
+          # TCP reachability, which Postgres accepts WHILE STILL starting up /
+          # performing recovery, rejecting real SQL connections with "FATAL:
+          # the database system is starting up" during that window).
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "Waiting for postgres to accept real connections (not just TCP)..."
+              ready=0
+              for i in $(seq 1 60); do
+                if pg_isready -d "$DATABASE_URL" -t 5 >/dev/null 2>&1; then
+                  echo "Postgres is ready for connections"
+                  ready=1
+                  break
+                fi
+                echo "Postgres not ready yet (attempt $i/60) -- retrying in 3s..."
+                sleep 3
+              done
+              if [ "$ready" -ne 1 ]; then
+                echo "Timed out waiting for postgres to become ready for real connections" >&2
+                exit 1
+              fi
+              diesel migration run
+          env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: host
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: port
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: password
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: signalengine-db-secret
+                  key: database
+            - name: DATABASE_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)"
+            - name: PGSSLMODE
+              value: {{ .Values.databaseMigration.pgsslmode | default "prefer" | quote }}
+          resources:
+            {{- toYaml (.Values.databaseMigration.resources | default dict) | nindent 12 }}
+{{- end }}

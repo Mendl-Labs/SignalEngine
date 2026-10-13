@@ -130,6 +130,18 @@ class SignalEngineE2E {
         throw new Error('Critical error pattern detected in SignalEngine logs');
       }
 
+      // A failed broker connection is a graceful WARN
+      // ("DeploymentSubscriber failed to start: ... — paper trading
+      // unavailable"), not a panic/FATAL — the check above alone would NOT
+      // have caught it. QA now runs the real binary against a real (if
+      // isolated) broker, so require it actually connected.
+      if (logs.includes('DeploymentSubscriber failed to start')) {
+        throw new Error('DeploymentSubscriber failed to start — broker connection failed');
+      }
+      if (!logs.includes('DeploymentSubscriber started on')) {
+        throw new Error('DeploymentSubscriber never reported a successful start — no confirmed broker connection');
+      }
+
       this.addResult(testName, 'pass', Date.now() - startTime, {
         bytesScanned: logs.length
       });

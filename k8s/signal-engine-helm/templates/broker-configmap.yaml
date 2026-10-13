@@ -1,0 +1,40 @@
+{{/*
+QA-only, hand-rolled MessageBrokerEngine config — NOT the MessageBrokerEngine
+Helm chart's own ConfigMap. Owner-confirmed: QA uses a true per-run, in-chart
+broker instance (not MessageBrokerEngine's own `messagebroker-qa` namespace),
+so there is zero cross-repo pipeline coupling and no shared mutable broker
+state between unrelated CI runs. Mirrors the real image's expected mount
+(ConfigMap data key `config.yaml`, mounted at /app/config/config.yaml via
+broker-deployment.yaml) and env-driven settings (BROKER_PORT, LOG_LEVEL),
+confirmed against MessageBrokerEngine's own chart
+(k8s/message-broker-engine/templates/configmap.yaml).
+*/}}
+{{- if .Values.messageBroker.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "signal-engine-helm.fullname" . }}-broker-config
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "signal-engine-helm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: message-broker
+data:
+  config.yaml: |
+    broker:
+      port: {{ .Values.messageBroker.port | default 8081 }}
+      max_connections: 100
+      buffer_size: 8192
+      timeout_seconds: 30
+
+    performance:
+      thread_pool_size: 2
+      message_queue_size: 1000
+      cache_size: 100
+      enable_metrics: true
+
+    logging:
+      level: {{ .Values.messageBroker.logLevel | default "INFO" | quote }}
+      format: json
+      enable_file_logging: false
+      log_directory: /var/log/message-broker
+{{- end }}

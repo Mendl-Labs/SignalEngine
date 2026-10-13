@@ -1,6 +1,20 @@
 # =============================================================================
 # SignalEngine QA Environment Configuration
-# Production-like topology with reduced resources for testing
+# Ephemeral, isolated QA: real binary + bundled Postgres (Bitnami subchart) +
+# a hand-rolled isolated message broker, all destroyed every CI run.
+#
+# Until this file, `Deploy to QA & Smoke Test` deployed the chart's default
+# placeholder (echo+sleep) container against no real dependencies, so the
+# pipeline's only pre-production gate never actually exercised real
+# SignalEngine code. This file now clears that placeholder, points the real
+# binary at an isolated-per-run Postgres + message broker, and enables real
+# exec probes against the actual process.
+#
+# No MASSIVE_API_KEY or CREDENTIALS_ENCRYPTION_KEY here (owner-confirmed):
+# the real binary already degrades gracefully without either (optional env
+# vars, graceful skip paths — see deployment.yaml's `optional: true`
+# secretKeyRefs), and an ephemeral QA namespace is a more exposed surface
+# than this key's policy-mandated vendor-data-stage-only usage allows.
 # =============================================================================
 
 global:
@@ -11,6 +25,26 @@ replicaCount: 1
 image:
   pullPolicy: Always
 
+# Clear the chart's default placeholder command/args (templates/deployment.yaml
+# only renders `command`/`args` blocks when non-empty — confirmed via
+# `{{- if .Values.command }}` / `{{- if .Values.args }}`) so the container
+# falls through to the image's own Dockerfile CMD/ENTRYPOINT (the real
+# SignalEngine binary), exactly like values-prod.yaml already does.
+command: []
+args: []
+
+imagePullSecrets:
+  - name: ghcr-secret
+
+# Deterministic resource naming so the broker Service name
+# (signal-engine-broker) is known at authoring time — the chart's env: block
+# renders values as literal strings, not through tpl, so MESSAGE_BROKER_HOST
+# below must already be this literal name. Does NOT change the
+# app.kubernetes.io/name selector label (that comes from nameOverride, not
+# fullnameOverride — confirmed in _helpers.tpl), so qa-e2e's existing
+# APP_LABEL selector is unaffected.
+fullnameOverride: "signal-engine"
+
 resources:
   limits:
     cpu: "1000m"
@@ -20,4 +54,241 @@ resources:
     memory: "512Mi"
 
 autoscaling:
+  enabled: false
+
+# The default 443/53-only egress lockdown (templates/networkpolicy.yaml)
+# would block the new in-namespace broker/Postgres pods — mirrors
+# values-prod.yaml already disabling this.
+networkPolicy:
+  enabled: false
+
+# =============================================================================
+# Real exec probes against the actual process (not the busybox-era
+# `pgrep -f "sleep 30"` placeholder check) — matches values-prod.yaml's
+# proven shape.
+# =============================================================================
+
+startupProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+  successThreshold: 1
+
+livenessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  exec:
+    command:
+      - /bin/sh
+      - -c
+      - pgrep signal-engine
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# =============================================================================
+# Isolated, in-chart message broker (owner-confirmed approach: hand-rolled,
+# not MessageBrokerEngine's own `messagebroker-qa` namespace). Image tag is
+# resolved at CI time from MessageBrokerEngine's own last-validated QA image
+# and passed via --set messageBroker.image.tag.
+# =============================================================================
+
+messageBroker:
+  enabled: true
+  port: 8081
+  logLevel: "INFO"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+
+# =============================================================================
+# In-cluster PostgreSQL (Bitnami) — ephemeral, no persistence. SignalEngine
+# needs its OWN instance, not BacktestingEngine's QA Postgres (the two
+# repos' QA passes are independently triggered with no reliable
+# shared-lifetime window).
+# =============================================================================
+
+postgresql:
+  enabled: true
+  auth:
+    username: "signalengine"
+    password: "qa-signalengine-pass"
+    database: "signalengine_qa"
+  primary:
+    persistence:
+      enabled: false
+    # Mirrors BacktestingEngine's values-qa.yaml fix for the same cold-start
+    # race: a startup probe holds off liveness/readiness until postgres has
+    # actually finished first-time init, with a 10-minute budget.
+    startupProbe:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 60
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+
+externalDatabase:
+  enabled: false
+
+# Run SignalEngine's diesel migrations (OSS `databaseschema` crate only — no
+# `databaseschema-internal` dependency) as a Helm post-install/post-upgrade
+# hook against the in-cluster Bitnami postgres. Included now for
+# forward-compatibility even though today's smoke test doesn't yet exercise
+# DB-writing paths.
+databaseMigration:
+  enabled: true
+  image:
+    repository: ghcr.io/nwagbara-group-llc/databaseschema
+    tag: latest
+    # `latest` is mutable — force a pull so QA always picks up the newest
+    # migrations, mirroring BacktestingEngine's rationale.
+    pullPolicy: Always
+  dbHost: signal-engine-postgresql
+  pgsslmode: disable
+  activeDeadlineSeconds: 1800
+
+# =============================================================================
+# Application Configuration — real, minimal signal-engine-config.yaml.
+# crates/config/src/lib.rs's Config::new() hard-fails if this file is
+# missing or doesn't deserialize into every field of the Config struct (no
+# #[serde(default)] anywhere), so every top-level key below is required, not
+# optional. message_broker.address/port here are placeholders immediately
+# overridden by MESSAGE_BROKER_HOST/MESSAGE_BROKER_PORT below
+# (apply_environment_overrides(), crates/config/src/lib.rs:173-178, runs
+# before validate()) — kept as the real resolved values anyway so the file
+# is self-consistent even if the env override were ever removed.
+# =============================================================================
+
+configMap:
+  enabled: true
+  data:
+    signal-engine-config.yaml: |
+      environment: Testing
+      message_broker:
+        address: "signal-engine-broker"
+        port: 8081
+        max_connections: 50
+        buffer_size: 4096
+        compression_enabled: true
+        batch_size: 50
+        flush_interval:
+          secs: 0
+          nanos: 100000000
+      publish_topics:
+        - "signals.buy"
+        - "signals.sell"
+        - "signals.market_making"
+        - "orders.execution"
+      subscribe_topics:
+        - "market.kraken.btcusd"
+        - "market.kraken.ethusd"
+        - "market.data.feed"
+        - "portfolio.updates"
+        - "wallet.balances"
+      topic_routing:
+        signals: "signals.trading"
+        orders: "orders.execution"
+        fills: "executions.fills"
+        positions: "portfolio.positions"
+      strategies: []
+      exchanges: []
+      performance:
+        worker_threads: 2
+        cpu_affinity_enabled: false
+        cpu_cores: []
+        memory_limit_mb: 512
+        latency_threshold_us: 100
+        metrics_enabled: true
+        metrics_interval:
+          secs: 1
+          nanos: 0
+        simd_enabled: true
+      security:
+        api_key_required: false
+        request_signing_required: false
+        rate_limiting_enabled: true
+        max_requests_per_minute: 1000
+        blocked_ips: []
+        allowed_ips: []
+        encryption_enabled: false
+      monitoring:
+        health_check_enabled: true
+        health_check_interval:
+          secs: 30
+          nanos: 0
+        metrics_retention_days: 1
+        alerting_enabled: false
+        alert_thresholds:
+          latency_us: 5000.0
+          error_rate_percent: 5.0
+          cpu_usage_percent: 80.0
+          memory_usage_percent: 85.0
+          connection_failures: 10
+        prometheus_enabled: true
+        prometheus_port: 9090
+      logging:
+        level: "info"
+        format: "json"
+        output: ["stdout"]
+        file_path: null
+        max_file_size_mb: 50
+        max_files: 3
+        structured_logging: true
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+# MESSAGE_BROKER_HOST/PORT override the ConfigMap's message_broker fields
+# before validation (crates/config/src/lib.rs:173-178). "signal-engine-broker"
+# is the literal Service name produced by fullnameOverride: "signal-engine"
+# above + the broker-service.yaml template's "-broker" suffix.
+# No MASSIVE_API_KEY / CREDENTIALS_ENCRYPTION_KEY (owner-confirmed, see
+# header).
+
+env:
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: RUST_LOG
+    value: "signal_engine=debug"
+  - name: ENVIRONMENT
+    value: "qa"
+  - name: TZ
+    value: "UTC"
+  - name: CONFIG_PATH
+    value: "/etc/signal-engine/signal-engine-config.yaml"
+  - name: MESSAGE_BROKER_HOST
+    value: "signal-engine-broker"
+  - name: MESSAGE_BROKER_PORT
+    value: "8081"
+
+podDisruptionBudget:
   enabled: false
