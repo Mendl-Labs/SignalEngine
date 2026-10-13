@@ -643,11 +643,30 @@ impl DeploymentSubscriber {
         // before removing them once the real culprit is confirmed.
         ultra_info!("🔍 [DeploymentSubscriber] start(): connecting publisher...");
         // Connect publisher for acknowledgments
+        //
+        // Defense in depth: publisher.connect() is already supposed to be
+        // internally bounded (3 attempts x 10s timeout + backoff, ~30s worst
+        // case per MessageBrokerEngine's publisher crate) -- but a real QA run
+        // showed it never returning at all even after 90+ seconds, meaning
+        // something inside it is not resolving the way its source reads. This
+        // outer timeout guarantees start() always returns within a bounded
+        // time regardless of that internal behavior, so a stuck broker
+        // handshake becomes a loud, fast, logged failure instead of a silent
+        // permanent hang. The true internal cause is still unexplained and
+        // should be investigated separately -- this is a safety net, not a
+        // root-cause fix.
         let pub_config = PublisherConfig::new(&self.broker_address);
         let publisher = UltraFastPublisher::new(pub_config);
-        publisher.connect().await.map_err(|e| {
-            DeploymentSubscriberError::ConnectionError(format!("Publisher: {:?}", e))
-        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(35), publisher.connect())
+            .await
+            .map_err(|_| {
+                DeploymentSubscriberError::ConnectionError(
+                    "Publisher: connect() did not return within 35s (internal retry logic \
+                     appears to hang beyond its own stated bounds)"
+                        .to_string(),
+                )
+            })?
+            .map_err(|e| DeploymentSubscriberError::ConnectionError(format!("Publisher: {:?}", e)))?;
         ultra_info!("🔍 [DeploymentSubscriber] start(): publisher connected");
         self.publisher = Some(Arc::new(publisher));
 
