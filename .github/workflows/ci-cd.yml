@@ -358,16 +358,20 @@ jobs:
           echo "Pull: docker pull ${{ env.IMAGE_NAME }}:$SHORT_SHA"
           echo "=========================================="
 
-  # NOTE: QA deploys with the chart's default placeholder command (values-qa.yaml does not clear it), so its
-  # smoke test exercises a placeholder container, not the SignalEngine binary. Making QA meaningful needs an
-  # isolated message broker and database (a QA pod on the production ones could act on real deployments).
-  # Until then production is a manual, explicitly triggered deploy and QA is not a gate that proves the app works.
+  # QA deploys the real SignalEngine binary against an isolated, ephemeral copy of the
+  # stack: a bundled Postgres (Bitnami subchart) and a hand-rolled, in-chart message broker
+  # (NOT MessageBrokerEngine's own messagebroker-qa namespace -- true per-run isolation, no
+  # cross-repo pipeline coupling), both destroyed every run. The smoke test below asserts the
+  # DeploymentSubscriber actually connects to that broker, not just "no crash."
   deploy-qa:
     name: Deploy to QA & Smoke Test
     runs-on: [self-hosted, Linux, X64]
     needs: build
     if: always() && github.ref == 'refs/heads/main' && needs.build.result == 'success' && vars.KUBERNETES_ENABLED == 'true'
-    timeout-minutes: 20
+    # Bundled Postgres cold-start (up to a 10-minute startup-probe budget) + the
+    # db-migrate hook's own waits can legitimately take longer than the old
+    # placeholder deploy ever did.
+    timeout-minutes: 30
     env:
       TARGET_NAMESPACE: signalengine-qa
       VALUES_FILE: values-qa.yaml
@@ -416,6 +420,28 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve Message Broker Image Tag
+        id: broker-tag
+        run: |
+          set +e
+          # Reads MessageBrokerEngine's own last-validated QA image tag -- a string
+          # lookup only, no runtime dependency on that pod being healthy right now.
+          TAG=$(kubectl get deployment message-broker-engine -n messagebroker-qa \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' --request-timeout=10s 2>/dev/null \
+            | awk -F: '{print $NF}')
+          set -e
+          if [ -z "$TAG" ]; then
+            echo "[WARN] Could not resolve MessageBrokerEngine's QA image tag; falling back"
+            TAG="${{ vars.MESSAGE_BROKER_ENGINE_QA_TAG }}"
+          fi
+          if [ -z "$TAG" ]; then
+            # MessageBrokerEngine's own chart default (k8s/message-broker-engine/values.yaml)
+            # when neither the live lookup nor the repo variable resolves anything.
+            TAG="1.0.0"
+          fi
+          echo "[INFO] Resolved MessageBrokerEngine image tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to QA
         run: |
           set -euo pipefail
@@ -427,12 +453,12 @@ jobs:
           kubectl create namespace "$TARGET_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
           echo "[QA] Granting CI service account (ci-system/qa-ci) admin rights in this namespace..."
-          # kubectl apply is idempotent, so reapplying this every run is
-          # cheap and self-healing (e.g. the very first run, when the
-          # namespace/binding don't exist yet at all) -- unlike
-          # BacktestingEngine's equivalent step, this namespace is never torn
-          # down between runs, so this isn't compensating for deletion, just
-          # not assuming the binding is already there.
+          # kubectl apply is idempotent, so reapplying this every run is cheap and
+          # self-healing. The namespace is now torn down at the end of every run (see
+          # "Teardown QA Environment" below), which also wipes this RoleBinding, so
+          # recreating it here every time is required, not just defensive -- same as
+          # BacktestingEngine's equivalent step. It also still covers the first-ever
+          # run, when the namespace/binding don't exist at all yet.
           cat <<RBAC | kubectl apply --validate=false -f -
           apiVersion: rbac.authorization.k8s.io/v1
           kind: RoleBinding
@@ -462,6 +488,31 @@ jobs:
             sleep 5
           fi
 
+          echo "[QA] Creating isolated Postgres secret for the bundled subchart..."
+          # Credentials come from values-qa.yaml's postgresql.auth.* via yq -- single
+          # source of truth, not duplicated as a second hardcoded literal here. The
+          # deployment template (templates/deployment.yaml) already expects this exact
+          # secret name/keys (it's how production's real Postgres is wired too).
+          YQ_BIN="yq"
+          if ! command -v yq >/dev/null 2>&1; then
+            curl -sL "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64" -o "${RUNNER_TEMP:-/tmp}/yq"
+            chmod +x "${RUNNER_TEMP:-/tmp}/yq"
+            YQ_BIN="${RUNNER_TEMP:-/tmp}/yq"
+          fi
+          PG_USER=$("$YQ_BIN" e '.postgresql.auth.username' "./${{ env.HELM_CHART_PATH }}/$VALUES_FILE")
+          PG_PASSWORD=$("$YQ_BIN" e '.postgresql.auth.password' "./${{ env.HELM_CHART_PATH }}/$VALUES_FILE")
+          PG_DATABASE=$("$YQ_BIN" e '.postgresql.auth.database' "./${{ env.HELM_CHART_PATH }}/$VALUES_FILE")
+          echo "::add-mask::$PG_PASSWORD"
+
+          kubectl create secret generic signalengine-db-secret \
+            --from-literal=host="${RELEASE_NAME}-postgresql" \
+            --from-literal=port="5432" \
+            --from-literal=username="$PG_USER" \
+            --from-literal=password="$PG_PASSWORD" \
+            --from-literal=database="$PG_DATABASE" \
+            --namespace="$TARGET_NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
           helm upgrade --install "$RELEASE_NAME" ./${{ env.HELM_CHART_PATH }} \
             --namespace "$TARGET_NAMESPACE" \
             --create-namespace \
@@ -470,15 +521,20 @@ jobs:
             --set "image.tag=$IMAGE_TAG" \
             --set "image.pullPolicy=IfNotPresent" \
             --set "imagePullSecrets[0].name=ghcr-secret" \
-            --timeout 5m
+            --set "messageBroker.image.tag=${{ steps.broker-tag.outputs.tag }}" \
+            --timeout 15m
           echo "[OK] QA deploy complete"
 
       - name: Smoke Test (QA)
         run: |
           set -euo pipefail
           echo "[SMOKE] Waiting for QA pods to become ready..."
-          kubectl rollout status deployment -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --timeout=4m || \
-            kubectl rollout status deployment -n "$TARGET_NAMESPACE" --timeout=4m
+          # Target each Deployment by its own component label -- the namespace
+          # now has TWO Deployments (the app and the isolated broker) sharing the
+          # same app.kubernetes.io/name, so a bare "-l app.kubernetes.io/name=..."
+          # selector (or no selector at all) is ambiguous for `rollout status`.
+          kubectl rollout status deployment -n "$TARGET_NAMESPACE" -l app.kubernetes.io/component=signal-engine --timeout=4m
+          kubectl rollout status deployment -n "$TARGET_NAMESPACE" -l app.kubernetes.io/component=message-broker --timeout=4m
           kubectl get pods -n "$TARGET_NAMESPACE" -o wide
           NOT_READY=$(kubectl get pods -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' | grep -c false || true)
           if [ "$NOT_READY" -gt 0 ]; then
@@ -490,6 +546,19 @@ jobs:
           LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers 2>&1 || true)
           if echo "$LOGS" | grep -qiE 'panic|FATAL'; then
             echo "[FAIL] Critical error pattern detected in QA logs"
+            echo "$LOGS" | tail -50
+            exit 1
+          fi
+          # A failed broker connection is a graceful WARN, not a panic/FATAL -- the
+          # check above alone would NOT have caught it. Now that QA runs the real
+          # binary against a real (if isolated) broker, require it actually connected.
+          if echo "$LOGS" | grep -q "DeploymentSubscriber failed to start"; then
+            echo "[FAIL] DeploymentSubscriber failed to start -- broker connection failed"
+            echo "$LOGS" | tail -50
+            exit 1
+          fi
+          if ! echo "$LOGS" | grep -q "DeploymentSubscriber started on"; then
+            echo "[FAIL] DeploymentSubscriber never reported a successful start -- no confirmed broker connection"
             echo "$LOGS" | tail -50
             exit 1
           fi
@@ -525,6 +594,14 @@ jobs:
           kubectl get events -n "$TARGET_NAMESPACE" --sort-by='.lastTimestamp' | tail -50
           echo "=== App Pod Logs ==="
           kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers || true
+
+      - name: Teardown QA Environment
+        if: always()
+        run: |
+          echo "[INFO] Tearing down QA environment..."
+          helm uninstall "$RELEASE_NAME" -n "$TARGET_NAMESPACE" --wait --timeout 2m 2>/dev/null || true
+          kubectl delete namespace "$TARGET_NAMESPACE" --ignore-not-found --timeout=60s 2>/dev/null || true
+          echo "[OK] QA environment cleaned up"
 
   deploy:
     name: Deploy to Kubernetes (Prod)
