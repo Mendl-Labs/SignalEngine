@@ -546,7 +546,12 @@ jobs:
             kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=80 --all-containers || true
             exit 1
           fi
-          LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers 2>&1 || true)
+          # Target the app pod specifically (not the shared name=signal-engine-helm
+          # selector, which also matches the broker Deployment -- the broker's own
+          # high-volume startup/perf-test logging can fill a combined --tail=200
+          # snapshot and crowd out the app pod's lines entirely; confirmed live,
+          # this is not hypothetical).
+          LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/component=signal-engine --tail=200 --all-containers 2>&1 || true)
           if echo "$LOGS" | grep -qiE 'panic|FATAL'; then
             echo "[FAIL] Critical error pattern detected in QA logs"
             echo "$LOGS" | tail -50
@@ -562,7 +567,7 @@ jobs:
           # for the result instead of inspecting a single immediate log snapshot.
           DEPLOYMENT_SUBSCRIBER_RESULT=""
           for i in $(seq 1 15); do
-            LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers 2>&1 || true)
+            LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/component=signal-engine --tail=200 --all-containers 2>&1 || true)
             if echo "$LOGS" | grep -q "DeploymentSubscriber failed to start"; then
               DEPLOYMENT_SUBSCRIBER_RESULT="failed"
               break
