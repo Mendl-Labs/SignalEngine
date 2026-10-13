@@ -263,7 +263,7 @@ podDisruptionBudget:
 messageBroker:
   enabled: false
   image:
-    repository: ghcr.io/mendl-labs/messagebroker-engine
+    repository: ghcr.io/nwagbara-group-llc/messagebroker-engine
     tag: "latest"
     pullPolicy: IfNotPresent
   port: 8081

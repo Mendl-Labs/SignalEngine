@@ -435,9 +435,12 @@ jobs:
             TAG="${{ vars.MESSAGE_BROKER_ENGINE_QA_TAG }}"
           fi
           if [ -z "$TAG" ]; then
-            # MessageBrokerEngine's own chart default (k8s/message-broker-engine/values.yaml)
-            # when neither the live lookup nor the repo variable resolves anything.
-            TAG="1.0.0"
+            # Matches prod's actual running broker image tag (verified live via
+            # `kubectl get deployment -n messagebroker`) when neither the live
+            # QA-namespace lookup nor the repo variable resolves anything. The
+            # package only ever publishes `latest` + short-SHA tags -- there is
+            # no "1.0.0" tag, so that prior fallback 404'd every time.
+            TAG="latest"
           fi
           echo "[INFO] Resolved MessageBrokerEngine image tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
