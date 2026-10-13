@@ -565,8 +565,18 @@ jobs:
           # logs a beat or two after `rollout status` reports the pod Ready (which
           # only checks the readiness probe, a bare `pgrep signal-engine`), so poll
           # for the result instead of inspecting a single immediate log snapshot.
+          # Bounded to comfortably exceed the real worst-case chain: no init
+          # container enforces broker-before-app startup ordering here, so a
+          # pod-scheduling race can delay the app's first connect attempt past
+          # the broker's own ~500ms startup; from there, publisher.connect()'s
+          # own retry logic (10s timeout x 3 attempts, MessageBrokerEngine
+          # publisher crate) plus the three now-timeout-bounded
+          # subscribe_to_topic calls (5s each) can legitimately take up to ~75s
+          # in the genuine worst case before DeploymentSubscriber::start()
+          # returns at all -- a fixed 30s poll window was observed live to cut
+          # this off before either outcome ever logged.
           DEPLOYMENT_SUBSCRIBER_RESULT=""
-          for i in $(seq 1 15); do
+          for i in $(seq 1 45); do
             LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/component=signal-engine --tail=200 --all-containers 2>&1 || true)
             if echo "$LOGS" | grep -q "DeploymentSubscriber failed to start"; then
               DEPLOYMENT_SUBSCRIBER_RESULT="failed"
