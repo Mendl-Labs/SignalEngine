@@ -865,6 +865,7 @@ impl UltraLowLatencyExecutionHandler {
             prometheus_metrics::inc_orders_rejected();
             match self.pre_trade_gate_mode {
                 risk_controls::PreTradeGateMode::Enforce => {
+                    prometheus_metrics::inc_risk_gate_rejection("enforce", e.reason_label());
                     log::warn!(
                         "[pre-trade-risk-gate] ENFORCE: rejecting order {} ({} on {}): {}",
                         signal.id, signal.symbol, exchange_name, e
@@ -872,6 +873,7 @@ impl UltraLowLatencyExecutionHandler {
                     return Err(ExecutionError::Rejected(format!("Pre-trade risk check failed: {}", e)));
                 }
                 risk_controls::PreTradeGateMode::DryRun => {
+                    prometheus_metrics::inc_risk_gate_rejection("dry_run", e.reason_label());
                     log::warn!(
                         "[pre-trade-risk-gate] DRY-RUN would-reject order {} ({} on {}): {} -- order still placed (dry-run, zero behavior change)",
                         signal.id, signal.symbol, exchange_name, e

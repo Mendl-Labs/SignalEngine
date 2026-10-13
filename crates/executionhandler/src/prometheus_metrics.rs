@@ -95,6 +95,13 @@ impl MetricsRegistry {
         self.register_labeled_counter("exchange_fills_total");
         self.register_labeled_counter("exchange_errors_total");
 
+        // Pre-trade risk gate rejections, labeled "<mode>:<reason>" (e.g.
+        // "dry_run:circuit_breaker") so the staging soak period can be
+        // queried instead of grepped from logs -- distinguishes a dry-run
+        // would-reject from an actual enforced rejection, and breaks down by
+        // which check tripped.
+        self.register_labeled_counter("risk_gate_rejections_total");
+
         // Labeled gauges for per-symbol metrics
         self.register_labeled_gauge("symbol_position_quantity");
         self.register_labeled_gauge("symbol_position_value_usd");
@@ -457,6 +464,15 @@ pub fn set_position_count(count: u64) {
 
 pub fn set_total_position_value_usd(value: f64) {
     METRICS.set_gauge_f64("risk_total_position_value_usd", value);
+}
+
+/// `mode` is "dry_run" or "enforce"; `reason` is "kill_switch",
+/// "circuit_breaker", or "position_limit" (see
+/// `risk_controls::RiskCheckError`). Combined into one label (the metrics
+/// registry here only supports a single label dimension per counter, same
+/// as every other labeled counter in this module).
+pub fn inc_risk_gate_rejection(mode: &str, reason: &str) {
+    METRICS.inc_labeled_counter("risk_gate_rejections_total", &format!("{mode}:{reason}"));
 }
 
 pub fn inc_exchange_orders(exchange: &str) {
