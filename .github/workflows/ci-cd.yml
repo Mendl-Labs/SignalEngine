@@ -555,12 +555,30 @@ jobs:
           # A failed broker connection is a graceful WARN, not a panic/FATAL -- the
           # check above alone would NOT have caught it. Now that QA runs the real
           # binary against a real (if isolated) broker, require it actually connected.
-          if echo "$LOGS" | grep -q "DeploymentSubscriber failed to start"; then
+          # DeploymentSubscriber::start() (crates/strategyloader) does a real TCP
+          # connect + subscribe handshake as a background async task -- it reliably
+          # logs a beat or two after `rollout status` reports the pod Ready (which
+          # only checks the readiness probe, a bare `pgrep signal-engine`), so poll
+          # for the result instead of inspecting a single immediate log snapshot.
+          DEPLOYMENT_SUBSCRIBER_RESULT=""
+          for i in $(seq 1 15); do
+            LOGS=$(kubectl logs -n "$TARGET_NAMESPACE" -l app.kubernetes.io/name=signal-engine-helm --tail=200 --all-containers 2>&1 || true)
+            if echo "$LOGS" | grep -q "DeploymentSubscriber failed to start"; then
+              DEPLOYMENT_SUBSCRIBER_RESULT="failed"
+              break
+            fi
+            if echo "$LOGS" | grep -q "DeploymentSubscriber started on"; then
+              DEPLOYMENT_SUBSCRIBER_RESULT="started"
+              break
+            fi
+            sleep 2
+          done
+          if [ "$DEPLOYMENT_SUBSCRIBER_RESULT" = "failed" ]; then
             echo "[FAIL] DeploymentSubscriber failed to start -- broker connection failed"
             echo "$LOGS" | tail -50
             exit 1
           fi
-          if ! echo "$LOGS" | grep -q "DeploymentSubscriber started on"; then
+          if [ "$DEPLOYMENT_SUBSCRIBER_RESULT" != "started" ]; then
             echo "[FAIL] DeploymentSubscriber never reported a successful start -- no confirmed broker connection"
             echo "$LOGS" | tail -50
             exit 1
