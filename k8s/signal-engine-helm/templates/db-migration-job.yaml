@@ -75,15 +75,21 @@ spec:
         - name: migrate
           image: "{{ .Values.databaseMigration.image.repository }}:{{ .Values.databaseMigration.image.tag }}"
           imagePullPolicy: {{ .Values.databaseMigration.image.pullPolicy | default "IfNotPresent" }}
-          # The generic databaseschema image (unlike BacktestingEngine's custom
-          # combined-schema migration image) bundles its migrations directly at
-          # /app (its own Dockerfile's WORKDIR), so the default CMD
-          # `diesel migration run` would already work as-is -- this override
-          # only adds the same proven pg_isready retry BacktestingEngine's job
-          # uses (the wait-for-postgres init container above only checks bare
-          # TCP reachability, which Postgres accepts WHILE STILL starting up /
-          # performing recovery, rejecting real SQL connections with "FATAL:
-          # the database system is starting up" during that window).
+          # The databaseschema image's WORKDIR (/app) has no diesel.toml of its
+          # own -- it bundles two separate crates, /app/internal (the private
+          # databaseschema-internal schema, BacktestingEngine only) and
+          # /app/public (the OSS schema SignalEngine actually depends on, each
+          # with its own diesel.toml + migrations/). `cd` into /app/public
+          # before invoking diesel, matching the comment above that SignalEngine
+          # depends only on the OSS-core crate (confirmed both pg_isready and
+          # diesel are present in the image; verified /app/public's layout
+          # directly via a containerd exec against the cached image). The
+          # pg_isready retry loop handles the same gap BacktestingEngine's job
+          # guards against (the wait-for-postgres init container above only
+          # checks bare TCP reachability, which Postgres accepts WHILE STILL
+          # starting up / performing recovery, rejecting real SQL connections
+          # with "FATAL: the database system is starting up" during that
+          # window).
           command:
             - sh
             - -c
@@ -104,6 +110,7 @@ spec:
                 echo "Timed out waiting for postgres to become ready for real connections" >&2
                 exit 1
               fi
+              cd /app/public
               diesel migration run
           env:
             - name: POSTGRES_HOST
