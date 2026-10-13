@@ -31,7 +31,7 @@
 //!   (the mandate specifies fractions/notionals, never units or a position
 //!   count) and are left at the caller-supplied baseline.
 
-use mandate_core::mandate::{validate_json, LadderAction, MandateBody};
+use mandate_core::mandate::{LadderAction, MandateBody};
 
 use crate::risk_controls::{CircuitBreakerConfig, PositionLimits};
 
@@ -47,6 +47,7 @@ use crate::risk_controls::{CircuitBreakerConfig, PositionLimits};
 pub mod fetch {
     use diesel::sql_types::{Jsonb, Uuid as SqlUuid};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use mandate_core::mandate::validate_json;
 
     use super::MandateBody;
 
