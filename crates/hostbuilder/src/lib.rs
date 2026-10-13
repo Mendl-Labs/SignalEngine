@@ -1034,7 +1034,26 @@ impl HostedObject {
         if self.is_running {
             return Err("HostedObject is already running".into());
         }
-        
+
+        // Prometheus metrics HTTP server -- defined in executionhandler since
+        // the first Phase 1 risk-gate work, never actually started anywhere
+        // in the real app. The risk_gate_rejections_total counter (staging
+        // soak period observability) was updating correctly in-memory the
+        // whole time; nothing exposed it. Spawns its own listener task
+        // internally and returns immediately -- safe to start this early,
+        // independent of everything else below.
+        match executionhandler::metrics_server::start_metrics_server(
+            executionhandler::metrics_server::MetricsServerConfig::default(),
+            None,
+        ).await {
+            Ok(_handle) => {
+                ultra_info!("✅ Metrics server listening on :9090 (/metrics, /health)");
+            }
+            Err(e) => {
+                ultra_warn!(format!("⚠️ Metrics server failed to start: {}", e));
+            }
+        }
+
         // State the credential mode ONCE, loudly, before anything can try to
         // resolve a credential (postgres builds only: without a database
         // there is no tenant credential store to describe).

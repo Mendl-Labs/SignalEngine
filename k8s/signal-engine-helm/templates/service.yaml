@@ -9,7 +9,11 @@ metadata:
   annotations:
     {{- if .Values.monitoring.prometheus.enabled }}
     prometheus.io/scrape: "true"
-    prometheus.io/port: "8081"
+    # Was "8081" -- that's the message broker's port, not this app's own
+    # metrics endpoint (executionhandler::metrics_server, port 9090; see
+    # values.yaml's service.ports "metrics" entry, similarly mislabeled
+    # until this change).
+    prometheus.io/port: "9090"
     prometheus.io/path: "/metrics"
     {{- end }}
     {{- if eq .Values.global.environment "prod" }}
