@@ -2249,6 +2249,50 @@ impl ExchangeConnector for GenericConnector {
         Ok(results.into_iter().filter_map(|r| r.ok()).collect())
     }
 
+    /// Real account equity (not raw per-asset balances) for mandate-derived
+    /// risk limits -- the existing `balance_path` endpoint doesn't give a
+    /// single equity figure for every exchange: Kraken's `/0/private/Balance`
+    /// returns raw per-asset holdings (no USD-equivalent total), not an
+    /// equity number. Uses the endpoint that actually answers "what is this
+    /// account's equity, in its margin currency" per exchange instead.
+    ///
+    /// Only implemented for the exchanges this platform actually runs today
+    /// (Kraken, OANDA) -- returns `ExecutionError::InvalidParameter` for any
+    /// other preset rather than silently returning a wrong number (falls
+    /// through to the trait's own default for everything else).
+    ///
+    /// NOTE: response field names (Kraken's `eb`, OANDA's `NAV`) are taken
+    /// from each exchange's documented REST API shape, not verified against
+    /// a live response in this change -- confirm against a real paper/testnet
+    /// account before trusting this for an actual risk-limit calculation.
+    async fn get_equity(&self) -> Result<f64, ExecutionError> {
+        match self.preset {
+            ExchangePreset::Kraken => {
+                let response = self.execute_request("POST", "/0/private/TradeBalance", HashMap::new()).await?;
+                response.get("result")
+                    .and_then(|r| r.get("eb"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| ExecutionError::SerializationError(
+                        "Kraken TradeBalance response missing result.eb (equivalent balance)".to_string()
+                    ))
+            }
+            ExchangePreset::OandaPractice => {
+                let response = self.execute_request("GET", "/v3/accounts/{account_id}/summary", HashMap::new()).await?;
+                response.get("account")
+                    .and_then(|a| a.get("NAV"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| ExecutionError::SerializationError(
+                        "OANDA account summary response missing account.NAV".to_string()
+                    ))
+            }
+            other => Err(ExecutionError::InvalidParameter(
+                format!("get_equity() is not implemented for {:?} -- only Kraken and OandaPractice are supported", other)
+            )),
+        }
+    }
+
     async fn cancel_order(&self, order_id: &str) -> Result<CancelResult, ExecutionError> {
         let mut params = HashMap::new();
         

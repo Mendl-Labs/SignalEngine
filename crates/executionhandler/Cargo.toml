@@ -93,6 +93,17 @@ exchangemetricaggregator = { path = "../exchangemetricaggregator" }
 databaseschema = { path = "../../../databaseschema", optional = true }
 diesel-async = { version = "0.7", features = ["deadpool", "postgres"], optional = true }
 bigdecimal = { version = "0.4", features = ["serde"], optional = true }
+# Direct `diesel` dependency (not just diesel-async) for mandate_risk_limits.rs's
+# raw sql_query/QueryableByName use -- same feature set as rebalancer-store's
+# PgAccountSource, the pattern this mirrors.
+diesel = { version = "2.3", features = ["postgres", "uuid", "chrono", "numeric", "64-column-tables", "serde_json"], optional = true }
+
+# Mandate types (pure, no I/O) for deriving pre-trade risk limits from a
+# tenant's mandate -- the raw mandates-table read lives in this crate (see
+# mandate_risk_limits.rs, postgres-feature-gated), not mandate-core itself.
+# Not optional: the pure conversion functions (and their unit tests) don't
+# need the postgres feature.
+mandate-core = { path = "../mandate-core" }
 
 # SimulationEngine (for paper trading connector)
 simulation-engine = { path = "../../../SimulationEngine" }
@@ -108,7 +119,7 @@ winapi = { version = "0.3.9", features = ["winbase", "processthreadsapi", "winnt
 [features]
 default = []
 testing = []
-postgres = ["databaseschema", "diesel-async", "bigdecimal", "smartorderrouter/postgres"]
+postgres = ["databaseschema", "diesel-async", "diesel", "bigdecimal", "smartorderrouter/postgres"]
 
 [dev-dependencies]
 tokio-test = "0.4"

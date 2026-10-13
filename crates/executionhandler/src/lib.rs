@@ -8,6 +8,7 @@ pub mod monitoring;
 pub mod validation;
 pub mod auth;
 pub mod risk_controls;
+pub mod mandate_risk_limits;
 pub mod reconciliation;
 pub mod prometheus_metrics;
 pub mod dead_letter_queue;
@@ -676,6 +677,19 @@ impl UltraLowLatencyExecutionHandler {
     pub async fn has_connector(&self, exchange_name: &str) -> bool {
         let connectors = self.connectors.read().await;
         connectors.contains_key(exchange_name)
+    }
+
+    /// Real account equity for `exchange_name`'s connector (see
+    /// `core::traits::ExchangeConnector::get_equity` -- only Kraken/OANDA
+    /// implement this today, everything else returns its default "not
+    /// supported" error), used to turn a mandate's fraction-of-equity caps
+    /// into dollar `PositionLimits`/`CircuitBreakerConfig` (see
+    /// `mandate_risk_limits.rs`).
+    pub async fn get_connector_equity(&self, exchange_name: &str) -> Result<f64, ExecutionError> {
+        let connectors = self.connectors.read().await;
+        let connector = connectors.get(exchange_name)
+            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
+        connector.get_equity().await
     }
 
     /// Start a connector's real-time order-update stream (currently only
