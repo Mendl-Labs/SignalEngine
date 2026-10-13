@@ -858,7 +858,73 @@ impl HostedObject {
                 }
             }
         }
-        
+
+        // ======================================================================
+        // Mandate-derived pre-trade risk limits (replaces RiskManager::with_defaults())
+        // ======================================================================
+        // Deliberately does NOT call circuit_breaker.initialize()/update_equity()
+        // -- that activates the circuit breaker's own dynamic drawdown tracking,
+        // which is separate, already-deferred work ("Phase 1b" in executionhandler/
+        // src/lib.rs's post-fill wiring comment) given a bad equity read's
+        // platform-wide kill-switch blast radius. This only computes better
+        // STATIC threshold values from a one-time startup equity snapshot; the
+        // circuit breaker's own equity tracking stays exactly as inert as before.
+        #[cfg(feature = "postgres")]
+        if let (Ok(database_url), Ok(tenant_id_str)) = (env::var("DATABASE_URL"), env::var("TENANT_ID")) {
+            if let Ok(tenant_id) = uuid::Uuid::parse_str(&tenant_id_str) {
+                match smartorderrouter::database::create_pool(&database_url).await {
+                    Ok(mandate_pool) => {
+                        match mandate_pool.get().await {
+                            Ok(mut conn) => {
+                                match executionhandler::mandate_risk_limits::fetch::fetch_tenant_mandate(&mut conn, tenant_id).await {
+                                    Ok(Some(mandate)) => {
+                                        let mut equity: Option<f64> = None;
+                                        for exchange_config in &config.exchanges {
+                                            if !exchange_config.enabled { continue; }
+                                            match execution_handler.get_connector_equity(&exchange_config.name).await {
+                                                Ok(e) => { equity = Some(e); break; }
+                                                Err(e) => {
+                                                    ultra_warn!(format!("⚠️ Could not fetch equity from {}: {:?}", exchange_config.name, e));
+                                                }
+                                            }
+                                        }
+                                        match equity {
+                                            Some(equity) => {
+                                                let baseline_limits = executionhandler::risk_controls::PositionLimits::default();
+                                                let baseline_cb = executionhandler::risk_controls::CircuitBreakerConfig::default();
+                                                let position_limits = executionhandler::mandate_risk_limits::position_limits_from_mandate(&mandate, equity, baseline_limits);
+                                                let circuit_breaker_config = executionhandler::mandate_risk_limits::circuit_breaker_config_from_mandate(&mandate, equity, baseline_cb);
+                                                let risk_manager = std::sync::Arc::new(
+                                                    executionhandler::risk_controls::RiskManager::new(position_limits, circuit_breaker_config)
+                                                );
+                                                execution_handler = execution_handler.with_risk_manager(risk_manager);
+                                                ultra_info!(format!("✅ Pre-trade risk limits derived from tenant mandate (equity snapshot: {:.2})", equity));
+                                            }
+                                            None => {
+                                                ultra_warn!("⚠️ Active mandate found but no exchange returned equity; keeping default risk limits");
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        ultra_info!("ℹ️ No active mandate for this tenant; keeping default risk limits");
+                                    }
+                                    Err(e) => {
+                                        ultra_warn!(format!("⚠️ Mandate lookup failed: {}; keeping default risk limits", e));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ultra_warn!(format!("⚠️ Could not get a DB connection for mandate lookup: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ultra_warn!(format!("⚠️ Could not connect to database for mandate lookup: {}", e));
+                    }
+                }
+            }
+        }
+
         Ok((datahandler, portfoliohandler, strategyhandler, execution_handler, config))
     }
     

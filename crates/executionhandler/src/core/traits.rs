@@ -17,6 +17,16 @@ pub trait ExchangeConnector: Send + Sync {
     /// Execute multiple orders in parallel for maximum throughput
     async fn execute_batch_orders(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError>;
 
+    /// Real account equity (for mandate-derived risk limits -- see
+    /// `mandate_risk_limits.rs`), not implemented for most connectors.
+    /// Default: a clear "not supported" error rather than a silently wrong
+    /// number.
+    async fn get_equity(&self) -> Result<f64, ExecutionError> {
+        Err(ExecutionError::InvalidParameter(
+            format!("get_equity() is not implemented for {}", self.exchange_name())
+        ))
+    }
+
     /// Execute multiple orders sequentially (safe, reliable)
     async fn execute_batch_orders_sequential(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
         let mut results = Vec::with_capacity(signals.len());
