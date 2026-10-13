@@ -1340,10 +1340,32 @@ impl HostedObject {
             // Only the postgres build persists paper fills; the other build has no fill sink.
             #[cfg(feature = "postgres")]
             let signal_fill_tx = paper_fill_tx.clone();
-            tokio::spawn(async move {
+            // `signal_rx` is a `crossbeam::channel::Receiver` (bounded(1000) at
+            // construction) -- `.recv()` on it is a genuinely BLOCKING
+            // synchronous call, not an async one. Spawning it on a plain
+            // `tokio::spawn(async move { ... })` task (as this used to) runs
+            // that blocking call directly on a core Tokio worker thread
+            // instead of the separate blocking-thread-pool: the moment this
+            // task is scheduled and calls `.recv()` on an empty channel (as
+            // it always does right after startup -- no strategies are
+            // deployed yet at this point), the worker thread parks
+            // indefinitely. Under QA's single-worker-thread runtime
+            // (`TOKIO_WORKER_THREADS=1`, sized to match its 1-CPU cgroup
+            // limit -- see program/src/main.rs), that one and only worker
+            // thread is now gone for good: nothing else the runtime owns can
+            // ever be polled again, including DeploymentSubscriber::start()'s
+            // publisher.connect() and the tokio::time::timeout wrapping it --
+            // timer completion itself requires a free worker thread to drive
+            // it. This is exactly why that "guaranteed" 35s timeout never
+            // fired: the whole runtime was starved, not just one task. The
+            // sibling market-data->strategy bridge just above already gets
+            // this right via `tokio::task::spawn_blocking` + `runtime.block_on`
+            // for its one `.await` point; this loop is brought in line with it.
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
                 ultra_logger::ultra_info!("🚀 Starting Phase 2 ultra-fast signal processing (0.6μs target)...");
                 let mut signal_count = 0u64;
-                
+
                 while let Ok(signal) = signal_rx.recv() {
                     signal_count += 1;
                     
@@ -1393,7 +1415,7 @@ impl HostedObject {
                     };
                     
                     // Execute ultra-fast order (0.6μs target)
-                    match ultra_order_manager.process_signal_order(
+                    match runtime.block_on(ultra_order_manager.process_signal_order(
                         &symbol,
                         &exchange,
                         side,
@@ -1403,7 +1425,7 @@ impl HostedObject {
                         signal.strategy_id,
                         priority,
                         paper_meta.as_ref().map(|m| OrderOrigin { deployment_id: m.deployment_id, tenant_id: m.tenant_id }),
-                    ).await {
+                    )) {
                         Ok(result) => {
                             if signal_count <= 10 {
                                 ultra_logger::ultra_info!(format!(
