@@ -119,11 +119,24 @@ service:
       port: 8080
       targetPort: 8080
       protocol: TCP
-    - name: grpc
+    # Was mislabeled "grpc" -- nothing gRPC-based runs on this port. 9090 is
+    # where executionhandler::metrics_server's real Prometheus /metrics
+    # HTTP server listens (MetricsServerConfig::default().port). Renamed so
+    # servicemonitor.yaml's `port: metrics` reference (by name) actually
+    # resolves to the right target -- it was previously resolving to the
+    # OTHER entry below (8081), which is the message broker's port, not
+    # this app's metrics endpoint.
+    - name: metrics
       port: 9090
       targetPort: 9090
       protocol: TCP
-    - name: metrics
+    # Was mislabeled "metrics" -- 8081 is the message broker's port
+    # (MESSAGE_BROKER_PORT). Nothing in this container actually serves this
+    # port in prod (the real broker is message-broker-engine's own separate
+    # Service); kept as-is rather than removed, since its purpose here
+    # wasn't otherwise investigated, but renamed so it no longer collides
+    # with the real metrics port's name.
+    - name: broker-legacy
       port: 8081
       targetPort: 8081
       protocol: TCP
