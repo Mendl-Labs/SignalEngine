@@ -27,6 +27,16 @@ pub trait ExchangeConnector: Send + Sync {
         ))
     }
 
+    /// Margin-usage snapshot for margin-traded venues (OANDA/FX today) --
+    /// see `risk_controls::MarginSnapshot`/`MarginUsageTracker`. `Ok(None)`
+    /// means this connector has no margin concept (spot, e.g. Kraken) --
+    /// the margin check stays inert for it. Default: `Ok(None)`, unlike
+    /// `get_equity`'s "unsupported" error default, since most connectors
+    /// legitimately have nothing to report here (not a missing feature).
+    async fn get_margin_snapshot(&self) -> Result<Option<crate::risk_controls::MarginSnapshot>, ExecutionError> {
+        Ok(None)
+    }
+
     /// Execute multiple orders sequentially (safe, reliable)
     async fn execute_batch_orders_sequential(&self, signals: &[Signal]) -> Result<Vec<ExecutionResult>, ExecutionError> {
         let mut results = Vec::with_capacity(signals.len());

@@ -692,6 +692,27 @@ impl UltraLowLatencyExecutionHandler {
         connector.get_equity().await
     }
 
+    /// Margin snapshot passthrough, mirrors `get_connector_equity`. `Ok(None)`
+    /// for a non-margin connector (Kraken etc.).
+    pub async fn get_connector_margin_snapshot(&self, exchange_name: &str) -> Result<Option<risk_controls::MarginSnapshot>, ExecutionError> {
+        let connectors = self.connectors.read().await;
+        let connector = connectors.get(exchange_name)
+            .ok_or_else(|| ExecutionError::Unknown(format!("Exchange not found: {exchange_name}")))?;
+        connector.get_margin_snapshot().await
+    }
+
+    /// Fetch and record a fresh margin snapshot for `exchange_name` into the
+    /// live `RiskManager` in one call -- intended for a periodic out-of-band
+    /// refresh job (same cadence as whatever already calls
+    /// `get_connector_equity` for mandate-derived limits), never the order
+    /// hot path. No-op if the connector has no margin snapshot to report.
+    pub async fn refresh_margin_snapshot(&self, exchange_name: &str) -> Result<(), ExecutionError> {
+        if let Some(snapshot) = self.get_connector_margin_snapshot(exchange_name).await? {
+            self.risk_manager.update_margin_snapshot(&snapshot);
+        }
+        Ok(())
+    }
+
     /// Start a connector's real-time order-update stream (currently only
     /// Alpaca does real work here -- see `GenericConnector::subscribe_to_updates`).
     /// A no-op, not an error, when no connector is registered for
@@ -893,6 +914,33 @@ impl UltraLowLatencyExecutionHandler {
                         signal.id, signal.symbol, exchange_name, e
                     );
                     // Fall through: proceed exactly as today.
+                }
+            }
+        }
+
+        // P1 margin-usage check (margin-traded venues only -- OANDA/FX
+        // today). Pure in-memory read, no network call: the snapshot is
+        // refreshed out-of-band via `refresh_margin_snapshot`. A true no-op
+        // for any exchange that has never had a snapshot recorded (Kraken
+        // spot) -- see `risk_controls::MarginUsageTracker`.
+        let order_notional = reference_price.map(|p| signal.quantity.abs() * p).unwrap_or(0.0);
+        if let Err(e) = self.risk_manager.check_margin_usage(order_notional) {
+            prometheus_metrics::inc_orders_rejected();
+            match self.pre_trade_gate_mode {
+                risk_controls::PreTradeGateMode::Enforce => {
+                    prometheus_metrics::inc_risk_gate_rejection("enforce", e.reason_label());
+                    log::warn!(
+                        "[pre-trade-risk-gate] ENFORCE: rejecting order {} ({} on {}) on margin usage: {}",
+                        signal.id, signal.symbol, exchange_name, e
+                    );
+                    return Err(ExecutionError::Rejected(format!("Pre-trade margin check failed: {}", e)));
+                }
+                risk_controls::PreTradeGateMode::DryRun => {
+                    prometheus_metrics::inc_risk_gate_rejection("dry_run", e.reason_label());
+                    log::warn!(
+                        "[pre-trade-risk-gate] DRY-RUN would-reject order {} ({} on {}) on margin usage: {} -- order still placed",
+                        signal.id, signal.symbol, exchange_name, e
+                    );
                 }
             }
         }
