@@ -857,6 +857,192 @@ pub struct CircuitBreakerStatus {
 }
 
 // ============================================================================
+// MARGIN USAGE (margin-traded venues only -- OANDA/FX today)
+// ============================================================================
+
+/// Margin-usage limit configuration. Only meaningful for margin-traded
+/// venues -- mirrors `CircuitBreakerConfig.max_drawdown_pct`'s
+/// fraction-of-equity convention, not `PositionLimits`' dollar fields,
+/// because margin headroom scales with equity, not a fixed dollar cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginLimits {
+    /// Fraction of account equity (NAV) that may be committed as margin
+    /// before an order is rejected. 0.80 = reject once an order would push
+    /// margin usage past 80% of equity.
+    pub max_margin_utilization: f64,
+}
+
+impl Default for MarginLimits {
+    fn default() -> Self {
+        Self {
+            max_margin_utilization: 0.80,
+        }
+    }
+}
+
+/// A single margin-usage data point fetched from a margin-traded venue's
+/// account-summary endpoint (OANDA's `marginUsed`/`NAV`/`marginRate` today
+/// -- see `GenericConnector::get_margin_snapshot`). Fetched out-of-band,
+/// same as `get_equity()`/`mandate_risk_limits.rs`'s equity -- never on the
+/// order hot path.
+#[derive(Debug, Clone, Copy)]
+pub struct MarginSnapshot {
+    /// Account equity (NAV) in the account's margin currency.
+    pub equity: f64,
+    /// Margin currently committed to open positions, before any new order.
+    pub margin_used: f64,
+    /// `marginAvailable`, kept only for status/diagnostics -- NOT used in
+    /// the utilization ratio (which uses `margin_used / equity` directly;
+    /// OANDA defines `marginAvailable == NAV - marginUsed`, so the two are
+    /// equivalent, but relying on `equity` directly is one fewer assumption
+    /// about a field this codebase hasn't verified against a live account).
+    pub margin_available: Option<f64>,
+    /// Fraction of notional required as margin for this account (OANDA's
+    /// account-level `marginRate`, e.g. 0.02 = 2% = 50:1). `None` if
+    /// unavailable -- see `MarginUsageTracker::check_margin_usage` for how
+    /// that's handled (never guessed).
+    pub margin_rate: Option<f64>,
+}
+
+/// Margin-utilization pre-trade check. Atomics-based and lock-free like
+/// `CircuitBreaker`, storing dollar fields as cents (`i64`) for the same
+/// reason. Inert (`check_margin_usage` always `Ok(())`) until
+/// `update_snapshot` is called at least once -- this is what keeps the
+/// check a true no-op for venues that never report margin (Kraken/spot),
+/// rather than a check with a permissive default.
+pub struct MarginUsageTracker {
+    limits: MarginLimits,
+    equity_cents: AtomicI64,
+    margin_used_cents: AtomicI64,
+    /// Margin rate scaled to parts-per-million; `-1` is the "unknown" sentinel.
+    margin_rate_ppm: AtomicI64,
+    has_snapshot: AtomicBool,
+}
+
+impl MarginUsageTracker {
+    pub fn new(limits: MarginLimits) -> Self {
+        Self {
+            limits,
+            equity_cents: AtomicI64::new(0),
+            margin_used_cents: AtomicI64::new(0),
+            margin_rate_ppm: AtomicI64::new(-1),
+            has_snapshot: AtomicBool::new(false),
+        }
+    }
+
+    /// Record a fresh snapshot (overwrites any previous one). Call this
+    /// out-of-band on a periodic refresh for margin-traded venues only --
+    /// never from the order hot path, and never for Kraken/spot.
+    pub fn update_snapshot(&self, snapshot: &MarginSnapshot) {
+        self.equity_cents.store((snapshot.equity * 100.0).round() as i64, Ordering::Release);
+        self.margin_used_cents.store((snapshot.margin_used * 100.0).round() as i64, Ordering::Release);
+        self.margin_rate_ppm.store(
+            snapshot.margin_rate.map(|r| (r * 1_000_000.0).round() as i64).unwrap_or(-1),
+            Ordering::Release,
+        );
+        self.has_snapshot.store(true, Ordering::Release);
+    }
+
+    pub fn has_snapshot(&self) -> bool {
+        self.has_snapshot.load(Ordering::Acquire)
+    }
+
+    /// Pure, synchronous check against the most recently recorded snapshot
+    /// -- never makes a network call. `order_notional` is the proposed
+    /// order's absolute dollar value (`quantity.abs() * reference_price`).
+    ///
+    /// This order's own incremental margin impact is estimated as
+    /// `order_notional * margin_rate` when a rate was recorded in the
+    /// snapshot; if no rate is available, the check conservatively
+    /// evaluates only the CURRENTLY-committed margin (this order's own
+    /// impact is NOT added) rather than inventing a rate -- so a breach can
+    /// still be caught (current usage already over threshold), but a
+    /// previously-safe account won't be rejected on a guessed number.
+    ///
+    /// Returns `Ok(())` -- a deliberate no-op, not "passed" -- if no
+    /// snapshot has ever been recorded (see `has_snapshot`).
+    pub fn check_margin_usage(&self, order_notional: f64) -> Result<(), MarginError> {
+        if !self.has_snapshot.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let equity = self.equity_cents.load(Ordering::Acquire) as f64 / 100.0;
+        if equity <= 0.0 {
+            return Err(MarginError::NoEquity);
+        }
+
+        let margin_used = self.margin_used_cents.load(Ordering::Acquire) as f64 / 100.0;
+        let margin_rate_ppm = self.margin_rate_ppm.load(Ordering::Acquire);
+        let order_margin_required = if margin_rate_ppm >= 0 {
+            order_notional.abs() * (margin_rate_ppm as f64 / 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        let projected_margin_used = margin_used + order_margin_required;
+        let projected_utilization = projected_margin_used / equity;
+
+        if projected_utilization > self.limits.max_margin_utilization {
+            return Err(MarginError::UtilizationTooHigh {
+                projected_utilization,
+                limit: self.limits.max_margin_utilization,
+                projected_margin_used,
+                equity,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Status snapshot for monitoring, mirrors `CircuitBreaker::get_status`.
+    /// `None` if no snapshot has ever been recorded.
+    pub fn get_status(&self) -> Option<MarginStatus> {
+        if !self.has_snapshot.load(Ordering::Acquire) {
+            return None;
+        }
+        let equity = self.equity_cents.load(Ordering::Acquire) as f64 / 100.0;
+        let margin_used = self.margin_used_cents.load(Ordering::Acquire) as f64 / 100.0;
+        Some(MarginStatus {
+            equity,
+            margin_used,
+            utilization: if equity > 0.0 { margin_used / equity } else { f64::INFINITY },
+            limit: self.limits.max_margin_utilization,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarginStatus {
+    pub equity: f64,
+    pub margin_used: f64,
+    pub utilization: f64,
+    pub limit: f64,
+}
+
+/// Margin-usage error types.
+#[derive(Debug, Clone)]
+pub enum MarginError {
+    /// Recorded equity is zero or negative -- can't compute a ratio.
+    NoEquity,
+    UtilizationTooHigh { projected_utilization: f64, limit: f64, projected_margin_used: f64, equity: f64 },
+}
+
+impl std::fmt::Display for MarginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEquity => write!(f, "Cannot evaluate margin utilization: recorded equity is zero or negative"),
+            Self::UtilizationTooHigh { projected_utilization, limit, projected_margin_used, equity } => write!(
+                f,
+                "Margin utilization would be {:.1}% (${:.2} used of ${:.2} equity), exceeds limit {:.1}%",
+                projected_utilization * 100.0, projected_margin_used, equity, limit * 100.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarginError {}
+
+// ============================================================================
 // PRE-TRADE GATE ENFORCE FLAG
 // ============================================================================
 
@@ -909,18 +1095,50 @@ impl PreTradeGateMode {
 pub struct RiskManager {
     pub position_limits: PositionLimitChecker,
     pub circuit_breaker: CircuitBreaker,
+    pub margin: MarginUsageTracker,
 }
 
 impl RiskManager {
     pub fn new(position_limits: PositionLimits, circuit_breaker_config: CircuitBreakerConfig) -> Self {
+        Self::with_margin_limits(position_limits, circuit_breaker_config, MarginLimits::default())
+    }
+
+    /// Same as `new`, but with an explicit margin-utilization limit instead
+    /// of the 0.80 default (see `MarginLimits`).
+    pub fn with_margin_limits(
+        position_limits: PositionLimits,
+        circuit_breaker_config: CircuitBreakerConfig,
+        margin_limits: MarginLimits,
+    ) -> Self {
         Self {
             position_limits: PositionLimitChecker::new(position_limits),
             circuit_breaker: CircuitBreaker::new(circuit_breaker_config),
+            margin: MarginUsageTracker::new(margin_limits),
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(PositionLimits::default(), CircuitBreakerConfig::default())
+    }
+
+    /// Record a fresh margin snapshot (out-of-band periodic refresh for a
+    /// margin-traded venue). See `MarginUsageTracker::update_snapshot`.
+    pub fn update_margin_snapshot(&self, snapshot: &MarginSnapshot) {
+        self.margin.update_snapshot(snapshot);
+    }
+
+    /// Margin-utilization pre-trade check. ADDITIVE to `pre_trade_check`/
+    /// `pre_trade_check_no_price` -- callers must still run one of those for
+    /// kill-switch/circuit-breaker/position-limit coverage; this only adds
+    /// the margin check, and is `Ok(())` for any venue with no margin
+    /// snapshot ever recorded (Kraken/spot; see `MarginUsageTracker`).
+    pub fn check_margin_usage(&self, order_notional: f64) -> Result<(), RiskCheckError> {
+        if KILL_SWITCH.is_triggered() {
+            return Err(RiskCheckError::KillSwitch(
+                KILL_SWITCH.get_trigger_reason().unwrap_or(KillReason::Manual)
+            ));
+        }
+        self.margin.check_margin_usage(order_notional).map_err(RiskCheckError::MarginUsage)
     }
 
     /// Pre-trade check - MUST be called before submitting any order
@@ -1025,6 +1243,7 @@ pub enum RiskCheckError {
     KillSwitch(KillReason),
     CircuitBreaker(CircuitBreakerTrip),
     PositionLimit(PositionLimitError),
+    MarginUsage(MarginError),
 }
 
 impl std::fmt::Display for RiskCheckError {
@@ -1033,6 +1252,7 @@ impl std::fmt::Display for RiskCheckError {
             Self::KillSwitch(reason) => write!(f, "Kill switch active: {:?}", reason),
             Self::CircuitBreaker(trip) => write!(f, "Circuit breaker tripped: {:?}", trip),
             Self::PositionLimit(err) => write!(f, "Position limit: {}", err),
+            Self::MarginUsage(err) => write!(f, "Margin usage: {}", err),
         }
     }
 }
@@ -1047,6 +1267,7 @@ impl RiskCheckError {
             Self::KillSwitch(_) => "kill_switch",
             Self::CircuitBreaker(_) => "circuit_breaker",
             Self::PositionLimit(_) => "position_limit",
+            Self::MarginUsage(_) => "margin_usage",
         }
     }
 }
@@ -1239,6 +1460,64 @@ mod tests {
         KILL_SWITCH.trigger(KillReason::Manual);
 
         let result = manager.pre_trade_check_no_price("BTC", "kraken", 0.1, true).await;
+        assert!(matches!(result, Err(RiskCheckError::KillSwitch(_))));
+
+        KILL_SWITCH.reset();
+    }
+
+    fn oanda_snapshot() -> MarginSnapshot {
+        // Matches crates/broker-adapters/tests/fixtures/oanda/account_summary_short_pos.json
+        MarginSnapshot { equity: 49_800.0, margin_used: 2_500.0, margin_available: Some(47_300.0), margin_rate: Some(0.02) }
+    }
+
+    #[test]
+    fn margin_check_allows_order_within_threshold() {
+        let tracker = MarginUsageTracker::new(MarginLimits::default()); // 80%
+        tracker.update_snapshot(&oanda_snapshot());
+
+        // 1,000,000-unit FX order at 2% margin rate -> +$20,000 margin.
+        // Projected: (2500 + 20000) / 49800 = 45.2% < 80%.
+        assert!(tracker.check_margin_usage(1_000_000.0).is_ok());
+    }
+
+    #[test]
+    fn margin_check_rejects_order_that_breaches_threshold() {
+        let tracker = MarginUsageTracker::new(MarginLimits::default()); // 80%
+        tracker.update_snapshot(&oanda_snapshot());
+
+        // 2,500,000-unit FX order at 2% margin rate -> +$50,000 margin.
+        // Projected: (2500 + 50000) / 49800 = 105.4% > 80% -> rejected.
+        let result = tracker.check_margin_usage(2_500_000.0);
+        assert!(matches!(result, Err(MarginError::UtilizationTooHigh { .. })), "{:?}", result);
+    }
+
+    #[test]
+    fn margin_check_is_a_no_op_before_any_snapshot_is_recorded() {
+        // Mirrors a spot venue (Kraken) that never calls update_snapshot.
+        let tracker = MarginUsageTracker::new(MarginLimits::default());
+        assert!(tracker.check_margin_usage(10_000_000.0).is_ok());
+        assert!(!tracker.has_snapshot());
+    }
+
+    #[test]
+    fn margin_check_falls_back_to_current_utilization_when_rate_unknown() {
+        let tracker = MarginUsageTracker::new(MarginLimits::default()); // 80%
+        tracker.update_snapshot(&MarginSnapshot {
+            equity: 49_800.0, margin_used: 45_000.0, margin_available: None, margin_rate: None,
+        });
+        // Current utilization already 90.4% > 80%: rejected even though this
+        // specific order's own impact couldn't be added (no rate).
+        let result = tracker.check_margin_usage(1_000_000.0);
+        assert!(matches!(result, Err(MarginError::UtilizationTooHigh { .. })), "{:?}", result);
+    }
+
+    #[test]
+    fn margin_check_via_risk_manager_still_enforces_kill_switch() {
+        let manager = RiskManager::with_defaults();
+        manager.update_margin_snapshot(&oanda_snapshot());
+        KILL_SWITCH.trigger(KillReason::Manual);
+
+        let result = manager.check_margin_usage(1_000_000.0);
         assert!(matches!(result, Err(RiskCheckError::KillSwitch(_))));
 
         KILL_SWITCH.reset();

@@ -2293,6 +2293,53 @@ impl ExchangeConnector for GenericConnector {
         }
     }
 
+    /// Margin snapshot for OANDA (NAV/marginUsed/marginRate from the same
+    /// account-summary endpoint `get_equity` uses). `Ok(None)` for every
+    /// other preset -- Kraken/crypto spot positions are untouched by the
+    /// margin check (see `core::traits::ExchangeConnector::get_margin_snapshot`).
+    ///
+    /// NOTE: same caveat as `get_equity` -- field names taken from OANDA's
+    /// documented shape, not verified against a live response here.
+    async fn get_margin_snapshot(&self) -> Result<Option<crate::risk_controls::MarginSnapshot>, ExecutionError> {
+        match self.preset {
+            ExchangePreset::OandaPractice => {
+                let response = self.execute_request("GET", "/v3/accounts/{account_id}/summary", HashMap::new()).await?;
+                let account = response.get("account");
+
+                let nav = account
+                    .and_then(|a| a.get("NAV"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| ExecutionError::SerializationError(
+                        "OANDA account summary response missing account.NAV".to_string()
+                    ))?;
+                let margin_used = account
+                    .and_then(|a| a.get("marginUsed"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .ok_or_else(|| ExecutionError::SerializationError(
+                        "OANDA account summary response missing account.marginUsed".to_string()
+                    ))?;
+                let margin_available = account
+                    .and_then(|a| a.get("marginAvailable"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok());
+                let margin_rate = account
+                    .and_then(|a| a.get("marginRate"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok());
+
+                Ok(Some(crate::risk_controls::MarginSnapshot {
+                    equity: nav,
+                    margin_used,
+                    margin_available,
+                    margin_rate,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn cancel_order(&self, order_id: &str) -> Result<CancelResult, ExecutionError> {
         let mut params = HashMap::new();
         
