@@ -689,10 +689,17 @@ jobs:
           SRC_NS=backtestingengine
           get() { kubectl get secret "$1" -n "$SRC_NS" -o "jsonpath={.data.$2}" | base64 -d; }
 
-          for PAIR in "POSTGRES_HOST:database-host" "POSTGRES_PORT:database-port" "POSTGRES_USER:database-username" "POSTGRES_PASSWORD:database-password" "POSTGRES_DB:database-name"; do
+          # Deliberately NOT backtesting-secrets here: that holds the `backtesting` role,
+          # which owns the entire database (full read/write on every table). SignalEngine
+          # only ever needs to SELECT exchange_credentials, so it connects as the narrowly
+          # scoped `signalengine_ro` role instead (signalengine-ro-db-secret, created
+          # out-of-band; GRANT SELECT ON exchange_credentials only, nothing else, verified
+          # via \dp). A SignalEngine compromise or bug can therefore never read or write
+          # any other table in this database.
+          for PAIR in "POSTGRES_HOST:host" "POSTGRES_PORT:port" "POSTGRES_USER:username" "POSTGRES_PASSWORD:password" "POSTGRES_DB:database"; do
             ENV_NAME="${PAIR%%:*}"; KEY="${PAIR#*:}"
-            VALUE=$(get backtesting-secrets "$KEY") || { echo "::error::could not read $KEY from backtesting-secrets"; exit 1; }
-            [ -n "$VALUE" ] || { echo "::error::empty value for $KEY in backtesting-secrets"; exit 1; }
+            VALUE=$(get signalengine-ro-db-secret "$KEY") || { echo "::error::could not read $KEY from signalengine-ro-db-secret"; exit 1; }
+            [ -n "$VALUE" ] || { echo "::error::empty value for $KEY in signalengine-ro-db-secret"; exit 1; }
             echo "::add-mask::$VALUE"
             echo "${ENV_NAME}=${VALUE}" >> "$GITHUB_ENV"
             echo "[OK] Read $KEY"
@@ -798,6 +805,19 @@ jobs:
             sleep 5
           fi
 
+          # credentialMode mirrors enable_live_credentials exactly: without this,
+          # values-prod.yaml's own default (config.credentialMode=none) would stay
+          # in effect even when the encryption key and DB secrets above were synced
+          # for a live run -- CREDENTIAL_MODE would render as `none` regardless, and
+          # every live deployment would still be rejected. This is the one line that
+          # actually turns live trading on for this deploy; everything else above
+          # only prepares the credentials it needs once it is.
+          CRED_MODE="none"
+          if [ "${{ inputs.enable_live_credentials }}" = "true" ]; then
+            CRED_MODE="multi_tenant"
+            echo "[WARN] config.credentialMode=multi_tenant for this deploy -- live trading reachable"
+          fi
+
           echo "Deploying with Helm..."
           helm upgrade --install signal-engine ./${{ env.HELM_CHART_PATH }} \
             --namespace ${{ env.NAMESPACE }} \
@@ -807,6 +827,7 @@ jobs:
             --set "image.tag=$IMAGE_TAG" \
             --set "image.pullPolicy=IfNotPresent" \
             --set "imagePullSecrets[0].name=ghcr-secret" \
+            --set "config.credentialMode=$CRED_MODE" \
             --timeout 5m
 
           echo "[OK] Helm deployment successful"
