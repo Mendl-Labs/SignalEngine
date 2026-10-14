@@ -209,6 +209,7 @@ impl Broker for SimBroker {
             avg_price: Some(px),
             cost: Some(notional),
             fee: Some(Dec::ZERO),
+            financing: 0.0,
             open_time: None,
             close_time: None,
         });

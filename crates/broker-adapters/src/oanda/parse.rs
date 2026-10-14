@@ -769,6 +769,7 @@ impl OrderResource {
             // OANDA reports no cost figure; we do not invent one.
             cost: None,
             fee: fill.and_then(|f| f.commission),
+            financing: fill.and_then(|f| f.financing).map(|d| d.to_f64()).unwrap_or(0.0),
             open_time: self.create_time,
             close_time: self.filled_time.or(self.cancelled_time),
         })
@@ -984,6 +985,86 @@ mod tests {
         for (state, exec, reason, want) in cases {
             assert_eq!(derive_order_status(state, Some(q), exec, reason).unwrap(), want, "{state} {exec} {reason:?}");
         }
+    }
+
+    // No RECORDED fixture under tests/fixtures/oanda/real/ carries a non-zero `financing`: every
+    // real fill there was opened and closed inside the same practice-account session, so OANDA
+    // never actually charged it overnight rollover. These two shapes are hand-authored (same
+    // convention as the other non-RECORDED fixtures in this crate) to exercise the case a held
+    // FX position does earn/pay carry.
+    #[test]
+    fn parse_fill_captures_a_nonzero_financing_value() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "id": "99", "orderID": "98", "instrument": "EUR_USD", "units": "-10000",
+                "price": "1.10000", "pl": "0.0000", "commission": "0.0000",
+                "financing": "-3.4500", "reason": "MARKET_ORDER", "time": "1758463200.000000000"
+            }"#,
+        )
+        .unwrap();
+        let fill = parse_fill(&v).unwrap();
+        assert_eq!(fill.financing, Some(d("-3.4500")));
+    }
+
+    #[test]
+    fn into_report_surfaces_financing_separately_from_fee() {
+        let fill_json: Value = serde_json::from_str(
+            r#"{
+                "id": "99", "orderID": "98", "instrument": "EUR_USD", "units": "-10000",
+                "price": "1.10000", "pl": "0.0000", "commission": "1.2000",
+                "financing": "-3.4500", "reason": "MARKET_ORDER"
+            }"#,
+        )
+        .unwrap();
+        let fill = parse_fill(&fill_json).unwrap();
+        let order = OrderResource {
+            id: "98".to_string(),
+            state: "FILLED".to_string(),
+            kind: "MARKET".to_string(),
+            instrument: Some("EUR_USD".to_string()),
+            units: Some(d("-10000")),
+            price: None,
+            client_id: None,
+            time_in_force: None,
+            filling_transaction_id: Some("99".to_string()),
+            cancelling_transaction_id: None,
+            create_time: None,
+            filled_time: None,
+            cancelled_time: None,
+        };
+        let report = order.into_report(Some(&fill), None, None).unwrap();
+        // Fee (commission) and financing both flow through, but as distinct figures: a real
+        // financing charge must never be blended into, or discarded in favour of, the fee.
+        assert_eq!(report.fee, Some(d("1.2000")));
+        assert!((report.financing - (-3.45)).abs() < 1e-9, "financing = {}", report.financing);
+        assert_ne!(report.financing, 0.0, "a real financing charge must not be discarded as zero");
+    }
+
+    #[test]
+    fn into_report_defaults_financing_to_zero_when_oanda_reports_none() {
+        let fill_json: Value = serde_json::from_str(
+            r#"{"id": "99", "orderID": "98", "instrument": "EUR_USD", "units": "-10000", "price": "1.10000"}"#,
+        )
+        .unwrap();
+        let fill = parse_fill(&fill_json).unwrap();
+        assert_eq!(fill.financing, None);
+        let order = OrderResource {
+            id: "98".to_string(),
+            state: "FILLED".to_string(),
+            kind: "MARKET".to_string(),
+            instrument: Some("EUR_USD".to_string()),
+            units: Some(d("-10000")),
+            price: None,
+            client_id: None,
+            time_in_force: None,
+            filling_transaction_id: Some("99".to_string()),
+            cancelling_transaction_id: None,
+            create_time: None,
+            filled_time: None,
+            cancelled_time: None,
+        };
+        let report = order.into_report(Some(&fill), None, None).unwrap();
+        assert_eq!(report.financing, 0.0);
     }
 
     #[test]
