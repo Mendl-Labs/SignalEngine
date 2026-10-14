@@ -160,6 +160,10 @@ pub struct OrderReport {
     pub cost: Option<Dec>,
     /// Total fee as reported (Kraken: quote currency). `None` = the field was absent.
     pub fee: Option<Dec>,
+    /// Overnight financing (rollover/swap) booked by this fill, account currency. This is the
+    /// carry premium an FX position earns or pays while held -- separate from trading P&L and
+    /// from `fee`. Only OANDA reports it today; every other adapter sets `0.0`.
+    pub financing: f64,
     pub open_time: Option<f64>,
     pub close_time: Option<f64>,
 }

@@ -343,6 +343,8 @@ pub fn parse_order_info(
         avg_price,
         cost: opt_dec(info, "cost")?,
         fee: opt_dec(info, "fee")?,
+        // Kraken is spot-only: no overnight financing/rollover concept.
+        financing: 0.0,
         open_time: info.get("opentm").and_then(Value::as_f64),
         close_time: info.get("closetm").and_then(Value::as_f64),
     })

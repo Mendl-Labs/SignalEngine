@@ -446,6 +446,8 @@ pub fn parse_order_value(v: &Value, own_tag_prefix: Option<&str>) -> Result<Orde
         avg_price,
         cost,
         fee: None,
+        // Alpaca equities: no overnight financing/rollover concept reported here.
+        financing: 0.0,
         open_time: opt_str(v, "submitted_at").or_else(|| opt_str(v, "created_at")).and_then(|s| parse_rfc3339(&s)),
         close_time: if status.is_terminal() { close_at } else { None },
     })

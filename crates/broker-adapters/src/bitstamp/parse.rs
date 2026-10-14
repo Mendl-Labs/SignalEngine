@@ -123,6 +123,8 @@ fn parse_open_order(v: &Value) -> Result<OrderReport, BrokerError> {
         avg_price: None,
         cost: None,
         fee: None,
+        // Bitstamp is spot-only: no overnight financing/rollover concept.
+        financing: 0.0,
         open_time: None,
         close_time: None,
     })
@@ -160,6 +162,7 @@ pub fn parse_order_status(v: &Value) -> Result<OrderReport, BrokerError> {
         avg_price: None,
         cost: None,
         fee: None,
+        financing: 0.0,
         open_time: None,
         close_time: None,
     })

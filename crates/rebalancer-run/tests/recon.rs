@@ -51,6 +51,7 @@ fn report(id: &str, tag: Option<&str>, status: OrderStatus, qty: &str, exec: &st
         avg_price: Some(d("60000")),
         cost: Some(d(exec).checked_mul(d("60000")).unwrap()),
         fee: Some(Dec::ZERO),
+        financing: 0.0,
         open_time: None,
         close_time: None,
     }

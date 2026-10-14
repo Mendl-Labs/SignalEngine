@@ -74,6 +74,7 @@ fn report(executed: &str, status: OrderStatus) -> OrderReport {
         avg_price: None,
         cost: None,
         fee: None,
+        financing: 0.0,
         open_time: None,
         close_time: None,
     }
