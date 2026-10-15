@@ -1,13 +1,16 @@
 //! `PgAccountSource` against a real database (paper-pilot slice S-5): enumeration of the pilot allow-list, every
 //! refusal that needs the database to prove (as opposed to `account_source.rs`'s own pure-data unit tests), and that
-//! it builds NO broker (the descriptor alone). Env-gated: see `tests/common/mod.rs`.
+//! it builds NO broker (the descriptor alone). The second half covers the proposal-derived plan source
+//! (`AccountScope::PilotAndProposals`, certified-envelopes Phase 0) and the reconciliation write-back. Env-gated:
+//! see `tests/common/mod.rs`.
 
 mod common;
 
 use common::{create, Opts, TestDb};
 use rebalancer_run::driver::AccountSource;
 use rebalancer_run::record::ExecutionMode;
-use rebalancer_store::{PgAccountSource, PilotAllowList};
+use rebalancer_store::{AccountScope, PgAccountSource, PgPlanReconciliation, PilotAllowList, PlanOrigin, PlanProvenanceRegistry, ReconciliationStatus};
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn source(db: &TestDb, allow: PilotAllowList) -> PgAccountSource {
@@ -252,4 +255,128 @@ fn last_exclusions_and_the_plan_provenance_registry_are_kept_current_on_each_enu
     src2.enumerate().unwrap();
     assert_eq!(src2.last_exclusions().len(), 1);
     assert!(registry.get(&pilot.account.to_string()).is_none(), "a fresh enumeration replaces the whole registry, it does not accumulate stale accounts");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The proposal-derived plan source (AccountScope::PilotAndProposals) and the reconciliation write-back
+// ---------------------------------------------------------------------------------------------------
+
+fn serving(db: &TestDb, pilot: Option<PilotAllowList>) -> PgAccountSource {
+    PgAccountSource::with_scope(db.pool(4), AccountScope::PilotAndProposals { pilot }).expect("account source")
+}
+
+#[test]
+fn proposal_plans_of_two_tenants_are_served_each_under_its_own_tenant_and_never_under_the_pilot_scope() {
+    let Some(db) = create("account_source_proposal_two_tenants", Opts::default()) else { return };
+    let a = db.seed_proposal_account(0.5, &[("etf_trend_faber", 1.0)]);
+    let b = db.seed_proposal_account(1.0, &[("etf_trend_faber", 0.6), ("crypto_trend_100d", 0.4)]);
+    assert_ne!(a.tenant, b.tenant);
+
+    // The serving scope with NO pilot pair: the allow-list is the database's non-closed plans, both tenants.
+    let registry = Arc::new(PlanProvenanceRegistry::new());
+    let src = serving(&db, None).with_plan_provenance(registry.clone());
+    let e = src.enumerate().expect("enumerate as the restricted role, no secret column");
+    assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+    assert_eq!(e.accounts.len(), 2);
+    let acc_a = e.accounts.iter().find(|x| x.active.account_id == a.account.to_string()).expect("tenant A's account");
+    let acc_b = e.accounts.iter().find(|x| x.active.account_id == b.account.to_string()).expect("tenant B's account");
+    assert_eq!(acc_a.active.tenant_id, a.tenant.to_string(), "tenant A's account carries tenant A");
+    assert_eq!(acc_b.active.tenant_id, b.tenant.to_string(), "tenant B's account carries tenant B");
+    assert_eq!((acc_a.origin, acc_a.plan_id), (PlanOrigin::Proposal, a.plan));
+    assert_eq!((acc_b.origin, acc_b.plan_id), (PlanOrigin::Proposal, b.plan));
+    assert_eq!(acc_a.credential_fingerprint, None);
+    assert_eq!(acc_a.active.mode, ExecutionMode::Live, "L2 + place_orders: orders against the paper venue");
+    assert_eq!(acc_a.active.sleeves.len(), 1);
+    assert_eq!(acc_a.active.sleeves[0].share, broker_adapters::Dec::parse("0.5").unwrap(), "weight 1.0 * risk_scale 0.5");
+    assert_eq!(acc_b.active.sleeves.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["etf_trend_faber", "crypto_trend_100d"]);
+    // Provenance is published for both, each under its own plan id.
+    assert_eq!(registry.get(&a.account.to_string()).map(|p| (p.origin.as_str(), p.plan_id)), Some(("proposal", a.plan)));
+    assert_eq!(registry.get(&b.account.to_string()).map(|p| (p.origin.as_str(), p.plan_id)), Some(("proposal", b.plan)));
+
+    // The pilot scope (the flag off) for tenant A's account: today's answer, PILOT_NO_PLAN, and tenant B is not
+    // even looked at.
+    let e = source(&db, PilotAllowList::new(a.tenant, [a.account]).unwrap()).enumerate().unwrap();
+    assert!(e.accounts.is_empty());
+    assert_eq!(e.exclusions.len(), 1);
+    assert_eq!(e.exclusions[0].reason.code(), "PILOT_NO_PLAN");
+
+    // A pilot pair naming tenant B's account under tenant A, alongside the proposal scope: refused as not found
+    // (never served with tenant B's rows), while the two real plans still run.
+    let e = serving(&db, Some(PilotAllowList::new(a.tenant, [b.account]).unwrap())).enumerate().unwrap();
+    assert_eq!(e.accounts.len(), 2);
+    assert_eq!(e.exclusions.len(), 1);
+    assert_eq!((e.exclusions[0].account_id, e.exclusions[0].reason.code()), (b.account, "PILOT_CREDENTIAL_NOT_FOUND"));
+}
+
+#[test]
+fn an_account_with_both_a_pilot_plan_and_a_proposal_plan_is_refused_under_the_serving_scope_too() {
+    let Some(db) = create("account_source_both_sources_serving", Opts::default()) else { return };
+    let pilot = db.seed_pilot("paper_orders");
+    // The proposal plan is inserted AFTER the pilot plan (the pilot guard trigger only refuses the other order).
+    let (_, _plan) = db.seed_proposal_plan(pilot.tenant, pilot.account, pilot.mandate, 1, 1.0, &[("etf_trend_faber", 1.0)]);
+    let other = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    let e = serving(&db, Some(PilotAllowList::new(pilot.tenant, [pilot.account]).unwrap())).enumerate().unwrap();
+    assert_eq!(e.accounts.len(), 1, "{:?}", e.accounts);
+    assert_eq!(e.accounts[0].active.account_id, other.account.to_string(), "the clean proposal account still runs");
+    assert_eq!(e.exclusions.len(), 1, "{:?}", e.exclusions);
+    assert_eq!((e.exclusions[0].account_id, e.exclusions[0].reason.code()), (pilot.account, "PILOT_STRATEGY_PLAN_PRESENT"));
+    // And the pilot scope gives the same answer (today's behaviour).
+    let e = source(&db, PilotAllowList::new(pilot.tenant, [pilot.account]).unwrap()).enumerate().unwrap();
+    assert_eq!(e.exclusions[0].reason.code(), "PILOT_STRATEGY_PLAN_PRESENT");
+}
+
+#[test]
+fn the_pilot_pair_and_a_proposal_account_run_side_by_side_under_the_serving_scope() {
+    let Some(db) = create("account_source_pilot_plus_proposal", Opts::default()) else { return };
+    let pilot = db.seed_pilot("paper_orders");
+    let other = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    let e = serving(&db, Some(PilotAllowList::new(pilot.tenant, [pilot.account]).unwrap())).enumerate().unwrap();
+    assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+    assert_eq!(e.accounts.len(), 2);
+    let p = e.accounts.iter().find(|x| x.active.account_id == pilot.account.to_string()).unwrap();
+    let o = e.accounts.iter().find(|x| x.active.account_id == other.account.to_string()).unwrap();
+    assert_eq!((p.origin, p.plan_id, p.credential_fingerprint.as_deref()), (PlanOrigin::OwnerPilot, pilot.plan, Some("0123456789abcdef")));
+    assert_eq!((o.origin, o.plan_id, o.credential_fingerprint.as_deref()), (PlanOrigin::Proposal, other.plan, None));
+}
+
+#[test]
+fn a_halted_or_live_proposal_plan_is_a_typed_exclusion_and_a_closed_one_is_invisible() {
+    let Some(db) = create("account_source_proposal_states", Opts::default()) else { return };
+    let halted = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    db.exec(&format!("UPDATE strategy_plans SET state = 'halted' WHERE id = '{}'", halted.plan));
+    let closed = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    db.exec(&format!("UPDATE strategy_plans SET state = 'closed' WHERE id = '{}'", closed.plan));
+    let e = serving(&db, None).enumerate().unwrap();
+    assert!(e.accounts.is_empty(), "{:?}", e.accounts);
+    assert_eq!(e.exclusions.len(), 1, "the closed plan produces no target at all: {:?}", e.exclusions);
+    assert_eq!((e.exclusions[0].account_id, e.exclusions[0].reason.code()), (halted.account, "PILOT_PROPOSAL_PLAN_NOT_SERVABLE"));
+}
+
+#[test]
+fn the_reconciliation_write_back_moves_a_plan_off_awaiting_first_run_as_the_restricted_role_and_only_for_its_tenant() {
+    let Some(db) = create("plan_reconciliation_write_back", Opts::default()) else { return };
+    let a = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    let b = db.seed_proposal_account(1.0, &[("etf_trend_faber", 1.0)]);
+    let status = |plan: Uuid| db.scalar(&format!("SELECT reconciliation_status::text || '|' || reconciliation_detail || '|' || coalesce(reconciliation_checked_at::text, 'null') AS v FROM strategy_plans WHERE id = '{plan}'")).unwrap();
+    assert!(status(a.plan).starts_with("awaiting_first_run|"), "{}", status(a.plan));
+
+    let recon = PgPlanReconciliation::new(db.pool(2)).expect("reconciliation store on the restricted role");
+    let at: chrono::DateTime<chrono::Utc> = "2026-10-15T15:00:30Z".parse().unwrap();
+    recon.record(a.tenant, a.plan, ReconciliationStatus::InSync, "run x: COMPLETED RUN_COMPLETED: ok", at).expect("the role may update exactly the reconciliation columns");
+    let s = status(a.plan);
+    assert!(s.starts_with("in_sync|run x: COMPLETED RUN_COMPLETED: ok|2026-10-15 15:00:30"), "{s}");
+    assert!(status(b.plan).starts_with("awaiting_first_run|"), "tenant B's plan is untouched");
+
+    // Bound to the tenant: tenant B's id with tenant A's plan writes nothing and says so.
+    let err = recon.record(b.tenant, a.plan, ReconciliationStatus::Mismatch, "never", at).unwrap_err();
+    assert!(err.starts_with("PLAN_RECONCILIATION_NOT_WRITTEN"), "{err}");
+    assert!(status(a.plan).starts_with("in_sync|"), "unchanged");
+
+    // A mismatch is recorded with its detail; a closed plan is never written.
+    recon.record(b.tenant, b.plan, ReconciliationStatus::Mismatch, "run y: HALTED RUN_RECON_HALT: drift", at).unwrap();
+    assert!(status(b.plan).starts_with("mismatch|run y: HALTED RUN_RECON_HALT: drift|"));
+    db.exec(&format!("UPDATE strategy_plans SET state = 'closed' WHERE id = '{}'", b.plan));
+    let err = recon.record(b.tenant, b.plan, ReconciliationStatus::InSync, "never", at).unwrap_err();
+    assert!(err.starts_with("PLAN_RECONCILIATION_NOT_WRITTEN"), "{err}");
+    assert!(status(b.plan).starts_with("mismatch|"), "a closed plan keeps its last status");
 }
