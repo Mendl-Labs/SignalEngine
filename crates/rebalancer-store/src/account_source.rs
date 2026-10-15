@@ -1382,7 +1382,8 @@ mod tests {
         };
         assert_eq!(mode("L2", &["place_orders", "halt"]), Ok(ExecutionMode::Live));
         assert_eq!(mode("L2", &["cancel_orders", "halt", "flatten"]), Ok(ExecutionMode::Assisted), "no place_orders: assisted, never refused (the plan did not ask)");
-        assert_eq!(mode("L1", &["place_orders", "halt"]), Ok(ExecutionMode::Assisted));
+        assert!(matches!(mode("L1", &["place_orders", "halt"]), Err(ExclusionReason::MandateBodyInvalid(_))), "L1 + place_orders is an invalid mandate: refused, never more than the mandate grants");
+        assert_eq!(mode("L1", &["halt"]), Ok(ExecutionMode::Assisted));
         assert_eq!(mode("L0", &["halt"]), Ok(ExecutionMode::Assisted));
         assert_eq!(mode("L3", &["place_orders", "halt"]), Err(ExclusionReason::AutonomyL3));
     }
