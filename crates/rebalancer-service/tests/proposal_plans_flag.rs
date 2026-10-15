@@ -259,6 +259,13 @@ fn keys_never_appear_in_debug_output() {
     let dbg = format!("{keys:?}");
     assert!(!dbg.contains(PAPER_KEY) && !dbg.contains(SECRET), "{dbg}");
     assert!(dbg.contains("redacted"));
+    // The providers holding the keys redact too (manual Debug, never derived).
+    let env_provider = EnvPilotCredentials::from_lookup(pair(), key_env()).unwrap();
+    let dbg = format!("{env_provider:?}");
+    assert!(dbg.contains(TENANT) && !dbg.contains(PAPER_KEY) && !dbg.contains(SECRET), "{dbg}");
+    let svc = ServiceCredentials::new(Some(env_provider), Box::new(TenantCredentialsNotBuilt));
+    let dbg = format!("{svc:?}");
+    assert!(!dbg.contains(PAPER_KEY) && !dbg.contains(SECRET), "{dbg}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -84,6 +84,13 @@ impl EnvPilotCredentials {
     }
 }
 
+/// Manual, redacting: the pair is not secret, the keys are. Never derive `Debug` on a type holding a secret.
+impl fmt::Debug for EnvPilotCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvPilotCredentials").field("pair", &self.pair).field("keys", &self.keys).finish()
+    }
+}
+
 fn same_id(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
@@ -126,6 +133,14 @@ impl ServiceCredentials {
 
     pub fn pilot(&self) -> Option<&EnvPilotCredentials> {
         self.pilot.as_ref()
+    }
+}
+
+/// Manual, redacting (through `EnvPilotCredentials`' and `PaperAlpacaKeys`' own redacting `Debug`); the tenant
+/// provider is named, not printed.
+impl fmt::Debug for ServiceCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceCredentials").field("pilot", &self.pilot).field("tenants", &"<dyn PaperCredentialProvider>").finish()
     }
 }
 
