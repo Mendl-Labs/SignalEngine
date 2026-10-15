@@ -84,6 +84,7 @@ use rebalancer_run::data::DataSource;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource, DueOutcome};
 use rebalancer_run::latency::LatencyRecorder;
 use rebalancer_run::pipeline::RunConfig;
+use rebalancer_service::broker_credentials::{BrokerConfig, HttpBrokerCredentials};
 use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
@@ -193,6 +194,15 @@ fn run_service() {
         Ok(p) => p,
         Err(refusal) => {
             eprintln!("rebalancer-service: refusing to start: {refusal}");
+            std::process::exit(1);
+        }
+    };
+    // Proposal plans need the credential broker (this process cannot decrypt tenant credentials): refuse to start
+    // with the flag on and either broker setting missing. Flag off: the broker is never used and not required.
+    let broker_config = match BrokerConfig::from_lookup(pilot.serve_proposal_plans, |k| std::env::var(k).ok()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rebalancer-service: refusing to start: {e}");
             std::process::exit(1);
         }
     };
@@ -354,8 +364,14 @@ fn run_service() {
         },
         None => None,
     };
-    let credentials = ServiceCredentials::new(pilot_credentials, Box::new(TenantCredentialsNotBuilt));
     let transport = build_transport();
+    // Every non-pilot account's paper key comes from the credential broker (flag on, config validated above); with
+    // the flag off no non-pilot account is ever enumerated, and the typed "not built" provider stays the answer.
+    let tenant_credentials: Box<dyn PaperCredentialProvider> = match broker_config {
+        Some(cfg) => Box::new(HttpBrokerCredentials::new(cfg, transport.clone())),
+        None => Box::new(TenantCredentialsNotBuilt),
+    };
+    let credentials = ServiceCredentials::new(pilot_credentials, tenant_credentials);
 
     let mut connected: Vec<(PilotAccount, PilotAlpaca)> = Vec::new();
     for account in enumeration.accounts {
