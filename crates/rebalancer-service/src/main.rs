@@ -16,18 +16,30 @@
 //! "cannot start a runtime from within a runtime" panic that design exists to avoid.
 //!
 //! # The real account source and runtime (slice S-6, `PAPER_PILOT_DRAGONSTONE_PLAN.md`)
-//! `run_service` serves exactly the ONE (tenant, account) pair `PilotConfig` names, enumerated from Postgres
+//! `run_service` serves the ONE (tenant, account) pair `PilotConfig` names, enumerated from Postgres
 //! (`rebalancer_store::PgAccountSource`, slice S-5: the mandate, the owner-authored pilot plan, the derived
 //! execution mode -- never more than the mandate grants). At startup it ALSO connects that account's real paper
-//! Alpaca broker and the real Massive data source ONCE (`rebalancer_service::runtime::connect_paper_alpaca`):
+//! Alpaca broker and the real Massive data source ONCE (`rebalancer_service::runtime::connect_account_alpaca`):
 //! verifies the account (`GET /v2/account`, the `PA` prefix), checks the connected key's fingerprint against the
-//! pilot plan row, and refreshes the five ETF assets. That one `AccountRuntime` is reused for every tick; a later
-//! tick that finds the account no longer eligible (mandate revoked, plan tightened to `assisted`, ...) simply has
-//! nothing due to run against it -- `PgAccountSource`'s own checks run fresh on every tick via `find_due_runs`.
+//! pilot plan row, and refreshes the ETF assets. That `AccountRuntime` is reused for every tick; a later tick that
+//! finds the account no longer eligible (mandate revoked, plan tightened to `assisted`, ...) simply has nothing due
+//! to run against it -- `PgAccountSource`'s own checks run fresh on every tick via `find_due_runs`.
+//!
+//! # Proposal-derived plans (certified-envelopes Phase 0, `REBALANCER_SERVE_PROPOSAL_PLANS=true`)
+//! With the flag on (default off: everything above is byte-for-byte the pilot), `PgAccountSource` is scoped to
+//! `AccountScope::PilotAndProposals`: every account of every tenant with an approved paper `strategy_plans` row is
+//! enumerated alongside the pilot pair (which becomes optional), exactly one plan source per account. Each
+//! enumerated account gets its own `AccountRuntime` from its paper Alpaca key, obtained through the typed
+//! `rebalancer_service::credentials` seam: the pilot pair's key from the environment as before, every other
+//! account's from the tenant provider -- which today is `TenantCredentialsNotBuilt` (see that module's doc for the
+//! design question: this process must not hold the tenant-credential master key). Such an account is logged and
+//! gets no runtime; nothing trades for it. After every tick, each proposal-served account's run outcome is written
+//! back to `strategy_plans.reconciliation_*` (`rebalancer_store::PgPlanReconciliation`), and the run rows carry
+//! `plan_origin = 'proposal'` through the provenance registry.
 //!
 //! There is no in-memory or demo account source anywhere in this binary's startup path any more (the previous
 //! `InMemoryAccountSource`/`demo_accounts()` wiring this replaces is gone, not merely unused): `PilotConfig::
-//! from_env`'s paper-only checks (`REBALANCER_PAPER_ONLY=true` plus both pilot ids) must already pass before any of
+//! from_env`'s paper-only checks (`REBALANCER_PAPER_ONLY=true` plus the pilot ids) must already pass before any of
 //! the above runs, and nothing past that point reads an env var that would substitute a fake broker or a fake
 //! account list -- `tests/runtime_construction.rs::rebalancer_demo_cannot_bypass_the_paper_only_startup_refusal`
 //! proves the startup gate itself refuses regardless of such a variable with a real call to the same function
@@ -45,7 +57,6 @@
 //! `print-fingerprint` (connects read-only and prints the connected key's fingerprint, never the key) and
 //! `pilot-template` (prints the `mandate_events` / `rebalancer_pilot_plans` insert template; touches no network,
 //! no database).
-
 //!
 //! # Alert delivery and the dead-man's heartbeat (W6.1 / W6.2, `rebalancer-alerts`)
 //! Both dark by default. With `ALERTS_ENABLED=true` a `DeliveryWorker` runs after every tick's runs, turning the
@@ -56,7 +67,7 @@
 //! on a short-timeout transport so the ping can never hold the loop; a failure streak is logged and raised once as
 //! `ALERT_HEARTBEAT_FAILED`. Neither can stop a run or change what a run does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -70,14 +81,16 @@ use rebalancer_alerts::{alerts_enabled, sender_from_lookup, DeliveryWorker, Hear
 use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_run::clock::Clock;
 use rebalancer_run::data::DataSource;
-use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource};
+use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource, DueOutcome};
 use rebalancer_run::latency::LatencyRecorder;
 use rebalancer_run::pipeline::RunConfig;
+use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
-use rebalancer_service::runtime::{connect_paper_alpaca, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate};
+use rebalancer_service::runtime::{connect_account_alpaca, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
 use rebalancer_store::{
-    AccountTenants, PgAccountLock, PgAccountSource, PgDeliveryLedger, PgKillFlag, PgLatencyStore, PgNotifier, PgRunStore, PgStateStore, PilotAllowList,
+    reconciliation_for, AccountScope, AccountTenants, PgAccountLock, PgAccountSource, PgDeliveryLedger, PgKillFlag, PgLatencyStore, PgNotifier, PgPlanReconciliation, PgRunStore, PgStateStore,
+    PilotAccount, PilotAllowList, PlanOrigin, PlanProvenanceRegistry,
 };
 
 const DEFAULT_TICK_SECS: u64 = 300;
@@ -85,9 +98,6 @@ const DEFAULT_TICK_SECS: u64 = 300;
 /// hold the loop for long enough to miss the next tick.
 const HEARTBEAT_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const HEARTBEAT_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(5);
-/// Read by both the service and `print-fingerprint`, never logged and never read from a secrets file.
-const ENV_ALPACA_KEY_ID: &str = "PILOT_ALPACA_KEY_ID";
-const ENV_ALPACA_KEY_SECRET: &str = "PILOT_ALPACA_KEY_SECRET";
 
 /// The real wall clock. `rebalancer-run`'s pipeline never calls `std::time`/`std::thread` directly (see
 /// `clock.rs`'s own module doc: "nothing in this workspace calls the system clock") -- this is the one
@@ -169,10 +179,16 @@ fn cmd_pilot_template() {
     print!("{}", pilot_template_sql());
 }
 
+/// The sleeve kinds an enumerated account's plan names (what its asset refresh must cover).
+fn sleeve_kinds(account: &PilotAccount) -> BTreeSet<rebalancer_run::data::SleeveKind> {
+    account.active.sleeves.iter().map(|s| s.kind).collect()
+}
+
 fn run_service() {
-    // The paper-pilot interlock (see `rebalancer_service::pilot`): this build serves ONE (tenant, account) pair and
-    // starts only with REBALANCER_PAPER_ONLY=true, PILOT_TENANT_ID and PILOT_ACCOUNT_ID set, and without the tenant
-    // credential master key in its environment. Anything else refuses to start (fail closed).
+    // The paper-pilot interlock (see `rebalancer_service::pilot`): this build serves the ONE (tenant, account) pair
+    // (plus approved proposal plans only with REBALANCER_SERVE_PROPOSAL_PLANS=true) and starts only with
+    // REBALANCER_PAPER_ONLY=true, the pilot ids set (optional only under the flag), and without the tenant credential
+    // master key in its environment. Anything else refuses to start (fail closed).
     let pilot = match PilotConfig::from_env() {
         Ok(p) => p,
         Err(refusal) => {
@@ -194,10 +210,14 @@ fn run_service() {
         }
     };
     let tick_secs = tick_secs();
-    log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY pilot for tenant {} account {}", pilot.tenant_id, pilot.account_id));
+    log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY; {}", pilot.describe()));
     log(observer_cfg.describe());
 
     let tenants = Arc::new(AccountTenants::new());
+    // Plan provenance (origin, plan id, paper) travels from the account source to the run store and the
+    // reconciliation write-back. Wired only when proposal plans are served, so the pilot-only build writes exactly
+    // the run rows it writes today.
+    let provenance = pilot.serve_proposal_plans.then(|| Arc::new(PlanProvenanceRegistry::new()));
     let pool = match rebalancer_store::pg::create_pool(&database_url, 10) {
         Ok(p) => p,
         Err(e) => {
@@ -213,7 +233,10 @@ fn run_service() {
         }
     };
     let run_store = match PgRunStore::new(pool.clone(), tenants.clone()) {
-        Ok(s) => s,
+        Ok(s) => match &provenance {
+            Some(reg) => s.with_plan_provenance(reg.clone()),
+            None => s,
+        },
         Err(e) => {
             eprintln!("rebalancer-service: could not build PgRunStore: {e}");
             std::process::exit(1);
@@ -247,13 +270,23 @@ fn run_service() {
         }
     };
 
-    // --- The real, Postgres-backed account source (slice S-5): allow-listed to exactly the pilot pair.
-    let allow = match PilotAllowList::parse(&pilot.tenant_id, &pilot.account_id) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("rebalancer-service: bad pilot allow-list: {e}");
-            std::process::exit(1);
-        }
+    // --- The real, Postgres-backed account source (slice S-5): allow-listed to exactly the pilot pair, or (flag on)
+    // the pilot pair plus every approved paper proposal plan in the database.
+    let allow = match &pilot.pilot {
+        Some(pair) => match PilotAllowList::parse(&pair.tenant_id, &pair.account_id) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("rebalancer-service: bad pilot allow-list: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let scope = if pilot.serve_proposal_plans {
+        AccountScope::PilotAndProposals { pilot: allow }
+    } else {
+        // `PilotConfig::from_lookup` guarantees the pair when the flag is off.
+        AccountScope::Pilot(allow.expect("the pilot pair is required when proposal plans are not served"))
     };
     // --- The latency recorder's store (W9.1). Its tables may not exist yet (the migration is applied by the owner
     // from databaseschema-internal); every call then fails with LATENCY_STORE_UNAVAILABLE, which the recorder logs
@@ -265,45 +298,104 @@ fn run_service() {
             std::process::exit(1);
         }
     };
-    let pg_source = match PgAccountSource::new(pool, allow) {
-        Ok(s) => s,
+    let pg_source = match PgAccountSource::with_scope(pool.clone(), scope) {
+        Ok(s) => match &provenance {
+            Some(reg) => s.with_plan_provenance(reg.clone()),
+            None => s,
+        },
         Err(e) => {
             eprintln!("rebalancer-service: could not build PgAccountSource: {e}");
             std::process::exit(1);
         }
     };
+    // --- The reconciliation write-back for proposal plans (flag on only).
+    let reconciliation = if pilot.serve_proposal_plans {
+        match PgPlanReconciliation::new(pool) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("rebalancer-service: could not build PgPlanReconciliation: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     // --- The real broker/data runtime (slice S-6): built ONCE at startup from whatever PgAccountSource enumerates
-    // right now for the pilot account. If it is not eligible yet (no plan, mandate not signed, ...) this refuses to
-    // start with no runtime at all -- the honest, safe default -- rather than starting with an empty `runtimes` map
-    // that would silently never run anything.
-    log("connecting the pilot's real paper broker and data source (one-time startup verification)...");
+    // right now. If no account is eligible yet (no plan, mandate not signed, ...) this refuses to start with no
+    // runtime at all -- the honest, safe default -- rather than starting with an empty `runtimes` map that would
+    // silently never run anything.
+    log("connecting the real paper broker(s) and data source (one-time startup verification)...");
     let enumeration = match pg_source.enumerate() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("rebalancer-service: could not enumerate the pilot account: {e}");
+            eprintln!("rebalancer-service: could not enumerate the accounts: {e}");
             std::process::exit(1);
         }
     };
     for excluded in &enumeration.exclusions {
-        log(format!("pilot account {} excluded at startup: {}", excluded.account_id, excluded.reason.code()));
+        log(format!("account {} excluded at startup: {}", excluded.account_id, excluded.reason.code()));
     }
-    let Some(pilot_account) = enumeration.accounts.first().cloned() else {
-        eprintln!("rebalancer-service: the pilot account is not eligible to run (see the exclusion logged above, if any); refusing to start with no runtime");
+    if enumeration.accounts.is_empty() {
+        eprintln!("rebalancer-service: no account is eligible to run (see the exclusions logged above, if any); refusing to start with no runtime");
         std::process::exit(1);
-    };
+    }
 
-    let alpaca_key_id = required_env(ENV_ALPACA_KEY_ID);
-    let alpaca_secret = required_env(ENV_ALPACA_KEY_SECRET);
-    let transport = build_transport();
-    let pilot_alpaca = match connect_paper_alpaca(&alpaca_key_id, &alpaca_secret, PAPER_BASE_URL, transport.clone(), &pilot_account.credential_fingerprint) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("rebalancer-service: could not connect the pilot's paper Alpaca account: {e}");
-            std::process::exit(1);
-        }
+    // --- Credentials: the pilot pair's key from the environment (required whenever a pilot pair is configured,
+    // exactly as before); every other account through the tenant provider, which is not built (see
+    // `rebalancer_service::credentials`).
+    let pilot_credentials = match &pilot.pilot {
+        Some(pair) => match EnvPilotCredentials::from_lookup(pair.clone(), |k| std::env::var(k).ok()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("rebalancer-service: {e}; refusing to start (fail closed)");
+                std::process::exit(1);
+            }
+        },
+        None => None,
     };
-    log(format!("connected paper Alpaca: key fingerprint {} matches the pilot plan row", pilot_alpaca.key_id_fingerprint()));
+    let credentials = ServiceCredentials::new(pilot_credentials, Box::new(TenantCredentialsNotBuilt));
+    let transport = build_transport();
+
+    let mut connected: Vec<(PilotAccount, PilotAlpaca)> = Vec::new();
+    for account in enumeration.accounts {
+        let (tenant_id, account_id) = (account.active.tenant_id.clone(), account.active.account_id.clone());
+        let is_pilot = account.origin == PlanOrigin::OwnerPilot;
+        let keys = match credentials.paper_alpaca_keys(&tenant_id, &account_id) {
+            Ok(k) => k,
+            Err(e) => {
+                if is_pilot {
+                    eprintln!("rebalancer-service: the pilot account {account_id} has no credential: {e}; refusing to start");
+                    std::process::exit(1);
+                }
+                log(format!("account {account_id} (tenant {tenant_id}, plan {} origin {}): NO RUNTIME -- {e}", account.plan_id, account.origin.as_str()));
+                continue;
+            }
+        };
+        match connect_account_alpaca(&keys.key_id, &keys.secret, PAPER_BASE_URL, transport.clone(), account.credential_fingerprint.as_deref(), &sleeve_kinds(&account)) {
+            Ok(alpaca) => {
+                log(format!(
+                    "connected paper Alpaca for account {account_id} (tenant {tenant_id}, plan {} origin {}): key fingerprint {}{}",
+                    account.plan_id,
+                    account.origin.as_str(),
+                    alpaca.key_id_fingerprint(),
+                    if is_pilot { " matches the pilot plan row" } else { "" }
+                ));
+                connected.push((account, alpaca));
+            }
+            Err(e) => {
+                if is_pilot {
+                    eprintln!("rebalancer-service: could not connect the pilot's paper Alpaca account: {e}");
+                    std::process::exit(1);
+                }
+                log(format!("account {account_id} (tenant {tenant_id}): could not connect its paper Alpaca account: {e}; NO RUNTIME"));
+            }
+        }
+    }
+    if connected.is_empty() {
+        eprintln!("rebalancer-service: no account could be connected (see above); refusing to start with no runtime");
+        std::process::exit(1);
+    }
 
     let massive_key = match EnvKeyProvider::from_env() {
         Ok(k) => k,
@@ -357,19 +449,23 @@ fn run_service() {
     };
     let recorder = LatencyRecorder::new(&observer_massive, &latency_store);
 
-    let broker = pilot_alpaca.broker();
-    let rules = pilot_alpaca.rules();
-    let venue_rules = VenueRuleBook::new().with("alpaca", &rules);
-
+    // One broker, one rule set and one venue book per connected account; the shared data source for all. The
+    // vectors are filled completely before anything borrows from them.
+    let brokers: Vec<_> = connected.iter().map(|(_, a)| a.broker()).collect();
+    let rules: Vec<_> = connected.iter().map(|(_, a)| a.rules()).collect();
+    let venue_books: Vec<VenueRuleBook<'_>> = rules.iter().map(|r| VenueRuleBook::new().with("alpaca", r)).collect();
     let mut runtimes: BTreeMap<String, AccountRuntime<'_>> = BTreeMap::new();
-    runtimes.insert(pilot_account.active.account_id.clone(), AccountRuntime { broker: &broker, data: data_source, venue_rules: &venue_rules });
+    for (i, (account, _)) in connected.iter().enumerate() {
+        runtimes.insert(account.active.account_id.clone(), AccountRuntime { broker: &brokers[i], data: data_source, venue_rules: &venue_books[i] });
+    }
+    log(format!("{} account runtime(s) built", runtimes.len()));
 
     let clock = SystemClock;
     // Paper-only: the pipeline refuses any broker that does not report a paper connection (`VenuePolicy::PaperOnly`).
     let config: RunConfig = pilot_run_config();
     // From here, every tick asks Postgres afresh who is due and eligible: a plan tightened or a mandate revoked
     // between ticks takes effect on the very next one, with no restart needed.
-    let accounts = PilotAccountSource::new(pg_source, pilot);
+    let accounts = PilotAccountSource::new(pg_source, pilot.clone());
 
     // --- Alert delivery (W6.1): dark unless ALERTS_ENABLED=true. The ledger is a separate small pool so a stuck
     // delivery query can never starve the run stores' connections.
@@ -416,6 +512,10 @@ fn run_service() {
         }
     };
     let heartbeat_monitor = HeartbeatMonitor::new();
+    let write_back = match (&provenance, &reconciliation) {
+        (Some(reg), Some(store)) => Some((reg.as_ref(), store)),
+        _ => None,
+    };
 
     loop {
         let outcome = match kill_flag_or_heartbeat(&kill_flag) {
@@ -424,7 +524,7 @@ fn run_service() {
                 TickOutcome::Ran
             }
             Ok(false) => {
-                let tick_outcome = run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes);
+                let tick_outcome = run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes, write_back);
                 // After the runs (and their data fetch), the observer; never before, never instead.
                 observe_tick(&observer_cfg, &recorder, &accounts, &notifier, &clock);
                 tick_outcome
@@ -460,7 +560,8 @@ fn kill_flag_or_heartbeat(kill_flag: &PgKillFlag) -> Result<bool, String> {
 
 /// One tick's runs. Returns whether the tick RAN (the due scan happened and every due account was attempted, whatever
 /// each run's outcome: those alert on their own) or could not (the due scan failed), which is all the dead-man's
-/// switch is told.
+/// switch is told. With `write_back` set (proposal plans served), every finished run of a proposal-served account
+/// is written to its plan's `reconciliation_*` columns after the runs.
 #[allow(clippy::too_many_arguments)]
 fn run_tick(
     accounts: &dyn AccountSource,
@@ -473,6 +574,7 @@ fn run_tick(
     lock: &PgAccountLock,
     config: &RunConfig,
     runtimes: &BTreeMap<String, AccountRuntime<'_>>,
+    write_back: Option<(&PlanProvenanceRegistry, &PgPlanReconciliation)>,
 ) -> TickOutcome {
     let now = clock.now();
     let due = match rebalancer_run::driver::find_due_runs(accounts, now) {
@@ -502,7 +604,34 @@ fn run_tick(
             Err(e) => log(format!("  {}: NOT ATTEMPTED -- {e}", o.spec.account_id)),
         }
     }
+    if let Some((registry, store)) = write_back {
+        write_back_reconciliation(&outcomes, registry, store, clock.now());
+    }
     TickOutcome::Ran
+}
+
+/// `strategy_plans.reconciliation_*` for every finished run of a proposal-served account this tick. A run that was
+/// not attempted (lock busy, no runtime, a panic) says nothing about the account's state and writes nothing; a
+/// pilot-plan run has no such columns. A failed write is logged, never fatal: the run record itself is already
+/// persisted and is the source of truth.
+fn write_back_reconciliation(outcomes: &[DueOutcome], registry: &PlanProvenanceRegistry, store: &PgPlanReconciliation, now: DateTime<Utc>) {
+    for o in outcomes {
+        let Ok(record) = &o.result else { continue };
+        let Some(provenance) = registry.get(&o.spec.account_id) else { continue };
+        if provenance.origin != PlanOrigin::Proposal {
+            continue;
+        }
+        let tenant_id = uuid_or_nil(&o.spec.tenant_id);
+        if tenant_id.is_nil() {
+            log(format!("  {}: plan {} reconciliation NOT written: tenant id {:?} is not a UUID", o.spec.account_id, provenance.plan_id, o.spec.tenant_id));
+            continue;
+        }
+        let (status, detail) = reconciliation_for(record);
+        match store.record(tenant_id, provenance.plan_id, status, &detail, now) {
+            Ok(()) => log(format!("  {}: plan {} reconciliation_status = {}", o.spec.account_id, provenance.plan_id, status.as_str())),
+            Err(e) => log(format!("  {}: plan {} reconciliation NOT written: {e}", o.spec.account_id, provenance.plan_id)),
+        }
+    }
 }
 
 /// The first-seen-latency / revision recorder's observation for this tick (W9.1): every tick, whether or not an

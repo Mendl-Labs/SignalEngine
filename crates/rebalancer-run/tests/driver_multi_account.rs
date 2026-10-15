@@ -241,3 +241,82 @@ fn d_calling_run_all_due_twice_in_quick_succession_does_not_double_run_either_ac
     assert!(outcomes3.iter().all(|o| o.result.is_ok()), "a third call must not see a stuck lock either");
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// (f) two accounts due on the SAME slot run one after the other under the per-account lock: the second account's
+//     lock is taken only after the first's was released, nothing overlaps, and both run to completion
+//     (certified-envelopes Phase 0: N proposal-served accounts share one tick and one `EvalCache`).
+// ---------------------------------------------------------------------------------------------------------------
+
+/// An `AccountLock` that records the order locks were taken in and refuses (fails the test) if a second account's
+/// lock is ever requested while another account's is still held: `run_all_due` must be strictly sequential.
+struct SerialLock {
+    held: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    order: std::sync::Mutex<Vec<String>>,
+}
+
+struct SerialGuard<'a> {
+    lock: &'a SerialLock,
+    account_id: String,
+}
+
+impl Drop for SerialGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.held.lock().unwrap().remove(&self.account_id);
+    }
+}
+
+impl rebalancer_run::driver::AccountLock for SerialLock {
+    type Guard<'a> = SerialGuard<'a>;
+
+    fn try_lock<'a>(&'a self, account_id: &str) -> Result<Option<Self::Guard<'a>>, String> {
+        let mut held = self.held.lock().unwrap();
+        assert!(held.is_empty(), "lock for {account_id} requested while {held:?} is still held: runs must be sequential");
+        held.insert(account_id.to_string());
+        self.order.lock().unwrap().push(account_id.to_string());
+        Ok(Some(SerialGuard { lock: self, account_id: account_id.to_string() }))
+    }
+}
+
+#[test]
+fn f_two_accounts_due_on_the_same_slot_run_sequentially_under_the_per_account_lock() {
+    let env_a = fixture_env();
+    let env_b = fixture_env();
+    let data_a = fixture_data(&env_a);
+    let data_b = fixture_data(&env_b);
+    let rules_a = kraken_rules(&env_a.pairs);
+    let rules_b = kraken_rules(&env_b.pairs);
+    let book_a = book(&rules_a);
+    let book_b = book(&rules_b);
+    let broker_a = env_a.broker();
+    let broker_b = env_b.broker();
+
+    let clock = ManualClock::new(slot_time(0));
+    let runs = InMemoryRunStore::new();
+    let states = InMemoryStateStore::new();
+    let notifier = RecordingNotifier::new();
+    let kill = SwitchKillFlag::new();
+    let lock = SerialLock { held: Default::default(), order: Default::default() };
+    let cfg = RunConfig::default();
+
+    // Two tenants, two accounts, the same (daily crypto) slot.
+    let source = InMemoryAccountSource::new().with_account(crypto_account("acct-a", "tenant-a")).with_account(crypto_account("acct-b", "tenant-b"));
+    let due = find_due_runs(&source, slot_time(0)).expect("enumeration must not fail");
+    assert_eq!(due.len(), 2);
+    assert_eq!(due[0].scheduled_for, due[1].scheduled_for, "both are due on the SAME slot");
+
+    let mut runtimes = BTreeMap::new();
+    runtimes.insert("acct-a".to_string(), AccountRuntime { broker: &broker_a, data: &data_a, venue_rules: &book_a });
+    runtimes.insert("acct-b".to_string(), AccountRuntime { broker: &broker_b, data: &data_b, venue_rules: &book_b });
+
+    let outcomes = run_all_due(due, &runtimes, &states, &runs, &notifier, &kill, &clock, &lock, &cfg);
+    assert_eq!(outcomes.len(), 2);
+    for o in &outcomes {
+        let rec = o.result.as_ref().unwrap_or_else(|e| panic!("{}: not attempted: {e}", o.spec.account_id));
+        assert_eq!(rec.outcome.kind, OutcomeKind::Completed, "{}: {:?}", o.spec.account_id, rec.outcome);
+        assert_eq!(rec.key.scheduled_for, slot_time(0));
+    }
+    assert_eq!(*lock.order.lock().unwrap(), vec!["acct-a".to_string(), "acct-b".to_string()], "one after the other, in enumeration order");
+    assert!(lock.held.lock().unwrap().is_empty(), "every lock was released");
+    assert!(env_a.bal("BTC").is_positive() && env_b.bal("BTC").is_positive(), "both accounts traded on their own exchange");
+}
