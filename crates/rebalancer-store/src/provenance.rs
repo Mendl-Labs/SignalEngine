@@ -1,6 +1,6 @@
 //! Plan provenance for run records (paper-pilot plan section 2.3 item 3): which plan a run executed
 //! under and against which venue environment, so a run row can never be read without knowing it was a
-//! paper-environment pilot run.
+//! paper-environment run, and under which plan source (owner pilot or approved proposal).
 //!
 //! Neither `RunStore::finish` nor `RunRecord` carries a plan, and this slice is not allowed to change the
 //! pipeline, so the account source that knows the plan (`PgAccountSource`) publishes it here and
@@ -13,16 +13,20 @@ use std::sync::RwLock;
 
 use uuid::Uuid;
 
-/// Where a plan came from. Only the owner-authored pilot exists in this crate.
+/// Where a plan came from: the owner-authored pilot (`rebalancer_pilot_plans`) or an approved proposal
+/// (`strategy_plans`, written by the Engine's approve path). Both strings are the ones
+/// `rebalancer_runs_provenance_check` allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanOrigin {
     OwnerPilot,
+    Proposal,
 }
 
 impl PlanOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             PlanOrigin::OwnerPilot => "owner_pilot",
+            PlanOrigin::Proposal => "proposal",
         }
     }
 }

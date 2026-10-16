@@ -41,13 +41,16 @@ fn refusal(pairs: &[(&str, &str)]) -> PilotRefusal {
 #[test]
 fn a_complete_paper_only_environment_is_accepted() {
     let cfg = PilotConfig::from_lookup(env(&good_env())).unwrap();
-    assert_eq!((cfg.tenant_id.as_str(), cfg.account_id.as_str()), (TENANT, ACCOUNT));
+    let pair = cfg.pilot.as_ref().expect("the pilot pair");
+    assert_eq!((pair.tenant_id.as_str(), pair.account_id.as_str()), (TENANT, ACCOUNT));
+    assert!(!cfg.serve_proposal_plans, "the flag defaults to off");
 }
 
 #[test]
 fn ids_are_canonicalised_to_lowercase_hyphenated_uuids() {
     let cfg = PilotConfig::from_lookup(env(&[(ENV_PAPER_ONLY, "true"), (ENV_TENANT, "  3F2A9C1E-5B7D-4E8A-9C0D-1A2B3C4D5E6F "), (ENV_ACCOUNT, "8D7C6B5A4F3E4D2C8B1A0F9E8D7C6B5A")])).unwrap();
-    assert_eq!((cfg.tenant_id.as_str(), cfg.account_id.as_str()), (TENANT, ACCOUNT));
+    let pair = cfg.pilot.as_ref().expect("the pilot pair");
+    assert_eq!((pair.tenant_id.as_str(), pair.account_id.as_str()), (TENANT, ACCOUNT));
 }
 
 #[test]
@@ -114,6 +117,7 @@ fn refusal_codes_are_stable_and_distinct() {
         PilotRefusal::NoSleeves { account_id: String::new() },
         PilotRefusal::NotPaperEnvironment { venue: String::new(), environment: String::new() },
         PilotRefusal::Adapter(String::new()),
+        PilotRefusal::ServeProposalPlansBadValue(String::new()),
     ];
     let codes: Vec<&str> = all.iter().map(PilotRefusal::code).collect();
     assert_eq!(
@@ -131,6 +135,7 @@ fn refusal_codes_are_stable_and_distinct() {
             "PILOT_NO_SLEEVES",
             "PILOT_NOT_PAPER_ENVIRONMENT",
             "PILOT_ADAPTER_REFUSED",
+            "PILOT_SERVE_PROPOSAL_PLANS_BAD_VALUE",
         ]
     );
     assert_eq!(codes.iter().collect::<std::collections::BTreeSet<_>>().len(), codes.len());

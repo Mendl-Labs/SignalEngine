@@ -8,10 +8,15 @@
 //! 1. [`PilotConfig::from_lookup`]: the service refuses to start unless `REBALANCER_PAPER_ONLY=true` and both
 //!    `PILOT_TENANT_ID` and `PILOT_ACCOUNT_ID` are set (UUIDs), and refuses when `CREDENTIALS_ENCRYPTION_KEY` (the
 //!    tenant-credential master key) is present in the process environment: the pilot pod must not be able to decrypt
-//!    a live credential even by accident.
-//! 2. [`PilotAccountSource`]: wraps any `AccountSource` and serves exactly ONE (tenant, account) pair. An account
-//!    with the pilot's account id under another tenant, an ambiguous match, an execution mode other than
-//!    Assisted/Live, a sleeve or mandate venue other than `alpaca`: the whole enumeration fails (loudly, nothing runs).
+//!    a live credential even by accident. With `REBALANCER_SERVE_PROPOSAL_PLANS=true` (default `false`;
+//!    certified-envelopes Phase 0) the pilot pair becomes OPTIONAL (both ids or neither) and the service also serves
+//!    every account with an approved paper `strategy_plans` row; every other refusal, including the master-key one,
+//!    is unchanged.
+//! 2. [`PilotAccountSource`]: wraps any `AccountSource` and serves exactly ONE (tenant, account) pair -- plus, only
+//!    with the flag on, every other account the inner source enumerates (the inner `PgAccountSource` then scopes
+//!    itself to approved proposal plans). An account with the pilot's account id under another tenant, an ambiguous
+//!    pilot match, an execution mode other than Assisted/Live, a sleeve or mandate venue other than `alpaca`: the
+//!    whole enumeration fails (loudly, nothing runs). The per-account checks apply to EVERY served account.
 //! 3. [`pilot_run_config`]: a `RunConfig` with `VenuePolicy::PaperOnly`, so the pipeline itself refuses (before
 //!    reading the broker) any broker that does not report a paper connection, in every execution mode. This is what
 //!    lets `ExecutionMode::Live` be paired ONLY with a paper environment in the pilot build.
@@ -42,6 +47,8 @@ use uuid::Uuid;
 pub const ENV_PAPER_ONLY: &str = "REBALANCER_PAPER_ONLY";
 pub const ENV_TENANT: &str = "PILOT_TENANT_ID";
 pub const ENV_ACCOUNT: &str = "PILOT_ACCOUNT_ID";
+/// `true` serves approved proposal plans (`strategy_plans`) alongside the pilot; unset or `false` is the pilot only.
+pub const ENV_SERVE_PROPOSAL_PLANS: &str = "REBALANCER_SERVE_PROPOSAL_PLANS";
 /// Environment variables the pilot process must NOT hold.
 pub const FORBIDDEN_ENV: [&str; 1] = ["CREDENTIALS_ENCRYPTION_KEY"];
 /// The only venue the pilot may serve.
@@ -66,6 +73,8 @@ pub enum PilotRefusal {
     NoSleeves { account_id: String },
     NotPaperEnvironment { venue: String, environment: String },
     Adapter(String),
+    /// `REBALANCER_SERVE_PROPOSAL_PLANS` is set to something other than exactly `true` or `false`.
+    ServeProposalPlansBadValue(String),
 }
 
 impl PilotRefusal {
@@ -84,6 +93,7 @@ impl PilotRefusal {
             PilotRefusal::NoSleeves { .. } => "PILOT_NO_SLEEVES",
             PilotRefusal::NotPaperEnvironment { .. } => "PILOT_NOT_PAPER_ENVIRONMENT",
             PilotRefusal::Adapter(_) => "PILOT_ADAPTER_REFUSED",
+            PilotRefusal::ServeProposalPlansBadValue(_) => "PILOT_SERVE_PROPOSAL_PLANS_BAD_VALUE",
         }
     }
 }
@@ -113,6 +123,7 @@ impl std::fmt::Display for PilotRefusal {
                 write!(f, "venue {venue:?} in environment {environment:?} is not on the pilot allow-list (only \"alpaca\" in \"paper\")")
             }
             PilotRefusal::Adapter(m) => write!(f, "{m}"),
+            PilotRefusal::ServeProposalPlansBadValue(v) => write!(f, "{ENV_SERVE_PROPOSAL_PLANS} is {v:?}; it must be exactly \"true\" or \"false\" (or unset)"),
         }
     }
 }
@@ -121,9 +132,17 @@ impl std::error::Error for PilotRefusal {}
 
 /// The one (tenant, account) pair the pilot serves, canonical (lowercase hyphenated UUIDs).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PilotConfig {
+pub struct PilotPair {
     pub tenant_id: String,
     pub account_id: String,
+}
+
+/// The service's startup configuration: the pilot pair (required unless proposal plans are served, in which case
+/// it is optional) and whether approved proposal plans are served (`REBALANCER_SERVE_PROPOSAL_PLANS`, default off).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PilotConfig {
+    pub pilot: Option<PilotPair>,
+    pub serve_proposal_plans: bool,
 }
 
 fn canonical_uuid(name: &'static str, raw: Option<String>) -> Result<String, PilotRefusal> {
@@ -148,7 +167,35 @@ impl PilotConfig {
             Some(v) if v.trim() == "true" => {}
             Some(v) => return Err(PilotRefusal::PaperOnlyBadValue(v)),
         }
-        Ok(Self { tenant_id: canonical_uuid(ENV_TENANT, lookup(ENV_TENANT))?, account_id: canonical_uuid(ENV_ACCOUNT, lookup(ENV_ACCOUNT))? })
+        let serve_proposal_plans = match lookup(ENV_SERVE_PROPOSAL_PLANS) {
+            None => false,
+            Some(v) if v.trim() == "true" => true,
+            Some(v) if v.trim() == "false" => false,
+            Some(v) => return Err(PilotRefusal::ServeProposalPlansBadValue(v)),
+        };
+        let tenant = lookup(ENV_TENANT).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let account = lookup(ENV_ACCOUNT).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        // Flag off: exactly today's rule, both ids required. Flag on: both or neither (a half-configured pilot pair
+        // is a mistake, never "no pilot").
+        let pilot = if serve_proposal_plans && tenant.is_none() && account.is_none() {
+            None
+        } else {
+            Some(PilotPair { tenant_id: canonical_uuid(ENV_TENANT, tenant)?, account_id: canonical_uuid(ENV_ACCOUNT, account)? })
+        };
+        Ok(Self { pilot, serve_proposal_plans })
+    }
+
+    /// One line for the startup log.
+    pub fn describe(&self) -> String {
+        let pair = match &self.pilot {
+            Some(p) => format!("pilot tenant {} account {}", p.tenant_id, p.account_id),
+            None => "no pilot pair".to_string(),
+        };
+        if self.serve_proposal_plans {
+            format!("{pair}; {ENV_SERVE_PROPOSAL_PLANS}=true: serving approved paper strategy_plans of every tenant too")
+        } else {
+            format!("{pair}; {ENV_SERVE_PROPOSAL_PLANS} off: pilot only")
+        }
     }
 
     pub fn from_env() -> Result<Self, PilotRefusal> {
@@ -192,8 +239,9 @@ pub fn allow_venue_environment(venue: &str, environment: &str) -> Result<(), Pil
     }
 }
 
-/// Serves exactly one (tenant, account) pair from an inner source and refuses anything about it that the pilot does
-/// not allow. See the module docs, layer 2.
+/// Serves exactly one (tenant, account) pair from an inner source -- plus every other enumerated account when
+/// proposal plans are served -- and refuses anything about any of them that the pilot does not allow. See the
+/// module docs, layer 2.
 pub struct PilotAccountSource<S> {
     inner: S,
     config: PilotConfig,
@@ -231,18 +279,28 @@ impl<S: AccountSource> PilotAccountSource<S> {
     fn select(&self) -> Result<Vec<ActiveAccount>, PilotRefusal> {
         let all = self.inner.active_accounts().map_err(PilotRefusal::Adapter)?;
         let mut mine = Vec::new();
+        let mut others = Vec::new();
         for a in all {
-            let account_matches = same_id(&a.account_id, &self.config.account_id);
-            let tenant_matches = same_id(&a.tenant_id, &self.config.tenant_id);
+            let (account_matches, tenant_matches) = match &self.config.pilot {
+                Some(p) => (same_id(&a.account_id, &p.account_id), same_id(&a.tenant_id, &p.tenant_id)),
+                None => (false, false),
+            };
             match (account_matches, tenant_matches) {
                 (true, true) => mine.push(a),
                 (true, false) => return Err(PilotRefusal::AccountUnderOtherTenant { account_id: a.account_id }),
-                _ => {} // every other account (any tenant) is invisible to the pilot
+                // Every other account (any tenant) is invisible to the pilot; with proposal plans served it is one
+                // of the inner source's approved-plan accounts and gets the same per-account checks.
+                _ => {
+                    if self.config.serve_proposal_plans {
+                        others.push(a);
+                    }
+                }
             }
         }
         if mine.len() > 1 {
             return Err(PilotRefusal::AmbiguousAccount { count: mine.len() });
         }
+        mine.extend(others);
         for a in &mine {
             self.check(a)?;
         }

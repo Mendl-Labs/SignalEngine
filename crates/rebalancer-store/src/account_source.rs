@@ -1,26 +1,38 @@
 //! `PgAccountSource`: the Postgres-backed [`AccountSource`] for the paper pilot (plan
-//! `product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md`, slice S-5).
+//! `product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md`, slice S-5) and, behind a flag, for every account whose plan is
+//! an APPROVED PROPOSAL (`strategy_plans`; certified-envelopes plan, Phase 0).
 //!
 //! It answers ONE question: which accounts may the driver run, in which execution mode, with which sleeves? It
 //! builds the [`ActiveAccount`] descriptors the driver needs and constructs NO broker, reads NO secret and calls no
-//! vendor: the `AccountRuntime` builder (S-6) comes later.
+//! vendor: the `AccountRuntime` builder (`rebalancer-service::runtime`) is the other half.
+//!
+//! # Two plan sources, exactly one per account
+//! * The owner-authored pilot plan (`rebalancer_pilot_plans`, newest row wins, `origin = 'owner_pilot'`).
+//! * The proposal-derived plan (`strategy_plans`, written by the Engine's approve path; `mode = 'paper'` and
+//!   `state = 'paper'` are the only servable values today, `live`/`halted` are typed exclusions, `closed` is
+//!   ignored). Served ONLY when the scope says so ([`AccountScope::PilotAndProposals`], the service's
+//!   `REBALANCER_SERVE_PROPOSAL_PLANS=true`); under [`AccountScope::Pilot`] the behaviour is exactly the pilot's.
+//! * An account that has BOTH a pilot plan and a non-closed proposal plan is refused
+//!   ([`ExclusionReason::StrategyPlanPresent`]): a plan cannot come from two sources. The pilot-plan guard trigger
+//!   refuses the insert in the same situation; this is the second, independent line.
 //!
 //! # Strict scoping
-//! * A PILOT ALLOW-LIST ([`PilotAllowList`]: one tenant id and explicit account ids) is a required input. Every
-//!   query is bound to that tenant AND to those account ids; nothing else is ever selected. An empty allow-list is
-//!   a construction error, never "all accounts".
+//! * Under [`AccountScope::Pilot`] a PILOT ALLOW-LIST ([`PilotAllowList`]: one tenant id and explicit account ids) is
+//!   the only input. Every query is bound to (tenant, account) pairs; nothing else is ever selected. An empty
+//!   allow-list is a construction error, never "all accounts".
+//! * Under [`AccountScope::PilotAndProposals`] the allow-list comes from the DATABASE: every (tenant, account) that
+//!   has a non-closed `strategy_plans` row, plus the pilot pair(s) if configured. The per-pair binding of every
+//!   other query is unchanged, so tenant A's rows can never be read while evaluating tenant B's account.
 //! * Only the non-secret `exchange_credentials` columns are selected (no `*_encrypted` column), so the service's
 //!   database role needs no access to them.
 //!
 //! # What makes an account eligible (each failure is a typed [`ExclusionReason`], never a silent skip)
-//! * its credential exists under the allow-listed tenant, is not deleted, is enabled, is a TESTNET (paper) credential
+//! * its credential exists under the targeted tenant, is not deleted, is enabled, is a TESTNET (paper) credential
 //!   and an Alpaca exchange (paper only: anything else is refused);
 //! * it has an ACTIVE, SIGNED mandate (status `active`, granted, effective and review dates present) whose body
 //!   validates and whose stored hash matches; a mandate at autonomy L3 (live) is refused;
-//! * it has an owner-authored pilot plan (`rebalancer_pilot_plans`, newest row wins), bound to exactly that mandate
-//!   version, paper environment and pilot origin, whose sleeves parse, are ETF-on-Alpaca only and pin a library
-//!   entry whose hash equals the platform's own;
-//! * it has NO proposal-derived plan (`strategy_plans`): a plan cannot come from two sources.
+//! * it has exactly one plan source (above), bound to exactly that mandate version, whose sleeves parse, run on
+//!   Alpaca only and pin library entries whose hashes equal the platform's own ([`check_entry`]).
 //!
 //! # The execution mode (plan section 3.5) the source derives, never more than the mandate grants
 //! | mandate level | plan `execution` | mode handed to the driver |
@@ -30,6 +42,10 @@
 //! | L2 | `paper_orders` and `place_orders` granted | `Live` (the pipeline's order-placing mode, against the PAPER venue) |
 //! | L2 | `paper_orders` without `place_orders` | refused |
 //! | L3 | any | refused |
+//!
+//! A proposal plan has no `execution` column: it asks for `paper_orders` when the mandate is L2 and grants
+//! `place_orders`, and for `assisted` otherwise, so the table above applies unchanged and such a plan is never
+//! refused for asking more than its mandate grants.
 //!
 //! A mandate whose `review_by` has passed is handed over as it is (status `Active`, its real dates): the pipeline
 //! computes the standing and only lets reducing orders through, exactly as it does for any account.
@@ -56,6 +72,33 @@ use crate::provenance::{PlanOrigin, PlanProvenance, PlanProvenanceRegistry, Venu
 /// Exchange strings a paper Alpaca credential may carry (which one production uses is unverified, plan
 /// section 3.1). Lower case.
 pub const ALPACA_EXCHANGES: [&str; 2] = ["alpaca_paper", "alpaca"];
+
+/// The only venue a plan sleeve may run on in this phase (both sources). Proposal plans name no venue in their body;
+/// this is what they get.
+pub const PLAN_VENUE: &str = "alpaca";
+
+/// `strategy_plans.mode` / `.state` values the source serves. `live` (either column) and `halted` are typed
+/// exclusions; `closed` rows are not read at all.
+pub const SERVABLE_PLAN_MODE: &str = "paper";
+pub const SERVABLE_PLAN_STATE: &str = "paper";
+
+/// The library entry -> sleeve kind table for proposal plans (`PlanSleeve.entry_id`). An entry id that is not here
+/// is a typed exclusion ([`ExclusionReason::UnsupportedSleeve`]), never a guess. Phase 4 of the certified-envelopes
+/// plan replaces this with per-point instruments; until then the kind pins the compile-time universe.
+pub const ENTRY_SLEEVE_KINDS: [(&str, SleeveKind); 2] = [("etf_trend_faber", SleeveKind::EtfTrend), ("crypto_trend_100d", SleeveKind::CryptoTrend)];
+
+pub fn sleeve_kind_for_entry(entry_id: &str) -> Option<SleeveKind> {
+    ENTRY_SLEEVE_KINDS.iter().find(|(id, _)| *id == entry_id).map(|(_, k)| *k)
+}
+
+/// The sleeve shape of a kind on [`PLAN_VENUE`]: (asset class, quote). The mandate names the same strings
+/// (`us_etf`; `crypto_spot` with `USD` quote, the Alpaca crypto path's own names).
+fn sleeve_shape(kind: SleeveKind) -> (&'static str, &'static str) {
+    match kind {
+        SleeveKind::EtfTrend => ("us_etf", ""),
+        SleeveKind::CryptoTrend => ("crypto_spot", "USD"),
+    }
+}
 
 // ---------------------------------------------------------------------------------------------------
 // Inputs and results
@@ -105,6 +148,41 @@ impl PilotAllowList {
     pub fn contains(&self, tenant_id: Uuid, account_id: Uuid) -> bool {
         self.tenant_id == tenant_id && self.account_ids.contains(&account_id)
     }
+
+    fn targets(&self) -> impl Iterator<Item = Target> + '_ {
+        self.account_ids.iter().map(move |a| Target { tenant_id: self.tenant_id, account_id: *a })
+    }
+}
+
+/// Which plan sources the source serves, and for whom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountScope {
+    /// The pilot only: exactly the allow-listed pair(s), pilot plans only. This is the service's behaviour with
+    /// `REBALANCER_SERVE_PROPOSAL_PLANS` unset or `false`.
+    Pilot(PilotAllowList),
+    /// The pilot pair(s), if any, PLUS every account of every tenant that has a non-closed `strategy_plans` row
+    /// (the allow-list comes from the database). `REBALANCER_SERVE_PROPOSAL_PLANS=true`.
+    PilotAndProposals { pilot: Option<PilotAllowList> },
+}
+
+impl AccountScope {
+    pub fn serves_proposal_plans(&self) -> bool {
+        matches!(self, AccountScope::PilotAndProposals { .. })
+    }
+
+    pub fn pilot(&self) -> Option<&PilotAllowList> {
+        match self {
+            AccountScope::Pilot(p) => Some(p),
+            AccountScope::PilotAndProposals { pilot } => pilot.as_ref(),
+        }
+    }
+}
+
+/// One (tenant, account) the source evaluates. Every row query is bound to these pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Target {
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -115,7 +193,8 @@ pub enum AccountSourceError {
     Db(String),
 }
 
-/// What the plan's `execution` column says (the DB CHECK allows exactly these two).
+/// What the plan's `execution` column says (the DB CHECK allows exactly these two). A proposal plan derives it from
+/// the mandate (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanExecution {
     Assisted,
@@ -132,10 +211,10 @@ impl PlanExecution {
     }
 }
 
-/// Why an allow-listed account was NOT handed to the driver. The account is excluded, never partially run.
+/// Why a targeted account was NOT handed to the driver. The account is excluded, never partially run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionReason {
-    /// No credential row for this id under the allow-listed tenant (missing, or it belongs to another tenant).
+    /// No credential row for this id under the targeted tenant (missing, or it belongs to another tenant).
     CredentialNotFound,
     CredentialDeleted,
     CredentialDisabled,
@@ -153,6 +232,7 @@ pub enum ExclusionReason {
     AutonomyL3,
     /// The plan asks for orders but the mandate is not at L2 with `place_orders` granted.
     OrdersNotGranted,
+    /// No pilot plan (and, under a proposal-serving scope, no proposal plan either).
     NoPilotPlan,
     /// The plan is bound to another mandate id or version than the active one.
     PlanBoundToOtherMandate { plan_version: i32, active_version: i32 },
@@ -160,13 +240,19 @@ pub enum ExclusionReason {
     PlanNotPaper(String),
     /// The plan row is not `origin = 'owner_pilot'`.
     PlanNotPilotOrigin(String),
-    /// The account ALSO has a proposal-derived plan (`strategy_plans`): a plan cannot come from two sources.
+    /// The account has BOTH a pilot plan and a non-closed proposal-derived plan (`strategy_plans`): a plan cannot
+    /// come from two sources.
     StrategyPlanPresent,
     PlanBodyInvalid(String),
-    /// A sleeve the paper pilot cannot run (any venue but Alpaca, any kind but the ETF sleeve).
+    /// A sleeve this service cannot run (any venue but Alpaca, a kind it has no rule for, an entry id not in
+    /// [`ENTRY_SLEEVE_KINDS`]).
     UnsupportedSleeve(String),
     /// The plan pins a library entry the platform does not have, or one whose hash differs from the platform's.
     EntryMismatch(String),
+    /// More than one non-closed proposal plan for the account: the source cannot pick, so it refuses loudly.
+    AmbiguousProposalPlans { count: usize },
+    /// The proposal plan is not `mode = 'paper'` and `state = 'paper'` (live, or halted by a person).
+    ProposalPlanNotServable { mode: String, state: String },
 }
 
 impl ExclusionReason {
@@ -191,6 +277,8 @@ impl ExclusionReason {
             ExclusionReason::PlanBodyInvalid(_) => "PILOT_PLAN_BODY_INVALID",
             ExclusionReason::UnsupportedSleeve(_) => "PILOT_UNSUPPORTED_SLEEVE",
             ExclusionReason::EntryMismatch(_) => "PILOT_ENTRY_MISMATCH",
+            ExclusionReason::AmbiguousProposalPlans { .. } => "PILOT_PROPOSAL_PLANS_AMBIGUOUS",
+            ExclusionReason::ProposalPlanNotServable { .. } => "PILOT_PROPOSAL_PLAN_NOT_SERVABLE",
         }
     }
 }
@@ -201,19 +289,28 @@ pub struct Exclusion {
     pub reason: ExclusionReason,
 }
 
-/// One account the driver may run, with the pilot facts the runtime builder (S-6) and the report need.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PilotAccount {
-    pub active: ActiveAccount,
-    pub plan_id: Uuid,
-    pub execution: PlanExecution,
-    pub credential_label: String,
-    /// The fingerprint the plan pinned (first 8 bytes of SHA-256 of the paper key id, hex): S-6 compares it with the
-    /// key it actually holds.
-    pub credential_fingerprint: String,
+/// A library entry a plan pins (the pilot pins exactly one; a proposal plan pins one per sleeve).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedEntry {
     pub entry_id: String,
     pub entry_version: u32,
     pub entry_hash: String,
+}
+
+/// One account the driver may run, with the facts the runtime builder and the report need. (Named for the pilot it
+/// was built for; a proposal-served account is the same shape with `origin = Proposal`.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct PilotAccount {
+    pub active: ActiveAccount,
+    pub origin: PlanOrigin,
+    pub plan_id: Uuid,
+    pub execution: PlanExecution,
+    pub credential_label: String,
+    /// The fingerprint the PILOT plan pinned (first 8 bytes of SHA-256 of the paper key id, hex): the runtime builder
+    /// compares it with the key it actually holds. `None` for a proposal plan, which records no fingerprint.
+    pub credential_fingerprint: Option<String>,
+    /// The entries the plan pins, in sleeve order.
+    pub entries: Vec<PinnedEntry>,
 }
 
 /// A full enumeration: who runs and who was refused (and why).
@@ -269,6 +366,7 @@ pub(crate) struct MandateRow {
     pub review_by: Option<DateTime<Utc>>,
 }
 
+/// A `rebalancer_pilot_plans` row.
 #[derive(diesel::QueryableByName, Debug, Clone)]
 pub(crate) struct PlanRow {
     #[diesel(sql_type = SqlUuid)]
@@ -301,10 +399,28 @@ pub(crate) struct PlanRow {
     pub credential_fingerprint: String,
 }
 
-#[derive(diesel::QueryableByName)]
-struct AccountIdRow {
+/// A non-closed `strategy_plans` row (the proposal-derived plan). `body` is the Engine's `PlanBody`:
+/// `{proposal_id, capital: {amount, ccy}, risk_scale, sleeves: [{entry_id, entry_version, entry_hash, weight}]}`.
+#[derive(diesel::QueryableByName, Debug, Clone)]
+pub(crate) struct ProposalPlanRow {
     #[diesel(sql_type = SqlUuid)]
-    id: Uuid,
+    pub id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub tenant_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub proposal_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub account_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub mandate_id: Uuid,
+    #[diesel(sql_type = Integer)]
+    pub mandate_version: i32,
+    #[diesel(sql_type = Text)]
+    pub mode: String,
+    #[diesel(sql_type = Text)]
+    pub state: String,
+    #[diesel(sql_type = Jsonb)]
+    pub body: Value,
 }
 
 /// Everything the SQL side hands to the pure evaluation.
@@ -314,8 +430,9 @@ pub(crate) struct Rows {
     pub mandates: Vec<MandateRow>,
     /// Newest first is NOT assumed: [`evaluate`] picks the highest `seq` per account itself.
     pub plans: Vec<PlanRow>,
-    /// Accounts that also have a proposal-derived (non-closed) plan.
-    pub strategy_plan_accounts: BTreeSet<Uuid>,
+    /// Non-closed proposal-derived plans of the targeted accounts (every non-closed state, so a halted plan is a
+    /// typed exclusion rather than invisible).
+    pub proposal_plans: Vec<ProposalPlanRow>,
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -347,7 +464,7 @@ fn parse_sleeves(plan: &PlanRow) -> Result<Vec<SleeveSpec>, ExclusionReason> {
             other => return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {id}: kind {other:?} cannot run in the paper pilot (ETF sleeve on Alpaca only)"))),
         };
         let venue = text("venue")?;
-        if !venue.eq_ignore_ascii_case("alpaca") {
+        if !venue.eq_ignore_ascii_case(PLAN_VENUE) {
             return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {id}: venue {venue:?} is not alpaca")));
         }
         let asset_class = text("asset_class")?;
@@ -373,19 +490,88 @@ fn parse_sleeves(plan: &PlanRow) -> Result<Vec<SleeveSpec>, ExclusionReason> {
     Ok(out)
 }
 
-/// The platform's own library must hold the pinned entry at the pinned hash.
-fn check_entry(plan: &PlanRow) -> Result<(), ExclusionReason> {
+/// The platform's own library must hold the pinned entry at the pinned hash. Shared by both plan sources: a plan
+/// (of either origin) whose entry drifted from the platform's library is refused, never run on a different rule.
+fn check_entry(entry_id: &str, entry_version: i32, pinned_hash: &str) -> Result<(), ExclusionReason> {
     let lib = seed_library().map_err(|e| ExclusionReason::EntryMismatch(format!("the platform library did not load: {e}")))?;
-    let version = u32::try_from(plan.entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
+    let version = u32::try_from(entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
     let entry = lib
         .iter()
-        .find(|e| e.id == plan.entry_id && e.version == version)
-        .ok_or_else(|| ExclusionReason::EntryMismatch(format!("the platform has no library entry {} version {version}", plan.entry_id)))?;
+        .find(|e| e.id == entry_id && e.version == version)
+        .ok_or_else(|| ExclusionReason::EntryMismatch(format!("the platform has no library entry {entry_id} version {version}")))?;
     let ours = entry_hash(entry);
-    if ours != plan.entry_hash {
-        return Err(ExclusionReason::EntryMismatch(format!("entry {} v{version}: the plan pins hash {} but the platform's is {ours}", plan.entry_id, plan.entry_hash)));
+    if ours != pinned_hash {
+        return Err(ExclusionReason::EntryMismatch(format!("entry {entry_id} v{version}: the plan pins hash {pinned_hash} but the platform's is {ours}")));
     }
     Ok(())
+}
+
+/// An f64 from the Engine's JSON (`weight`, `risk_scale`) as an exact decimal: via its shortest round-trip text, so
+/// `0.25` stays `0.25` and no binary artefact is introduced by a float multiplication here.
+fn dec_from_f64(name: &str, v: f64) -> Result<Dec, ExclusionReason> {
+    if !v.is_finite() {
+        return Err(ExclusionReason::PlanBodyInvalid(format!("{name} is not a finite number")));
+    }
+    Dec::parse(&format!("{v}")).map_err(|e| ExclusionReason::PlanBodyInvalid(format!("{name} {v} is not representable as a decimal: {e}")))
+}
+
+/// The sleeves of a proposal plan (`PlanBody`): `share = weight * risk_scale`, kind from [`ENTRY_SLEEVE_KINDS`],
+/// venue/asset class/quote from the kind. Returns the sleeves and the entries they pin, in order.
+fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<(Vec<SleeveSpec>, Vec<PinnedEntry>), ExclusionReason> {
+    let bad = |m: String| ExclusionReason::PlanBodyInvalid(m);
+    let body = &plan.body;
+    let body_proposal = body.get("proposal_id").and_then(Value::as_str).ok_or_else(|| bad("body.proposal_id missing or not a string".into()))?;
+    if body_proposal.parse::<Uuid>().ok() != Some(plan.proposal_id) {
+        return Err(bad(format!("body.proposal_id {body_proposal:?} does not match the row's proposal_id {}", plan.proposal_id)));
+    }
+    let risk_scale_f = body.get("risk_scale").and_then(Value::as_f64).ok_or_else(|| bad("body.risk_scale missing or not a number".into()))?;
+    let one = Dec::from_i64(1);
+    let risk_scale = dec_from_f64("risk_scale", risk_scale_f)?;
+    if risk_scale <= Dec::ZERO || risk_scale > one {
+        return Err(bad(format!("risk_scale {risk_scale} is not in (0, 1]")));
+    }
+    let arr = body.get("sleeves").and_then(Value::as_array).ok_or_else(|| bad("body.sleeves is not an array".into()))?;
+    if arr.is_empty() {
+        return Err(bad("body.sleeves is empty".into()));
+    }
+    // Inverse-vol weights are f64 sums to 1 up to the last bit; tolerate that, and only that.
+    let cap = Dec::parse("1.000000001").expect("literal");
+    let mut sleeves: Vec<SleeveSpec> = Vec::new();
+    let mut entries: Vec<PinnedEntry> = Vec::new();
+    let mut total = Dec::ZERO;
+    for (i, s) in arr.iter().enumerate() {
+        let entry_id = s.get("entry_id").and_then(Value::as_str).ok_or_else(|| bad(format!("sleeve {i}: entry_id missing or not a string")))?.to_string();
+        let entry_version = s.get("entry_version").and_then(Value::as_i64).ok_or_else(|| bad(format!("sleeve {i}: entry_version missing or not an integer")))?;
+        let entry_version = i32::try_from(entry_version).map_err(|_| bad(format!("sleeve {i}: entry_version {entry_version} out of range")))?;
+        let entry_hash = s.get("entry_hash").and_then(Value::as_str).ok_or_else(|| bad(format!("sleeve {i}: entry_hash missing or not a string")))?.to_string();
+        let weight_f = s.get("weight").and_then(Value::as_f64).ok_or_else(|| bad(format!("sleeve {i}: weight missing or not a number")))?;
+        if entry_id.trim().is_empty() || entry_id.contains('+') {
+            return Err(bad(format!("sleeve {i}: entry_id must be non-empty and contain no '+'")));
+        }
+        if sleeves.iter().any(|o| o.id == entry_id) {
+            return Err(bad(format!("entry {entry_id} appears twice")));
+        }
+        let kind = sleeve_kind_for_entry(&entry_id)
+            .ok_or_else(|| ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: no sleeve kind is registered for this library entry (ENTRY_SLEEVE_KINDS)")))?;
+        let weight = dec_from_f64(&format!("sleeve {entry_id}: weight"), weight_f)?;
+        if weight <= Dec::ZERO || weight > one {
+            return Err(bad(format!("sleeve {entry_id}: weight {weight} is not in (0, 1]")));
+        }
+        let share = weight.checked_mul(risk_scale).ok_or_else(|| bad(format!("sleeve {entry_id}: share overflows")))?;
+        if share <= Dec::ZERO || share > one {
+            return Err(bad(format!("sleeve {entry_id}: share {share} is not in (0, 1]")));
+        }
+        total = total.checked_add(weight).ok_or_else(|| bad("the sleeve weights overflow".into()))?;
+        let (asset_class, quote) = sleeve_shape(kind);
+        // The sleeve id is the entry id: stable, part of the run key and every order tag, unique within the plan.
+        sleeves.push(SleeveSpec { id: entry_id.clone(), kind, share, venue: PLAN_VENUE.to_string(), asset_class: asset_class.to_string(), quote: quote.to_string() });
+        let version = u32::try_from(entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
+        entries.push(PinnedEntry { entry_id, entry_version: version, entry_hash });
+    }
+    if total > cap {
+        return Err(bad(format!("the sleeve weights sum to {total}, above 1")));
+    }
+    Ok((sleeves, entries))
 }
 
 fn derive_mode(body: &MandateBody, execution: PlanExecution) -> Result<ExecutionMode, ExclusionReason> {
@@ -405,13 +591,94 @@ fn derive_mode(body: &MandateBody, execution: PlanExecution) -> Result<Execution
     }
 }
 
-fn evaluate_one(allow: &PilotAllowList, account: Uuid, rows: &Rows) -> Result<PilotAccount, ExclusionReason> {
+/// The checked mandate of an account: what both plan paths build the descriptor from.
+struct CheckedMandate<'a> {
+    row: &'a MandateRow,
+    body: MandateBody,
+    version: u32,
+    effective_from: DateTime<Utc>,
+    review_by: DateTime<Utc>,
+}
+
+fn evaluate_pilot_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, plan: &PlanRow, proposal_plans_present: bool) -> Result<PilotAccount, ExclusionReason> {
+    if plan.venue_environment != "paper" {
+        return Err(ExclusionReason::PlanNotPaper(plan.venue_environment.clone()));
+    }
+    if plan.origin != "owner_pilot" {
+        return Err(ExclusionReason::PlanNotPilotOrigin(plan.origin.clone()));
+    }
+    if plan.mandate_id != mandate.row.id || plan.mandate_version != mandate.row.version {
+        return Err(ExclusionReason::PlanBoundToOtherMandate { plan_version: plan.mandate_version, active_version: mandate.row.version });
+    }
+    if proposal_plans_present {
+        return Err(ExclusionReason::StrategyPlanPresent);
+    }
+    let execution = PlanExecution::parse(&plan.execution).ok_or_else(|| ExclusionReason::PlanBodyInvalid(format!("unknown execution {:?}", plan.execution)))?;
+    let sleeves = parse_sleeves(plan)?;
+    check_entry(&plan.entry_id, plan.entry_version, &plan.entry_hash)?;
+
+    // --- the mode, never more than the mandate grants.
+    let mode = derive_mode(&mandate.body, execution)?;
+
+    let active = ActiveAccount {
+        account_id: target.account_id.to_string(),
+        tenant_id: target.tenant_id.to_string(),
+        mandate: mandate.body.clone(),
+        envelope: MandateEnvelope { version: mandate.version, status: MandateStatus::Active, effective_from: mandate.effective_from, review_by: mandate.review_by },
+        plan_approved: true,
+        sleeves,
+        mode,
+    };
+    Ok(PilotAccount {
+        active,
+        origin: PlanOrigin::OwnerPilot,
+        plan_id: plan.id,
+        execution,
+        credential_label: cred.label.clone(),
+        credential_fingerprint: Some(plan.credential_fingerprint.clone()),
+        entries: vec![PinnedEntry { entry_id: plan.entry_id.clone(), entry_version: u32::try_from(plan.entry_version).unwrap_or_default(), entry_hash: plan.entry_hash.clone() }],
+    })
+}
+
+fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, candidates: &[&ProposalPlanRow]) -> Result<PilotAccount, ExclusionReason> {
+    if candidates.len() > 1 {
+        return Err(ExclusionReason::AmbiguousProposalPlans { count: candidates.len() });
+    }
+    let plan = candidates[0];
+    if plan.mode != SERVABLE_PLAN_MODE || plan.state != SERVABLE_PLAN_STATE {
+        return Err(ExclusionReason::ProposalPlanNotServable { mode: plan.mode.clone(), state: plan.state.clone() });
+    }
+    if plan.mandate_id != mandate.row.id || plan.mandate_version != mandate.row.version {
+        return Err(ExclusionReason::PlanBoundToOtherMandate { plan_version: plan.mandate_version, active_version: mandate.row.version });
+    }
+    let (sleeves, entries) = parse_proposal_sleeves(plan)?;
+    for e in &entries {
+        check_entry(&e.entry_id, i32::try_from(e.entry_version).unwrap_or(i32::MAX), &e.entry_hash)?;
+    }
+    // A proposal plan has no `execution` column: it asks for orders exactly when the mandate grants them.
+    let execution = if mandate.body.autonomy.level == AutonomyLevel::L2 && mandate.body.autonomy.may.contains(&AgentAction::PlaceOrders) {
+        PlanExecution::PaperOrders
+    } else {
+        PlanExecution::Assisted
+    };
+    let mode = derive_mode(&mandate.body, execution)?;
+
+    let active = ActiveAccount {
+        account_id: target.account_id.to_string(),
+        tenant_id: target.tenant_id.to_string(),
+        mandate: mandate.body.clone(),
+        envelope: MandateEnvelope { version: mandate.version, status: MandateStatus::Active, effective_from: mandate.effective_from, review_by: mandate.review_by },
+        plan_approved: true,
+        sleeves,
+        mode,
+    };
+    Ok(PilotAccount { active, origin: PlanOrigin::Proposal, plan_id: plan.id, execution, credential_label: cred.label.clone(), credential_fingerprint: None, entries })
+}
+
+fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool) -> Result<PilotAccount, ExclusionReason> {
+    let Target { tenant_id, account_id } = target;
     // --- credential: paper Alpaca, enabled, not deleted, of THIS tenant.
-    let cred = rows
-        .credentials
-        .iter()
-        .find(|c| c.id == account && c.tenant_id == allow.tenant_id)
-        .ok_or(ExclusionReason::CredentialNotFound)?;
+    let cred = rows.credentials.iter().find(|c| c.id == account_id && c.tenant_id == tenant_id).ok_or(ExclusionReason::CredentialNotFound)?;
     if cred.deleted_at.is_some() {
         return Err(ExclusionReason::CredentialDeleted);
     }
@@ -426,77 +693,54 @@ fn evaluate_one(allow: &PilotAllowList, account: Uuid, rows: &Rows) -> Result<Pi
     }
 
     // --- mandate: the active, signed one of this tenant and account.
-    let mandate = rows
+    let row = rows
         .mandates
         .iter()
-        .find(|m| m.account_id == account && m.tenant_id == allow.tenant_id && m.status == "active")
+        .find(|m| m.account_id == account_id && m.tenant_id == tenant_id && m.status == "active")
         .ok_or(ExclusionReason::NoActiveMandate)?;
-    let (Some(_granted), Some(effective_from), Some(review_by)) = (mandate.granted_at, mandate.effective_from, mandate.review_by) else {
+    let (Some(_granted), Some(effective_from), Some(review_by)) = (row.granted_at, row.effective_from, row.review_by) else {
         return Err(ExclusionReason::MandateNotSigned);
     };
-    let body = validate_json(&mandate.body).map_err(|v| ExclusionReason::MandateBodyInvalid(v.iter().map(|x| format!("{}: {}", x.field, x.message)).collect::<Vec<_>>().join("; ")))?;
-    if canonical_hash(&body) != mandate.body_hash {
+    let body = validate_json(&row.body).map_err(|v| ExclusionReason::MandateBodyInvalid(v.iter().map(|x| format!("{}: {}", x.field, x.message)).collect::<Vec<_>>().join("; ")))?;
+    if canonical_hash(&body) != row.body_hash {
         return Err(ExclusionReason::MandateHashMismatch);
     }
-    let version = u32::try_from(mandate.version).map_err(|_| ExclusionReason::MandateBodyInvalid("negative mandate version".into()))?;
+    let version = u32::try_from(row.version).map_err(|_| ExclusionReason::MandateBodyInvalid("negative mandate version".into()))?;
+    let mandate = CheckedMandate { row, body, version, effective_from, review_by };
 
-    // --- plan: the newest pilot plan row of this tenant and account.
-    let plan = rows
-        .plans
-        .iter()
-        .filter(|p| p.account_id == account && p.tenant_id == allow.tenant_id)
-        .max_by_key(|p| p.seq)
-        .ok_or(ExclusionReason::NoPilotPlan)?;
-    if plan.venue_environment != "paper" {
-        return Err(ExclusionReason::PlanNotPaper(plan.venue_environment.clone()));
+    // --- the plan: exactly one source. The newest pilot plan row of this tenant and account, or its non-closed
+    // proposal plan(s).
+    let pilot_plan = rows.plans.iter().filter(|p| p.account_id == account_id && p.tenant_id == tenant_id).max_by_key(|p| p.seq);
+    let proposal_plans: Vec<&ProposalPlanRow> = rows.proposal_plans.iter().filter(|p| p.account_id == account_id && p.tenant_id == tenant_id && p.state != "closed").collect();
+    match pilot_plan {
+        Some(plan) => evaluate_pilot_plan(target, cred, &mandate, plan, !proposal_plans.is_empty()),
+        None if serve_proposal_plans && !proposal_plans.is_empty() => evaluate_proposal_plan(target, cred, &mandate, &proposal_plans),
+        None => Err(ExclusionReason::NoPilotPlan),
     }
-    if plan.origin != "owner_pilot" {
-        return Err(ExclusionReason::PlanNotPilotOrigin(plan.origin.clone()));
-    }
-    if plan.mandate_id != mandate.id || plan.mandate_version != mandate.version {
-        return Err(ExclusionReason::PlanBoundToOtherMandate { plan_version: plan.mandate_version, active_version: mandate.version });
-    }
-    if rows.strategy_plan_accounts.contains(&account) {
-        return Err(ExclusionReason::StrategyPlanPresent);
-    }
-    let execution = PlanExecution::parse(&plan.execution).ok_or_else(|| ExclusionReason::PlanBodyInvalid(format!("unknown execution {:?}", plan.execution)))?;
-    let sleeves = parse_sleeves(plan)?;
-    check_entry(plan)?;
-
-    // --- the mode, never more than the mandate grants.
-    let mode = derive_mode(&body, execution)?;
-
-    let active = ActiveAccount {
-        account_id: account.to_string(),
-        tenant_id: allow.tenant_id.to_string(),
-        mandate: body,
-        envelope: MandateEnvelope { version, status: MandateStatus::Active, effective_from, review_by },
-        plan_approved: true,
-        sleeves,
-        mode,
-    };
-    Ok(PilotAccount {
-        active,
-        plan_id: plan.id,
-        execution,
-        credential_label: cred.label.clone(),
-        credential_fingerprint: plan.credential_fingerprint.clone(),
-        entry_id: plan.entry_id.clone(),
-        entry_version: u32::try_from(plan.entry_version).unwrap_or_default(),
-        entry_hash: plan.entry_hash.clone(),
-    })
 }
 
 /// Rows in, descriptors and typed exclusions out. Pure: no I/O, so every refusal has a test that needs no database.
-pub(crate) fn evaluate(allow: &PilotAllowList, rows: &Rows) -> Enumeration {
+/// `targets` is evaluated in order; a target is never silently dropped.
+pub(crate) fn evaluate(targets: &[Target], rows: &Rows, serve_proposal_plans: bool) -> Enumeration {
     let mut out = Enumeration::default();
-    for account in allow.account_ids() {
-        match evaluate_one(allow, account, rows) {
+    for target in targets {
+        match evaluate_one(*target, rows, serve_proposal_plans) {
             Ok(a) => out.accounts.push(a),
-            Err(reason) => out.exclusions.push(Exclusion { account_id: account, reason }),
+            Err(reason) => out.exclusions.push(Exclusion { account_id: target.account_id, reason }),
         }
     }
     out
+}
+
+/// The targets of a scope given the proposal plans the database holds: the pilot pair(s), plus (when serving
+/// proposals) every (tenant, account) with a non-closed proposal plan. Sorted and de-duplicated, so an account that
+/// is both pilot-listed and proposal-planned is evaluated once (and refused once, as two sources).
+pub(crate) fn targets_for(scope: &AccountScope, proposal_plans: &[ProposalPlanRow]) -> Vec<Target> {
+    let mut set: BTreeSet<Target> = scope.pilot().map(|p| p.targets().collect()).unwrap_or_default();
+    if scope.serves_proposal_plans() {
+        set.extend(proposal_plans.iter().filter(|p| p.state != "closed").map(|p| Target { tenant_id: p.tenant_id, account_id: p.account_id }));
+    }
+    set.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -505,24 +749,37 @@ pub(crate) fn evaluate(allow: &PilotAllowList, rows: &Rows) -> Enumeration {
 
 pub struct PgAccountSource {
     bridge: Bridge,
-    allow: PilotAllowList,
+    scope: AccountScope,
     provenance: Option<Arc<PlanProvenanceRegistry>>,
     last_exclusions: Mutex<Vec<Exclusion>>,
 }
 
+const PROPOSAL_PLAN_COLUMNS: &str = "id, tenant_id, proposal_id, account_id, mandate_id, mandate_version, mode::text AS mode, state::text AS state, body";
+
 impl PgAccountSource {
+    /// The pilot-only source (today's behaviour): exactly the allow-listed pair(s).
     pub fn new(pool: Pool, allow: PilotAllowList) -> Result<Self, String> {
-        Ok(Self { bridge: Bridge::new(pool)?, allow, provenance: None, last_exclusions: Mutex::new(Vec::new()) })
+        Self::with_scope(pool, AccountScope::Pilot(allow))
     }
 
-    /// Publish each enumerated account's plan provenance (`owner_pilot`, plan id, `paper`) for `PgRunStore::finish`.
+    pub fn with_scope(pool: Pool, scope: AccountScope) -> Result<Self, String> {
+        Ok(Self { bridge: Bridge::new(pool)?, scope, provenance: None, last_exclusions: Mutex::new(Vec::new()) })
+    }
+
+    /// Publish each enumerated account's plan provenance (origin, plan id, `paper`) for `PgRunStore::finish` and
+    /// the reconciliation write-back.
     pub fn with_plan_provenance(mut self, registry: Arc<PlanProvenanceRegistry>) -> Self {
         self.provenance = Some(registry);
         self
     }
 
-    pub fn allow_list(&self) -> &PilotAllowList {
-        &self.allow
+    pub fn scope(&self) -> &AccountScope {
+        &self.scope
+    }
+
+    /// The pilot allow-list, if the scope has one.
+    pub fn allow_list(&self) -> Option<&PilotAllowList> {
+        self.scope.pilot()
     }
 
     /// The exclusions of the most recent enumeration (the service logs and alerts on them).
@@ -530,49 +787,68 @@ impl PgAccountSource {
         self.last_exclusions.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn fetch(&self) -> Result<Rows, AccountSourceError> {
-        let tenant = self.allow.tenant_id;
-        let ids: Vec<Uuid> = self.allow.account_ids().collect();
+    /// Read the rows of the scope's targets. Every per-account query is bound to (tenant, account) PAIRS
+    /// (`unnest` of two parallel arrays), never to a bare account id, so a row of another tenant is never read.
+    fn fetch(&self) -> Result<(Vec<Target>, Rows), AccountSourceError> {
+        let scope = self.scope.clone();
         self.bridge
             .block_on(move |mut conn| async move {
+                // 1. The proposal plans: of the pilot pair(s) only (to refuse two sources), or of every tenant (the
+                //    database allow-list) when serving proposals.
+                let proposal_plans: Vec<ProposalPlanRow> = if scope.serves_proposal_plans() {
+                    diesel::sql_query(format!("SELECT {PROPOSAL_PLAN_COLUMNS} FROM strategy_plans WHERE state <> 'closed' ORDER BY tenant_id, account_id, created_at"))
+                        .get_results(&mut conn)
+                        .await
+                        .map_err(|e| format!("strategy plans: {e}"))?
+                } else {
+                    let (tenants, accounts) = pair_arrays(scope.pilot().map(|p| p.targets().collect::<Vec<_>>()).unwrap_or_default());
+                    diesel::sql_query(format!(
+                        "SELECT {PROPOSAL_PLAN_COLUMNS} FROM strategy_plans sp \
+                         JOIN unnest($1::uuid[], $2::uuid[]) AS t(tenant_id, account_id) ON sp.tenant_id = t.tenant_id AND sp.account_id = t.account_id \
+                         WHERE sp.state <> 'closed' ORDER BY sp.tenant_id, sp.account_id, sp.created_at"
+                    ))
+                    .bind::<Array<SqlUuid>, _>(&tenants)
+                    .bind::<Array<SqlUuid>, _>(&accounts)
+                    .get_results(&mut conn)
+                    .await
+                    .map_err(|e| format!("strategy plans: {e}"))?
+                };
+                let targets = targets_for(&scope, &proposal_plans);
+                let (tenants, accounts) = pair_arrays(targets.clone());
+
+                // 2. Credentials, mandates and pilot plans of exactly those pairs.
                 let credentials: Vec<CredentialRow> = diesel::sql_query(
-                    "SELECT id, tenant_id, exchange::text AS exchange, label::text AS label, is_testnet, is_enabled, deleted_at \
-                     FROM exchange_credentials WHERE tenant_id = $1 AND id = ANY($2)",
+                    "SELECT c.id, c.tenant_id, c.exchange::text AS exchange, c.label::text AS label, c.is_testnet, c.is_enabled, c.deleted_at \
+                     FROM exchange_credentials c JOIN unnest($1::uuid[], $2::uuid[]) AS t(tenant_id, account_id) ON c.tenant_id = t.tenant_id AND c.id = t.account_id",
                 )
-                .bind::<SqlUuid, _>(tenant)
-                .bind::<Array<SqlUuid>, _>(&ids)
+                .bind::<Array<SqlUuid>, _>(&tenants)
+                .bind::<Array<SqlUuid>, _>(&accounts)
                 .get_results(&mut conn)
                 .await
                 .map_err(|e| format!("credentials: {e}"))?;
                 let mandates: Vec<MandateRow> = diesel::sql_query(
-                    "SELECT id, tenant_id, account_id, version, status::text AS status, body, body_hash::text AS body_hash, granted_at, effective_from, review_by \
-                     FROM mandates WHERE tenant_id = $1 AND account_id = ANY($2) AND status = 'active'",
+                    "SELECT m.id, m.tenant_id, m.account_id, m.version, m.status::text AS status, m.body, m.body_hash::text AS body_hash, m.granted_at, m.effective_from, m.review_by \
+                     FROM mandates m JOIN unnest($1::uuid[], $2::uuid[]) AS t(tenant_id, account_id) ON m.tenant_id = t.tenant_id AND m.account_id = t.account_id \
+                     WHERE m.status = 'active'",
                 )
-                .bind::<SqlUuid, _>(tenant)
-                .bind::<Array<SqlUuid>, _>(&ids)
+                .bind::<Array<SqlUuid>, _>(&tenants)
+                .bind::<Array<SqlUuid>, _>(&accounts)
                 .get_results(&mut conn)
                 .await
                 .map_err(|e| format!("mandates: {e}"))?;
                 let plans: Vec<PlanRow> = diesel::sql_query(
-                    "SELECT id, seq, tenant_id, account_id, mandate_id, mandate_version, origin::text AS origin, venue_environment::text AS venue_environment, \
-                            execution::text AS execution, body, entry_id::text AS entry_id, entry_version, entry_hash::text AS entry_hash, \
-                            credential_fingerprint::text AS credential_fingerprint \
-                     FROM rebalancer_pilot_plans WHERE tenant_id = $1 AND account_id = ANY($2) ORDER BY seq DESC",
+                    "SELECT p.id, p.seq, p.tenant_id, p.account_id, p.mandate_id, p.mandate_version, p.origin::text AS origin, p.venue_environment::text AS venue_environment, \
+                            p.execution::text AS execution, p.body, p.entry_id::text AS entry_id, p.entry_version, p.entry_hash::text AS entry_hash, \
+                            p.credential_fingerprint::text AS credential_fingerprint \
+                     FROM rebalancer_pilot_plans p JOIN unnest($1::uuid[], $2::uuid[]) AS t(tenant_id, account_id) ON p.tenant_id = t.tenant_id AND p.account_id = t.account_id \
+                     ORDER BY p.seq DESC",
                 )
-                .bind::<SqlUuid, _>(tenant)
-                .bind::<Array<SqlUuid>, _>(&ids)
+                .bind::<Array<SqlUuid>, _>(&tenants)
+                .bind::<Array<SqlUuid>, _>(&accounts)
                 .get_results(&mut conn)
                 .await
                 .map_err(|e| format!("pilot plans: {e}"))?;
-                let strategy_plans: Vec<AccountIdRow> = diesel::sql_query(
-                    "SELECT DISTINCT account_id AS id FROM strategy_plans WHERE tenant_id = $1 AND account_id = ANY($2) AND state <> 'closed'",
-                )
-                .bind::<SqlUuid, _>(tenant)
-                .bind::<Array<SqlUuid>, _>(&ids)
-                .get_results(&mut conn)
-                .await
-                .map_err(|e| format!("strategy plans: {e}"))?;
-                Ok(Rows { credentials, mandates, plans, strategy_plan_accounts: strategy_plans.into_iter().map(|r| r.id).collect() })
+                Ok((targets, Rows { credentials, mandates, plans, proposal_plans }))
             })
             .map_err(AccountSourceError::Db)
     }
@@ -580,16 +856,19 @@ impl PgAccountSource {
     /// Read the database and decide, keeping the typed exclusions. A database failure is an error (the driver then
     /// runs nothing this tick), never an empty list dressed up as success.
     pub fn enumerate(&self) -> Result<Enumeration, AccountSourceError> {
-        let rows = self.fetch()?;
-        let result = evaluate(&self.allow, &rows);
+        let (targets, rows) = self.fetch()?;
+        let result = evaluate(&targets, &rows, self.scope.serves_proposal_plans());
         *self.last_exclusions.lock().unwrap_or_else(|e| e.into_inner()) = result.exclusions.clone();
         if let Some(reg) = &self.provenance {
-            reg.set_all(result.accounts.iter().map(|a| {
-                (a.active.account_id.clone(), PlanProvenance { origin: PlanOrigin::OwnerPilot, plan_id: a.plan_id, venue_environment: VenueEnvironment::Paper })
-            }));
+            reg.set_all(result.accounts.iter().map(|a| (a.active.account_id.clone(), PlanProvenance { origin: a.origin, plan_id: a.plan_id, venue_environment: VenueEnvironment::Paper })));
         }
         Ok(result)
     }
+}
+
+/// Two parallel arrays for `unnest($1::uuid[], $2::uuid[])`.
+fn pair_arrays(targets: Vec<Target>) -> (Vec<Uuid>, Vec<Uuid>) {
+    targets.into_iter().map(|t| (t.tenant_id, t.account_id)).unzip()
 }
 
 impl AccountSource for PgAccountSource {
@@ -604,7 +883,7 @@ pub fn exclusions_by_account(exclusions: &[Exclusion]) -> BTreeMap<Uuid, &Exclus
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Unit tests of the pure decision (no database): every refusal, the mode table, the allow-list.
+// Unit tests of the pure decision (no database): every refusal, the mode table, the allow-list, both sources.
 // ---------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -618,6 +897,8 @@ mod tests {
     const OTHER_ACCOUNT: Uuid = Uuid::from_u128(0x101);
     const MANDATE: Uuid = Uuid::from_u128(0x200);
     const PLAN: Uuid = Uuid::from_u128(0x300);
+    const PROPOSAL: Uuid = Uuid::from_u128(0x400);
+    const STRATEGY_PLAN: Uuid = Uuid::from_u128(0x500);
 
     fn mandate_body(level: &str, may: &[&str]) -> Value {
         let mut v: Value = serde_json::from_str(include_str!("../../mandate-core/tests/fixtures/baseline_mandate.json")).unwrap();
@@ -626,14 +907,32 @@ mod tests {
         v
     }
 
-    fn entry_hash_v1() -> String {
+    fn library_hash(id: &str) -> String {
         let lib = seed_library().unwrap();
-        entry_hash(lib.iter().find(|e| e.id == "etf_trend_faber" && e.version == 1).unwrap())
+        entry_hash(lib.iter().find(|e| e.id == id && e.version == 1).unwrap())
+    }
+
+    fn entry_hash_v1() -> String {
+        library_hash("etf_trend_faber")
     }
 
     fn plan_body(hash: &str) -> Value {
         json!({"sleeves": [{"sleeve_id": "etf", "entry_id": "etf_trend_faber", "entry_version": 1, "entry_hash": hash,
                             "kind": "etf_trend", "share": "1.0", "venue": "alpaca", "asset_class": "us_etf", "quote": ""}]})
+    }
+
+    /// The Engine's `PlanBody` shape, exactly.
+    fn proposal_body(proposal_id: Uuid, risk_scale: f64, sleeves: &[(&str, f64)]) -> Value {
+        json!({
+            "proposal_id": proposal_id.to_string(),
+            "capital": {"amount": "5000.00", "ccy": "USD"},
+            "risk_scale": risk_scale,
+            "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": 1, "entry_hash": library_hash(id), "weight": w})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn proposal_plan(tenant: Uuid, account: Uuid, mandate: Uuid, body: Value) -> ProposalPlanRow {
+        ProposalPlanRow { id: STRATEGY_PLAN, tenant_id: tenant, proposal_id: PROPOSAL, account_id: account, mandate_id: mandate, mandate_version: 1, mode: "paper".into(), state: "paper".into(), body }
     }
 
     fn set_mandate(rows: &mut Rows, level: &str, may: &[&str]) {
@@ -677,24 +976,53 @@ mod tests {
                 entry_hash: hash,
                 credential_fingerprint: "0123456789abcdef".into(),
             }],
-            strategy_plan_accounts: BTreeSet::new(),
+            proposal_plans: Vec::new(),
         }
+    }
+
+    /// The same account with a proposal plan INSTEAD of the pilot plan.
+    fn proposal_rows(level: &str, may: &[&str], risk_scale: f64, sleeves: &[(&str, f64)]) -> Rows {
+        let mut rows = happy_rows(level, "assisted");
+        set_mandate(&mut rows, level, may);
+        rows.plans.clear();
+        rows.proposal_plans.push(proposal_plan(TENANT, ACCOUNT, MANDATE, proposal_body(PROPOSAL, risk_scale, sleeves)));
+        rows
     }
 
     fn allow() -> PilotAllowList {
         PilotAllowList::new(TENANT, [ACCOUNT]).unwrap()
     }
 
+    fn pilot_targets() -> Vec<Target> {
+        allow().targets().collect()
+    }
+
+    fn evaluate_pilot(rows: &Rows) -> Enumeration {
+        evaluate(&pilot_targets(), rows, false)
+    }
+
+    fn evaluate_serving(rows: &Rows) -> Enumeration {
+        let targets = targets_for(&AccountScope::PilotAndProposals { pilot: Some(allow()) }, &rows.proposal_plans);
+        evaluate(&targets, rows, true)
+    }
+
     fn only_reason(rows: &Rows) -> ExclusionReason {
-        let e = evaluate(&allow(), rows);
+        let e = evaluate_pilot(rows);
         assert!(e.accounts.is_empty(), "must be excluded: {:?}", e.accounts);
         assert_eq!(e.exclusions.len(), 1);
         e.exclusions.into_iter().next().unwrap().reason
     }
 
+    fn only_reason_serving(rows: &Rows) -> ExclusionReason {
+        let e = evaluate_serving(rows);
+        assert!(e.accounts.is_empty(), "must be excluded: {:?}", e.accounts);
+        assert_eq!(e.exclusions.len(), 1, "{:?}", e.exclusions);
+        e.exclusions.into_iter().next().unwrap().reason
+    }
+
     #[test]
     fn the_happy_path_builds_the_descriptor_the_driver_needs() {
-        let e = evaluate(&allow(), &happy_rows("L2", "assisted"));
+        let e = evaluate_pilot(&happy_rows("L2", "assisted"));
         assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
         let a = &e.accounts[0];
         assert_eq!(a.active.account_id, ACCOUNT.to_string());
@@ -707,7 +1035,9 @@ mod tests {
         assert_eq!(a.active.sleeves[0].id, "etf");
         assert_eq!(a.active.sleeves[0].kind, SleeveKind::EtfTrend);
         assert_eq!(a.active.sleeves[0].venue, "alpaca");
-        assert_eq!((a.plan_id, a.credential_fingerprint.as_str(), a.entry_version), (PLAN, "0123456789abcdef", 1));
+        assert_eq!(a.origin, PlanOrigin::OwnerPilot);
+        assert_eq!((a.plan_id, a.credential_fingerprint.as_deref(), a.entries[0].entry_version), (PLAN, Some("0123456789abcdef"), 1));
+        assert_eq!(a.entries.len(), 1);
     }
 
     #[test]
@@ -715,7 +1045,7 @@ mod tests {
         let mode = |level: &str, exec: &str, may: &[&str]| -> Result<ExecutionMode, ExclusionReason> {
             let mut rows = happy_rows(level, exec);
             set_mandate(&mut rows, level, may);
-            let e = evaluate(&allow(), &rows);
+            let e = evaluate_pilot(&rows);
             match e.accounts.into_iter().next() {
                 Some(a) => Ok(a.active.mode),
                 None => Err(e.exclusions.into_iter().next().unwrap().reason),
@@ -747,7 +1077,7 @@ mod tests {
         rows.credentials[0].exchange = "kraken".into();
         assert_eq!(only_reason(&rows), ExclusionReason::NotAlpaca("kraken".into()));
         rows.credentials[0].exchange = "ALPACA".into();
-        assert!(evaluate(&allow(), &rows).exclusions.is_empty(), "the exchange match is case-insensitive");
+        assert!(evaluate_pilot(&rows).exclusions.is_empty(), "the exchange match is case-insensitive");
         rows.credentials[0].exchange = "alpaca_live".into();
         assert!(matches!(only_reason(&rows), ExclusionReason::NotAlpaca(_)));
     }
@@ -834,26 +1164,26 @@ mod tests {
     fn the_newest_plan_row_wins_so_inserting_an_assisted_row_tightens() {
         // paper_orders first, then a NEWER assisted row: tightened, whatever the order the rows arrive in.
         let mut rows = happy_rows("L2", "paper_orders");
-        assert_eq!(evaluate(&allow(), &rows).accounts[0].active.mode, ExecutionMode::Live);
+        assert_eq!(evaluate_pilot(&rows).accounts[0].active.mode, ExecutionMode::Live);
         let mut newer = rows.plans[0].clone();
         newer.id = Uuid::from_u128(0x301);
         newer.seq = 2;
         newer.execution = "assisted".into();
         rows.plans.push(newer.clone());
-        let e = evaluate(&allow(), &rows);
+        let e = evaluate_pilot(&rows);
         assert_eq!(e.accounts[0].active.mode, ExecutionMode::Assisted);
         assert_eq!(e.accounts[0].plan_id, newer.id);
         rows.plans.reverse();
-        assert_eq!(evaluate(&allow(), &rows).accounts[0].active.mode, ExecutionMode::Assisted);
+        assert_eq!(evaluate_pilot(&rows).accounts[0].active.mode, ExecutionMode::Assisted);
         // And the other way round: a newer paper_orders row loosens.
         let mut rows = happy_rows("L2", "assisted");
         let mut newer = rows.plans[0].clone();
         newer.seq = 5;
         newer.execution = "paper_orders".into();
         rows.plans.push(newer);
-        assert_eq!(evaluate(&allow(), &rows).accounts[0].active.mode, ExecutionMode::Live);
+        assert_eq!(evaluate_pilot(&rows).accounts[0].active.mode, ExecutionMode::Live);
         rows.plans.reverse();
-        assert_eq!(evaluate(&allow(), &rows).accounts[0].active.mode, ExecutionMode::Live);
+        assert_eq!(evaluate_pilot(&rows).accounts[0].active.mode, ExecutionMode::Live);
     }
 
     #[test]
@@ -877,13 +1207,19 @@ mod tests {
     }
 
     #[test]
-    fn an_account_with_a_proposal_derived_plan_too_is_refused() {
+    fn an_account_with_a_proposal_derived_plan_too_is_refused_under_either_scope() {
         let mut rows = happy_rows("L2", "assisted");
-        rows.strategy_plan_accounts.insert(ACCOUNT);
+        rows.proposal_plans.push(proposal_plan(TENANT, ACCOUNT, MANDATE, json!({})));
+        assert_eq!(only_reason(&rows), ExclusionReason::StrategyPlanPresent, "pilot scope");
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::StrategyPlanPresent, "serving scope: two sources is two sources");
+        // Even a halted proposal plan counts: only `closed` frees the account for the pilot.
+        rows.proposal_plans[0].state = "halted".into();
         assert_eq!(only_reason(&rows), ExclusionReason::StrategyPlanPresent);
+        rows.proposal_plans[0].state = "closed".into();
+        assert!(evaluate_pilot(&rows).exclusions.is_empty(), "a closed proposal plan is no plan");
         let mut rows = happy_rows("L2", "assisted");
-        rows.strategy_plan_accounts.insert(OTHER_ACCOUNT);
-        assert!(evaluate(&allow(), &rows).exclusions.is_empty(), "another account's strategy plan does not matter");
+        rows.proposal_plans.push(proposal_plan(TENANT, OTHER_ACCOUNT, MANDATE, json!({})));
+        assert!(evaluate_pilot(&rows).exclusions.is_empty(), "another account's strategy plan does not matter");
     }
 
     #[test]
@@ -948,17 +1284,17 @@ mod tests {
         p.account_id = OTHER_ACCOUNT;
         p.mandate_id = Uuid::from_u128(0x201);
         rows.plans.push(p);
-        let e = evaluate(&allow(), &rows);
+        let e = evaluate_pilot(&rows);
         assert_eq!(e.accounts.iter().map(|a| a.active.account_id.clone()).collect::<Vec<_>>(), vec![ACCOUNT.to_string()], "the other account is never returned");
         assert!(e.exclusions.is_empty(), "and is not even reported: it is outside the pilot");
         // With both on the list, both run; an allow-listed account that does not exist is reported, not dropped.
         let both = PilotAllowList::new(TENANT, [ACCOUNT, OTHER_ACCOUNT, Uuid::from_u128(0x102)]).unwrap();
-        let e = evaluate(&both, &rows);
+        let e = evaluate(&both.targets().collect::<Vec<_>>(), &rows, false);
         assert_eq!(e.accounts.len(), 2);
         assert_eq!(e.exclusions, vec![Exclusion { account_id: Uuid::from_u128(0x102), reason: ExclusionReason::CredentialNotFound }]);
         // The allow-list's tenant is the only tenant: a different list tenant finds nothing.
         let wrong = PilotAllowList::new(OTHER_TENANT, [ACCOUNT]).unwrap();
-        assert_eq!(evaluate(&wrong, &rows).exclusions[0].reason, ExclusionReason::CredentialNotFound);
+        assert_eq!(evaluate(&wrong.targets().collect::<Vec<_>>(), &rows, false).exclusions[0].reason, ExclusionReason::CredentialNotFound);
     }
 
     #[test]
@@ -996,9 +1332,203 @@ mod tests {
             ExclusionReason::PlanBodyInvalid(String::new()),
             ExclusionReason::UnsupportedSleeve(String::new()),
             ExclusionReason::EntryMismatch(String::new()),
+            ExclusionReason::AmbiguousProposalPlans { count: 2 },
+            ExclusionReason::ProposalPlanNotServable { mode: String::new(), state: String::new() },
         ];
         let codes: BTreeSet<&str> = all.iter().map(ExclusionReason::code).collect();
         assert_eq!(codes.len(), all.len());
         assert!(codes.iter().all(|c| c.starts_with("PILOT_")));
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // The proposal-derived plan source
+    // -----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_proposal_plan_is_served_only_under_the_serving_scope_and_the_pilot_scope_is_unchanged() {
+        let rows = proposal_rows("L2", &["place_orders", "cancel_orders", "halt", "flatten"], 0.5, &[("etf_trend_faber", 0.6), ("crypto_trend_100d", 0.4)]);
+        // Pilot scope (flag off): exactly today's answer -- no pilot plan, nothing else is looked at.
+        assert_eq!(only_reason(&rows), ExclusionReason::NoPilotPlan);
+        // Serving scope: the plan runs.
+        let e = evaluate_serving(&rows);
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        let a = &e.accounts[0];
+        assert_eq!(a.origin, PlanOrigin::Proposal);
+        assert_eq!(a.plan_id, STRATEGY_PLAN);
+        assert_eq!(a.credential_fingerprint, None, "a proposal plan pins no key fingerprint");
+        assert_eq!(a.active.tenant_id, TENANT.to_string());
+        assert_eq!(a.active.mode, ExecutionMode::Live, "L2 + place_orders: orders on the paper venue");
+        assert_eq!(a.execution, PlanExecution::PaperOrders);
+        assert_eq!(a.active.sleeves.len(), 2);
+        let etf = &a.active.sleeves[0];
+        assert_eq!((etf.id.as_str(), etf.kind, etf.venue.as_str(), etf.asset_class.as_str(), etf.quote.as_str()), ("etf_trend_faber", SleeveKind::EtfTrend, "alpaca", "us_etf", ""));
+        assert_eq!(etf.share, Dec::parse("0.30").unwrap(), "share = weight 0.6 * risk_scale 0.5");
+        let crypto = &a.active.sleeves[1];
+        assert_eq!((crypto.id.as_str(), crypto.kind, crypto.asset_class.as_str(), crypto.quote.as_str()), ("crypto_trend_100d", SleeveKind::CryptoTrend, "crypto_spot", "USD"));
+        assert_eq!(crypto.share, Dec::parse("0.20").unwrap());
+        assert_eq!(a.entries.iter().map(|e| e.entry_id.as_str()).collect::<Vec<_>>(), ["etf_trend_faber", "crypto_trend_100d"]);
+        assert_eq!(a.entries[1].entry_hash, library_hash("crypto_trend_100d"));
+    }
+
+    #[test]
+    fn a_proposal_plan_asks_for_orders_exactly_when_the_mandate_grants_them() {
+        let mode = |level: &str, may: &[&str]| -> Result<ExecutionMode, ExclusionReason> {
+            let rows = proposal_rows(level, may, 1.0, &[("etf_trend_faber", 1.0)]);
+            let e = evaluate_serving(&rows);
+            match e.accounts.into_iter().next() {
+                Some(a) => Ok(a.active.mode),
+                None => Err(e.exclusions.into_iter().next().unwrap().reason),
+            }
+        };
+        assert_eq!(mode("L2", &["place_orders", "halt"]), Ok(ExecutionMode::Live));
+        assert_eq!(mode("L2", &["cancel_orders", "halt", "flatten"]), Ok(ExecutionMode::Assisted), "no place_orders: assisted, never refused (the plan did not ask)");
+        assert!(matches!(mode("L1", &["place_orders", "halt"]), Err(ExclusionReason::MandateBodyInvalid(_))), "L1 + place_orders is an invalid mandate: refused, never more than the mandate grants");
+        assert_eq!(mode("L1", &["halt"]), Ok(ExecutionMode::Assisted));
+        assert_eq!(mode("L0", &["halt"]), Ok(ExecutionMode::Assisted));
+        assert_eq!(mode("L3", &["place_orders", "halt"]), Err(ExclusionReason::AutonomyL3));
+    }
+
+    #[test]
+    fn a_proposal_plan_that_is_live_halted_or_ambiguous_is_a_typed_exclusion() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        rows.proposal_plans[0].state = "halted".into();
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::ProposalPlanNotServable { mode: "paper".into(), state: "halted".into() });
+        rows.proposal_plans[0].state = "live".into();
+        rows.proposal_plans[0].mode = "live".into();
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::ProposalPlanNotServable { mode: "live".into(), state: "live".into() });
+        rows.proposal_plans[0].state = "paper".into();
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::ProposalPlanNotServable { mode: "live".into(), state: "paper".into() }, "mode live with state paper is still not servable");
+        // Two non-closed rows: refused loudly, never "the newest wins".
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        let mut second = rows.proposal_plans[0].clone();
+        second.id = Uuid::from_u128(0x501);
+        second.proposal_id = Uuid::from_u128(0x401);
+        rows.proposal_plans.push(second);
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::AmbiguousProposalPlans { count: 2 });
+        // A closed second row does not count.
+        rows.proposal_plans[1].state = "closed".into();
+        assert!(evaluate_serving(&rows).exclusions.is_empty());
+    }
+
+    #[test]
+    fn a_proposal_plan_bound_to_another_mandate_version_is_refused() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        rows.proposal_plans[0].mandate_version = 2;
+        assert_eq!(only_reason_serving(&rows), ExclusionReason::PlanBoundToOtherMandate { plan_version: 2, active_version: 1 });
+        rows.proposal_plans[0].mandate_version = 1;
+        rows.proposal_plans[0].mandate_id = Uuid::from_u128(0x999);
+        assert!(matches!(only_reason_serving(&rows), ExclusionReason::PlanBoundToOtherMandate { .. }));
+    }
+
+    #[test]
+    fn a_proposal_plan_body_is_validated_and_an_unknown_entry_or_drifted_hash_is_refused() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let with = |mutate: &dyn Fn(&mut Value)| -> ExclusionReason {
+            let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+            mutate(&mut rows.proposal_plans[0].body);
+            only_reason_serving(&rows)
+        };
+        // An entry the table does not know: typed, never guessed.
+        assert!(matches!(with(&|b| b["sleeves"][0]["entry_id"] = json!("fx_tsmom_12m")), ExclusionReason::UnsupportedSleeve(m) if m.contains("fx_tsmom_12m")));
+        // A known entry whose hash is not the platform's.
+        assert!(matches!(with(&|b| b["sleeves"][0]["entry_hash"] = json!("0".repeat(64))), ExclusionReason::EntryMismatch(_)));
+        assert!(matches!(with(&|b| b["sleeves"][0]["entry_version"] = json!(99)), ExclusionReason::EntryMismatch(_)));
+        // Body shape.
+        assert!(matches!(with(&|b| b["proposal_id"] = json!(Uuid::from_u128(0x401).to_string())), ExclusionReason::PlanBodyInvalid(m) if m.contains("proposal_id")));
+        assert!(matches!(with(&|b| *b = json!({})), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["sleeves"] = json!([])), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["risk_scale"] = json!(0.0)), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["risk_scale"] = json!(1.5)), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["risk_scale"] = json!("0.5")), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["sleeves"][0]["weight"] = json!(0.0)), ExclusionReason::PlanBodyInvalid(_)));
+        assert!(matches!(with(&|b| b["sleeves"][0]["weight"] = json!(1.2)), ExclusionReason::PlanBodyInvalid(_)));
+        // Weights above 1 in total; a last-bit float overshoot is tolerated.
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 0.6), ("crypto_trend_100d", 0.6)]);
+        assert!(matches!(only_reason_serving(&rows), ExclusionReason::PlanBodyInvalid(m) if m.contains("above 1")));
+        rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 0.7), ("crypto_trend_100d", 0.30000000000000004)]);
+        assert!(evaluate_serving(&rows).exclusions.is_empty(), "f64 weights that sum to 1 up to the last bit are fine");
+        // The same entry twice.
+        rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 0.5), ("etf_trend_faber", 0.5)]);
+        assert!(matches!(only_reason_serving(&rows), ExclusionReason::PlanBodyInvalid(m) if m.contains("twice")));
+    }
+
+    #[test]
+    fn tenants_are_isolated_the_targets_come_from_the_plans_and_each_is_evaluated_under_its_own_tenant() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        // Tenant B: its own credential, mandate and proposal plan for a different account.
+        let other_mandate = Uuid::from_u128(0x201);
+        let mut cred = rows.credentials[0].clone();
+        cred.id = OTHER_ACCOUNT;
+        cred.tenant_id = OTHER_TENANT;
+        rows.credentials.push(cred);
+        let mut m = rows.mandates[0].clone();
+        m.id = other_mandate;
+        m.tenant_id = OTHER_TENANT;
+        m.account_id = OTHER_ACCOUNT;
+        rows.mandates.push(m);
+        let mut p = proposal_plan(OTHER_TENANT, OTHER_ACCOUNT, other_mandate, proposal_body(Uuid::from_u128(0x401), 1.0, &[("etf_trend_faber", 1.0)]));
+        p.id = Uuid::from_u128(0x501);
+        p.proposal_id = Uuid::from_u128(0x401);
+        rows.proposal_plans.push(p);
+
+        // No pilot pair at all: the targets are exactly the two plans' (tenant, account) pairs.
+        let scope = AccountScope::PilotAndProposals { pilot: None };
+        let targets = targets_for(&scope, &rows.proposal_plans);
+        assert_eq!(targets, vec![Target { tenant_id: TENANT, account_id: ACCOUNT }, Target { tenant_id: OTHER_TENANT, account_id: OTHER_ACCOUNT }]);
+        let e = evaluate(&targets, &rows, true);
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        assert_eq!(e.accounts.iter().map(|a| (a.active.tenant_id.clone(), a.active.account_id.clone())).collect::<Vec<_>>(), vec![(TENANT.to_string(), ACCOUNT.to_string()), (OTHER_TENANT.to_string(), OTHER_ACCOUNT.to_string())]);
+        assert_ne!(e.accounts[0].plan_id, e.accounts[1].plan_id);
+
+        // A plan whose account id exists only under ANOTHER tenant: the target carries the plan's tenant, so the
+        // credential is not found -- tenant B's credential is never used for tenant A's plan.
+        rows.proposal_plans[1].tenant_id = TENANT;
+        let targets = targets_for(&scope, &rows.proposal_plans);
+        let e = evaluate(&targets, &rows, true);
+        assert_eq!(e.accounts.len(), 1);
+        assert_eq!(e.exclusions, vec![Exclusion { account_id: OTHER_ACCOUNT, reason: ExclusionReason::CredentialNotFound }]);
+
+        // The pilot scope never targets a proposal account, whatever the database holds.
+        assert_eq!(targets_for(&AccountScope::Pilot(allow()), &rows.proposal_plans), vec![Target { tenant_id: TENANT, account_id: ACCOUNT }]);
+        // Closed plans produce no target.
+        let mut closed = rows.proposal_plans.clone();
+        closed.iter_mut().for_each(|p| p.state = "closed".into());
+        assert!(targets_for(&scope, &closed).is_empty());
+    }
+
+    #[test]
+    fn a_pilot_pair_and_a_proposal_account_are_served_side_by_side_each_from_its_own_source() {
+        let mut rows = happy_rows("L2", "paper_orders");
+        // Tenant B's proposal account.
+        let other_mandate = Uuid::from_u128(0x201);
+        let mut cred = rows.credentials[0].clone();
+        cred.id = OTHER_ACCOUNT;
+        cred.tenant_id = OTHER_TENANT;
+        rows.credentials.push(cred);
+        let mut m = rows.mandates[0].clone();
+        m.id = other_mandate;
+        m.tenant_id = OTHER_TENANT;
+        m.account_id = OTHER_ACCOUNT;
+        rows.mandates.push(m);
+        rows.proposal_plans.push(proposal_plan(OTHER_TENANT, OTHER_ACCOUNT, other_mandate, proposal_body(PROPOSAL, 0.8, &[("etf_trend_faber", 1.0)])));
+        let e = evaluate_serving(&rows);
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        assert_eq!(e.accounts.len(), 2);
+        let pilot = e.accounts.iter().find(|a| a.active.account_id == ACCOUNT.to_string()).unwrap();
+        let proposal = e.accounts.iter().find(|a| a.active.account_id == OTHER_ACCOUNT.to_string()).unwrap();
+        assert_eq!((pilot.origin, pilot.plan_id), (PlanOrigin::OwnerPilot, PLAN));
+        assert_eq!((proposal.origin, proposal.plan_id), (PlanOrigin::Proposal, STRATEGY_PLAN));
+        assert_eq!(proposal.active.sleeves[0].share, Dec::parse("0.8").unwrap());
+    }
+
+    #[test]
+    fn the_entry_to_sleeve_kind_table_is_exactly_the_two_runnable_entries() {
+        assert_eq!(sleeve_kind_for_entry("etf_trend_faber"), Some(SleeveKind::EtfTrend));
+        assert_eq!(sleeve_kind_for_entry("crypto_trend_100d"), Some(SleeveKind::CryptoTrend));
+        assert_eq!(sleeve_kind_for_entry("fx_tsmom_12m"), None, "FX has no runnable sleeve kind in this service");
+        assert_eq!(sleeve_kind_for_entry(""), None);
     }
 }

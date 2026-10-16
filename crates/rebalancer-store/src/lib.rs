@@ -9,7 +9,11 @@
 //! * [`account_lock::PgAccountLock`] -- `rebalancer_run::driver::AccountLock`, the primary
 //!   concurrency-safety mechanism `run_all_due` uses.
 //! * [`account_source::PgAccountSource`] -- `rebalancer_run::driver::AccountSource` for the paper pilot: the allow-listed
-//!   tenant/account(s), their active signed mandate and owner-authored pilot plan, paper-only, no broker built.
+//!   tenant/account(s), their active signed mandate and owner-authored pilot plan, paper-only, no broker built; and,
+//!   under [`account_source::AccountScope::PilotAndProposals`], every account with an approved paper
+//!   `strategy_plans` row (the proposal-derived plan), exactly one source per account.
+//! * [`plan_reconciliation::PgPlanReconciliation`] -- the `strategy_plans.reconciliation_*` write-back after each
+//!   run of a proposal-served account.
 //! * [`delivery_ledger::PgDeliveryLedger`] -- `rebalancer_alerts::DeliveryLedger` (W6.1): alert DELIVERY rows over
 //!   `alert_channels` / `alert_deliveries` (`databaseschema-internal` `feat/w6-1-alert-channels`), the half
 //!   `PgNotifier` deliberately does not do.
@@ -39,17 +43,19 @@ pub mod latency_store;
 pub mod ledger;
 pub mod notifier;
 pub mod pg;
+pub mod plan_reconciliation;
 pub mod provenance;
 pub mod run_store;
 pub mod state_store;
 pub mod tenants;
 
 pub use account_lock::PgAccountLock;
-pub use account_source::{AccountSourceError, Enumeration, Exclusion, ExclusionReason, PilotAccount, PilotAllowList, PgAccountSource, PlanExecution};
+pub use account_source::{AccountScope, AccountSourceError, Enumeration, Exclusion, ExclusionReason, PilotAccount, PilotAllowList, PgAccountSource, PinnedEntry, PlanExecution};
 pub use delivery_ledger::PgDeliveryLedger;
 pub use kill_flag::PgKillFlag;
 pub use latency_store::PgLatencyStore;
 pub use notifier::PgNotifier;
+pub use plan_reconciliation::{reconciliation_for, PgPlanReconciliation, ReconciliationStatus};
 pub use provenance::{PlanOrigin, PlanProvenance, PlanProvenanceRegistry, VenueEnvironment};
 pub use run_store::PgRunStore;
 pub use state_store::PgStateStore;

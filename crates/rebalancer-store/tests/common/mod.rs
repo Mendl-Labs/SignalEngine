@@ -121,6 +121,7 @@ pub fn create(test: &str, opts: Opts) -> Option<TestDb> {
              GRANT CONNECT ON DATABASE {name} TO {role};
              GRANT USAGE ON SCHEMA public TO {role};
              GRANT SELECT ON mandates, strategy_plans TO {role};
+             GRANT UPDATE (reconciliation_status, reconciliation_detail, reconciliation_checked_at) ON strategy_plans TO {role};
              GRANT SELECT (id, tenant_id, exchange, label, is_testnet, is_enabled, is_valid, last_validated_at, deleted_at, created_at) ON exchange_credentials TO {role};
              GRANT SELECT, INSERT, UPDATE ON rebalancer_account_state, rebalancer_equity_snapshots, rebalancer_runs, rebalancer_run_journal, rebalancer_alerts, rebalancer_kill_flags TO {role};
              GRANT SELECT, INSERT, UPDATE, DELETE ON rebalancer_account_locks TO {role};"
@@ -276,6 +277,33 @@ impl TestDb {
         id
     }
 
+    /// A proposal-derived plan: an `approved` proposals row and its `strategy_plans` row (mode/state `paper`,
+    /// `reconciliation_status` at the DB default `awaiting_first_run`), with the Engine's `PlanBody` shape and the
+    /// platform's own entry hashes. Returns (proposal id, plan id).
+    pub fn seed_proposal_plan(&self, tenant: Uuid, account: Uuid, mandate: Uuid, version: i32, risk_scale: f64, sleeves: &[(&str, f64)]) -> (Uuid, Uuid) {
+        let proposal = Uuid::new_v4();
+        let plan = Uuid::new_v4();
+        let body = proposal_plan_body(proposal, risk_scale, sleeves);
+        let body_hash = self.scalar(&format!("SELECT encode(sha256(convert_to($j${body}$j$::jsonb::text,'UTF8')),'hex') AS v")).unwrap();
+        self.exec(&format!(
+            "INSERT INTO proposals (id, tenant_id, account_id, mandate_id, mandate_version, status, body, body_hash, generated_by) \
+             VALUES ('{proposal}', '{tenant}', '{account}', '{mandate}', {version}, 'approved', $j${body}$j$::jsonb, '{body_hash}', 'test');
+             INSERT INTO strategy_plans (id, tenant_id, proposal_id, account_id, mandate_id, mandate_version, body, body_hash) \
+             VALUES ('{plan}', '{tenant}', '{proposal}', '{account}', '{mandate}', {version}, $j${body}$j$::jsonb, '{body_hash}');"
+        ));
+        (proposal, plan)
+    }
+
+    /// The whole proposal path: tenant, paper Alpaca credential, active signed L2 mandate (place_orders granted),
+    /// one approved paper plan with the given sleeves.
+    pub fn seed_proposal_account(&self, risk_scale: f64, sleeves: &[(&str, f64)]) -> ProposalAccount {
+        let tenant = self.seed_tenant(&format!("Tenant {}", Uuid::new_v4().simple()));
+        let account = self.seed_credential(tenant, "alpaca_paper", true);
+        let (mandate, body) = self.seed_mandate(tenant, account, 1, "active", "L2", true, true);
+        let (proposal, plan) = self.seed_proposal_plan(tenant, account, mandate, 1, risk_scale, sleeves);
+        ProposalAccount { tenant, account, mandate, proposal, plan, body }
+    }
+
     /// The whole happy path: tenant, paper Alpaca credential, active signed L2 mandate, one plan of `execution`.
     pub fn seed_pilot(&self, execution: &str) -> Pilot {
         let tenant = self.seed_tenant(&format!("Tenant {}", Uuid::new_v4().simple()));
@@ -292,6 +320,27 @@ pub struct Pilot {
     pub mandate: Uuid,
     pub plan: Uuid,
     pub body: MandateBody,
+}
+
+pub struct ProposalAccount {
+    pub tenant: Uuid,
+    pub account: Uuid,
+    pub mandate: Uuid,
+    pub proposal: Uuid,
+    pub plan: Uuid,
+    pub body: MandateBody,
+}
+
+/// The Engine's `PlanBody` (`BacktestingEngine/program/src/proposals.rs`), with the platform's entry hashes.
+pub fn proposal_plan_body(proposal_id: Uuid, risk_scale: f64, sleeves: &[(&str, f64)]) -> Value {
+    let lib = seed_library().unwrap();
+    let hash = |id: &str| entry_hash(lib.iter().find(|e| e.id == id && e.version == 1).unwrap_or_else(|| panic!("{id} v1 in the seed library")));
+    json!({
+        "proposal_id": proposal_id.to_string(),
+        "capital": {"amount": "5000.00", "ccy": "USD"},
+        "risk_scale": risk_scale,
+        "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": 1, "entry_hash": hash(id), "weight": w})).collect::<Vec<_>>(),
+    })
 }
 
 pub fn ack_json() -> Value {

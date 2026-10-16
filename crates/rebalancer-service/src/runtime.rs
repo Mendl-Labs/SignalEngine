@@ -53,6 +53,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use std::collections::BTreeSet;
+
 use broker_adapters::alpaca::{AssetTable, PaperOnlyAlpaca, PrepareOptions};
 use broker_adapters::transport::HttpTransport;
 use broker_adapters::BrokerError;
@@ -69,6 +71,18 @@ use crate::pilot::{build_paper_alpaca, PilotRefusal};
 
 /// The pilot's one ETF sleeve, exactly (plan section 1, `PAPER_PILOT_DRAGONSTONE_PLAN.md`).
 pub const PILOT_ETF_SYMBOLS: [&str; 5] = ["SPY", "EFA", "IEF", "DBC", "VNQ"];
+/// The crypto trend sleeve's pairs on Alpaca paper (`reference_rules::CRYPTO_SYMBOLS`, in Alpaca's `BASE/QUOTE`
+/// spelling), refreshed only for an account whose plan has a `CryptoTrend` sleeve.
+pub const PILOT_CRYPTO_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
+
+/// The symbols an account's sleeves need in the verified asset table, by kind. Exhaustive so a new kind forces a
+/// decision here. (Phase 4 of the certified-envelopes plan replaces this with the plan's own instruments.)
+pub fn symbols_for_kind(kind: SleeveKind) -> &'static [&'static str] {
+    match kind {
+        SleeveKind::EtfTrend => &PILOT_ETF_SYMBOLS,
+        SleeveKind::CryptoTrend => &PILOT_CRYPTO_SYMBOLS,
+    }
+}
 
 /// A sizing price is trusted for this many calendar days of lookback when asking Massive for the last complete
 /// close (weekends plus a holiday plus one day of margin). Bars older than this inside the window are simply not
@@ -153,7 +167,8 @@ impl PilotAlpaca {
 /// the pilot plan row (before any network call), verify the account (`GET /v2/account` + the `PA` prefix check),
 /// then refresh the asset table for the five pilot ETFs (each `GET /v2/assets/{symbol}` also updates the adapter's
 /// OWN internal table as a side effect, which is what lets `refuse_builtin_assets = true` accept these five symbols
-/// once this function returns `Ok`).
+/// once this function returns `Ok`). This is [`connect_account_alpaca`] with the fingerprint REQUIRED and the ETF
+/// sleeve's symbols: exactly the pilot's startup path.
 pub fn connect_paper_alpaca(
     key_id: &str,
     secret: &str,
@@ -161,17 +176,37 @@ pub fn connect_paper_alpaca(
     transport: Arc<dyn HttpTransport>,
     expected_fingerprint: &str,
 ) -> Result<PilotAlpaca, RuntimeError> {
+    connect_account_alpaca(key_id, secret, base_url, transport, Some(expected_fingerprint), &BTreeSet::from([SleeveKind::EtfTrend]))
+}
+
+/// Connect ONE account's paper Alpaca broker (certified-envelopes Phase 0: one per served account). Identical to
+/// [`connect_paper_alpaca`] except that (a) the fingerprint check runs only when the plan pins one (`Some`: the
+/// pilot plan row; `None`: a proposal plan, which records no fingerprint -- the paper-only construction, the `PA`
+/// check and the asset refresh are NOT weakened by its absence) and (b) the asset table is refreshed for the symbols
+/// of the account's own sleeve kinds ([`symbols_for_kind`]), so a crypto sleeve's pairs are verified too.
+pub fn connect_account_alpaca(
+    key_id: &str,
+    secret: &str,
+    base_url: &str,
+    transport: Arc<dyn HttpTransport>,
+    expected_fingerprint: Option<&str>,
+    kinds: &BTreeSet<SleeveKind>,
+) -> Result<PilotAlpaca, RuntimeError> {
     let adapter = build_paper_alpaca(key_id, secret, base_url, transport).map_err(RuntimeError::Connect)?;
-    let actual = adapter.key_id_fingerprint();
-    if !fingerprint_matches(expected_fingerprint, &actual) {
-        return Err(RuntimeError::FingerprintMismatch { expected: expected_fingerprint.trim().to_string(), actual });
+    if let Some(expected) = expected_fingerprint {
+        let actual = adapter.key_id_fingerprint();
+        if !fingerprint_matches(expected, &actual) {
+            return Err(RuntimeError::FingerprintMismatch { expected: expected.trim().to_string(), actual });
+        }
     }
     adapter.verify_paper_account().map_err(RuntimeError::Verify)?;
 
     let mut assets = AssetTable::empty();
-    for sym in PILOT_ETF_SYMBOLS {
-        let info = adapter.adapter().refresh_asset(sym).map_err(|source| RuntimeError::AssetRefresh { symbol: sym, source })?;
-        assets.upsert(info);
+    for kind in kinds {
+        for sym in symbols_for_kind(*kind) {
+            let info = adapter.adapter().refresh_asset(sym).map_err(|source| RuntimeError::AssetRefresh { symbol: sym, source })?;
+            assets.upsert(info);
+        }
     }
     let cfg = adapter.adapter().config();
     let options = PrepareOptions {
