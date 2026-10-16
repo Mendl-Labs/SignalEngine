@@ -138,7 +138,7 @@ fn an_asset_refresh_failure_refuses_the_whole_connection() {
     t.enqueue_json(200, &asset_json("SPY"));
     t.enqueue_json(404, r#"{"message":"asset not found"}"#); // EFA refresh fails
     let err = connect_paper_alpaca(PAPER_KEY, SECRET, PAPER_BASE_URL, t, &fp).unwrap_err();
-    assert!(matches!(err, RuntimeError::AssetRefresh { symbol: "EFA", .. }), "{err}");
+    assert!(matches!(&err, RuntimeError::AssetRefresh { symbol, .. } if symbol == "EFA"), "{err}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -186,7 +186,7 @@ fn pilot_data_source_sleeve_data_really_calls_massive_not_a_stand_in() {
     let keys = StaticKeyProvider::new("not-a-real-massive-key").unwrap();
     let massive = MassiveDataSource::new(keys, t.clone());
     let source = pilot_data_source(&massive);
-    let sleeve = SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: Dec::parse("1.0").unwrap(), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "".into() };
+    let sleeve = SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: Dec::parse("1.0").unwrap(), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None };
     let err = source.sleeve_data(&sleeve, Utc::now().date_naive()).unwrap_err();
     assert_eq!(t.request_count(), 1, "sleeve_data must reach the real transport exactly once (a stand-in would touch it zero times)");
     assert!(err.code != "DATA_UNSUPPORTED", "must be Massive's own error, not the price-only source's refusal: {err}");
@@ -246,7 +246,7 @@ fn the_constructed_runtime_reports_paper_passes_the_real_policy_check_and_run_on
     let broker = pilot_alpaca.broker();
 
     let now = Utc.with_ymd_and_hms(2026, 9, 28, 15, 0, 0).unwrap(); // the ETF sleeve's market-hours run slot
-    let sleeve = SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: Dec::parse("1.0").unwrap(), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "".into() };
+    let sleeve = SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: Dec::parse("1.0").unwrap(), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None };
     let active = ActiveAccount {
         account_id: "pilot-acct".to_string(),
         tenant_id: "11111111-1111-1111-1111-111111111111".to_string(),

@@ -139,6 +139,7 @@ mod tests {
             venue: "v".into(),
             asset_class: "a".into(),
             quote: quote.into(),
+            instruments: Vec::new(), tranche_sessions: 0, lookback: None,
         }
     }
 

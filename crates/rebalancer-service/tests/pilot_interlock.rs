@@ -191,7 +191,7 @@ fn mandate_body(venues: &[&str]) -> mandate_core::mandate::MandateBody {
 }
 
 fn sleeve(venue: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: rebalancer_run::Dec::parse("1").unwrap(), venue: venue.into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: rebalancer_run::Dec::parse("1").unwrap(), venue: venue.into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn account(tenant: &str, account: &str, mode: ExecutionMode) -> ActiveAccount {

@@ -46,7 +46,7 @@ use rebalancer_risk::store::{InMemoryStateStore, StateStore};
 use rebalancer_run::broker::{AlpacaBroker, Broker};
 use rebalancer_run::clock::ManualClock;
 use rebalancer_run::data::{DataError, DataSource, SleeveData, SleeveKind, SleeveSpec};
-use rebalancer_run::decision::{evaluate, EvalCache};
+use rebalancer_run::decision::{evaluate, EvalCache, EvalError, RuleDecision};
 use rebalancer_run::driver::{find_due_runs, run_all_due, AccountRuntime, ActiveAccount, InMemoryAccountSource};
 use rebalancer_run::pipeline::{run_once, RunConfig, RunContext};
 use rebalancer_run::record::{ExecutionMode, OutcomeKind, RunKey, RunRecord, SleeveDecision};
@@ -336,11 +336,11 @@ impl DataSource for Vendor {
 // ---------------------------------------------------------------------------------------------------------------
 
 fn etf_sleeve(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn crypto_sleeve(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: d(share), venue: "alpaca".into(), asset_class: "crypto_spot".into(), quote: "USD".into() }
+    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: d(share), venue: "alpaca".into(), asset_class: "crypto_spot".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn mandate() -> mandate_core::mandate::MandateBody {
@@ -1422,4 +1422,133 @@ fn s3_an_etf_decision_whose_orders_are_not_carried_out_stays_pending_run_after_r
         assert_eq!(sim.tick(date(2019, 9, 11), &vendor).outcome.code, "RUN_NOTHING_PENDING");
         assert_eq!(not_acted_alerts().len(), 3, "no further alert once it is acted");
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Certified-envelopes Phase 4: the implementation point (tranche, proxy instruments, lookback). A sleeve at the
+// published point is every test above; these pin what a non-published point does.
+// ---------------------------------------------------------------------------------------------------------------
+
+fn etf_world_named(cal: &Calendar, from: NaiveDate, to: NaiveDate, names: [&str; 5]) -> Panel {
+    let days = cal.sessions(from, to);
+    Panel::new(names.iter().enumerate().map(|(i, s)| PriceSeries::new(*s, days.clone(), days.iter().map(|d| etf_close(i, *d)).collect()).unwrap()).collect()).unwrap()
+}
+
+fn proxy_names() -> [&'static str; 5] {
+    ["IVV", "EFA", "IEF", "DBC", "VNQ"]
+}
+
+#[test]
+fn tranche_3_acts_three_sessions_after_tranche_0_on_the_same_decision_and_the_ledger_keeps_the_decision_date() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    with_alpaca(false, |rig| {
+        let runs = InMemoryRunStore::new();
+        let mut late = etf_sleeve("1");
+        late.tranche_sessions = 3;
+        let sim = Sim::new(rig, &runs, vec![account_named("acct-t0", vec![etf_sleeve("1")]), account_named("acct-t3", vec![late])]);
+        let mut plans: BTreeMap<String, Vec<(NaiveDate, NaiveDate)>> = BTreeMap::new();
+        let mut waiting_notes = 0;
+        for day in all_days(date(2019, 9, 5), date(2019, 10, 14)) {
+            for (acct, rec) in sim.tick_all(day, &vendor) {
+                if day >= date(2019, 9, 25) && etf_planned(&rec) {
+                    plans.entry(acct.clone()).or_default().push((day, etf_decision(&rec).decision_date));
+                }
+                if acct == "acct-t3" && rec.steps.iter().any(|n| n.note.contains("waiting for its tranche")) {
+                    waiting_notes += 1;
+                }
+            }
+        }
+        // The run of Wed 2019-10-02 (first October bar printed 10-01) is the published action session for
+        // September's decision. A run sees bars up to the day before, so the bars after 09-30 number 1, 2, 3, 4 on
+        // the runs of 10-02, 10-03, 10-04 and Sat 10-05: tranche 3 acts on the 10-05 run, whose orders reach the
+        // venue at Monday's open, three sessions after the published action session's.
+        assert_eq!(plans["acct-t0"], vec![(date(2019, 10, 2), date(2019, 9, 30))], "tranche 0 is the published timing");
+        assert_eq!(plans["acct-t3"], vec![(date(2019, 10, 5), date(2019, 9, 30))], "tranche 3 acts three sessions later, on the SAME decision, once");
+        assert_eq!(waiting_notes, 3, "the three runs in between recorded that the decision was waiting for its tranche");
+        // The ledger keeps the DECISION date, not the act date.
+        assert_eq!(runs.last_acted_decision("acct-t3", "etf").unwrap(), Some(date(2019, 9, 30)));
+        assert_eq!(runs.last_acted_decision("acct-t0", "etf").unwrap(), Some(date(2019, 9, 30)));
+    });
+}
+
+#[test]
+fn a_tranche_account_enters_immediately_when_the_decision_in_force_is_old_enough() {
+    // Mid-month, the decision in force is already more than `k` sessions past its action session: an entry is not
+    // delayed by the tranche.
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    with_alpaca(false, |rig| {
+        let runs = InMemoryRunStore::new();
+        let mut late = etf_sleeve("1");
+        late.tranche_sessions = 4;
+        let sim = Sim::new(rig, &runs, vec![account_named("acct-t4", vec![late])]);
+        let rec = sim.tick(date(2019, 9, 18), &vendor);
+        assert!(etf_planned(&rec) && etf_decision(&rec).entry);
+        assert_eq!(etf_decision(&rec).decision_date, date(2019, 8, 30));
+    });
+}
+
+#[test]
+fn a_proxy_point_decides_on_its_own_instruments_and_lookback_and_never_on_the_published_ones() {
+    let cal = Calendar::us(2017, 2021);
+    let proxy_vendor = Vendor::build(etf_world_named(&cal, date(2018, 1, 1), date(2020, 6, 30), proxy_names()), None, None);
+    let mut s = etf_sleeve("1");
+    s.instruments = proxy_names().iter().map(|x| x.to_string()).collect();
+    s.lookback = Some(8);
+    let ev = evaluate(&proxy_vendor, None, &s, date(2019, 10, 2)).expect("the proxy point decides");
+    assert_eq!(ev.decision_date, date(2019, 9, 30));
+    let RuleDecision::Etf(dec) = &ev.rule else { panic!("an ETF sleeve gives an ETF decision") };
+    assert_eq!(dec.instruments.iter().map(|i| i.symbol.as_str()).collect::<Vec<_>>(), proxy_names());
+    assert_eq!(dec.month_end_dates.len(), 8, "the 8-month-end lookback, not the published 10");
+    assert_eq!(ev.sessions_past_action(), 0, "10-02 is the published action session");
+
+    // A published-point sleeve over the proxy world has no SPY: the rule refuses, it does not fall back.
+    assert!(matches!(evaluate(&proxy_vendor, None, &etf_sleeve("1"), date(2019, 10, 2)), Err(EvalError::Rule(_))));
+}
+
+#[test]
+fn the_eval_cache_separates_points_and_still_shares_within_a_point() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    let cache = EvalCache::new();
+    let as_of = date(2019, 10, 2);
+    let published = etf_sleeve("1");
+    let mut lookback8 = etf_sleeve("1");
+    lookback8.lookback = Some(8);
+    let mut tranche3 = etf_sleeve("1");
+    tranche3.tranche_sessions = 3;
+
+    let a = evaluate(&vendor, Some(&cache), &published, as_of).unwrap();
+    let b = evaluate(&vendor, Some(&cache), &published, as_of).unwrap();
+    assert_eq!(vendor.etf_fetches(), 1, "two accounts at the same point share one fetch");
+    assert!(Arc::ptr_eq(&a, &b));
+    let c = evaluate(&vendor, Some(&cache), &lookback8, as_of).unwrap();
+    assert_eq!(vendor.etf_fetches(), 2, "another lookback is another fetch and another decision");
+    let RuleDecision::Etf(dc) = &c.rule else { panic!() };
+    assert_eq!(dc.month_end_dates.len(), 8);
+    evaluate(&vendor, Some(&cache), &tranche3, as_of).unwrap();
+    assert_eq!(vendor.etf_fetches(), 3, "another tranche is its own cache entry (it never shares a decision with tranche 0)");
+    assert_eq!(cache.sizes(), (3, 3));
+}
+
+#[test]
+fn a_crypto_tranche_is_a_lagged_decision_and_a_lookback_override_changes_the_window() {
+    let cal = Calendar::us(2017, 2021);
+    let vendor = Vendor::standard(&cal);
+    let as_of = date(2019, 10, 2);
+    let published = evaluate(&vendor, None, &crypto_sleeve("1"), as_of).unwrap();
+    assert_eq!(published.decision_date, date(2019, 10, 1));
+
+    let mut lagged = crypto_sleeve("1");
+    lagged.tranche_sessions = 1;
+    let l = evaluate(&vendor, None, &lagged, as_of).expect("a lagged decision is not refused for the panel ending after it");
+    assert_eq!(l.decision_date, date(2019, 9, 30), "tranche 1 = yesterday minus one day");
+    assert_eq!(l.instruments[0].close, crypto_close(0, date(2019, 9, 30)));
+
+    let mut short = crypto_sleeve("1");
+    short.lookback = Some(80);
+    let sh = evaluate(&vendor, None, &short, as_of).unwrap();
+    let want: f64 = (0..80).map(|k| crypto_close(0, date(2019, 10, 1) - Duration::days(k))).sum::<f64>() / 80.0;
+    assert!((sh.instruments[0].sma - want).abs() < 1e-6 * want, "{} vs {want}", sh.instruments[0].sma);
 }

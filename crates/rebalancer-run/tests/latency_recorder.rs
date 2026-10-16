@@ -287,6 +287,7 @@ fn instruments_come_from_the_reference_rules_symbol_lists_and_are_deduplicated()
         venue: "v".into(),
         asset_class: "a".into(),
         quote: "USD".into(),
+        instruments: Vec::new(), tranche_sessions: 0, lookback: None,
     };
     let sleeves = [
         sleeve("etf-a", SleeveKind::EtfTrend),

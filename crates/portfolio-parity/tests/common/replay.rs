@@ -65,11 +65,11 @@ pub fn envelope() -> MandateEnvelope {
 }
 
 pub fn etf_sleeve(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 pub fn crypto_sleeve(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: d(share), venue: "alpaca".into(), asset_class: "crypto_spot".into(), quote: "USD".into() }
+    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: d(share), venue: "alpaca".into(), asset_class: "crypto_spot".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 pub fn account(sleeves: Vec<SleeveSpec>, mode: ExecutionMode, mandate: MandateBody) -> ActiveAccount {

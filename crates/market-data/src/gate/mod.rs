@@ -28,7 +28,7 @@ use reference_rules::data_fingerprint;
 use crate::error::SleeveError;
 use crate::source::{FetchedSleeve, SleeveFetcher};
 
-pub use compare::{compare, Comparison};
+pub use compare::{compare, compare_with, Comparison};
 pub use policy::{diff_bps, Policy, Tolerance, POLICY_VERSION};
 
 pub const ENV_DATA_GATE_MODE: &str = "DATA_GATE_MODE";
@@ -142,7 +142,12 @@ impl<P: SleeveFetcher> TwoSourceGate<P> {
                 r
             }
             Ok(f) => {
-                let c = compare(sleeve.kind, as_of, &primary.panel, &f.panel, &self.policy);
+                // The sleeve's OWN instruments and window (the published constants at the published point).
+                let window = match sleeve.kind {
+                    SleeveKind::EtfTrend => sleeve.sma_lookback(),
+                    SleeveKind::CryptoTrend => sleeve.sma_lookback() + usize::from(sleeve.tranche_sessions),
+                };
+                let c = compare_with(sleeve.kind, &sleeve.rule_symbols(), window, as_of, &primary.panel, &f.panel, &self.policy);
                 let mut r = base(secondary.source_id().to_string());
                 r.secondary_fingerprint = Some(data_fingerprint(&f.panel));
                 r.primary_decision_date = c.primary_decision_date;

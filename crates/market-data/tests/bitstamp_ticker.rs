@@ -98,6 +98,7 @@ fn sleeves_are_refused_because_the_ticker_has_no_history() {
         venue: "bitstamp".to_string(),
         asset_class: "crypto".to_string(),
         quote: "USD".to_string(),
+        instruments: Vec::new(), tranche_sessions: 0, lookback: None,
     };
     let err = src.sleeve_data(&spec, chrono::NaiveDate::from_ymd_opt(2026, 10, 6).unwrap()).unwrap_err();
     assert_eq!(err.code, "BITSTAMP_NO_HISTORY");

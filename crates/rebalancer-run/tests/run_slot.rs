@@ -22,7 +22,7 @@ use rebalancer_run::driver::{
 use rebalancer_run::record::{ExecutionMode, RunKey};
 
 fn etf(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn acct(id: &str, sleeves: Vec<SleeveSpec>) -> ActiveAccount {

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use rebalancer_core::guard::PricePoint;
 use rebalancer_core::Dec;
-use reference_rules::Panel;
+use reference_rules::{Panel, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SleeveKind {
@@ -63,6 +63,58 @@ pub struct SleeveSpec {
     pub asset_class: String,
     /// Quote currency for crypto pairs (`BTC` becomes `BTC/USD`); ignored for ETFs.
     pub quote: String,
+    /// The tenant's IMPLEMENTATION POINT inside the library entry's pre-registered envelope (certified-envelopes
+    /// plan, Phase 4). **Empty = the published instruments** (`ETF_SYMBOLS` / `CRYPTO_SYMBOLS`); otherwise one per
+    /// slot, in the entry's slot order (ETF: tickers; crypto: `BASE/QUOTE` as the entry spells them). The
+    /// account source fills it from the plan's point only after the point passed the envelope check.
+    pub instruments: Vec<String>,
+    /// Execution lag in trading sessions (ETF: sessions AFTER the published action session; crypto: days of
+    /// signal lag). `0` = the published timing.
+    pub tranche_sessions: u8,
+    /// Lookback override (ETF: month-ends; crypto: days). `None` = the published lookback.
+    pub lookback: Option<u32>,
+}
+
+impl SleeveSpec {
+    /// The published point: nothing overridden. A sleeve at the published point behaves exactly as before the
+    /// envelope fields existed.
+    pub fn is_published_point(&self) -> bool {
+        self.instruments.is_empty() && self.tranche_sessions == 0 && self.lookback.is_none()
+    }
+
+    /// The symbols the reference rule and the market-data fetch use (the panel's series names): the ETF tickers, or
+    /// the crypto BASE of each `BASE/QUOTE` instrument. Published constants when `instruments` is empty.
+    pub fn rule_symbols(&self) -> Vec<String> {
+        if self.instruments.is_empty() {
+            return match self.kind {
+                SleeveKind::EtfTrend => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
+                SleeveKind::CryptoTrend => CRYPTO_SYMBOLS.iter().map(|s| s.to_string()).collect(),
+            };
+        }
+        match self.kind {
+            SleeveKind::EtfTrend => self.instruments.clone(),
+            SleeveKind::CryptoTrend => self.instruments.iter().map(|i| i.split('/').next().unwrap_or(i).to_string()).collect(),
+        }
+    }
+
+    /// The rule's lookback: the override, else the published constant (month-ends for ETF, days for crypto).
+    pub fn sma_lookback(&self) -> usize {
+        match (self.kind, self.lookback) {
+            (_, Some(n)) => n as usize,
+            (SleeveKind::EtfTrend, None) => ETF_SMA_MONTH_ENDS,
+            (SleeveKind::CryptoTrend, None) => CRYPTO_SMA_DAYS,
+        }
+    }
+
+    /// `""` at the published point, else a stable text of everything about the point that can change what a fetch
+    /// or a decision returns. Part of the per-tick `EvalCache` keys, so two accounts at different points never share
+    /// a fetch or a decision, and two at the same point still do.
+    pub fn variant_key(&self) -> String {
+        if self.is_published_point() {
+            return String::new();
+        }
+        format!("{}|t{}|l{}", self.instruments.join(","), self.tranche_sessions, self.lookback.map(|l| l.to_string()).unwrap_or_default())
+    }
 }
 
 /// The validated data one sleeve's rule needs.
@@ -240,4 +292,59 @@ pub trait DataSource {
     /// Current prices for sizing and for valuing held positions, by canonical symbol. A symbol that cannot be
     /// priced is simply absent (the planner then skips it and records `NoPrice`); an outage is an `Err`.
     fn prices(&self, symbols: &[String], now: DateTime<Utc>) -> Result<BTreeMap<String, PricePoint>, DataError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sleeve(kind: SleeveKind) -> SleeveSpec {
+        SleeveSpec {
+            id: "s".into(),
+            kind,
+            share: Dec::from_i64(1),
+            venue: "alpaca".into(),
+            asset_class: "us_etf".into(),
+            quote: "USD".into(),
+            instruments: Vec::new(),
+            tranche_sessions: 0,
+            lookback: None,
+        }
+    }
+
+    #[test]
+    fn a_sleeve_without_a_point_is_the_published_constants_and_has_an_empty_variant_key() {
+        let etf = sleeve(SleeveKind::EtfTrend);
+        assert!(etf.is_published_point());
+        assert_eq!(etf.rule_symbols(), ETF_SYMBOLS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(etf.sma_lookback(), ETF_SMA_MONTH_ENDS);
+        assert_eq!(etf.variant_key(), "");
+        let crypto = sleeve(SleeveKind::CryptoTrend);
+        assert_eq!(crypto.rule_symbols(), CRYPTO_SYMBOLS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(crypto.sma_lookback(), CRYPTO_SMA_DAYS);
+        assert_eq!(crypto.variant_key(), "");
+    }
+
+    #[test]
+    fn every_axis_of_the_point_changes_the_variant_key_and_unsets_the_published_flag() {
+        let base = sleeve(SleeveKind::EtfTrend);
+        let proxy = SleeveSpec { instruments: vec!["IVV".into(), "EFA".into(), "IEF".into(), "DBC".into(), "VNQ".into()], ..base.clone() };
+        let lagged = SleeveSpec { tranche_sessions: 2, ..base.clone() };
+        let longer = SleeveSpec { lookback: Some(12), ..base.clone() };
+        let keys = [base.variant_key(), proxy.variant_key(), lagged.variant_key(), longer.variant_key()];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(!proxy.is_published_point() && !lagged.is_published_point() && !longer.is_published_point());
+        assert_eq!(proxy.rule_symbols()[0], "IVV");
+        assert_eq!(longer.sma_lookback(), 12);
+    }
+
+    #[test]
+    fn a_crypto_pairs_rule_symbol_is_its_base() {
+        let s = SleeveSpec { instruments: vec!["BTC/USD".into(), "ETH/USD".into()], ..sleeve(SleeveKind::CryptoTrend) };
+        assert_eq!(s.rule_symbols(), vec!["BTC", "ETH"]);
+    }
 }

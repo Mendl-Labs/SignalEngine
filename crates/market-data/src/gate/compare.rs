@@ -79,10 +79,11 @@ fn consecutive_in(s: &PriceSeries, from: NaiveDate, to: NaiveDate) -> Vec<(Naive
     out
 }
 
-fn symbols(kind: SleeveKind) -> &'static [&'static str] {
+/// The published instruments of a kind (what [`compare`] compares).
+fn published_symbols(kind: SleeveKind) -> Vec<String> {
     match kind {
-        SleeveKind::EtfTrend => &ETF_SYMBOLS,
-        SleeveKind::CryptoTrend => &CRYPTO_SYMBOLS,
+        SleeveKind::EtfTrend => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
+        SleeveKind::CryptoTrend => CRYPTO_SYMBOLS.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -91,7 +92,7 @@ fn worst(reasons: &[GateReason]) -> GateVerdict {
 }
 
 /// The comparison dates of one instrument and the position of each.
-fn comparison_dates(kind: SleeveKind, as_of: NaiveDate, p: Option<&PriceSeries>, s: Option<&PriceSeries>, p_dd: Option<NaiveDate>, s_dd: Option<NaiveDate>) -> Vec<(NaiveDate, BarPosition)> {
+fn comparison_dates(kind: SleeveKind, window: usize, as_of: NaiveDate, p: Option<&PriceSeries>, s: Option<&PriceSeries>, p_dd: Option<NaiveDate>, s_dd: Option<NaiveDate>) -> Vec<(NaiveDate, BarPosition)> {
     match kind {
         SleeveKind::EtfTrend => {
             let mut dates: BTreeSet<NaiveDate> = BTreeSet::new();
@@ -101,12 +102,12 @@ fn comparison_dates(kind: SleeveKind, as_of: NaiveDate, p: Option<&PriceSeries>,
                 if let Some(dd) = dd {
                     ends.retain(|d| *d <= dd);
                 }
-                let keep = ends.len().saturating_sub(ETF_SMA_MONTH_ENDS);
+                let keep = ends.len().saturating_sub(window);
                 dates.extend(ends.into_iter().skip(keep));
             }
             dates.into_iter().map(|d| (d, BarPosition::MonthEnd)).collect()
         }
-        SleeveKind::CryptoTrend => (1..=CRYPTO_SMA_DAYS as i64)
+        SleeveKind::CryptoTrend => (1..=window as i64)
             .rev()
             .filter_map(|k| as_of.checked_sub_signed(Duration::days(k)))
             .map(|d| (d, if d == as_of - Duration::days(1) { BarPosition::DecisionDay } else { BarPosition::Window }))
@@ -114,8 +115,20 @@ fn comparison_dates(kind: SleeveKind, as_of: NaiveDate, p: Option<&PriceSeries>,
     }
 }
 
-/// Compare `primary` and `secondary` for `kind` as of `as_of` under `policy`. See the module docs.
+/// Compare `primary` and `secondary` for `kind` as of `as_of` under `policy`, at the PUBLISHED point (the published
+/// instruments and window). See the module docs.
 pub fn compare(kind: SleeveKind, as_of: NaiveDate, primary: &Panel, secondary: &Panel, policy: &Policy) -> Comparison {
+    let window = match kind {
+        SleeveKind::EtfTrend => ETF_SMA_MONTH_ENDS,
+        SleeveKind::CryptoTrend => CRYPTO_SMA_DAYS,
+    };
+    compare_with(kind, &published_symbols(kind), window, as_of, primary, secondary, policy)
+}
+
+/// [`compare`] over an explicit instrument list and window (ETF: the lookback in month-ends; crypto: the lookback
+/// plus the signal lag, in calendar days). A sleeve at an envelope point compares ITS instruments, never the
+/// published constants; at the published point this is exactly [`compare`].
+pub fn compare_with(kind: SleeveKind, symbols: &[String], window: usize, as_of: NaiveDate, primary: &Panel, secondary: &Panel, policy: &Policy) -> Comparison {
     let mut reasons: Vec<GateReason> = Vec::new();
 
     // (h) a bar dated on or after the run date, on either side
@@ -138,7 +151,7 @@ pub fn compare(kind: SleeveKind, as_of: NaiveDate, primary: &Panel, secondary: &
         SleeveKind::EtfTrend => {
             let mut dd = [None, None];
             for (i, (side, panel)) in [(Side::Primary, primary), (Side::Secondary, secondary)].into_iter().enumerate() {
-                match latest_decision_date(panel, &ETF_SYMBOLS) {
+                match latest_decision_date(panel, &symbols.iter().map(String::as_str).collect::<Vec<_>>()) {
                     Ok(d) => dd[i] = Some(d),
                     Err(e) => reasons.push(reason("REFUSE_DATE_MISMATCH", GateVerdict::Refuse, None, None, format!("{}: no decision date can be computed: {e}", side.name()))),
                 }
@@ -157,13 +170,13 @@ pub fn compare(kind: SleeveKind, as_of: NaiveDate, primary: &Panel, secondary: &
     };
 
     let mut instruments = Vec::new();
-    for sym in symbols(kind) {
+    for sym in symbols.iter().map(String::as_str) {
         let p = primary.get(sym).ok();
         let s = secondary.get(sym).ok();
         let mut mine: Vec<GateReason> = Vec::new();
         let mut comparisons = Vec::new();
 
-        let dates = comparison_dates(kind, as_of, p, s, p_dd, s_dd);
+        let dates = comparison_dates(kind, window, as_of, p, s, p_dd, s_dd);
         // (a) + (c): every comparison date on both sides, within tolerance
         for (date, position) in &dates {
             let pc = close_at(p, *date);

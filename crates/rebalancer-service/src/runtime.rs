@@ -75,13 +75,34 @@ pub const PILOT_ETF_SYMBOLS: [&str; 5] = ["SPY", "EFA", "IEF", "DBC", "VNQ"];
 /// spelling), refreshed only for an account whose plan has a `CryptoTrend` sleeve.
 pub const PILOT_CRYPTO_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
 
-/// The symbols an account's sleeves need in the verified asset table, by kind. Exhaustive so a new kind forces a
-/// decision here. (Phase 4 of the certified-envelopes plan replaces this with the plan's own instruments.)
+/// The symbols an account's sleeves need in the verified asset table, by kind, AT THE PUBLISHED POINT. Exhaustive so
+/// a new kind forces a decision here. A sleeve at an envelope point names its own instruments:
+/// see [`symbols_for_sleeves`].
 pub fn symbols_for_kind(kind: SleeveKind) -> &'static [&'static str] {
     match kind {
         SleeveKind::EtfTrend => &PILOT_ETF_SYMBOLS,
         SleeveKind::CryptoTrend => &PILOT_CRYPTO_SYMBOLS,
     }
+}
+
+/// The symbols an account's sleeves need in the verified asset table: each sleeve's OWN instruments (its proxies)
+/// when it carries an implementation point, the published symbols of its kind otherwise. Kind order (the
+/// published order within a kind), de-duplicated, so an account with only published-point sleeves gets exactly
+/// what [`symbols_for_kind`] gives, in the same request order.
+pub fn symbols_for_sleeves(sleeves: &[SleeveSpec]) -> Vec<String> {
+    let kinds: BTreeSet<SleeveKind> = sleeves.iter().map(|s| s.kind).collect();
+    let mut out: Vec<String> = Vec::new();
+    for kind in kinds {
+        for s in sleeves.iter().filter(|s| s.kind == kind) {
+            let own: Vec<String> = if s.instruments.is_empty() { symbols_for_kind(kind).iter().map(|x| x.to_string()).collect() } else { s.instruments.clone() };
+            for sym in own {
+                if !out.contains(&sym) {
+                    out.push(sym);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A sizing price is trusted for this many calendar days of lookback when asking Massive for the last complete
@@ -100,8 +121,9 @@ pub enum RuntimeError {
     /// `GET /v2/account` failed, the account is blocked, or (via `verify_paper_account`) its account number does not
     /// start with `PA`.
     Verify(BrokerError),
-    /// `GET /v2/assets/{symbol}` failed for one of the five pilot ETFs.
-    AssetRefresh { symbol: &'static str, source: BrokerError },
+    /// `GET /v2/assets/{symbol}` failed for one of the account's instruments (one of the five pilot ETFs, or a
+    /// tenant's proxy): the account is refused, never sized on an unverified (built-in) asset row.
+    AssetRefresh { symbol: String, source: BrokerError },
 }
 
 impl fmt::Display for RuntimeError {
@@ -192,6 +214,34 @@ pub fn connect_account_alpaca(
     expected_fingerprint: Option<&str>,
     kinds: &BTreeSet<SleeveKind>,
 ) -> Result<PilotAlpaca, RuntimeError> {
+    let symbols: Vec<String> = kinds.iter().flat_map(|k| symbols_for_kind(*k).iter().map(|s| s.to_string())).collect();
+    connect_with_symbols(key_id, secret, base_url, transport, expected_fingerprint, &symbols)
+}
+
+/// [`connect_account_alpaca`] for the account's actual sleeves: the asset table is refreshed for each sleeve's OWN
+/// instruments ([`symbols_for_sleeves`]), so a tenant whose implementation point names a proxy (IVV for SPY) has
+/// that proxy verified into the table too. An instrument that cannot be refreshed refuses the whole connection
+/// ([`RuntimeError::AssetRefresh`]): the account gets no runtime and nothing is sized (the paper adapter runs with
+/// `refuse_builtin_assets`, so an unrefreshed symbol would be refused at order time as well).
+pub fn connect_account_alpaca_for_sleeves(
+    key_id: &str,
+    secret: &str,
+    base_url: &str,
+    transport: Arc<dyn HttpTransport>,
+    expected_fingerprint: Option<&str>,
+    sleeves: &[SleeveSpec],
+) -> Result<PilotAlpaca, RuntimeError> {
+    connect_with_symbols(key_id, secret, base_url, transport, expected_fingerprint, &symbols_for_sleeves(sleeves))
+}
+
+fn connect_with_symbols(
+    key_id: &str,
+    secret: &str,
+    base_url: &str,
+    transport: Arc<dyn HttpTransport>,
+    expected_fingerprint: Option<&str>,
+    symbols: &[String],
+) -> Result<PilotAlpaca, RuntimeError> {
     let adapter = build_paper_alpaca(key_id, secret, base_url, transport).map_err(RuntimeError::Connect)?;
     if let Some(expected) = expected_fingerprint {
         let actual = adapter.key_id_fingerprint();
@@ -202,11 +252,9 @@ pub fn connect_account_alpaca(
     adapter.verify_paper_account().map_err(RuntimeError::Verify)?;
 
     let mut assets = AssetTable::empty();
-    for kind in kinds {
-        for sym in symbols_for_kind(*kind) {
-            let info = adapter.adapter().refresh_asset(sym).map_err(|source| RuntimeError::AssetRefresh { symbol: sym, source })?;
-            assets.upsert(info);
-        }
+    for sym in symbols {
+        let info = adapter.adapter().refresh_asset(sym).map_err(|source| RuntimeError::AssetRefresh { symbol: sym.clone(), source })?;
+        assets.upsert(info);
     }
     let cfg = adapter.adapter().config();
     let options = PrepareOptions {
