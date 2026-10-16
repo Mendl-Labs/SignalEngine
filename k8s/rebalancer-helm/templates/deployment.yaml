@@ -110,6 +110,24 @@ spec:
                   name: {{ .Values.secrets.alpaca.secretName }}
                   key: {{ .Values.secrets.alpaca.keySecretKey }}
 
+            # --- Credential broker (certified-envelopes Phase 0). Only rendered when
+            # credentialBroker.enabled. With REBALANCER_SERVE_PROPOSAL_PLANS=true the service
+            # refuses to start unless both are set: it cannot decrypt tenant credentials itself
+            # (CREDENTIALS_ENCRYPTION_KEY stays forbidden) and fetches each paper key from the
+            # BacktestingEngine API pod. Secret created out of band.
+            {{- if .Values.credentialBroker.enabled }}
+            - name: REBALANCER_CREDENTIAL_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentialBroker.secretName }}
+                  key: {{ .Values.credentialBroker.urlKey }}
+            - name: CREDENTIAL_BROKER_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentialBroker.secretName }}
+                  key: {{ .Values.credentialBroker.tokenKey }}
+            {{- end }}
+
             # --- Massive market data. Required here (unlike k8s/signal-engine-helm's optional,
             # warm-start-only use of this same key) -- market_data::EnvKeyProvider::from_env is
             # called unconditionally by run_service().

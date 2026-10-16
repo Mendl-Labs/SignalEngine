@@ -197,3 +197,18 @@ serviceAccount:
   automount: false
   annotations: {}
   name: ""
+
+# ==============================================================================
+# Credential broker (certified-envelopes Phase 0). Off by default.
+# ==============================================================================
+# Required when REBALANCER_SERVE_PROPOSAL_PLANS=true. One Secret holding the broker base URL
+# (e.g. the BacktestingEngine API Service, http://<api-svc>:<port>) and the shared bearer token
+# (the same value as the API pod's CREDENTIAL_BROKER_SERVICE_TOKEN), created out of band:
+#   kubectl create secret generic rebalancer-credential-broker -n <ns> \
+#     --from-literal=url='http://...' --from-literal=token='...'
+# The chart never contains the values.
+credentialBroker:
+  enabled: false
+  secretName: rebalancer-credential-broker
+  urlKey: url
+  tokenKey: token
