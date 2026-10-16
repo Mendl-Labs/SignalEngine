@@ -62,7 +62,7 @@ jobs:
       - name: Checkout LoggingEngine
         uses: actions/checkout@v7
         with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
+          repository: Mendl-Labs/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: LoggingEngine
           fetch-depth: 0
@@ -70,7 +70,7 @@ jobs:
       - name: Checkout MessageBrokerEngine
         uses: actions/checkout@v7
         with:
-          repository: Nwagbara-Group-LLC/MessageBrokerEngine
+          repository: Mendl-Labs/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: MessageBrokerEngine
           fetch-depth: 0
@@ -78,7 +78,7 @@ jobs:
       - name: Checkout databaseschema
         uses: actions/checkout@v7
         with:
-          repository: Nwagbara-Group-LLC/databaseschema
+          repository: Mendl-Labs/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: databaseschema
           fetch-depth: 0
@@ -94,7 +94,7 @@ jobs:
       - name: Checkout BacktestingEngine
         uses: actions/checkout@v7
         with:
-          repository: Nwagbara-Group-LLC/BacktestingEngine
+          repository: Mendl-Labs/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingEngine
           fetch-depth: 0
@@ -102,8 +102,8 @@ jobs:
       - name: Checkout BacktestingCore
         uses: actions/checkout@v7
         with:
-          repository: Nwagbara-Group-LLC/BacktestingCore
-          ref: v0.1.49
+          repository: Mendl-Labs/BacktestingCore
+          ref: v0.1.51
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           path: BacktestingCore
           fetch-depth: 0
