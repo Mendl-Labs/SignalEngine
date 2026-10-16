@@ -534,7 +534,10 @@ fn dec_from_f64(name: &str, v: f64) -> Result<Dec, ExclusionReason> {
 
 /// The sleeves of a proposal plan (`PlanBody`): `share = weight * risk_scale`, kind from [`ENTRY_SLEEVE_KINDS`],
 /// venue/asset class/quote from the kind. Returns the sleeves and the entries they pin, in order.
-fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<(Vec<SleeveSpec>, Vec<PinnedEntry>, Vec<Option<PlanPoint>>), ExclusionReason> {
+/// The sleeves, pinned entries and (frozen) implementation points of one proposal plan, in sleeve order.
+type ParsedProposalSleeves = (Vec<SleeveSpec>, Vec<PinnedEntry>, Vec<Option<PlanPoint>>);
+
+fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeves, ExclusionReason> {
     let bad = |m: String| ExclusionReason::PlanBodyInvalid(m);
     let body = &plan.body;
     let body_proposal = body.get("proposal_id").and_then(Value::as_str).ok_or_else(|| bad("body.proposal_id missing or not a string".into()))?;
@@ -693,7 +696,7 @@ fn apply_point(spec: &mut SleeveSpec, point: &PlanPoint, verifier: &dyn Envelope
         return Err(out(format!("tranche {} exceeds the maximum of {MAX_TRANCHE_SESSIONS} sessions", point.tranche_sessions)));
     }
     // The envelope, from the platform's own files.
-    verifier.verify(point).map_err(&out)?;
+    verifier.verify(point).map_err(out)?;
 
     // What this runtime can actually run (an envelope may pre-register more than the data and venue layers serve).
     let lookback = match override_value {
