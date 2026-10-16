@@ -1,0 +1,23 @@
+name: Rebalancer chart render tests
+
+on:
+  pull_request:
+    paths:
+      - 'k8s/rebalancer-helm/**'
+      - '.github/workflows/rebalancer-chart-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.15.3'
+      - name: helm template cases (positive and refusal)
+        run: bash k8s/rebalancer-helm/tests/render-test.sh

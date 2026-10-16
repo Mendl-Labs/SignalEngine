@@ -102,8 +102,48 @@ running (and then immediately exiting) pod.
 */}}
 {{- define "rebalancer-helm.validatedExtraEnv" -}}
 {{- range .Values.extraEnv }}
+{{- if eq .name "REBALANCER_SERVE_PROPOSAL_PLANS" }}
+{{- fail "extraEnv must not set REBALANCER_SERVE_PROPOSAL_PLANS: use the serveProposalPlans value, which also enforces the credential-broker requirement." }}
+{{- end }}
 {{- if eq .name "CREDENTIALS_ENCRYPTION_KEY" }}
 {{- fail "extraEnv must not set CREDENTIALS_ENCRYPTION_KEY: rebalancer-service refuses to start if this variable is present in its environment at all (see PilotConfig::from_lookup's FORBIDDEN_ENV check) -- this chart deliberately never wires the tenant-credential master key to the pilot rebalancer." }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+"true" when the owner pilot (tenant, account) pair is served, else empty. With serveProposalPlans off the
+pair is always served (and validatedUuid fails on a bad/nil id, as before). With it on, both ids unset
+(empty or the nil UUID) means no pilot pair; both set means the pair is served; exactly one is a render
+error (mirrors PilotConfig::from_lookup: a half-configured pair is a mistake, never "no pilot").
+*/}}
+{{- define "rebalancer-helm.pilotPresent" -}}
+{{- if eq (toString .Values.serveProposalPlans) "true" -}}
+{{- $nil := "00000000-0000-0000-0000-000000000000" -}}
+{{- $t := .Values.pilot.tenantId | toString | trim | lower -}}
+{{- $a := .Values.pilot.accountId | toString | trim | lower -}}
+{{- $tSet := and (ne $t "") (ne $t $nil) -}}
+{{- $aSet := and (ne $a "") (ne $a $nil) -}}
+{{- if and $tSet $aSet -}}true
+{{- else if or $tSet $aSet -}}
+{{- fail "serveProposalPlans: set BOTH pilot.tenantId and pilot.accountId (owner pilot alongside proposal plans) or NEITHER (proposal plans only); exactly one is a half-configured pilot pair." -}}
+{{- end -}}
+{{- else -}}true
+{{- end -}}
+{{- end }}
+
+{{/*
+Fails the render when serveProposalPlans is on without the credential broker: with
+REBALANCER_SERVE_PROPOSAL_PLANS=true the service cannot decrypt tenant credentials itself
+(CREDENTIALS_ENCRYPTION_KEY stays forbidden) and refuses to start without the broker URL and token.
+*/}}
+{{- define "rebalancer-helm.validatedProposalPlans" -}}
+{{- if eq (toString .Values.serveProposalPlans) "true" -}}
+{{- if not .Values.credentialBroker.enabled -}}
+{{- fail "serveProposalPlans=true requires credentialBroker.enabled=true: this pod cannot decrypt tenant credentials (CREDENTIALS_ENCRYPTION_KEY is forbidden here) and fetches each paper key from the Engine credential broker. Create Secret rebalancer-credential-broker with keys url and token, then set credentialBroker.enabled=true." -}}
+{{- end -}}
+{{- if or (not .Values.credentialBroker.secretName) (not .Values.credentialBroker.urlKey) (not .Values.credentialBroker.tokenKey) -}}
+{{- fail "serveProposalPlans=true requires credentialBroker.secretName, credentialBroker.urlKey and credentialBroker.tokenKey (the Secret holding the broker URL and bearer token)." -}}
+{{- end -}}
+{{- end -}}
 {{- end }}

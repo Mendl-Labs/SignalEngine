@@ -48,6 +48,10 @@ fullnameOverride: ""
 # nil UUID so an un-overridden `helm install` fails closed instead of silently deploying nothing
 # useful (PilotAllowList::parse refuses the nil UUID too -- the application would fail-closed
 # either way, but failing at render time is a faster, clearer signal).
+#
+# EXCEPTION when serveProposalPlans is true (below): both may be left unset (empty or the nil
+# UUID) for a proposal-plans-only pod; set both (the owner pilot may still be served alongside) or
+# neither -- exactly one is a render-time error.
 pilot:
   tenantId: "00000000-0000-0000-0000-000000000000"
   accountId: "00000000-0000-0000-0000-000000000000"
@@ -197,6 +201,17 @@ serviceAccount:
   automount: false
   annotations: {}
   name: ""
+
+# ==============================================================================
+# Proposal plans (certified-envelopes Phase 0). Off by default.
+# ==============================================================================
+# true -> REBALANCER_SERVE_PROPOSAL_PLANS=true: the pod also serves approved paper strategy_plans
+# of every tenant. Then: pilot.tenantId/pilot.accountId and the secrets.alpaca Secret become
+# optional (omit them for a proposal-plans-only pod), and credentialBroker.enabled=true with the
+# Secret refs below is REQUIRED (the chart fails otherwise). Set this value, not extraEnv (extraEnv
+# is refused for REBALANCER_SERVE_PROPOSAL_PLANS). The pod still never holds
+# CREDENTIALS_ENCRYPTION_KEY or live keys.
+serveProposalPlans: false
 
 # ==============================================================================
 # Credential broker (certified-envelopes Phase 0). Off by default.

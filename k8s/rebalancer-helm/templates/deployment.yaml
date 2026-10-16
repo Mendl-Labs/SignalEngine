@@ -57,6 +57,7 @@ spec:
           # `docker run`), never wired into this Deployment.
           env:
             {{- include "rebalancer-helm.validatedExtraEnv" . }}
+            {{- include "rebalancer-helm.validatedProposalPlans" . }}
             {{- range .Values.extraEnv }}
             - name: {{ .name }}
               value: {{ .value | quote }}
@@ -68,6 +69,14 @@ spec:
             - name: REBALANCER_PAPER_ONLY
               value: "true"
 
+            {{- if eq (toString .Values.serveProposalPlans) "true" }}
+            # --- Also serve approved paper strategy_plans of every tenant (requires the credential
+            # broker below; validated at render time).
+            - name: REBALANCER_SERVE_PROPOSAL_PLANS
+              value: "true"
+            {{- end }}
+
+            {{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
             # --- The pilot's one (tenant, account) pair. Not secret -- read from the ConfigMap.
             - name: PILOT_TENANT_ID
               valueFrom:
@@ -79,6 +88,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "rebalancer-helm.fullname" . }}-config
                   key: pilot-account-id
+            {{- end }}
             - name: REBALANCER_TICK_SECS
               valueFrom:
                 configMapKeyRef:
@@ -99,6 +109,7 @@ spec:
             # rebalancer_pilot_plans row before any order can be placed, and PaperOnlyAlpaca
             # (S-8) cannot name a live Alpaca environment at all -- see
             # crates/broker-adapters/src/alpaca/paper_only.rs.
+            {{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
             - name: PILOT_ALPACA_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -109,6 +120,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.alpaca.secretName }}
                   key: {{ .Values.secrets.alpaca.keySecretKey }}
+            {{- end }}
 
             # --- Credential broker (certified-envelopes Phase 0). Only rendered when
             # credentialBroker.enabled. With REBALANCER_SERVE_PROPOSAL_PLANS=true the service

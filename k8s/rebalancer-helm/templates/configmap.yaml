@@ -8,6 +8,8 @@ metadata:
     app.kubernetes.io/component: configuration
 data:
   # Not secret (ordinary primary keys, not credentials) -- validated as real UUIDs at render time.
+  {{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
   pilot-tenant-id: {{ include "rebalancer-helm.validatedUuid" (list "pilot.tenantId" .Values.pilot.tenantId) | quote }}
   pilot-account-id: {{ include "rebalancer-helm.validatedUuid" (list "pilot.accountId" .Values.pilot.accountId) | quote }}
+  {{- end }}
   tick-secs: {{ .Values.pilot.tickSecs | toString | quote }}
