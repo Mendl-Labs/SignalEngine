@@ -88,13 +88,17 @@ impl PaperCredentialProvider for FakeBroker {
 }
 
 /// The "connect" step: succeeds with a label naming the account, never reads the secret into the label.
-fn build(keys: &PaperAlpacaKeys, acct: &PilotAccount) -> Result<String, RuntimeError> {
-    assert_eq!(keys.secret, SECRET_MARKER);
-    Ok(format!("runtime:{}", acct.active.account_id))
+/// Returned as a closure (not a fn item) so clippy::result_large_err, which lints fn signatures, does not apply to
+/// the production `RuntimeError` this seam has to name.
+fn build() -> impl Fn(&PaperAlpacaKeys, &PilotAccount) -> Result<String, RuntimeError> {
+    |keys: &PaperAlpacaKeys, acct: &PilotAccount| {
+        assert_eq!(keys.secret, SECRET_MARKER);
+        Ok(format!("runtime:{}", acct.active.account_id))
+    }
 }
 
 fn cycle(fleet: &mut Fleet<String>, broker: &FakeBroker, accounts: &[PilotAccount], now: DateTime<Utc>) -> rebalancer_service::fleet::ReconcileReport {
-    fleet.reconcile(accounts, now, |a| connect_account(a, broker, build))
+    fleet.reconcile(accounts, now, |a| connect_account(a, broker, build()))
 }
 
 #[test]
@@ -211,7 +215,7 @@ fn a_connect_failure_after_a_good_credential_fetch_is_typed_and_isolated() {
             if acct.active.account_id == ACCT_A {
                 Err(RuntimeError::Connect(PilotRefusal::Adapter(format!("refused for {}", keys.key_id.len()))))
             } else {
-                build(keys, acct)
+                build()(keys, acct)
             }
         })
     });
