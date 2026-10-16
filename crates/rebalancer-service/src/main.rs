@@ -37,6 +37,13 @@
 //! back to `strategy_plans.reconciliation_*` (`rebalancer_store::PgPlanReconciliation`), and the run rows carry
 //! `plan_origin = 'proposal'` through the provenance registry.
 //!
+//! With the flag on the account runtimes are NOT fixed at startup: every `REBALANCER_REENUMERATE_SECS` (default 300)
+//! the source is enumerated again and `rebalancer_service::fleet::Fleet::reconcile` builds a runtime for each newly
+//! eligible account (credential broker fetch, connect, verify), rebuilds one whose plan was replaced and drops one
+//! no longer eligible. Zero eligible accounts keeps the pod up (heartbeat log); one account's failure is logged,
+//! alerted once per failure streak (`ALERT_RUN_FAILED`, `RUNTIME_UNAVAILABLE`) and retried with backoff, and never
+//! stops another. With the flag off nothing is re-enumerated and startup behaves exactly as before.
+//!
 //! There is no in-memory or demo account source anywhere in this binary's startup path any more (the previous
 //! `InMemoryAccountSource`/`demo_accounts()` wiring this replaces is gone, not merely unused): `PilotConfig::
 //! from_env`'s paper-only checks (`REBALANCER_PAPER_ONLY=true` plus the pilot ids) must already pass before any of
@@ -84,8 +91,11 @@ use rebalancer_run::data::DataSource;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource, DueOutcome};
 use rebalancer_run::latency::LatencyRecorder;
 use rebalancer_run::pipeline::RunConfig;
+use rebalancer_run::record::{Alert, AlertCode, AlertSeverity};
+use rebalancer_run::stores::Notifier;
 use rebalancer_service::broker_credentials::{BrokerConfig, HttpBrokerCredentials};
 use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
+use rebalancer_service::fleet::{connect_account, reenumerate_secs_from_lookup, Fleet, ReenumerateSchedule, DEFAULT_REENUMERATE_SECS};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
 use rebalancer_service::runtime::{connect_account_alpaca_for_sleeves, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
@@ -214,6 +224,18 @@ fn run_service() {
             std::process::exit(1);
         }
     };
+    // The re-enumeration interval (flag on only): a malformed value refuses the start like every other setting.
+    let reenumerate_secs = if pilot.serve_proposal_plans {
+        match reenumerate_secs_from_lookup(|k| std::env::var(k).ok()) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("rebalancer-service: refusing to start: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        DEFAULT_REENUMERATE_SECS
+    };
     let tick_secs = tick_secs();
     log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY; {}", pilot.describe()));
     log(observer_cfg.describe());
@@ -341,7 +363,12 @@ fn run_service() {
     for excluded in &enumeration.exclusions {
         log(format!("account {} excluded at startup: {}", excluded.account_id, excluded.reason.code()));
     }
-    if enumeration.accounts.is_empty() {
+    // With proposal plans served, zero eligible accounts is a normal state (nothing approved yet): the loop below
+    // re-enumerates every REBALANCER_REENUMERATE_SECS and builds a runtime when a plan appears. Flag off: unchanged.
+    if enumeration.accounts.is_empty() && pilot.serve_proposal_plans {
+        log(format!("no account is eligible yet; serving proposal plans, so staying up and re-enumerating every {reenumerate_secs}s"));
+    }
+    if enumeration.accounts.is_empty() && !pilot.serve_proposal_plans {
         eprintln!("rebalancer-service: no account is eligible to run (see the exclusions logged above, if any); refusing to start with no runtime");
         std::process::exit(1);
     }
@@ -403,7 +430,7 @@ fn run_service() {
             }
         }
     }
-    if connected.is_empty() {
+    if connected.is_empty() && !pilot.serve_proposal_plans {
         eprintln!("rebalancer-service: no account could be connected (see above); refusing to start with no runtime");
         std::process::exit(1);
     }
@@ -452,7 +479,7 @@ fn run_service() {
     // source instance, so the observer polling seven instruments every tick can never starve the decision fetch, and
     // its unfiltered observations never touch the decision source's provenance log.
     let observer_massive = match EnvKeyProvider::from_env() {
-        Ok(k) => MassiveDataSource::new(k, transport),
+        Ok(k) => MassiveDataSource::new(k, transport.clone()),
         Err(e) => {
             eprintln!("rebalancer-service: MASSIVE_API_KEY (observer): {e}");
             std::process::exit(1);
@@ -460,16 +487,13 @@ fn run_service() {
     };
     let recorder = LatencyRecorder::new(&observer_massive, &latency_store);
 
-    // One broker, one rule set and one venue book per connected account; the shared data source for all. The
-    // vectors are filled completely before anything borrows from them.
-    let brokers: Vec<_> = connected.iter().map(|(_, a)| a.broker()).collect();
-    let rules: Vec<_> = connected.iter().map(|(_, a)| a.rules()).collect();
-    let venue_books: Vec<VenueRuleBook<'_>> = rules.iter().map(|r| VenueRuleBook::new().with("alpaca", r)).collect();
-    let mut runtimes: BTreeMap<String, AccountRuntime<'_>> = BTreeMap::new();
-    for (i, (account, _)) in connected.iter().enumerate() {
-        runtimes.insert(account.active.account_id.clone(), AccountRuntime { broker: &brokers[i], data: data_source, venue_rules: &venue_books[i] });
-    }
-    log(format!("{} account runtime(s) built", runtimes.len()));
+    // The connected accounts live in a `Fleet` (owned, keyed by account id). Each tick borrows one broker, one rule
+    // set and one venue book per account from it (built in the tick loop); with the flag on the fleet is re-enumerated
+    // every `reenumerate_secs` (new plans get a runtime, ineligible accounts lose theirs), with it off it never
+    // changes after this point, exactly as before.
+    let mut fleet: Fleet<PilotAlpaca> = Fleet::with_connected(reenumerate_secs as i64, connected.into_iter().map(|(a, alpaca)| (a.active.account_id.clone(), a.plan_id, alpaca)));
+    log(format!("{} account runtime(s) built", fleet.len()));
+    let mut reenumerate_schedule = pilot.serve_proposal_plans.then(|| ReenumerateSchedule::new(reenumerate_secs, Utc::now()));
 
     let clock = SystemClock;
     // Paper-only: the pipeline refuses any broker that does not report a paper connection (`VenuePolicy::PaperOnly`).
@@ -535,7 +559,24 @@ fn run_service() {
                 TickOutcome::Ran
             }
             Ok(false) => {
-                let tick_outcome = run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes, write_back);
+                if let Some(schedule) = reenumerate_schedule.as_mut() {
+                    let now = clock.now();
+                    if schedule.due(now) {
+                        reenumerate_fleet(accounts.inner(), &mut fleet, &credentials, &transport, &tenants, &notifier, now);
+                    }
+                }
+                let tick_outcome = {
+                    // One broker, one rule set and one venue book per runtime in the fleet, borrowed for this tick only;
+                    // the vectors are filled completely before anything borrows from them.
+                    let brokers: Vec<_> = fleet.iter().map(|(_, a)| a.broker()).collect();
+                    let rules: Vec<_> = fleet.iter().map(|(_, a)| a.rules()).collect();
+                    let venue_books: Vec<VenueRuleBook<'_>> = rules.iter().map(|r| VenueRuleBook::new().with("alpaca", r)).collect();
+                    let mut runtimes: BTreeMap<String, AccountRuntime<'_>> = BTreeMap::new();
+                    for (i, (id, _)) in fleet.iter().enumerate() {
+                        runtimes.insert(id.clone(), AccountRuntime { broker: &brokers[i], data: data_source, venue_rules: &venue_books[i] });
+                    }
+                    run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes, write_back)
+                };
                 // After the runs (and their data fetch), the observer; never before, never instead.
                 observe_tick(&observer_cfg, &recorder, &accounts, &notifier, &clock);
                 tick_outcome
@@ -561,6 +602,78 @@ fn run_service() {
             }
         }
         clock.sleep_secs(tick_secs);
+    }
+}
+
+/// One re-enumeration cycle (proposal plans served): enumerate the eligible accounts afresh and reconcile the fleet.
+/// A failed enumeration keeps the current runtimes; one account's failed credential fetch or connect is logged,
+/// alerted once per failure streak and retried with backoff, and never stops another account.
+fn reenumerate_fleet(
+    source: &PgAccountSource,
+    fleet: &mut Fleet<PilotAlpaca>,
+    credentials: &ServiceCredentials,
+    transport: &Arc<dyn HttpTransport>,
+    tenants: &Arc<AccountTenants>,
+    notifier: &PgNotifier,
+    now: DateTime<Utc>,
+) {
+    let enumeration = match source.enumerate() {
+        Ok(e) => e,
+        Err(e) => {
+            log(format!("re-enumeration failed: could not enumerate the accounts: {e}; keeping the {} current runtime(s)", fleet.len()));
+            return;
+        }
+    };
+    for excluded in &enumeration.exclusions {
+        log(format!("account {} excluded: {}", excluded.account_id, excluded.reason.code()));
+    }
+    let report = fleet.reconcile(&enumeration.accounts, now, |account| {
+        connect_account(account, credentials, |keys, acct| {
+            let alpaca = connect_account_alpaca_for_sleeves(&keys.key_id, &keys.secret, PAPER_BASE_URL, transport.clone(), acct.credential_fingerprint.as_deref(), &acct.active.sleeves)?;
+            log(format!(
+                "connected paper Alpaca for account {} (tenant {}, plan {} origin {}): key fingerprint {}",
+                acct.active.account_id,
+                acct.active.tenant_id,
+                acct.plan_id,
+                acct.origin.as_str(),
+                alpaca.key_id_fingerprint()
+            ));
+            Ok(alpaca)
+        })
+    });
+    for id in &report.dropped {
+        log(format!("account {id} is no longer eligible: runtime dropped"));
+    }
+    for f in &report.failed {
+        log(format!(
+            "account {} (tenant {}, plan {} origin {}): NO RUNTIME -- {} (failure #{}, next attempt after {})",
+            f.account_id,
+            f.tenant_id,
+            f.plan_id,
+            f.origin.as_str(),
+            f.failure,
+            f.consecutive,
+            f.retry_at.to_rfc3339()
+        ));
+        if f.first_in_streak {
+            tenants.register(&f.account_id, uuid_or_nil(&f.tenant_id));
+            let alert = Alert {
+                code: AlertCode::RunFailed,
+                severity: AlertSeverity::Warning,
+                account_id: f.account_id.clone(),
+                run_key: format!("runtime|{}", now.to_rfc3339()),
+                message: format!("RUNTIME_UNAVAILABLE: no runtime for plan {} ({}); nothing will trade for this account until it connects; retrying with backoff", f.plan_id, f.failure.code),
+                dedupe_key: format!("runtime-unavailable|{}|{}", f.account_id, f.failure.code),
+                at: now,
+            };
+            if let Err(e) = notifier.notify(&alert) {
+                log(format!("account {}: the runtime-unavailable alert could not be persisted either: {e}", f.account_id));
+            }
+        }
+    }
+    log(report.summary_line(fleet.len()));
+    if fleet.is_empty() {
+        log("heartbeat: no account runtime yet; serving proposal plans, waiting for an eligible account");
     }
 }
 

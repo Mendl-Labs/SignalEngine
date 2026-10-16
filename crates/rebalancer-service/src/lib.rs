@@ -3,6 +3,7 @@
 
 pub mod broker_credentials;
 pub mod credentials;
+pub mod fleet;
 pub mod kill_drill;
 pub mod observer;
 pub mod pilot;
