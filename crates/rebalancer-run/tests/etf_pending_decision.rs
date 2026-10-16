@@ -1454,7 +1454,7 @@ fn tranche_3_acts_three_sessions_after_tranche_0_on_the_same_decision_and_the_le
                 if day >= date(2019, 9, 25) && etf_planned(&rec) {
                     plans.entry(acct.clone()).or_default().push((day, etf_decision(&rec).decision_date));
                 }
-                if acct == "acct-t3" && rec.steps.iter().any(|n| n.note.contains("waiting for its tranche")) {
+                if day >= date(2019, 9, 25) && acct == "acct-t3" && rec.steps.iter().any(|n| n.note.contains("waiting for its tranche")) {
                     waiting_notes += 1;
                 }
             }
