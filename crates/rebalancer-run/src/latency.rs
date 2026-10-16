@@ -331,7 +331,18 @@ pub fn instruments_for_sleeves<'a>(
 ) -> Vec<Instrument> {
     let mut out: Vec<Instrument> = sleeves
         .into_iter()
-        .flat_map(|s| instruments_for_kind(s.kind, &s.quote))
+        .flat_map(|s| {
+            if s.instruments.is_empty() {
+                instruments_for_kind(s.kind, &s.quote)
+            } else {
+                // A sleeve at an envelope point reads ITS instruments (its proxies), not the published ones.
+                let quote = match s.kind {
+                    SleeveKind::EtfTrend => String::new(),
+                    SleeveKind::CryptoTrend => s.quote.clone(),
+                };
+                s.rule_symbols().into_iter().map(|symbol| Instrument { symbol, kind: s.kind, quote: quote.clone() }).collect()
+            }
+        })
         .collect();
     out.sort();
     out.dedup();

@@ -92,6 +92,7 @@ pub fn crypto_sleeve(share: &str) -> SleeveSpec {
         venue: "kraken".into(),
         asset_class: "crypto_spot".into(),
         quote: "USD".into(),
+        instruments: Vec::new(), tranche_sessions: 0, lookback: None,
     }
 }
 

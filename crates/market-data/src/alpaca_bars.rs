@@ -19,7 +19,7 @@ use std::time::Duration;
 use broker_adapters::transport::{HttpMethod, HttpRequest, HttpTransport};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rebalancer_run::data::{SleeveKind, SleeveSpec};
-use reference_rules::{data_fingerprint, Panel, PriceSeries, ETF_SYMBOLS};
+use reference_rules::{data_fingerprint, Panel, PriceSeries};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -135,10 +135,10 @@ impl AlpacaBarsSource {
 
     /// Every page of the multi-symbol daily request: `symbol -> (bar date, close)` in the vendor's order, plus the
     /// request records and raw-body hashes.
-    fn fetch_pages(&self, from: NaiveDate, to: NaiveDate) -> Result<Pages, MassiveError> {
-        let symbols = ETF_SYMBOLS.join(",");
-        let path = format!("/v2/stocks/bars?symbols={symbols}&timeframe=1Day&start={from}&end={to}&adjustment=split&feed={}&limit={PAGE_LIMIT}&sort=asc", self.feed);
-        let mut by_symbol: Vec<(String, Vec<(NaiveDate, f64)>)> = ETF_SYMBOLS.iter().map(|s| (s.to_string(), Vec::new())).collect();
+    fn fetch_pages(&self, symbols: &[String], from: NaiveDate, to: NaiveDate) -> Result<Pages, MassiveError> {
+        let list = symbols.join(",");
+        let path = format!("/v2/stocks/bars?symbols={list}&timeframe=1Day&start={from}&end={to}&adjustment=split&feed={}&limit={PAGE_LIMIT}&sort=asc", self.feed);
+        let mut by_symbol: Vec<(String, Vec<(NaiveDate, f64)>)> = symbols.iter().map(|s| (s.to_string(), Vec::new())).collect();
         let mut paths = Vec::new();
         let mut hashes = Vec::new();
         let mut page_token: Option<String> = None;
@@ -188,11 +188,11 @@ impl AlpacaBarsSource {
         Err(MassiveError::Malformed { instrument: "alpaca".to_string(), detail: format!("more than {MAX_PAGES} pages: refusing to follow page_token further") })
     }
 
-    fn fetch_etf(&self, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
+    fn fetch_etf(&self, symbols: &[String], as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
         let unsupported = || MassiveError::Unsupported { detail: format!("run date {as_of} is too close to the calendar's limits") };
         let from = as_of.checked_sub_signed(ChronoDuration::days(self.history_days)).ok_or_else(unsupported)?;
         let to = as_of.checked_sub_signed(ChronoDuration::days(1)).ok_or_else(unsupported)?;
-        let (by_symbol, paths, hashes, fetched_at) = self.fetch_pages(from, to)?;
+        let (by_symbol, paths, hashes, fetched_at) = self.fetch_pages(symbols, from, to)?;
         let now = self.clock.now();
         let mut series = Vec::with_capacity(by_symbol.len());
         let mut provenance = Vec::with_capacity(by_symbol.len());
@@ -249,7 +249,7 @@ impl SleeveFetcher for AlpacaBarsSource {
 
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         let r = match sleeve.kind {
-            SleeveKind::EtfTrend => self.fetch_etf(as_of),
+            SleeveKind::EtfTrend => self.fetch_etf(&sleeve.rule_symbols(), as_of),
             SleeveKind::CryptoTrend => Err(MassiveError::Unsupported { detail: "Alpaca bars serve the ETF sleeve only; the crypto secondary is Kraken".to_string() }),
         };
         r.map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })

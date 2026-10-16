@@ -28,7 +28,7 @@ use rebalancer_risk::store::InMemoryStateStore;
 use std::collections::BTreeMap;
 
 fn etf_sleeve(share: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "kraken".into(), asset_class: "crypto_spot".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d(share), venue: "kraken".into(), asset_class: "crypto_spot".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn crypto_account(account_id: &str, tenant_id: &str) -> ActiveAccount {

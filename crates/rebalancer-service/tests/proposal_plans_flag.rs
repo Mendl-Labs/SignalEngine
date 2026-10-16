@@ -18,7 +18,7 @@ use rebalancer_service::credentials::{
     TENANT_CREDENTIALS_NOT_BUILT,
 };
 use rebalancer_service::pilot::{PilotAccountSource, PilotConfig, PilotPair, PilotRefusal, ENV_ACCOUNT, ENV_PAPER_ONLY, ENV_SERVE_PROPOSAL_PLANS, ENV_TENANT};
-use rebalancer_service::runtime::{connect_account_alpaca, symbols_for_kind, RuntimeError, PILOT_CRYPTO_SYMBOLS, PILOT_ETF_SYMBOLS};
+use rebalancer_service::runtime::{connect_account_alpaca, connect_account_alpaca_for_sleeves, symbols_for_kind, symbols_for_sleeves, RuntimeError, PILOT_CRYPTO_SYMBOLS, PILOT_ETF_SYMBOLS};
 use serde_json::{json, Value};
 
 const TENANT: &str = "3f2a9c1e-5b7d-4e8a-9c0d-1a2b3c4d5e6f";
@@ -120,7 +120,7 @@ fn mandate_body(venues: &[&str]) -> mandate_core::mandate::MandateBody {
 }
 
 fn sleeve(venue: &str, asset_class: &str) -> SleeveSpec {
-    SleeveSpec { id: "etf_trend_faber".into(), kind: SleeveKind::EtfTrend, share: rebalancer_run::Dec::parse("1").unwrap(), venue: venue.into(), asset_class: asset_class.into(), quote: "".into() }
+    SleeveSpec { id: "etf_trend_faber".into(), kind: SleeveKind::EtfTrend, share: rebalancer_run::Dec::parse("1").unwrap(), venue: venue.into(), asset_class: asset_class.into(), quote: "".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 fn account(tenant: &str, account: &str, mode: ExecutionMode) -> ActiveAccount {
@@ -342,4 +342,45 @@ fn the_asset_refresh_covers_exactly_the_accounts_sleeve_kinds() {
     let ok = connect_account_alpaca(PAPER_KEY, SECRET, PAPER_BASE_URL, t.clone(), None, &BTreeSet::from([SleeveKind::EtfTrend, SleeveKind::CryptoTrend])).unwrap();
     assert_eq!(t.request_count(), 1 + PILOT_ETF_SYMBOLS.len() + PILOT_CRYPTO_SYMBOLS.len());
     assert!(ok.assets().lookup("VNQ").is_some() && ok.assets().lookup("ETH/USD").is_some());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Certified-envelopes Phase 4: the asset refresh covers each account's OWN instruments (its proxies)
+// ---------------------------------------------------------------------------------------------------------------
+
+fn proxy_etf_sleeve() -> SleeveSpec {
+    SleeveSpec { instruments: ["IVV", "EFA", "IEF", "DBC", "VNQ"].iter().map(|s| s.to_string()).collect(), tranche_sessions: 2, lookback: Some(9), ..sleeve("alpaca", "us_etf") }
+}
+
+#[test]
+fn the_symbols_of_published_sleeves_are_exactly_the_per_kind_symbols_in_the_same_order() {
+    let etf = sleeve("alpaca", "us_etf");
+    let crypto = SleeveSpec { id: "crypto_trend_100d".into(), kind: SleeveKind::CryptoTrend, asset_class: "crypto_spot".into(), quote: "USD".into(), ..sleeve("alpaca", "us_etf") };
+    let want: Vec<String> = PILOT_ETF_SYMBOLS.iter().chain(PILOT_CRYPTO_SYMBOLS.iter()).map(|s| s.to_string()).collect();
+    assert_eq!(symbols_for_sleeves(&[etf.clone(), crypto.clone()]), want);
+    assert_eq!(symbols_for_sleeves(&[crypto, etf]), want, "kind order, whatever the sleeve order");
+}
+
+#[test]
+fn a_proxy_account_refreshes_its_proxy_into_the_asset_table_and_not_the_published_symbol() {
+    let sleeves = [proxy_etf_sleeve()];
+    assert_eq!(symbols_for_sleeves(&sleeves), vec!["IVV", "EFA", "IEF", "DBC", "VNQ"]);
+    let t = Arc::new(FakeTransport::new());
+    t.enqueue_json(200, &account_json("PA3TESTFIXT1"));
+    for sym in ["IVV", "EFA", "IEF", "DBC", "VNQ"] {
+        t.enqueue_json(200, &asset_json(sym, "us_equity"));
+    }
+    let ok = connect_account_alpaca_for_sleeves(PAPER_KEY, SECRET, PAPER_BASE_URL, t.clone(), None, &sleeves).unwrap();
+    assert_eq!(t.request_count(), 6);
+    assert!(ok.assets().lookup("IVV").is_some(), "the proxy is verified into the table");
+    assert!(ok.assets().lookup("SPY").is_none(), "the published symbol this account does not trade is not");
+}
+
+#[test]
+fn an_account_whose_proxy_cannot_be_refreshed_gets_no_runtime() {
+    let t = Arc::new(FakeTransport::new());
+    t.enqueue_json(200, &account_json("PA3TESTFIXT1"));
+    t.enqueue_json(404, r#"{"message":"asset not found"}"#); // IVV is unknown to the venue
+    let err = connect_account_alpaca_for_sleeves(PAPER_KEY, SECRET, PAPER_BASE_URL, t, None, &[proxy_etf_sleeve()]).unwrap_err();
+    assert!(matches!(&err, RuntimeError::AssetRefresh { symbol, .. } if symbol == "IVV"), "{err}");
 }

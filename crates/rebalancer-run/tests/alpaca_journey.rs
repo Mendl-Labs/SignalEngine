@@ -196,7 +196,7 @@ impl DataSource for Vendor {
 // ---------------------------------------------------------------------------------------------------------------
 
 fn etf_sleeve() -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 /// A mandate at autonomy L2, universe/exposure scoped to Alpaca's five pilot ETFs, capital matching the fake

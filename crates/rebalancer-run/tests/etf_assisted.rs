@@ -86,7 +86,7 @@ fn the_etf_trend_sleeve_produces_tickets_from_real_month_end_data_on_an_alpaca_a
         })
         .collect();
     let data = FixtureData::new().with_panel("etf", panel).with_price_fn(move |sym| closes.get(sym).copied());
-    let sleeves = [SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }];
+    let sleeves = [SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: d("1"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }];
     let assets = AssetTable::builtin();
     let opts = PrepareOptions { allow_extended_hours: false, min_notional: d("1"), own_tag_prefix: Some("rb1:".into()), refuse_builtin_assets: false, allow_crypto: false };
     let rules = AlpacaRules { assets: &assets, options: &opts };

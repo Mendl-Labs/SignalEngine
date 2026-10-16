@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rebalancer_core::guard::PricePoint;
 use rebalancer_run::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveKind, SleeveSpec};
 use reference_rules::options::{CRYPTO_MAX_STALE_DAYS, ETF_MAX_STALE_DAYS};
-use reference_rules::{completed_month_end_dates, data_fingerprint, Panel, PriceSeries, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
+use reference_rules::{completed_month_end_dates, data_fingerprint, Panel, PriceSeries, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -605,19 +605,21 @@ impl MassiveDataSource {
         Ok(DailyBars { dates: f.dates, closes: f.closes, provenance })
     }
 
-    fn fetch_etf(&self, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
+    /// The ETF panel of `symbols` (the sleeve's own instruments; the published five at the published point) with
+    /// `sma_month_ends` completed month-ends required of each.
+    fn fetch_etf(&self, symbols: &[String], sma_month_ends: usize, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
         let (from, to) = self.window(as_of, self.cfg.etf_history_days)?;
         let key = self.key()?;
-        let mut fetched = Vec::with_capacity(ETF_SYMBOLS.len());
-        for sym in ETF_SYMBOLS {
+        let mut fetched = Vec::with_capacity(symbols.len());
+        for sym in symbols {
             let plan = Plan { symbol: sym.to_string(), ticker: sym.to_string(), clock: BarClock::StockMidnightNewYork, from, to, settle: self.cfg.completeness.stock_settle };
             let f = self.fetch_instrument(&plan, as_of, &key)?;
-            let insufficient = |have: usize| MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed: ETF_SMA_MONTH_ENDS, have };
+            let insufficient = |have: usize| MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed: sma_month_ends, have };
             if f.dates.is_empty() {
                 return Err(insufficient(0));
             }
             let have = completed_month_end_dates(&Self::series_of(&f)?).len();
-            if have < ETF_SMA_MONTH_ENDS {
+            if have < sma_month_ends {
                 return Err(insufficient(have));
             }
             let newest = f.dates[f.dates.len() - 1];
@@ -654,7 +656,9 @@ impl MassiveDataSource {
         self.finish(fetched, as_of)
     }
 
-    fn fetch_crypto(&self, quote: &str, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
+    /// `window_days` is the number of trailing calendar days every coin must have a bar for: the published
+    /// `CRYPTO_SMA_DAYS`, or the point's lookback plus its signal lag (the same 100 at the published point).
+    fn fetch_crypto(&self, quote: &str, window_days: usize, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
         if quote != "USD" {
             return Err(MassiveError::Unsupported { detail: format!("crypto quote currency {:?} is not supported (USD only)", bounded(quote)) });
         }
@@ -664,8 +668,8 @@ impl MassiveDataSource {
         for sym in CRYPTO_SYMBOLS {
             let plan = Plan { symbol: sym.to_string(), ticker: format!("X:{sym}{quote}"), clock: BarClock::MidnightUtc, from, to, settle: self.cfg.completeness.crypto_settle };
             let f = self.fetch_instrument(&plan, as_of, &key)?;
-            if f.dates.len() < CRYPTO_SMA_DAYS {
-                return Err(MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed: CRYPTO_SMA_DAYS, have: f.dates.len() });
+            if f.dates.len() < window_days {
+                return Err(MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed: window_days, have: f.dates.len() });
             }
             let newest = f.dates[f.dates.len() - 1];
             if (as_of - newest).num_days() > CRYPTO_MAX_STALE_DAYS {
@@ -676,8 +680,9 @@ impl MassiveDataSource {
                     detail: "yesterday's UTC bar is not (yet) available as a complete bar".to_string(),
                 });
             }
-            // Crypto trades every day: each of the last 100 calendar days must have its bar.
-            for k in (1..=CRYPTO_SMA_DAYS as i64).rev() {
+            // Crypto trades every day: each of the last `window_days` (100 at the published point) calendar days must
+            // have its bar.
+            for k in (1..=window_days as i64).rev() {
                 let d = as_of.checked_sub_signed(ChronoDuration::days(k)).ok_or_else(|| MassiveError::Unsupported { detail: "date out of range".to_string() })?;
                 if f.dates.binary_search(&d).is_err() {
                     return Err(MassiveError::MissingBar { symbol: f.symbol.clone(), date: d });
@@ -694,12 +699,14 @@ impl SleeveFetcher for MassiveDataSource {
         SOURCE_ID
     }
 
-    /// The panel depends ONLY on `(sleeve.kind, sleeve.quote (crypto), as_of)`: never on the sleeve id, venue,
-    /// asset class, share or tenant, which is what lets the per-tick `EvalCache` share one fetch between accounts.
+    /// The panel depends ONLY on `(sleeve.kind, sleeve.quote (crypto), sleeve's implementation point, as_of)`: never
+    /// on the sleeve id, venue, asset class, share or tenant, which is what lets the per-tick `EvalCache` share one
+    /// fetch between accounts at the same point. At the published point (`instruments` empty, no lookback, tranche
+    /// 0) the instruments and windows are exactly the published constants.
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         let r = match sleeve.kind {
-            SleeveKind::EtfTrend => self.fetch_etf(as_of),
-            SleeveKind::CryptoTrend => self.fetch_crypto(&sleeve.quote, as_of),
+            SleeveKind::EtfTrend => self.fetch_etf(&sleeve.rule_symbols(), sleeve.sma_lookback(), as_of),
+            SleeveKind::CryptoTrend => self.fetch_crypto(&sleeve.quote, sleeve.sma_lookback() + usize::from(sleeve.tranche_sessions), as_of),
         };
         r.map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })
     }

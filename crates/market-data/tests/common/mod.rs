@@ -33,11 +33,11 @@ pub fn at(date: NaiveDate, h: u32, m: u32) -> DateTime<Utc> {
 }
 
 pub fn etf_sleeve() -> SleeveSpec {
-    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: dec("0.5"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into() }
+    SleeveSpec { id: "etf".into(), kind: SleeveKind::EtfTrend, share: dec("0.5"), venue: "alpaca".into(), asset_class: "us_etf".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 pub fn crypto_sleeve() -> SleeveSpec {
-    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: dec("0.5"), venue: "kraken".into(), asset_class: "crypto_spot".into(), quote: "USD".into() }
+    SleeveSpec { id: "crypto".into(), kind: SleeveKind::CryptoTrend, share: dec("0.5"), venue: "kraken".into(), asset_class: "crypto_spot".into(), quote: "USD".into(), instruments: Vec::new(), tranche_sessions: 0, lookback: None }
 }
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -16,6 +16,18 @@
 //!   ([`ExclusionReason::StrategyPlanPresent`]): a plan cannot come from two sources. The pilot-plan guard trigger
 //!   refuses the insert in the same situation; this is the second, independent line.
 //!
+//! # Implementation points (certified-envelopes plan, Phase 4)
+//! A proposal-plan sleeve may carry the tenant's frozen `point` (`PlanSleeve.point`: instruments, execution tranche,
+//! lookback). It is copied into the [`SleeveSpec`] ONLY after the point is shown to be inside the platform's
+//! pre-registered envelope for that entry; otherwise the account is excluded with
+//! [`ExclusionReason::PointOutsideEnvelope`], never partially run and never run at the published point instead.
+//! The point equal to the published one (the entry's own instruments, tranche 0, the published lookback) needs no
+//! envelope: it IS the certified rule, and the sleeve is left at the published point (byte-for-byte today's run).
+//! The envelope check itself sits behind [`EnvelopeVerifier`]: this crate cannot import the Engine's
+//! `replication::envelope`, and `mandate-core` carries no envelope sidecar files yet, so no verifier is wired in the
+//! shipped build -- [`NoEnvelopes`] refuses every non-published point (fail closed). See the PR description for the
+//! cross-repo seam that closes it.
+//!
 //! # Strict scoping
 //! * Under [`AccountScope::Pilot`] a PILOT ALLOW-LIST ([`PilotAllowList`]: one tenant id and explicit account ids) is
 //!   the only input. Every query is bound to (tenant, account) pairs; nothing else is ever selected. An empty
@@ -83,8 +95,9 @@ pub const SERVABLE_PLAN_MODE: &str = "paper";
 pub const SERVABLE_PLAN_STATE: &str = "paper";
 
 /// The library entry -> sleeve kind table for proposal plans (`PlanSleeve.entry_id`). An entry id that is not here
-/// is a typed exclusion ([`ExclusionReason::UnsupportedSleeve`]), never a guess. Phase 4 of the certified-envelopes
-/// plan replaces this with per-point instruments; until then the kind pins the compile-time universe.
+/// is a typed exclusion ([`ExclusionReason::UnsupportedSleeve`]), never a guess. The kind pins the rule and the
+/// PUBLISHED universe; a sleeve's implementation point (see `apply_point`) overrides the instruments, lookback and
+/// timing only after it passed the envelope check.
 pub const ENTRY_SLEEVE_KINDS: [(&str, SleeveKind); 2] = [("etf_trend_faber", SleeveKind::EtfTrend), ("crypto_trend_100d", SleeveKind::CryptoTrend)];
 
 pub fn sleeve_kind_for_entry(entry_id: &str) -> Option<SleeveKind> {
@@ -253,6 +266,9 @@ pub enum ExclusionReason {
     AmbiguousProposalPlans { count: usize },
     /// The proposal plan is not `mode = 'paper'` and `state = 'paper'` (live, or halted by a person).
     ProposalPlanNotServable { mode: String, state: String },
+    /// A sleeve's implementation point is not inside the platform's pre-registered envelope for its entry (or no
+    /// envelope is available to prove it is), or is malformed, or names something this runtime cannot run.
+    PointOutsideEnvelope(String),
 }
 
 impl ExclusionReason {
@@ -279,6 +295,7 @@ impl ExclusionReason {
             ExclusionReason::EntryMismatch(_) => "PILOT_ENTRY_MISMATCH",
             ExclusionReason::AmbiguousProposalPlans { .. } => "PILOT_PROPOSAL_PLANS_AMBIGUOUS",
             ExclusionReason::ProposalPlanNotServable { .. } => "PILOT_PROPOSAL_PLAN_NOT_SERVABLE",
+            ExclusionReason::PointOutsideEnvelope(_) => "PILOT_POINT_OUTSIDE_ENVELOPE",
         }
     }
 }
@@ -474,7 +491,7 @@ fn parse_sleeves(plan: &PlanRow) -> Result<Vec<SleeveSpec>, ExclusionReason> {
             return Err(bad(format!("sleeve {id}: share {share} is not in (0, 1]")));
         }
         total = total.checked_add(share).ok_or_else(|| bad("the sleeve shares overflow".into()))?;
-        out.push(SleeveSpec { id, kind, share, venue, asset_class, quote });
+        out.push(SleeveSpec { id, kind, share, venue, asset_class, quote, instruments: Vec::new(), tranche_sessions: 0, lookback: None });
     }
     if total > one {
         return Err(bad(format!("the sleeve shares sum to {total}, above 1")));
@@ -517,7 +534,10 @@ fn dec_from_f64(name: &str, v: f64) -> Result<Dec, ExclusionReason> {
 
 /// The sleeves of a proposal plan (`PlanBody`): `share = weight * risk_scale`, kind from [`ENTRY_SLEEVE_KINDS`],
 /// venue/asset class/quote from the kind. Returns the sleeves and the entries they pin, in order.
-fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<(Vec<SleeveSpec>, Vec<PinnedEntry>), ExclusionReason> {
+/// The sleeves, pinned entries and (frozen) implementation points of one proposal plan, in sleeve order.
+type ParsedProposalSleeves = (Vec<SleeveSpec>, Vec<PinnedEntry>, Vec<Option<PlanPoint>>);
+
+fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeves, ExclusionReason> {
     let bad = |m: String| ExclusionReason::PlanBodyInvalid(m);
     let body = &plan.body;
     let body_proposal = body.get("proposal_id").and_then(Value::as_str).ok_or_else(|| bad("body.proposal_id missing or not a string".into()))?;
@@ -538,6 +558,7 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<(Vec<SleeveSpec>, Ve
     let cap = Dec::parse("1.000000001").expect("literal");
     let mut sleeves: Vec<SleeveSpec> = Vec::new();
     let mut entries: Vec<PinnedEntry> = Vec::new();
+    let mut points: Vec<Option<PlanPoint>> = Vec::new();
     let mut total = Dec::ZERO;
     for (i, s) in arr.iter().enumerate() {
         let entry_id = s.get("entry_id").and_then(Value::as_str).ok_or_else(|| bad(format!("sleeve {i}: entry_id missing or not a string")))?.to_string();
@@ -564,14 +585,148 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<(Vec<SleeveSpec>, Ve
         total = total.checked_add(weight).ok_or_else(|| bad("the sleeve weights overflow".into()))?;
         let (asset_class, quote) = sleeve_shape(kind);
         // The sleeve id is the entry id: stable, part of the run key and every order tag, unique within the plan.
-        sleeves.push(SleeveSpec { id: entry_id.clone(), kind, share, venue: PLAN_VENUE.to_string(), asset_class: asset_class.to_string(), quote: quote.to_string() });
+        sleeves.push(SleeveSpec { id: entry_id.clone(), kind, share, venue: PLAN_VENUE.to_string(), asset_class: asset_class.to_string(), quote: quote.to_string(), instruments: Vec::new(), tranche_sessions: 0, lookback: None });
         let version = u32::try_from(entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
+        points.push(parse_point(i, &entry_id, version, s)?);
         entries.push(PinnedEntry { entry_id, entry_version: version, entry_hash });
     }
     if total > cap {
         return Err(bad(format!("the sleeve weights sum to {total}, above 1")));
     }
-    Ok((sleeves, entries))
+    Ok((sleeves, entries, points))
+}
+
+/// A plan sleeve's implementation point, exactly as the Engine froze it in the immutable plan body
+/// (`ImplementationPoint`). `parameters` holds OVERRIDES only (`{lookback key: value}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanPoint {
+    pub entry_id: String,
+    pub entry_version: u32,
+    pub envelope_hash: String,
+    pub tranche_sessions: u8,
+    pub instruments: Vec<String>,
+    pub parameters: BTreeMap<String, Value>,
+    pub cell_key: String,
+}
+
+/// Proves a [`PlanPoint`] is inside the platform's pre-registered envelope for its entry (hash, tranche, instrument
+/// slot membership, lookback band, cell key: the Engine's `envelope::check_point_in_envelope`). `Err` carries the
+/// reason. A verifier must be pure and must hold the PLATFORM's own envelope files, never the plan's.
+pub trait EnvelopeVerifier: Send + Sync {
+    fn verify(&self, point: &PlanPoint) -> Result<(), String>;
+}
+
+/// The verifier of a build with no envelope sidecars: every non-published point is refused (fail closed).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoEnvelopes;
+
+impl EnvelopeVerifier for NoEnvelopes {
+    fn verify(&self, point: &PlanPoint) -> Result<(), String> {
+        Err(format!(
+            "this build holds no envelope for {} v{} (point drawn from envelope {}), so a non-published point cannot be shown to be covered",
+            point.entry_id, point.entry_version, point.envelope_hash
+        ))
+    }
+}
+
+/// The `point` of one `body.sleeves[i]`: absent or `null` = `None` (the published point).
+fn parse_point(i: usize, entry_id: &str, entry_version: u32, s: &Value) -> Result<Option<PlanPoint>, ExclusionReason> {
+    let bad = |m: String| ExclusionReason::PlanBodyInvalid(format!("sleeve {i}: point: {m}"));
+    let p = match s.get("point") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(p) => p,
+    };
+    let text = |k: &str| p.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| bad(format!("{k} missing or not a string")));
+    let tranche = p.get("tranche_sessions").and_then(Value::as_u64).ok_or_else(|| bad("tranche_sessions missing or not an unsigned integer".into()))?;
+    let tranche_sessions = u8::try_from(tranche).map_err(|_| bad(format!("tranche_sessions {tranche} out of range")))?;
+    let instruments = p
+        .get("instruments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("instruments missing or not an array".into()))?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string).ok_or_else(|| bad("an instrument is not a string".into())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parameters: BTreeMap<String, Value> =
+        p.get("parameters").and_then(Value::as_object).ok_or_else(|| bad("parameters missing or not an object".into()))?.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    Ok(Some(PlanPoint { entry_id: entry_id.to_string(), entry_version, envelope_hash: text("envelope_hash")?, tranche_sessions, instruments, parameters, cell_key: text("cell_key")? }))
+}
+
+/// The largest tranche this runtime will ever honour, whatever an envelope says: the Engine's
+/// `envelope::MAX_TRANCHE_SESSIONS` (a tranche must act before the rule's next decision).
+const MAX_TRANCHE_SESSIONS: u8 = 5;
+
+/// The lookback parameter key each sleeve kind accepts as an override.
+fn lookback_key(kind: SleeveKind) -> &'static str {
+    match kind {
+        SleeveKind::EtfTrend => "sma_month_ends",
+        SleeveKind::CryptoTrend => "sma_days",
+    }
+}
+
+/// Fill `spec` from `point`, after proving the point is covered. At the published point nothing is filled.
+fn apply_point(spec: &mut SleeveSpec, point: &PlanPoint, verifier: &dyn EnvelopeVerifier) -> Result<(), ExclusionReason> {
+    let sleeve_id = spec.id.clone();
+    let out = |m: String| ExclusionReason::PointOutsideEnvelope(format!("sleeve {sleeve_id}: {m}"));
+    let lib = seed_library().map_err(|e| ExclusionReason::EntryMismatch(format!("the platform library did not load: {e}")))?;
+    let entry = lib
+        .iter()
+        .find(|e| e.id == point.entry_id && e.version == point.entry_version)
+        .ok_or_else(|| ExclusionReason::EntryMismatch(format!("the platform has no library entry {} version {}", point.entry_id, point.entry_version)))?;
+    if point.instruments.len() != entry.instruments.len() {
+        return Err(out(format!("the point names {} instrument(s) but the entry has {} slot(s)", point.instruments.len(), entry.instruments.len())));
+    }
+    let key = lookback_key(spec.kind);
+    if let Some(extra) = point.parameters.keys().find(|k| k.as_str() != key) {
+        return Err(out(format!("the point overrides '{extra}', which this runtime does not honour (only '{key}')")));
+    }
+    let published_lookback = entry.parameters.get(key);
+    let override_value = point.parameters.get(key);
+    let lookback_is_published = match (override_value, published_lookback) {
+        (None, _) => true,
+        (Some(v), Some(p)) => v == p,
+        (Some(_), None) => false,
+    };
+    let instruments_are_published = point.instruments == entry.instruments;
+    if instruments_are_published && point.tranche_sessions == 0 && lookback_is_published {
+        // The certified rule itself: nothing to prove, nothing to fill.
+        return Ok(());
+    }
+    // A defensive cap, independent of any envelope.
+    if point.tranche_sessions > MAX_TRANCHE_SESSIONS {
+        return Err(out(format!("tranche {} exceeds the maximum of {MAX_TRANCHE_SESSIONS} sessions", point.tranche_sessions)));
+    }
+    // The envelope, from the platform's own files.
+    verifier.verify(point).map_err(out)?;
+
+    // What this runtime can actually run (an envelope may pre-register more than the data and venue layers serve).
+    let lookback = match override_value {
+        Some(v) if !lookback_is_published => {
+            let n = v.as_u64().filter(|n| (1..=500).contains(n)).ok_or_else(|| out(format!("'{key}' = {v} is not a lookback in 1..=500")))?;
+            Some(u32::try_from(n).map_err(|_| out(format!("'{key}' = {n} out of range")))?)
+        }
+        _ => None,
+    };
+    if !instruments_are_published {
+        for inst in &point.instruments {
+            match spec.kind {
+                SleeveKind::EtfTrend => {
+                    if inst.is_empty() || !inst.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.') {
+                        return Err(out(format!("'{inst}' is not a plain exchange-traded ticker")));
+                    }
+                }
+                SleeveKind::CryptoTrend => {
+                    let (base, quote) = inst.split_once('/').ok_or_else(|| out(format!("'{inst}' is not a BASE/QUOTE pair")))?;
+                    if base.is_empty() || quote != spec.quote {
+                        return Err(out(format!("'{inst}': quote substitution is not served by this runtime (the sleeve's quote is {})", spec.quote)));
+                    }
+                }
+            }
+        }
+    }
+    spec.instruments = if instruments_are_published { Vec::new() } else { point.instruments.clone() };
+    spec.tranche_sessions = point.tranche_sessions;
+    spec.lookback = lookback;
+    Ok(())
 }
 
 fn derive_mode(body: &MandateBody, execution: PlanExecution) -> Result<ExecutionMode, ExclusionReason> {
@@ -640,7 +795,7 @@ fn evaluate_pilot_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMa
     })
 }
 
-fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, candidates: &[&ProposalPlanRow]) -> Result<PilotAccount, ExclusionReason> {
+fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, candidates: &[&ProposalPlanRow], verifier: &dyn EnvelopeVerifier) -> Result<PilotAccount, ExclusionReason> {
     if candidates.len() > 1 {
         return Err(ExclusionReason::AmbiguousProposalPlans { count: candidates.len() });
     }
@@ -651,9 +806,15 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
     if plan.mandate_id != mandate.row.id || plan.mandate_version != mandate.row.version {
         return Err(ExclusionReason::PlanBoundToOtherMandate { plan_version: plan.mandate_version, active_version: mandate.row.version });
     }
-    let (sleeves, entries) = parse_proposal_sleeves(plan)?;
+    let (mut sleeves, entries, points) = parse_proposal_sleeves(plan)?;
     for e in &entries {
         check_entry(&e.entry_id, i32::try_from(e.entry_version).unwrap_or(i32::MAX), &e.entry_hash)?;
+    }
+    // The implementation points, only now that the entries are known to be the platform's own.
+    for (spec, point) in sleeves.iter_mut().zip(&points) {
+        if let Some(point) = point {
+            apply_point(spec, point, verifier)?;
+        }
     }
     // A proposal plan has no `execution` column: it asks for orders exactly when the mandate grants them.
     let execution = if mandate.body.autonomy.level == AutonomyLevel::L2 && mandate.body.autonomy.may.contains(&AgentAction::PlaceOrders) {
@@ -675,7 +836,7 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
     Ok(PilotAccount { active, origin: PlanOrigin::Proposal, plan_id: plan.id, execution, credential_label: cred.label.clone(), credential_fingerprint: None, entries })
 }
 
-fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool) -> Result<PilotAccount, ExclusionReason> {
+fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier) -> Result<PilotAccount, ExclusionReason> {
     let Target { tenant_id, account_id } = target;
     // --- credential: paper Alpaca, enabled, not deleted, of THIS tenant.
     let cred = rows.credentials.iter().find(|c| c.id == account_id && c.tenant_id == tenant_id).ok_or(ExclusionReason::CredentialNotFound)?;
@@ -714,17 +875,23 @@ fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool) -> Resu
     let proposal_plans: Vec<&ProposalPlanRow> = rows.proposal_plans.iter().filter(|p| p.account_id == account_id && p.tenant_id == tenant_id && p.state != "closed").collect();
     match pilot_plan {
         Some(plan) => evaluate_pilot_plan(target, cred, &mandate, plan, !proposal_plans.is_empty()),
-        None if serve_proposal_plans && !proposal_plans.is_empty() => evaluate_proposal_plan(target, cred, &mandate, &proposal_plans),
+        None if serve_proposal_plans && !proposal_plans.is_empty() => evaluate_proposal_plan(target, cred, &mandate, &proposal_plans, verifier),
         None => Err(ExclusionReason::NoPilotPlan),
     }
 }
 
 /// Rows in, descriptors and typed exclusions out. Pure: no I/O, so every refusal has a test that needs no database.
 /// `targets` is evaluated in order; a target is never silently dropped.
+#[cfg(test)]
 pub(crate) fn evaluate(targets: &[Target], rows: &Rows, serve_proposal_plans: bool) -> Enumeration {
+    evaluate_with(targets, rows, serve_proposal_plans, &NoEnvelopes)
+}
+
+/// [`evaluate`] with the envelope verifier that proves non-published implementation points.
+pub(crate) fn evaluate_with(targets: &[Target], rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier) -> Enumeration {
     let mut out = Enumeration::default();
     for target in targets {
-        match evaluate_one(*target, rows, serve_proposal_plans) {
+        match evaluate_one(*target, rows, serve_proposal_plans, verifier) {
             Ok(a) => out.accounts.push(a),
             Err(reason) => out.exclusions.push(Exclusion { account_id: target.account_id, reason }),
         }
@@ -752,6 +919,7 @@ pub struct PgAccountSource {
     scope: AccountScope,
     provenance: Option<Arc<PlanProvenanceRegistry>>,
     last_exclusions: Mutex<Vec<Exclusion>>,
+    envelopes: Arc<dyn EnvelopeVerifier>,
 }
 
 const PROPOSAL_PLAN_COLUMNS: &str = "id, tenant_id, proposal_id, account_id, mandate_id, mandate_version, mode::text AS mode, state::text AS state, body";
@@ -763,7 +931,14 @@ impl PgAccountSource {
     }
 
     pub fn with_scope(pool: Pool, scope: AccountScope) -> Result<Self, String> {
-        Ok(Self { bridge: Bridge::new(pool)?, scope, provenance: None, last_exclusions: Mutex::new(Vec::new()) })
+        Ok(Self { bridge: Bridge::new(pool)?, scope, provenance: None, last_exclusions: Mutex::new(Vec::new()), envelopes: Arc::new(NoEnvelopes) })
+    }
+
+    /// The verifier that proves a plan sleeve's non-published implementation point is inside the platform's
+    /// pre-registered envelope. Without one, [`NoEnvelopes`] refuses every non-published point.
+    pub fn with_envelope_verifier(mut self, verifier: Arc<dyn EnvelopeVerifier>) -> Self {
+        self.envelopes = verifier;
+        self
     }
 
     /// Publish each enumerated account's plan provenance (origin, plan id, `paper`) for `PgRunStore::finish` and
@@ -857,7 +1032,7 @@ impl PgAccountSource {
     /// runs nothing this tick), never an empty list dressed up as success.
     pub fn enumerate(&self) -> Result<Enumeration, AccountSourceError> {
         let (targets, rows) = self.fetch()?;
-        let result = evaluate(&targets, &rows, self.scope.serves_proposal_plans());
+        let result = evaluate_with(&targets, &rows, self.scope.serves_proposal_plans(), self.envelopes.as_ref());
         *self.last_exclusions.lock().unwrap_or_else(|e| e.into_inner()) = result.exclusions.clone();
         if let Some(reg) = &self.provenance {
             reg.set_all(result.accounts.iter().map(|a| (a.active.account_id.clone(), PlanProvenance { origin: a.origin, plan_id: a.plan_id, venue_environment: VenueEnvironment::Paper })));
@@ -1522,6 +1697,142 @@ mod tests {
         assert_eq!((pilot.origin, pilot.plan_id), (PlanOrigin::OwnerPilot, PLAN));
         assert_eq!((proposal.origin, proposal.plan_id), (PlanOrigin::Proposal, STRATEGY_PLAN));
         assert_eq!(proposal.active.sleeves[0].share, Dec::parse("0.8").unwrap());
+    }
+
+    // ----- implementation points (certified-envelopes plan, Phase 4) -----------------------------------------------
+
+    /// A stand-in for the platform's envelope sidecar check: accepts everything or nothing.
+    struct Verdict(bool);
+
+    impl EnvelopeVerifier for Verdict {
+        fn verify(&self, point: &PlanPoint) -> Result<(), String> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err(format!("cell {} is not in the pre-registered grid", point.cell_key))
+            }
+        }
+    }
+
+    fn evaluate_serving_with(rows: &Rows, verifier: &dyn EnvelopeVerifier) -> Enumeration {
+        let targets = targets_for(&AccountScope::PilotAndProposals { pilot: Some(allow()) }, &rows.proposal_plans);
+        evaluate_with(&targets, rows, true, verifier)
+    }
+
+    fn point_json(instruments: &[&str], tranche: u64, parameters: Value) -> Value {
+        json!({"envelope_hash": "e".repeat(64), "tranche_sessions": tranche, "instruments": instruments, "parameters": parameters, "cell_key": "etf_trend_faber|abc|t3|8"})
+    }
+
+    fn etf_rows_with_point(point: Value) -> Rows {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        rows.proposal_plans[0].body["sleeves"][0]["point"] = point;
+        rows
+    }
+
+    const PUBLISHED_ETFS: [&str; 5] = ["SPY", "EFA", "IEF", "DBC", "VNQ"];
+    const PROXY_ETFS: [&str; 5] = ["IVV", "EFA", "IEF", "DBC", "VNQ"];
+
+    #[test]
+    fn a_plan_without_a_point_or_with_the_published_point_is_served_at_the_published_point_without_any_envelope() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        // No `point` key at all (every plan written before Phase 1).
+        let rows = proposal_rows("L2", &full, 1.0, &[("etf_trend_faber", 1.0)]);
+        let e = evaluate_serving(&rows);
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        assert!(e.accounts[0].active.sleeves[0].is_published_point());
+        // `point: null`.
+        let e = evaluate_serving(&etf_rows_with_point(Value::Null));
+        assert!(e.exclusions.is_empty() && e.accounts[0].active.sleeves[0].is_published_point());
+        // The published point written out (the entry's own instruments, tranche 0, the published lookback): it IS
+        // the certified rule, so it needs no envelope (default `NoEnvelopes`) and is left unfilled.
+        let e = evaluate_serving(&etf_rows_with_point(point_json(&PUBLISHED_ETFS, 0, json!({"sma_month_ends": 10}))));
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        let s = &e.accounts[0].active.sleeves[0];
+        assert!(s.is_published_point(), "{s:?}");
+        assert_eq!((s.instruments.len(), s.tranche_sessions, s.lookback), (0, 0, None));
+    }
+
+    #[test]
+    fn a_covered_point_fills_the_sleeve_from_the_plans_point() {
+        let rows = etf_rows_with_point(point_json(&PROXY_ETFS, 3, json!({"sma_month_ends": 8})));
+        let e = evaluate_serving_with(&rows, &Verdict(true));
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        let s = &e.accounts[0].active.sleeves[0];
+        assert_eq!(s.instruments, PROXY_ETFS.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!((s.tranche_sessions, s.lookback), (3, Some(8)));
+        assert!(!s.is_published_point());
+        // Only the timing moved: published instruments and lookback stay unfilled (published constants).
+        let e = evaluate_serving_with(&etf_rows_with_point(point_json(&PUBLISHED_ETFS, 2, json!({"sma_month_ends": 10}))), &Verdict(true));
+        let s = &e.accounts[0].active.sleeves[0];
+        assert_eq!((s.instruments.len(), s.tranche_sessions, s.lookback), (0, 2, None));
+    }
+
+    #[test]
+    fn a_point_outside_the_envelope_refuses_the_account_with_a_typed_exclusion() {
+        let rows = etf_rows_with_point(point_json(&PROXY_ETFS, 3, json!({"sma_month_ends": 8})));
+        let e = evaluate_serving_with(&rows, &Verdict(false));
+        assert!(e.accounts.is_empty());
+        assert!(matches!(&e.exclusions[0].reason, ExclusionReason::PointOutsideEnvelope(m) if m.contains("not in the pre-registered grid")), "{:?}", e.exclusions);
+        assert_eq!(e.exclusions[0].reason.code(), "PILOT_POINT_OUTSIDE_ENVELOPE");
+        // No envelope available at all (the shipped build): every non-published point is refused, fail closed.
+        let e = evaluate_serving(&rows);
+        assert!(e.accounts.is_empty());
+        assert!(matches!(&e.exclusions[0].reason, ExclusionReason::PointOutsideEnvelope(m) if m.contains("holds no envelope")), "{:?}", e.exclusions);
+    }
+
+    #[test]
+    fn points_the_runtime_cannot_honour_are_refused_even_when_an_envelope_covers_them() {
+        let refused = |point: Value| {
+            let e = evaluate_serving_with(&etf_rows_with_point(point), &Verdict(true));
+            assert!(e.accounts.is_empty(), "served: {:?}", e.accounts);
+            e.exclusions.into_iter().next().unwrap().reason
+        };
+        // A tranche past the maximum.
+        assert!(matches!(refused(point_json(&PROXY_ETFS, 6, json!({"sma_month_ends": 10}))), ExclusionReason::PointOutsideEnvelope(m) if m.contains("maximum")));
+        // A parameter other than the sleeve's lookback key.
+        assert!(matches!(refused(point_json(&PROXY_ETFS, 1, json!({"sma_days": 80}))), ExclusionReason::PointOutsideEnvelope(m) if m.contains("sma_days")));
+        // A lookback that is not a positive integer.
+        assert!(matches!(refused(point_json(&PROXY_ETFS, 1, json!({"sma_month_ends": 0}))), ExclusionReason::PointOutsideEnvelope(_)));
+        assert!(matches!(refused(point_json(&PROXY_ETFS, 1, json!({"sma_month_ends": "8"}))), ExclusionReason::PointOutsideEnvelope(_)));
+        // The wrong number of instrument slots, and a non-ticker.
+        assert!(matches!(refused(point_json(&["IVV", "EFA"], 1, json!({}))), ExclusionReason::PointOutsideEnvelope(m) if m.contains("slot")));
+        assert!(matches!(refused(point_json(&["IVV", "EFA", "IEF", "DBC", "vnq"], 1, json!({}))), ExclusionReason::PointOutsideEnvelope(m) if m.contains("ticker")));
+    }
+
+    #[test]
+    fn a_crypto_quote_substitution_is_refused_because_this_runtime_serves_usd_only() {
+        let full = ["place_orders", "cancel_orders", "halt", "flatten"];
+        let mut rows = proposal_rows("L2", &full, 1.0, &[("crypto_trend_100d", 1.0)]);
+        rows.proposal_plans[0].body["sleeves"][0]["point"] =
+            json!({"envelope_hash": "e".repeat(64), "tranche_sessions": 1, "instruments": ["BTC/USDT", "ETH/USDT"], "parameters": {"sma_days": 90}, "cell_key": "crypto_trend_100d|abc|t1|90"});
+        let e = evaluate_serving_with(&rows, &Verdict(true));
+        assert!(e.accounts.is_empty());
+        assert!(matches!(&e.exclusions[0].reason, ExclusionReason::PointOutsideEnvelope(m) if m.contains("quote substitution")), "{:?}", e.exclusions);
+        // The USD pairs with a lag and a lookback are served.
+        rows.proposal_plans[0].body["sleeves"][0]["point"] =
+            json!({"envelope_hash": "e".repeat(64), "tranche_sessions": 1, "instruments": ["BTC/USD", "ETH/USD"], "parameters": {"sma_days": 90}, "cell_key": "crypto_trend_100d|abc|t1|90"});
+        let e = evaluate_serving_with(&rows, &Verdict(true));
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        let s = &e.accounts[0].active.sleeves[0];
+        assert_eq!((s.instruments.len(), s.tranche_sessions, s.lookback), (0, 1, Some(90)), "the published pairs stay unfilled");
+    }
+
+    #[test]
+    fn a_malformed_point_is_a_plan_body_error_and_the_pilot_ignores_points() {
+        let bad = |point: Value| {
+            let e = evaluate_serving_with(&etf_rows_with_point(point), &Verdict(true));
+            assert!(e.accounts.is_empty());
+            e.exclusions.into_iter().next().unwrap().reason
+        };
+        assert!(matches!(bad(json!({"tranche_sessions": 1})), ExclusionReason::PlanBodyInvalid(m) if m.contains("point")));
+        assert!(matches!(bad(json!({"envelope_hash": "x", "tranche_sessions": 300, "instruments": [], "parameters": {}, "cell_key": "k"})), ExclusionReason::PlanBodyInvalid(m) if m.contains("out of range")));
+        assert!(matches!(bad(json!({"envelope_hash": "x", "tranche_sessions": 1, "instruments": [1], "parameters": {}, "cell_key": "k"})), ExclusionReason::PlanBodyInvalid(_)));
+        // A pilot plan sleeve never carries a point; the pilot path does not read one.
+        let mut rows = happy_rows("L2", "paper_orders");
+        rows.plans[0].body["sleeves"][0]["point"] = point_json(&PROXY_ETFS, 3, json!({"sma_month_ends": 8}));
+        let e = evaluate_pilot(&rows);
+        assert!(e.exclusions.is_empty() && e.accounts[0].active.sleeves[0].is_published_point());
     }
 
     #[test]

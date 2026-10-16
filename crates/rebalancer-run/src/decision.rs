@@ -14,10 +14,12 @@
 //! # The in-tick cache
 //! [`EvalCache`] lives for ONE driver tick (`run_all_due` makes one per call) and is keyed so that a stale answer can
 //! never be served for a different question:
-//! * fetches by `(kind, venue, asset_class, quote, as_of)`: everything about a sleeve that can change what a
-//!   `DataSource` returns, plus the run date. (A fetch cannot be keyed by the data fingerprint: it is only known once
+//! * fetches by `(kind, venue, asset_class, quote, variant, as_of)`: everything about a sleeve that can change what a
+//!   `DataSource` returns, plus the run date. `variant` is [`SleeveSpec::variant_key`] (empty at the published
+//!   point): a tenant's implementation point (other instruments, other lookback or lag) never shares a fetch with
+//!   another point, while two accounts at the SAME point still do. (A fetch cannot be keyed by the data fingerprint: it is only known once
 //!   the data has been fetched.) `DataSource` implementations must not vary the panel by sleeve id or tenant.
-//! * decisions by `(kind, as_of, data fingerprint)`: two panels that differ by a single bar never share a decision.
+//! * decisions by `(kind, as_of, data fingerprint, variant)`: two panels that differ by a single bar never share a decision.
 //!
 //! Errors are cached for the tick as well (a vendor that returned 429 is not asked again by every account); the next
 //! tick starts with an empty cache, so a corrected bar is always re-fetched.
@@ -29,8 +31,7 @@ use chrono::NaiveDate;
 use rebalancer_core::dec_math::MathError;
 use rebalancer_core::planner::SleeveTarget;
 use reference_rules::{
-    data_fingerprint, decide_crypto_trend, decide_etf_trend, latest_decision_date, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel,
-    RuleError, ETF_SYMBOLS,
+    data_fingerprint, decide_crypto_trend_with, decide_etf_trend_with, latest_decision_date, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel, RuleError,
 };
 
 use crate::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveKind, SleeveSpec};
@@ -63,6 +64,14 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// Trading sessions past the PUBLISHED action session of this decision (bars after the decision date, minus the
+    /// one that makes the decision computable: `NextMonthBar`). `0` on the published action session itself, so a
+    /// tranche of `k` acts when this reaches `k` (certified-envelopes plan Phase 4; quant ruling R38: "k sessions
+    /// after the published action session"). Meaningful for `OnDecision` kinds.
+    pub fn sessions_past_action(&self) -> u32 {
+        self.lag_sessions.saturating_sub(1)
+    }
+
     /// The planner target of `sleeve` for this decision.
     pub fn target(&self, sleeve: &SleeveSpec) -> Result<SleeveTarget, MathError> {
         match &self.rule {
@@ -87,8 +96,8 @@ pub struct Fetched {
     pub fingerprint: String,
 }
 
-type FetchKey = (SleeveKind, String, String, String, NaiveDate);
-type DecisionKey = (SleeveKind, NaiveDate, String);
+type FetchKey = (SleeveKind, String, String, String, String, NaiveDate);
+type DecisionKey = (SleeveKind, NaiveDate, String, String);
 
 /// Per-tick memo of fetches and decisions. See the module docs for the keys.
 #[derive(Default)]
@@ -117,7 +126,7 @@ fn evidence(i: &InstrumentDecision) -> InstrumentEvidence {
 }
 
 fn fetch(data: &dyn DataSource, cache: Option<&EvalCache>, s: &SleeveSpec, as_of: NaiveDate) -> Result<Arc<Fetched>, DataError> {
-    let key: FetchKey = (s.kind, s.venue.clone(), s.asset_class.clone(), s.quote.clone(), as_of);
+    let key: FetchKey = (s.kind, s.venue.clone(), s.asset_class.clone(), s.quote.clone(), s.variant_key(), as_of);
     if let Some(c) = cache {
         if let Some(hit) = lock(&c.fetched).get(&key) {
             return hit.clone();
@@ -137,24 +146,41 @@ fn newest_bar(panel: &Panel) -> Option<NaiveDate> {
     panel.iter().map(|s| s.last_date()).max()
 }
 
-fn decide(kind: SleeveKind, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate, RuleDecision), RuleError> {
-    match kind {
+/// The reference rule at the sleeve's implementation point. At the published point (`instruments` empty, no
+/// lookback override, tranche 0) the `_with` functions are called with exactly the published constants, which is
+/// what `decide_etf_trend` / `decide_crypto_trend` themselves do: byte-for-byte the behaviour before envelopes.
+///
+/// * ETF: the decision date is the newest completed month-end of the point's own instruments; the tranche does NOT
+///   move it (it delays ACTING, see `pipeline::step_decisions`).
+/// * Crypto (a `Daily` kind): tranche `k` is a LAGGED DECISION, the rule evaluated at yesterday minus `k` days; the
+///   live options then no longer require the panel to end on the decision date (the bars after it are ignored).
+fn decide(s: &SleeveSpec, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate, RuleDecision), RuleError> {
+    let symbols = s.rule_symbols();
+    let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
+    match s.kind {
         SleeveKind::EtfTrend => {
-            let date = latest_decision_date(panel, &ETF_SYMBOLS)?;
-            let d = decide_etf_trend(panel, date, &Options::etf_live(as_of))?;
+            let date = latest_decision_date(panel, &refs)?;
+            let d = decide_etf_trend_with(panel, date, &Options::etf_live(as_of), &refs, s.sma_lookback())?;
             Ok((date, RuleDecision::Etf(d)))
         }
         SleeveKind::CryptoTrend => {
-            let date = as_of.pred_opt().unwrap_or(as_of);
-            let d = decide_crypto_trend(panel, date, &Options::crypto_live(as_of))?;
+            let yesterday = as_of.pred_opt().unwrap_or(as_of);
+            let lag = i64::from(s.tranche_sessions);
+            let date = yesterday.checked_sub_signed(chrono::Duration::days(lag)).unwrap_or(yesterday);
+            let mut opts = Options::crypto_live(as_of);
+            if lag > 0 {
+                opts.require_panel_end_on_decision_date = false;
+            }
+            let d = decide_crypto_trend_with(panel, date, &opts, &refs, s.sma_lookback())?;
             Ok((date, RuleDecision::Crypto(d)))
         }
     }
 }
 
-fn build(kind: SleeveKind, as_of: NaiveDate, fetched: &Fetched) -> Result<Evaluation, RuleError> {
+fn build(s: &SleeveSpec, as_of: NaiveDate, fetched: &Fetched) -> Result<Evaluation, RuleError> {
+    let kind = s.kind;
     let panel = &fetched.data.panel;
-    let (decision_date, rule) = decide(kind, panel, as_of)?;
+    let (decision_date, rule) = decide(s, panel, as_of)?;
     let instruments: Vec<InstrumentEvidence> = match &rule {
         RuleDecision::Etf(d) => d.instruments.iter().map(evidence).collect(),
         RuleDecision::Crypto(d) => d.instruments.iter().map(evidence).collect(),
@@ -185,13 +211,13 @@ fn build(kind: SleeveKind, as_of: NaiveDate, fetched: &Fetched) -> Result<Evalua
 /// Fetch the sleeve's panel and run its rule as of `as_of`, through `cache` when one is given.
 pub fn evaluate(data: &dyn DataSource, cache: Option<&EvalCache>, s: &SleeveSpec, as_of: NaiveDate) -> Result<Arc<Evaluation>, EvalError> {
     let fetched = fetch(data, cache, s, as_of).map_err(EvalError::Data)?;
-    let key: DecisionKey = (s.kind, as_of, fetched.fingerprint.clone());
+    let key: DecisionKey = (s.kind, as_of, fetched.fingerprint.clone(), s.variant_key());
     if let Some(c) = cache {
         if let Some(hit) = lock(&c.decided).get(&key) {
             return hit.clone().map_err(EvalError::Rule);
         }
     }
-    let result = build(s.kind, as_of, &fetched).map(Arc::new);
+    let result = build(s, as_of, &fetched).map(Arc::new);
     if let Some(c) = cache {
         lock(&c.decided).insert(key, result.clone());
     }

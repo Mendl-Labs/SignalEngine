@@ -67,7 +67,7 @@
 //! on a short-timeout transport so the ping can never hold the loop; a failure streak is logged and raised once as
 //! `ALERT_HEARTBEAT_FAILED`. Neither can stop a run or change what a run does.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -88,7 +88,7 @@ use rebalancer_service::broker_credentials::{BrokerConfig, HttpBrokerCredentials
 use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
-use rebalancer_service::runtime::{connect_account_alpaca, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
+use rebalancer_service::runtime::{connect_account_alpaca_for_sleeves, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
 use rebalancer_store::{
     reconciliation_for, AccountScope, AccountTenants, PgAccountLock, PgAccountSource, PgDeliveryLedger, PgKillFlag, PgLatencyStore, PgNotifier, PgPlanReconciliation, PgRunStore, PgStateStore,
     PilotAccount, PilotAllowList, PlanOrigin, PlanProvenanceRegistry,
@@ -178,11 +178,6 @@ fn cmd_print_fingerprint() {
 /// connection: this subcommand only formats and prints a string.
 fn cmd_pilot_template() {
     print!("{}", pilot_template_sql());
-}
-
-/// The sleeve kinds an enumerated account's plan names (what its asset refresh must cover).
-fn sleeve_kinds(account: &PilotAccount) -> BTreeSet<rebalancer_run::data::SleeveKind> {
-    account.active.sleeves.iter().map(|s| s.kind).collect()
 }
 
 fn run_service() {
@@ -388,7 +383,7 @@ fn run_service() {
                 continue;
             }
         };
-        match connect_account_alpaca(&keys.key_id, &keys.secret, PAPER_BASE_URL, transport.clone(), account.credential_fingerprint.as_deref(), &sleeve_kinds(&account)) {
+        match connect_account_alpaca_for_sleeves(&keys.key_id, &keys.secret, PAPER_BASE_URL, transport.clone(), account.credential_fingerprint.as_deref(), &account.active.sleeves) {
             Ok(alpaca) => {
                 log(format!(
                     "connected paper Alpaca for account {account_id} (tenant {tenant_id}, plan {} origin {}): key fingerprint {}{}",

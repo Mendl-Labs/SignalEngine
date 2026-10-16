@@ -50,7 +50,9 @@ pub mod state_store;
 pub mod tenants;
 
 pub use account_lock::PgAccountLock;
-pub use account_source::{AccountScope, AccountSourceError, Enumeration, Exclusion, ExclusionReason, PilotAccount, PilotAllowList, PgAccountSource, PinnedEntry, PlanExecution};
+pub use account_source::{
+    AccountScope, AccountSourceError, Enumeration, EnvelopeVerifier, Exclusion, ExclusionReason, NoEnvelopes, PilotAccount, PilotAllowList, PgAccountSource, PinnedEntry, PlanExecution, PlanPoint,
+};
 pub use delivery_ledger::PgDeliveryLedger;
 pub use kill_flag::PgKillFlag;
 pub use latency_store::PgLatencyStore;

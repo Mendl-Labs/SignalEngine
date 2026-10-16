@@ -1031,10 +1031,29 @@ impl Run<'_> {
                     Err(e) => return Err(self.fail_closed(RunCode::StoreUnavailable, format!("the run store failed: {e}"))),
                 },
             };
-            let pending = match cadence {
+            // An OnDecision sleeve is pending iff its decision is newer than the last one ACTED on AND the sleeve's
+            // tranche has elapsed: `k` trading sessions past the published action session (R38; `k = 0` is the
+            // published timing and always elapsed). The ledger keeps recording the DECISION date, so a tranche
+            // never re-plans a decision it already acted on. A Daily sleeve's tranche is a lagged DECISION (see
+            // `decision::decide`), so it needs no wait here.
+            let decision_is_new = match cadence {
                 Cadence::Daily => true,
                 Cadence::OnDecision => last_acted.is_none_or(|acted| eval.decision_date > acted),
             };
+            let tranche_elapsed = cadence == Cadence::Daily || eval.sessions_past_action() >= u32::from(s.tranche_sessions);
+            let pending = decision_is_new && tranche_elapsed;
+            if decision_is_new && !tranche_elapsed {
+                self.note(
+                    "decisions",
+                    format!(
+                        "sleeve {}: decision {} is waiting for its tranche ({} of {} session(s) past the published action session)",
+                        s.id,
+                        eval.decision_date,
+                        eval.sessions_past_action(),
+                        s.tranche_sessions
+                    ),
+                );
+            }
             let entry = cadence == Cadence::OnDecision && last_acted.is_none();
             // The two-source gate, SHADOW mode (W9.2): the verdict is recorded on the decision and a refusal is
             // alerted, one per (sleeve, instrument, date); the run goes on exactly as it would without a gate.
