@@ -50,7 +50,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout SignalEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: SignalEngine
           fetch-depth: 0
@@ -60,7 +60,7 @@ jobs:
       # for the verified reason they are still required: Cargo resolves every workspace member's
       # manifest, including `program`'s, before it will build any one member).
       - name: Checkout LoggingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/LoggingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -68,7 +68,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout MessageBrokerEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/MessageBrokerEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -76,7 +76,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout databaseschema
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/databaseschema
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -84,7 +84,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout SimulationEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/SimulationEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -92,7 +92,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout BacktestingEngine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/BacktestingEngine
           token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
@@ -100,7 +100,7 @@ jobs:
           fetch-depth: 0
 
       - name: Checkout BacktestingCore
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Nwagbara-Group-LLC/BacktestingCore
           ref: v0.1.49
@@ -109,7 +109,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: 'v3.15.3'
 
@@ -125,7 +125,7 @@ jobs:
 
       - name: Login to GHCR
         if: ${{ inputs.push_image == true }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
