@@ -252,6 +252,11 @@ impl<S: AccountSource> PilotAccountSource<S> {
         Self { inner, config }
     }
 
+    /// The wrapped source (the service re-enumerates through it, see `crate::fleet`).
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     fn check(&self, a: &ActiveAccount) -> Result<(), PilotRefusal> {
         match a.mode {
             ExecutionMode::Assisted | ExecutionMode::Live => {}
