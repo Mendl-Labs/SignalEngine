@@ -43,10 +43,11 @@ ultra-logger = { path = "../LoggingEngine/ultra-logger" }
 # RUSTSEC-2026-0258; v0.1.50, cut 2026-10-01, was the previous pin). Previously pinned to a bare commit (BacktestingCore#f1a65a1, PR #39) with a note to switch to a tag
 # once one existed for this crate -- it now does.
 #
-# Re-pinned 2026-10-16 to the merged BacktestingCore `local-dev` commit e82ed83 (PR #69): adds the parametric
-# `decide_etf_trend_with` / `decide_crypto_trend_with` (certified-envelope Phase 2); the published `decide_*`
-# fns delegate with the constants, so the certified point is unchanged. Back to a tag at the next Core release.
-reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "e82ed83ace41e0d87c3ceec069e374fae55b6ea7" }
+# Re-pinned 2026-10-17 to the merge commit 9943b51 of BacktestingCore `local-dev` PR #73 (R41-A slice 1): adds
+# `decide_etf_trend_with_weight` (explicit per-instrument weight of a Long signal; `decide_etf_trend_with` delegates
+# with the 0.20 constant, so the certified point is unchanged) on top of e82ed83 (PR #69: the parametric
+# `decide_etf_trend_with` / `decide_crypto_trend_with`). Back to a tag at the next Core release.
+reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "9943b51e5266f117bc9189f52f0609e5bdb3321b" }
 
 # Internal workspace crates
 smartorderrouter = { path = "crates/smartorderrouter" }
