@@ -53,9 +53,9 @@ fn key_order_and_whitespace_in_the_source_json_do_not_change_the_hash() {
 /// `program/tests/seed_entry_hashes_pinned.rs` (BacktestingEngine), so a difference between the two repos fails in CI on
 /// whichever side drifted. Order is the Engine's `SEED_JSON` order.
 const PINNED_ENTRY_HASHES: [(&str, u32, &str); 3] = [
-    ("etf_trend_faber", 2, "TBD"),
-    ("crypto_trend_100d", 1, "TBD"),
-    ("etf_cross_sectional_momentum", 2, "TBD"),
+    ("etf_trend_faber", 2, "ac1d40c85c13378097ae821a62507fefc6ea5edc3f8efd42864c37a573fd015f"),
+    ("crypto_trend_100d", 1, "ab0496c70394de70af6a78f55ce6a2c5e7d85ae8f7f7f4f001ecfe3d224c8287"),
+    ("etf_cross_sectional_momentum", 2, "22e148b9dd234fea3062c4209c7e4dac8c1294357b2bcd470af4501adc872d40"),
 ];
 
 #[test]
