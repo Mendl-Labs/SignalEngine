@@ -144,7 +144,7 @@ impl<P: SleeveFetcher> TwoSourceGate<P> {
             Ok(f) => {
                 // The sleeve's OWN instruments and window (the published constants at the published point).
                 let window = match sleeve.kind {
-                    SleeveKind::EtfTrend => sleeve.sma_lookback(),
+                    SleeveKind::EtfTrend | SleeveKind::EtfMomentum => sleeve.sma_lookback(),
                     SleeveKind::CryptoTrend => sleeve.sma_lookback() + usize::from(sleeve.tranche_sessions),
                 };
                 let c = compare_with(sleeve.kind, &sleeve.rule_symbols(), window, as_of, &primary.panel, &f.panel, &self.policy);

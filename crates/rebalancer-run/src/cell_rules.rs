@@ -12,7 +12,9 @@
 //! constant under [`WeightPolicy::FixedConstant`]). Signals, month-end and gap checks are Core's, one
 //! implementation; a non-`Long` instrument carries weight 0.0.
 //!
-//! Momentum cells (linear rank weights) are NOT executable here: see `rebalancer-store`'s account source.
+//! Momentum cells (linear rank weights) are a different kind, `SleeveKind::EtfMomentum`: their decision is
+//! `decision::decide_momentum` over Core's pure `momentum_rank_weights`, with no weight policy to apply (the rank
+//! weights sum to 1 at any K); only the gross guard, [`sleeve_max_gross`], is shared with this module.
 
 use chrono::NaiveDate;
 use reference_rules::{decide_etf_trend_with_weight, EtfDecision, Options, Panel, RuleError, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
@@ -80,6 +82,9 @@ pub fn sleeve_max_gross(sleeve: &SleeveSpec) -> f64 {
             let n = if sleeve.instruments.is_empty() { CRYPTO_SYMBOLS.len() } else { sleeve.instruments.len() };
             CRYPTO_WEIGHT_PER_INSTRUMENT * (n as f64)
         }
+        // R41-A(2): the linear-rank weights of the K ranked names sum to exactly 1.0 for every K, so the maximum gross
+        // is 100% of the sleeve at any N, by construction (no parameter to derive, none to tune).
+        SleeveKind::EtfMomentum => 1.0,
     };
     per_unit * sleeve.share.to_f64()
 }

@@ -23,7 +23,7 @@ use crate::time::BarClock;
 /// The vendor ticker and clock of a recorder instrument: exactly what `fetch_sleeve` uses for the same symbol.
 pub fn vendor_ticker(instrument: &Instrument) -> (String, BarClock) {
     match instrument.kind {
-        SleeveKind::EtfTrend => (instrument.symbol.clone(), BarClock::StockMidnightNewYork),
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => (instrument.symbol.clone(), BarClock::StockMidnightNewYork),
         SleeveKind::CryptoTrend => (
             format!("X:{}{}", instrument.symbol, instrument.quote),
             BarClock::MidnightUtc,

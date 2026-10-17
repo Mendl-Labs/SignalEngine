@@ -608,18 +608,37 @@ impl MassiveDataSource {
     /// The ETF panel of `symbols` (the sleeve's own instruments; the published five at the published point) with
     /// `sma_month_ends` completed month-ends required of each.
     fn fetch_etf(&self, symbols: &[String], sma_month_ends: usize, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
+        self.fetch_etf_with(symbols, EtfHistory::MonthEnds(sma_month_ends), as_of)
+    }
+
+    /// The ETF panel of a MOMENTUM cell's instruments: `lookback + 1` complete daily bars required of EACH (the rank
+    /// reads the last close and the close `lookback` bars earlier). An instrument with fewer is a typed
+    /// `InsufficientHistory` refusal here, never a silent drop from the ranking: a vendor that returned a truncated
+    /// series must not change K (and every weight) behind the account's back. Everything else (same completeness rule,
+    /// staleness bound, same-sessions check) is the monthly ETF fetch's.
+    fn fetch_etf_momentum(&self, symbols: &[String], lookback: usize, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
+        self.fetch_etf_with(symbols, EtfHistory::Bars(lookback + 1), as_of)
+    }
+
+    fn fetch_etf_with(&self, symbols: &[String], history: EtfHistory, as_of: NaiveDate) -> Result<FetchedSleeve, MassiveError> {
         let (from, to) = self.window(as_of, self.cfg.etf_history_days)?;
         let key = self.key()?;
         let mut fetched = Vec::with_capacity(symbols.len());
         for sym in symbols {
             let plan = Plan { symbol: sym.to_string(), ticker: sym.to_string(), clock: BarClock::StockMidnightNewYork, from, to, settle: self.cfg.completeness.stock_settle };
             let f = self.fetch_instrument(&plan, as_of, &key)?;
-            let insufficient = |have: usize| MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed: sma_month_ends, have };
+            let needed = match history {
+                EtfHistory::MonthEnds(n) | EtfHistory::Bars(n) => n,
+            };
+            let insufficient = |have: usize| MassiveError::InsufficientHistory { symbol: f.symbol.clone(), needed, have };
             if f.dates.is_empty() {
                 return Err(insufficient(0));
             }
-            let have = completed_month_end_dates(&Self::series_of(&f)?).len();
-            if have < sma_month_ends {
+            let have = match history {
+                EtfHistory::MonthEnds(_) => completed_month_end_dates(&Self::series_of(&f)?).len(),
+                EtfHistory::Bars(_) => f.dates.len(),
+            };
+            if have < needed {
                 return Err(insufficient(have));
             }
             let newest = f.dates[f.dates.len() - 1];
@@ -694,6 +713,15 @@ impl MassiveDataSource {
     }
 }
 
+/// What an ETF fetch must find in each instrument's complete bars.
+#[derive(Clone, Copy)]
+enum EtfHistory {
+    /// Trend: this many completed month-ends.
+    MonthEnds(usize),
+    /// Momentum: this many daily bars.
+    Bars(usize),
+}
+
 impl SleeveFetcher for MassiveDataSource {
     fn source_id(&self) -> &'static str {
         SOURCE_ID
@@ -706,6 +734,7 @@ impl SleeveFetcher for MassiveDataSource {
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         let r = match sleeve.kind {
             SleeveKind::EtfTrend => self.fetch_etf(&sleeve.rule_symbols(), sleeve.sma_lookback(), as_of),
+            SleeveKind::EtfMomentum => self.fetch_etf_momentum(&sleeve.rule_symbols(), sleeve.sma_lookback(), as_of),
             SleeveKind::CryptoTrend => self.fetch_crypto(&sleeve.quote, sleeve.sma_lookback() + usize::from(sleeve.tranche_sessions), as_of),
         };
         r.map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })

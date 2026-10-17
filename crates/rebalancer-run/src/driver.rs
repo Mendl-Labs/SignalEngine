@@ -144,7 +144,7 @@ pub const MARKET_HOURS_RUN_MINUTE_UTC: u32 = 0;
 pub fn run_slot_utc(kind: SleeveKind) -> (u32, u32) {
     match kind {
         SleeveKind::CryptoTrend => (DAILY_RUN_HOUR_UTC, DAILY_RUN_MINUTE_UTC),
-        SleeveKind::EtfTrend => (MARKET_HOURS_RUN_HOUR_UTC, MARKET_HOURS_RUN_MINUTE_UTC),
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => (MARKET_HOURS_RUN_HOUR_UTC, MARKET_HOURS_RUN_MINUTE_UTC),
     }
 }
 
@@ -175,7 +175,7 @@ pub fn run_slot_on(sleeves: &[SleeveSpec], date: NaiveDate) -> Option<DateTime<U
 /// `match` stays exhaustive so a new sleeve kind forces a decision here.
 fn sleeve_due_on(kind: SleeveKind, _date: NaiveDate) -> bool {
     match kind {
-        SleeveKind::CryptoTrend | SleeveKind::EtfTrend => true,
+        SleeveKind::CryptoTrend | SleeveKind::EtfTrend | SleeveKind::EtfMomentum => true,
     }
 }
 

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use rebalancer_core::guard::PricePoint;
 use rebalancer_core::Dec;
-use reference_rules::{Panel, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
+use reference_rules::{Panel, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SleeveKind {
@@ -21,6 +21,13 @@ pub enum SleeveKind {
     EtfTrend,
     /// 100-day crypto trend (BTC, ETH; 50% each of the sleeve).
     CryptoTrend,
+    /// R41 CELLS ONLY: cross-sectional ETF momentum (`etf_cross_sectional_momentum`, linear rank weights over the
+    /// cell's universe, trailing 126-bar return). Never a published-point sleeve: the account source builds it only
+    /// from a registered cell, so `instruments` is always set. The rule re-decides on every completed daily bar
+    /// (`DecisionSchedule::Daily`, `RebalancePolicy::OnDecision`, Amendment 14): the decision date is the newest
+    /// completed bar, and the platform acts when that date is newer than the last one it acted on (so a weekend or
+    /// holiday run, which sees no new bar, plans nothing). Closes are daily, like [`SleeveKind::EtfTrend`].
+    EtfMomentum,
 }
 
 /// When a sleeve's target is ACTED on, as opposed to when its rule is evaluated (every driver run evaluates every
@@ -39,7 +46,7 @@ impl SleeveKind {
     pub fn cadence(self) -> Cadence {
         match self {
             SleeveKind::CryptoTrend => Cadence::Daily,
-            SleeveKind::EtfTrend => Cadence::OnDecision,
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => Cadence::OnDecision,
         }
     }
 
@@ -47,6 +54,7 @@ impl SleeveKind {
         match self {
             SleeveKind::EtfTrend => "etf_trend",
             SleeveKind::CryptoTrend => "crypto_trend",
+            SleeveKind::EtfMomentum => "etf_momentum",
         }
     }
 }
@@ -87,22 +95,24 @@ impl SleeveSpec {
     pub fn rule_symbols(&self) -> Vec<String> {
         if self.instruments.is_empty() {
             return match self.kind {
-                SleeveKind::EtfTrend => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
+                SleeveKind::EtfTrend | SleeveKind::EtfMomentum => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
                 SleeveKind::CryptoTrend => CRYPTO_SYMBOLS.iter().map(|s| s.to_string()).collect(),
             };
         }
         match self.kind {
-            SleeveKind::EtfTrend => self.instruments.clone(),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => self.instruments.clone(),
             SleeveKind::CryptoTrend => self.instruments.iter().map(|i| i.split('/').next().unwrap_or(i).to_string()).collect(),
         }
     }
 
-    /// The rule's lookback: the override, else the published constant (month-ends for ETF, days for crypto).
+    /// The rule's lookback: the override, else the published constant (month-ends for ETF trend, days for crypto,
+    /// trading-day bars for momentum: 126).
     pub fn sma_lookback(&self) -> usize {
         match (self.kind, self.lookback) {
             (_, Some(n)) => n as usize,
             (SleeveKind::EtfTrend, None) => ETF_SMA_MONTH_ENDS,
             (SleeveKind::CryptoTrend, None) => CRYPTO_SMA_DAYS,
+            (SleeveKind::EtfMomentum, None) => MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
         }
     }
 
@@ -180,6 +190,9 @@ pub enum BarPosition {
     DecisionDay,
     /// Crypto: one of the other SMA inputs (weight 1/100).
     Window,
+    /// ETF momentum: the decision-day close or the close one lookback earlier (the two closes the rank reads); the
+    /// equity-ETF tolerance row, the same one a month-end close is held to.
+    DailyClose,
 }
 
 impl BarPosition {
@@ -188,6 +201,7 @@ impl BarPosition {
             BarPosition::MonthEnd => "month_end",
             BarPosition::DecisionDay => "decision_day",
             BarPosition::Window => "window",
+            BarPosition::DailyClose => "daily_close",
         }
     }
 }

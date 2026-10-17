@@ -72,7 +72,7 @@ use diesel_async::RunQueryDsl;
 use mandate_core::cell_registry::{CellClaim, CellRefusal, CellRegistry, VerifiedCell};
 use mandate_core::mandate::{canonical_hash, validate_json, AgentAction, AutonomyLevel, MandateBody};
 use mandate_core::replication::cell::WeightPolicy as CellWeightPolicy;
-use mandate_core::strategy_library::{entry_hash, seed_library};
+use mandate_core::strategy_library::{entry_hash, platform_library, seed_library};
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
 use rebalancer_run::cell_rules::sleeve_max_gross;
 use rebalancer_run::data::{SleeveKind, SleeveSpec};
@@ -107,11 +107,20 @@ pub fn sleeve_kind_for_entry(entry_id: &str) -> Option<SleeveKind> {
     ENTRY_SLEEVE_KINDS.iter().find(|(id, _)| *id == entry_id).map(|(_, k)| *k)
 }
 
+/// The rule entries that execute ONLY as a registered R41 cell (rule x universe), never at a published point: their
+/// sleeve kind exists solely for cells (`SleeveKind::EtfMomentum`). A plan sleeve naming one of these without a cell
+/// reference is a typed [`ExclusionReason::UnsupportedSleeve`], exactly as an unknown entry is.
+pub const CELL_ONLY_SLEEVE_KINDS: [(&str, SleeveKind); 1] = [("etf_cross_sectional_momentum", SleeveKind::EtfMomentum)];
+
+pub fn cell_only_kind_for_entry(entry_id: &str) -> Option<SleeveKind> {
+    CELL_ONLY_SLEEVE_KINDS.iter().find(|(id, _)| *id == entry_id).map(|(_, k)| *k)
+}
+
 /// The sleeve shape of a kind on [`PLAN_VENUE`]: (asset class, quote). The mandate names the same strings
 /// (`us_etf`; `crypto_spot` with `USD` quote, the Alpaca crypto path's own names).
 fn sleeve_shape(kind: SleeveKind) -> (&'static str, &'static str) {
     match kind {
-        SleeveKind::EtfTrend => ("us_etf", ""),
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => ("us_etf", ""),
         SleeveKind::CryptoTrend => ("crypto_spot", "USD"),
     }
 }
@@ -604,16 +613,18 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeve
             return Err(bad(format!("entry {entry_id} appears twice")));
         }
         let cell_ref = parse_cell_ref(i, s)?;
-        let kind = match (sleeve_kind_for_entry(&entry_id), cell_ref.is_some()) {
-            (Some(k), false) => k,
-            (Some(SleeveKind::EtfTrend), true) => SleeveKind::EtfTrend,
-            (Some(_), true) => return Err(ExclusionReason::CellNotExecutable(format!("sleeve {entry_id}: only long-only ETF cells execute"))),
-            (None, true) => {
-                return Err(ExclusionReason::CellNotExecutable(format!(
-                    "sleeve {entry_id}: no executable rule family is registered for this cell's rule (the momentum family has no runtime yet)"
-                )))
+        let kind = match (sleeve_kind_for_entry(&entry_id), cell_only_kind_for_entry(&entry_id), cell_ref.is_some()) {
+            (Some(k), _, false) => k,
+            (Some(SleeveKind::EtfTrend), _, true) => SleeveKind::EtfTrend,
+            (Some(_), _, true) => return Err(ExclusionReason::CellNotExecutable(format!("sleeve {entry_id}: only long-only ETF cells execute"))),
+            (None, Some(k), true) => k,
+            (None, Some(_), false) => {
+                return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: this rule executes only as a registered R41 cell, and the plan names no cell")))
             }
-            (None, false) => return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: no sleeve kind is registered for this library entry (ENTRY_SLEEVE_KINDS)"))),
+            (None, None, true) => {
+                return Err(ExclusionReason::CellNotExecutable(format!("sleeve {entry_id}: no executable rule family is registered for this cell's rule")))
+            }
+            (None, None, false) => return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: no sleeve kind is registered for this library entry (ENTRY_SLEEVE_KINDS)"))),
         };
         let weight = dec_from_f64(&format!("sleeve {entry_id}: weight"), weight_f)?;
         if weight <= Dec::ZERO || weight > one {
@@ -769,6 +780,8 @@ fn lookback_key(kind: SleeveKind) -> &'static str {
     match kind {
         SleeveKind::EtfTrend => "sma_month_ends",
         SleeveKind::CryptoTrend => "sma_days",
+        // Never reached: a momentum sleeve is built only from a registered cell, which has no point (`apply_point`).
+        SleeveKind::EtfMomentum => "lookback_bars",
     }
 }
 
@@ -823,6 +836,7 @@ fn apply_point(spec: &mut SleeveSpec, point: &PlanPoint, verifier: &dyn Envelope
                         return Err(out(format!("'{inst}' is not a plain exchange-traded ticker")));
                     }
                 }
+                SleeveKind::EtfMomentum => return Err(out("a momentum rule runs only as a registered cell, never at an implementation point".into())),
                 SleeveKind::CryptoTrend => {
                     let (base, quote) = inst.split_once('/').ok_or_else(|| out(format!("'{inst}' is not a BASE/QUOTE pair")))?;
                     if base.is_empty() || quote != spec.quote {
@@ -852,14 +866,26 @@ fn apply_cell(spec: &mut SleeveSpec, entry: &PinnedEntry, cell: &PlanCell, cells
     };
     let verified = cells.verify(&claim).map_err(ExclusionReason::CellRefused)?;
     let not_executable = |m: String| ExclusionReason::CellNotExecutable(format!("sleeve {}: {m}", spec.id));
-    if spec.kind != SleeveKind::EtfTrend {
-        return Err(not_executable("only long-only ETF cells execute".into()));
-    }
-    if verified.weight_policy != CellWeightPolicy::EqualOverN {
-        return Err(not_executable(format!("weight policy {:?} is not applied by this runtime (only equal_1_over_N)", verified.weight_policy)));
-    }
-    if verified.instruments.len() < 5 {
-        return Err(not_executable(format!("a trend cell needs at least 5 instruments, the registered universe has {}", verified.instruments.len())));
+    match spec.kind {
+        SleeveKind::EtfTrend => {
+            if verified.weight_policy != CellWeightPolicy::EqualOverN {
+                return Err(not_executable(format!("weight policy {:?} is not applied by this runtime (only equal_1_over_N)", verified.weight_policy)));
+            }
+            if verified.instruments.len() < 5 {
+                return Err(not_executable(format!("a trend cell needs at least 5 instruments, the registered universe has {}", verified.instruments.len())));
+            }
+        }
+        // R41-A(2): momentum has NO weight parameter (the rank weights sum to 1 at any K), so its cell is registered
+        // under `fixed_constant` (no n, no derived weight); `equal_1_over_N` on a momentum cell is a malformed cell.
+        SleeveKind::EtfMomentum => {
+            if verified.weight_policy != CellWeightPolicy::FixedConstant {
+                return Err(not_executable(format!("a momentum cell has no weight policy to apply; {:?} is not its registered form (fixed_constant)", verified.weight_policy)));
+            }
+            if verified.instruments.len() < 2 {
+                return Err(not_executable(format!("a momentum cell ranks at least 2 instruments, the registered universe has {}", verified.instruments.len())));
+            }
+        }
+        SleeveKind::CryptoTrend => return Err(not_executable("only long-only ETF cells execute".into())),
     }
     for inst in &verified.instruments {
         if inst.is_empty() || !inst.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.') {
@@ -2082,7 +2108,7 @@ mod tests {
 
     fn registry_of(pairs: &[(&Universe, &Cell)]) -> CellRegistry {
         let universes: BTreeMap<String, Universe> = pairs.iter().map(|(u, _)| (u.key(), (*u).clone())).collect();
-        CellRegistry::from_parts(&universes, pairs.iter().map(|(_, c)| (*c).clone()).collect(), &seed_library().unwrap()).unwrap()
+        CellRegistry::from_parts(&universes, pairs.iter().map(|(_, c)| (*c).clone()).collect(), &platform_library().unwrap()).unwrap()
     }
 
     fn cell_ref_json(c: &Cell, policy: &str) -> Value {
@@ -2197,16 +2223,10 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_of_a_rule_family_or_asset_class_this_runtime_cannot_execute_is_refused_with_its_own_code() {
+    fn a_cell_of_an_asset_class_or_weight_policy_this_runtime_cannot_execute_is_refused_with_its_own_code() {
         let u = sec9();
         let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
         let reg = registry_of(&[(&u, &c)]);
-        // Momentum: its entry has no sleeve kind (no runtime for the rank-weighted family yet).
-        let mut rows = cell_rows(&c);
-        rows.proposal_plans[0].body["sleeves"][0]["entry_id"] = json!("etf_cross_sectional_momentum");
-        let r = refused_with(&rows, &reg);
-        assert_eq!(r.code(), "PILOT_CELL_NOT_EXECUTABLE");
-        assert!(matches!(&r, ExclusionReason::CellNotExecutable(m) if m.contains("momentum")), "{r:?}");
         // A crypto entry: long-only ETF cells only.
         let mut rows = proposal_rows("L2", &CELL_FULL, 1.0, &[("crypto_trend_100d", 1.0)]);
         rows.proposal_plans[0].body["sleeves"][0]["cell"] = cell_ref_json(&c, "equal_1_over_N");
@@ -2253,7 +2273,10 @@ mod tests {
 
     /// The same cell plan under a mandate whose `exposure.max_gross` is `cap`.
     fn cell_rows_with_max_gross(c: &Cell, cap: f64) -> Rows {
-        let mut rows = cell_rows(c);
+        with_max_gross(cell_rows(c), cap)
+    }
+
+    fn with_max_gross(mut rows: Rows, cap: f64) -> Rows {
         let mut body = mandate_body("L2", &CELL_FULL);
         body["exposure"]["max_gross"] = json!(cap);
         body["exposure"]["max_net"] = json!(cap);
@@ -2281,6 +2304,95 @@ mod tests {
             plain.mandates[0] = rows.mandates[0].clone();
             let e = evaluate_serving(&plain);
             assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        }
+    }
+
+    // ----- momentum cells (cross-sectional ETF momentum, linear rank weights) ---------------------------------------
+
+    const MOMENTUM: &str = "etf_cross_sectional_momentum";
+
+    fn momentum_hash() -> String {
+        entry_hash(platform_library().unwrap().iter().find(|e| e.id == MOMENTUM && e.version == 2).unwrap())
+    }
+
+    /// A momentum cell: the rule is the cell-only momentum entry, the weight policy `fixed_constant` (no weight
+    /// parameter; R41-A(2)), unless `policy` says otherwise.
+    fn momentum_cell_of(u: &Universe, policy: CellWeightPolicy, status: CellStatus) -> Cell {
+        let mut c = cell_of(u, policy, status);
+        c.rule_entry_id = MOMENTUM.to_string();
+        c.rule_entry_version = 2;
+        c.premium_ref = "cross_sectional_momentum".to_string();
+        c
+    }
+
+    fn momentum_rows(c: &Cell, policy: &str) -> Rows {
+        let mut rows = proposal_rows("L2", &CELL_FULL, 1.0, &[("etf_trend_faber", 1.0)]);
+        let sleeve = &mut rows.proposal_plans[0].body["sleeves"][0];
+        sleeve["entry_id"] = json!(MOMENTUM);
+        sleeve["entry_version"] = json!(2);
+        sleeve["entry_hash"] = json!(momentum_hash());
+        sleeve["cell"] = cell_ref_json(c, policy);
+        rows
+    }
+
+    #[test]
+    fn a_registered_momentum_cell_runs_the_momentum_kind_on_the_registered_universe_for_9_and_11_names() {
+        for (u, n) in [(sec9(), 9usize), (ac11(), 11)] {
+            let c = momentum_cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+            let reg = registry_of(&[(&u, &c)]);
+            let e = evaluate_cells(&momentum_rows(&c, "fixed_constant"), &reg);
+            assert!(e.exclusions.is_empty(), "N = {n}: {:?}", e.exclusions);
+            let s = &e.accounts[0].active.sleeves[0];
+            assert_eq!((s.kind, s.id.as_str()), (SleeveKind::EtfMomentum, MOMENTUM));
+            assert_eq!(s.instruments, u.slots.iter().map(|x| x.ticker.clone()).collect::<Vec<_>>(), "the platform's universe, in slot order");
+            assert_eq!(s.instruments.len(), n);
+            assert_eq!((s.tranche_sessions, s.lookback), (0, None), "the cell inherits lookback 126 and the daily timing");
+            assert_eq!((s.venue.as_str(), s.asset_class.as_str(), s.quote.as_str()), ("alpaca", "us_etf", ""));
+            assert_eq!(s.share, Dec::parse("1").unwrap());
+        }
+    }
+
+    #[test]
+    fn an_unregistered_momentum_cell_is_refused_and_never_run() {
+        let u = sec9();
+        let c = momentum_cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+        let rows = momentum_rows(&c, "fixed_constant");
+        let other = ac11();
+        let other_cell = momentum_cell_of(&other, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+        for verifier in [&NoCells as &dyn CellVerifier, &CellRegistry::empty(), &registry_of(&[(&other, &other_cell)])] {
+            let reason = refused_with(&rows, verifier);
+            assert_eq!(reason.code(), "PILOT_CELL_NOT_REGISTERED", "{reason:?}");
+        }
+        let held = momentum_cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Held);
+        assert_eq!(refused_with(&momentum_rows(&held, "fixed_constant"), &registry_of(&[(&u, &held)])).code(), "PILOT_CELL_NOT_RUNNABLE");
+    }
+
+    #[test]
+    fn a_momentum_entry_without_a_cell_or_with_a_weight_policy_is_refused_with_typed_reasons() {
+        let u = sec9();
+        // No cell reference: the momentum rule is a cell-only rule, never a published-point sleeve.
+        let c = momentum_cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &c)]);
+        let mut rows = momentum_rows(&c, "fixed_constant");
+        rows.proposal_plans[0].body["sleeves"][0].as_object_mut().unwrap().remove("cell");
+        let r = refused_with(&rows, &reg);
+        assert_eq!(r.code(), "PILOT_UNSUPPORTED_SLEEVE", "{r:?}");
+        // A momentum cell registered under equal_1_over_N: momentum has no weight to derive.
+        let eq = momentum_cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let r = refused_with(&momentum_rows(&eq, "equal_1_over_N"), &registry_of(&[(&u, &eq)]));
+        assert_eq!(r.code(), "PILOT_CELL_NOT_EXECUTABLE", "{r:?}");
+        assert!(matches!(&r, ExclusionReason::CellNotExecutable(m) if m.contains("momentum")), "{r:?}");
+    }
+
+    #[test]
+    fn a_momentum_cells_max_gross_is_its_share_at_any_n() {
+        for u in [sec9(), ac11()] {
+            let c = momentum_cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+            let reg = registry_of(&[(&u, &c)]);
+            let e = evaluate_cells(&with_max_gross(momentum_rows(&c, "fixed_constant"), 1.0), &reg);
+            assert!(e.exclusions.is_empty(), "N = {}: {:?}", u.n(), e.exclusions);
+            let r = refused_with(&with_max_gross(momentum_rows(&c, "fixed_constant"), 0.5), &reg);
+            assert_eq!(r.code(), "PILOT_CELL_GROSS_EXCEEDS_MANDATE", "{r:?}");
         }
     }
 }

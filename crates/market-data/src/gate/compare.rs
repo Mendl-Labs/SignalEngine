@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use chrono::{Duration, NaiveDate};
 use rebalancer_run::data::{BarPosition, GateComparison, GateInstrument, GateReason, GateVerdict, SleeveKind};
 use reference_rules::months::missing_weekdays_between;
-use reference_rules::{completed_month_end_dates, latest_decision_date, Panel, PriceSeries, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
+use reference_rules::{completed_month_end_dates, latest_decision_date, Panel, PriceSeries, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK};
 
 use super::policy::{diff_bps, Policy};
 
@@ -82,7 +82,7 @@ fn consecutive_in(s: &PriceSeries, from: NaiveDate, to: NaiveDate) -> Vec<(Naive
 /// The published instruments of a kind (what [`compare`] compares).
 fn published_symbols(kind: SleeveKind) -> Vec<String> {
     match kind {
-        SleeveKind::EtfTrend => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => ETF_SYMBOLS.iter().map(|s| s.to_string()).collect(),
         SleeveKind::CryptoTrend => CRYPTO_SYMBOLS.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -107,6 +107,20 @@ fn comparison_dates(kind: SleeveKind, window: usize, as_of: NaiveDate, p: Option
             }
             dates.into_iter().map(|d| (d, BarPosition::MonthEnd)).collect()
         }
+        // Momentum reads two closes of each instrument: the decision day's and the one `window` (= the lookback) bars
+        // earlier, by index within each source's own series. Each side contributes its own pair; the union is compared.
+        SleeveKind::EtfMomentum => {
+            let mut dates: BTreeSet<NaiveDate> = BTreeSet::new();
+            for (series, dd) in [(p, p_dd), (s, s_dd)] {
+                let (Some(series), Some(dd)) = (series, dd) else { continue };
+                let Some(pos) = series.position_of(dd) else { continue };
+                dates.insert(dd);
+                if pos >= window {
+                    dates.insert(series.dates()[pos - window]);
+                }
+            }
+            dates.into_iter().map(|d| (d, BarPosition::DailyClose)).collect()
+        }
         SleeveKind::CryptoTrend => (1..=window as i64)
             .rev()
             .filter_map(|k| as_of.checked_sub_signed(Duration::days(k)))
@@ -120,6 +134,7 @@ fn comparison_dates(kind: SleeveKind, window: usize, as_of: NaiveDate, p: Option
 pub fn compare(kind: SleeveKind, as_of: NaiveDate, primary: &Panel, secondary: &Panel, policy: &Policy) -> Comparison {
     let window = match kind {
         SleeveKind::EtfTrend => ETF_SMA_MONTH_ENDS,
+        SleeveKind::EtfMomentum => MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
         SleeveKind::CryptoTrend => CRYPTO_SMA_DAYS,
     };
     compare_with(kind, &published_symbols(kind), window, as_of, primary, secondary, policy)
@@ -162,6 +177,18 @@ pub fn compare_with(kind: SleeveKind, symbols: &[String], window: usize, as_of: 
                 }
             }
             (dd[0], dd[1])
+        }
+        // Momentum: every completed bar is a decision bar, so the decision date of a source is its newest bar of the
+        // sleeve's instruments; the two sources must agree on it.
+        SleeveKind::EtfMomentum => {
+            let newest = |panel: &Panel| symbols.iter().filter_map(|s| panel.get(s).ok()).map(|s| s.last_date()).max();
+            let (p, s) = (newest(primary), newest(secondary));
+            if let (Some(p), Some(s)) = (p, s) {
+                if p != s {
+                    reasons.push(reason("REFUSE_DATE_MISMATCH", GateVerdict::Refuse, None, Some(p.max(s)), format!("the newest completed bars differ: primary {p}, secondary {s}")));
+                }
+            }
+            (p, s)
         }
         SleeveKind::CryptoTrend => {
             let d = as_of.pred_opt();
@@ -231,7 +258,7 @@ pub fn compare_with(kind: SleeveKind, symbols: &[String], window: usize, as_of: 
         let window_to = [p, s].into_iter().flatten().map(|x| x.last_date()).max().map(|d| d.min(as_of - Duration::days(1)));
         if let (Some(from), Some(to)) = (window_from, window_to) {
             // (d) gap guard (ETF; crypto's missing-bar check already covers every calendar day)
-            if kind == SleeveKind::EtfTrend {
+            if matches!(kind, SleeveKind::EtfTrend | SleeveKind::EtfMomentum) {
                 for (side, series) in [(Side::Primary, p), (Side::Secondary, s)] {
                     let Some(series) = series else { continue };
                     for (d1, d2, _, _) in consecutive_in(series, from, to) {
