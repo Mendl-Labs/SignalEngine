@@ -121,7 +121,7 @@ fn an_unregistered_cell_is_refused_with_the_typed_code_by_the_empty_registry_and
 fn every_component_of_the_claim_must_equal_the_registered_cell() {
     let u = sec9();
     let c = cell_for(&u, WeightPolicy::EqualOverN, CellStatus::Admitted);
-    let reg = registry(&[u.clone()], vec![c.clone()]).unwrap();
+    let reg = registry(std::slice::from_ref(&u), vec![c.clone()]).unwrap();
     let good = claim_for(&c, &u);
     reg.verify(&good).unwrap();
 
@@ -144,7 +144,7 @@ fn only_admitted_and_paper_only_cells_are_runnable() {
     let u = sec9();
     for status in [CellStatus::Preregistered, CellStatus::Evaluated, CellStatus::Held] {
         let c = cell_for(&u, WeightPolicy::EqualOverN, status);
-        let reg = registry(&[u.clone()], vec![c.clone()]).unwrap();
+        let reg = registry(std::slice::from_ref(&u), vec![c.clone()]).unwrap();
         let err = reg.verify(&claim_for(&c, &u)).unwrap_err();
         assert!(matches!(err, CellRefusal::NotRunnable(_)), "{status:?}: {err:?}");
         assert_eq!(err.code(), PILOT_CELL_NOT_RUNNABLE);
@@ -157,7 +157,7 @@ fn the_registry_refuses_to_load_a_cell_the_engines_validator_would_refuse() {
     // A derived weight that is not exactly 1/N.
     let mut c = cell_for(&u, WeightPolicy::EqualOverN, CellStatus::Admitted);
     c.derived_weight = Some(0.2);
-    assert!(registry(&[u.clone()], vec![c]).unwrap_err().contains("derived_weight"));
+    assert!(registry(std::slice::from_ref(&u), vec![c]).unwrap_err().contains("derived_weight"));
     // A trend (equal_1_over_N) cell on a universe with fewer than 5 instruments.
     let mut small = sec9();
     small.slots.truncate(4);
@@ -166,11 +166,11 @@ fn the_registry_refuses_to_load_a_cell_the_engines_validator_would_refuse() {
     // A cell bound to a universe hash that is not the universe file's.
     let mut c = cell_for(&u, WeightPolicy::EqualOverN, CellStatus::Admitted);
     c.universe_hash = "0".repeat(64);
-    assert!(registry(&[u.clone()], vec![c]).unwrap_err().contains("universe_hash"));
+    assert!(registry(std::slice::from_ref(&u), vec![c]).unwrap_err().contains("universe_hash"));
     // A cell of a rule entry the platform library does not hold.
     let mut c = cell_for(&u, WeightPolicy::EqualOverN, CellStatus::Admitted);
     c.rule_entry_id = "no_such_rule".to_string();
-    assert!(registry(&[u.clone()], vec![c]).unwrap_err().contains("no library entry"));
+    assert!(registry(std::slice::from_ref(&u), vec![c]).unwrap_err().contains("no library entry"));
     // A cell whose universe is not loaded.
     let c = cell_for(&u, WeightPolicy::EqualOverN, CellStatus::Admitted);
     assert!(registry(&[], vec![c]).unwrap_err().contains("no universe"));
