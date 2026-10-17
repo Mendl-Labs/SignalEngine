@@ -13,7 +13,6 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use common::*;
 use fake_broker::alpaca::{AssetSpec, FakeAlpaca};
 use fake_broker::alpaca_rig::AlpacaRig;
-use rebalancer_core::dec_math::{ratio_to_dec, RatioRound};
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
 use rebalancer_core::venue::{AlpacaRules, VenueRuleBook};
 use rebalancer_risk::store::InMemoryStateStore;
@@ -183,13 +182,18 @@ fn check_linear_rank_targets(tickers: &[&str]) {
     let weights: BTreeMap<&str, broker_adapters::Dec> = r.targets[0].weights.iter().map(|(s, w)| (s.as_str(), *w)).collect();
     assert_eq!(weights.len(), n, "the target names every instrument of the universe");
     let mut total = 0.0;
+    let mut target_sum = 0.0;
     for (i, t) in tickers.iter().enumerate() {
         let want = expected_weight(i, n);
-        assert_eq!(weights[t], ratio_to_dec(want, RatioRound::Down).unwrap(), "N = {n}: {t} (level {})", level(i, n));
+        // The target carries the rule's weight floored to 12 decimals (so the sleeve's sum can never exceed 1).
+        let got = weights[t].to_f64();
+        assert!(got <= want && want - got < 2e-12, "N = {n}: {t} (level {}): target {got}, rule {want}", level(i, n));
+        target_sum += got;
         assert_eq!(dec.instruments[i].weight.to_bits(), want.to_bits(), "the record carries the rule's own f64 weight for {t}");
         total += want;
     }
     assert!((total - 1.0).abs() < 1e-12, "N = {n}: gross is 100% by construction, got {total}");
+    assert!(target_sum <= 1.0 && target_sum > 1.0 - 1e-10, "N = {n}: the target never exceeds 100%, got {target_sum}");
     // Concentration, disclosed (R41-A(2)): the top weight is 2 / (K + 1).
     let top = dec.instruments.iter().map(|i| i.weight).fold(0.0, f64::max);
     assert!((top - 2.0 / (n as f64 + 1.0)).abs() < 1e-12);

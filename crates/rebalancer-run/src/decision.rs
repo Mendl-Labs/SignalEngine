@@ -85,10 +85,26 @@ impl Evaluation {
     /// The planner target of `sleeve` for this decision.
     pub fn target(&self, sleeve: &SleeveSpec) -> Result<SleeveTarget, MathError> {
         match &self.rule {
+            // Rank weights are K different quotients, so converting each to its SHORTEST decimal can round a few up and push
+            // the sleeve's sum a few 1e-17 above 1 (the planner then refuses the plan: `WeightsExceedOne`). The target
+            // therefore carries each momentum weight floored to 12 decimals, which keeps the sum <= 1 for every K; the
+            // evidence in the run record keeps the rule's own f64 weights.
+            RuleDecision::Etf(d) if self.kind == SleeveKind::EtfMomentum => {
+                let mut floored = d.clone();
+                for i in &mut floored.instruments {
+                    i.weight = floor_weight(i.weight);
+                }
+                SleeveTarget::from_etf(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, &floored)
+            }
             RuleDecision::Etf(d) => SleeveTarget::from_etf(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, d),
             RuleDecision::Crypto(d) => SleeveTarget::from_crypto(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, &sleeve.quote, d),
         }
     }
+}
+
+/// `w` floored to 12 decimals (never up): see [`Evaluation::target`].
+fn floor_weight(w: f64) -> f64 {
+    (w * 1e12).floor() / 1e12
 }
 
 #[derive(Debug, Clone, PartialEq)]
