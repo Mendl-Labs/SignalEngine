@@ -417,7 +417,7 @@ impl SleeveFetcher for Fixed {
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         self.calls.lock().unwrap().push(sleeve.kind);
         let r = match sleeve.kind {
-            SleeveKind::EtfTrend => self.etf.lock().unwrap().clone(),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => self.etf.lock().unwrap().clone(),
             SleeveKind::CryptoTrend => self.crypto.lock().unwrap().clone(),
         };
         r.map(|panel| FetchedSleeve { panel, provenance: vec![], gate: None }).map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })

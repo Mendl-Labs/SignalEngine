@@ -29,7 +29,7 @@ struct ClosedBarsOnly {
 impl DataSource for ClosedBarsOnly {
     fn sleeve_data(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<SleeveData, DataError> {
         let (syms, window): (Vec<(String, String)>, i64) = match sleeve.kind {
-            SleeveKind::EtfTrend => (ETF_SYMBOLS.iter().map(|s| (s.to_string(), s.to_string())).collect(), ETF_HISTORY_DAYS),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => (ETF_SYMBOLS.iter().map(|s| (s.to_string(), s.to_string())).collect(), ETF_HISTORY_DAYS),
             SleeveKind::CryptoTrend => (CRYPTO_SYMBOLS.iter().map(|s| (s.to_string(), format!("X:{s}USD"))).collect(), CRYPTO_HISTORY_DAYS),
         };
         let cutoff = as_of.pred_opt().unwrap();
