@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::replication::cell::{cell_hash, embedded_cells, validate, validate_cell_set, Cell, CellStatus, WeightPolicy};
 use crate::replication::universe::{embedded_universes, universe_hash, Universe};
-use crate::strategy_library::{entry_hash, platform_library, LibraryEntry};
+use crate::strategy_library::{entry_hash, seed_library, LibraryEntry};
 
 /// Refusal code: the claimed cell is not one the platform registered (unknown hash, or any component differing).
 pub const PILOT_CELL_NOT_REGISTERED: &str = "PILOT_CELL_NOT_REGISTERED";
@@ -101,7 +101,7 @@ impl CellRegistry {
     /// today. `Err` is a defect in the compiled-in sidecars; the caller must then fall back to [`Self::empty`]
     /// (fail closed), not run cells.
     pub fn platform() -> Result<Self, String> {
-        let library = platform_library()?;
+        let library = seed_library()?;
         let universes = embedded_universes()?;
         let cells = embedded_cells(&universes, &library)?;
         Self::from_parts(&universes, cells.into_values().collect(), &library)

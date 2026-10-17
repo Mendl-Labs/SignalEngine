@@ -72,7 +72,7 @@ use diesel_async::RunQueryDsl;
 use mandate_core::cell_registry::{CellClaim, CellRefusal, CellRegistry, VerifiedCell};
 use mandate_core::mandate::{canonical_hash, validate_json, AgentAction, AutonomyLevel, MandateBody};
 use mandate_core::replication::cell::WeightPolicy as CellWeightPolicy;
-use mandate_core::strategy_library::{entry_hash, platform_library, seed_library};
+use mandate_core::strategy_library::{entry_hash, seed_library};
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
 use rebalancer_run::cell_rules::sleeve_max_gross;
 use rebalancer_run::data::{SleeveKind, SleeveSpec};
@@ -2108,7 +2108,7 @@ mod tests {
 
     fn registry_of(pairs: &[(&Universe, &Cell)]) -> CellRegistry {
         let universes: BTreeMap<String, Universe> = pairs.iter().map(|(u, _)| (u.key(), (*u).clone())).collect();
-        CellRegistry::from_parts(&universes, pairs.iter().map(|(_, c)| (*c).clone()).collect(), &platform_library().unwrap()).unwrap()
+        CellRegistry::from_parts(&universes, pairs.iter().map(|(_, c)| (*c).clone()).collect(), &seed_library().unwrap()).unwrap()
     }
 
     fn cell_ref_json(c: &Cell, policy: &str) -> Value {
@@ -2312,7 +2312,7 @@ mod tests {
     const MOMENTUM: &str = "etf_cross_sectional_momentum";
 
     fn momentum_hash() -> String {
-        entry_hash(platform_library().unwrap().iter().find(|e| e.id == MOMENTUM && e.version == 2).unwrap())
+        entry_hash(seed_library().unwrap().iter().find(|e| e.id == MOMENTUM && e.version == 2).unwrap())
     }
 
     /// A momentum cell: the rule is the cell-only momentum entry, the weight policy `fixed_constant` (no weight
