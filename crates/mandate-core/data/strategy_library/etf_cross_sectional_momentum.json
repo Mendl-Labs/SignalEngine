@@ -1,0 +1,106 @@
+{
+  "id": "etf_cross_sectional_momentum",
+  "version": 2,
+  "name": "Cross-sectional momentum (rank-weighted, 5 ETFs)",
+  "sources": [
+    "Jegadeesh, N. and Titman, S., \"Returns to Buying Winners and Selling Losers: Implications for Stock Market Efficiency\", The Journal of Finance 48(1), March 1993, 65-91, DOI 10.1111/j.1540-6261.1993.tb04702.x. Bibliographic details and the abstract were CHECKED on 2026-10-16 against the Crossref record of that DOI (title, authors, journal, volume, issue, pages, year match; the abstract reports significant positive returns over 3- to 12-month holding periods for buying past winners and selling past losers, in US stocks). The full paper text was NOT read for this entry: the citation supports only the general existence of a cross-sectional momentum premium, not this rule's 126-day lookback, its five-ETF universe or its rank weights, which are this entry's own construction (a long-only, linearly rank-weighted variant on a fixed ETF basket; the paper's strategies are long-short, on stocks).",
+    "Reference implementation: BacktestingCore reference-rules::MomentumRankWeighted (weightsim::WeightRule id \"momentum_rank_weighted\"), run by weightsim_rules::adapters::MomentumRankWeightedRule against the embedded, SHA-256-pinned replication_ladder_momentum_evidence answer key (Amendment 14, etf_cross_sectional_momentum_evidence_v1)."
+  ],
+  "citation_claims": [
+    {
+      "source_index": 0,
+      "claim": {
+        "quotes": [
+          "3- to 12-month holding periods"
+        ],
+        "numbers": [],
+        "sample_period": null
+      }
+    }
+  ],
+  "rule_text": "Universe: SPY, EFA, IEF, DBC, VNQ (daily closes). Each day, rank every instrument by its trailing 126-trading-day return (close_t / close_(t-126) - 1), descending (ties broken by ascending alphabetical ticker). With K ranked instruments, the instrument at rank r (1 = highest return) gets weight (K + 1 - r) / (K * (K + 1) / 2) of the sleeve's equity -- strictly positive for every ranked instrument, largest for rank 1, smallest for rank K; there is no momentum-based cutoff. An instrument with fewer than 127 closes is excluded from ranking and gets zero weight, and is removed from K and the denominator. Rebalance daily at the close. A position decided at the close of day t earns returns from the next trading day's close-to-close return onward; a decision uses only data available at the close of the decision day. Long only, no leverage: the K ranked weights sum to exactly 100% of sleeve equity.",
+  "reference_implementation": "weightsim_rules::ladder rule id \"momentum_rank_weighted\" (S4), the compiled rule replication::registry::certified_key_bars resolves against the embedded, SHA-256-pinned replication_ladder_momentum_evidence answer key (Amendment 14), over reference-rules::MomentumRankWeighted.",
+  "instruments": [
+    "SPY",
+    "EFA",
+    "IEF",
+    "DBC",
+    "VNQ"
+  ],
+  "requirements": {
+    "needs_shorting": false,
+    "min_leverage_gross": 1.0,
+    "needs_portfolio_vol_target": false,
+    "max_abs_weight_per_instrument": 0.3333333333333333,
+    "cross_asset_rebalance": "preferred",
+    "asset_classes": [
+      "us_etf"
+    ],
+    "venues_supported": [
+      "alpaca"
+    ],
+    "min_history_years": 0.503968253968254,
+    "notes": [
+      "min_history_years is the history needed for the FIRST instrument to clear the 127-close (126-bar lookback + 1) ranking floor only; a meaningful backtest needs far more.",
+      "Covers only this premium's us_etf asset class; a separate entry would be needed for a crypto leg.",
+      "Drafted from library_curation::draft::RuleTemplate::CrossSectionalMomentum -- structural fields (requirements, rebalance, parameters, operating_procedure, rule_text) are template-fixed, matched here exactly to avoid RULE_DRIFT against the compiled rule."
+    ]
+  },
+  "rebalance": {
+    "kind": "daily",
+    "detail": "Ranks recompute at the close of every daily bar (weightsim::RebalancePolicy::OnDecision); with a daily decision schedule every bar is itself a decision bar, so the sleeve trades back to the newly ranked weights daily."
+  },
+  "operating_procedure": {
+    "decision_schedule": "daily",
+    "evaluation": "daily",
+    "actionable_after": "next_bar",
+    "rebalance_policy": "on_decision",
+    "expected_delay_bars": 1,
+    "execution_assumption": "next_open",
+    "catch_up": "cap"
+  },
+  "parameters": {
+    "L": 126,
+    "schedule": "daily",
+    "rebalance_policy": "on_decision",
+    "max_weight_per_instrument": 0.3333333333333333
+  },
+  "expected_ranges": [
+    {
+      "metric": "sharpe_gross",
+      "low": null,
+      "high": null,
+      "role": "performance_band",
+      "source": "No band, deliberately. Amendment 14 section 7 (program/tests/fixtures/replication_ladder_momentum_evidence/AMENDMENT_14.md): no performance band is offered for customer-facing display; that is a separate, later, separately pre-registered decision, and council rulings R22/R23 (expected ranges come from the certified window only) apply as for crypto_trend_100d. A single ~5.6-year window is one regime sequence, not several independent ones.",
+      "note": "Window-specific reference only, NOT an expectation for other windows. Certified replication (Amendment 14, etf_cross_sectional_momentum_evidence_v1, 2021-03-01 to 2026-10-13, 5.618 years, 1413 daily bars, price-only closes): gross Sharpe 0.670904, CAGR 7.1639%, vol 11.2591%, max drawdown -19.0050%; net (certification_flat_10bps_per_side) Sharpe 0.536536, CAGR 5.5612%, vol 11.2726%, max drawdown -19.7468%. These are the first numbers anyone saw for this rule: Amendment 14 offered no prior estimate. No buy-and-hold comparison has been measured for this window."
+    }
+  ],
+  "backtest_window": {
+    "start": "2021-03-01",
+    "end": "2026-10-13",
+    "max_observed_drawdown": 0.197468149094
+  },
+  "known_deviations": [
+    "Reuses the same 5-ETF panel as etf_trend_faber (SPY, EFA, IEF, DBC, VNQ) rather than a broader, dedicated cross-sectional universe -- a thin basket for rank-based diversification; see failure_regimes.",
+    "Price-only closes: dividends are excluded from all five ETFs.",
+    "No lot rounding or minimum tickets: the compiled rule trades fractional, continuous weights every day.",
+    "Same-close fills in the certified replication: a decision made at a close is filled at that same close. A live account acts one session later (operating_procedure.execution_assumption next_open).",
+    "Evidence window is 2021-03-01 to 2026-10-13: it was fixed mechanically by the pre-registered window rule (Amendment 14 section 3) from the data that passed the data-quality certificate, and covers whichever market regimes fall in it; it is a single regime sequence.",
+    "C4 venue check (data_quality_certificate.json): the Stooq corroboration could not be obtained (anti-bot challenge, status not_available), so the primary-vs-arbiter (Massive vs Alpaca SIP) comparison is the only cross-vendor check; it passed with no bar above 10 bp inside the window.",
+    "The certified net figure uses a flat 10 bps per-side accounting cost (cost_model_id certification_flat_10bps_per_side), a stated bookkeeping device, not a claim about realised trading costs on any venue."
+  ],
+  "failure_regimes": [
+    "Momentum crashes: a sharp reversal after a strong trend can hit the highest-ranked (largest-weight) instrument hardest.",
+    "A 5-instrument universe is thin for cross-sectional ranking: rank weights can be dominated by whichever one or two instruments happen to lead, reducing real diversification versus a broader universe.",
+    "Sideways or choppy regimes where the rank ordering flips frequently (high turnover, whipsaw): the certified window shows turnover of about 15 times sleeve equity per year."
+  ],
+  "cost_profile": {
+    "turnover_per_year_estimate": 15.07,
+    "signal_flips_per_year_shadow": null,
+    "note": "Measured by the certified replication (key_metrics.json): turnover_sum_x_equity 84.6696 over 5.618070 years (1413 daily rebalances), about 15.07 times sleeve equity per year; cost_sum_x_equity 0.084670 at the certification_flat_10bps_per_side accounting cost. Signal flips are not a meaningful measure for an always-invested rank-weighted book (0 sign changes). ETF spreads on these five funds are small but were not measured here."
+  },
+  "evidence": "reference_only",
+  "last_verified": "2026-10-16",
+  "verification_note": "Rule text, parameters, requirements, rebalance and operating_procedure are copied verbatim from library_curation::draft::RuleTemplate::CrossSectionalMomentum to guarantee zero drift against the compiled MomentumRankWeightedRule adapter, whose declared parameters are exactly L, schedule, rebalance_policy and max_weight_per_instrument. Backtest window and every performance number come from Amendment 14's pre-registered evidence fixture (program/tests/fixtures/replication_ladder_momentum_evidence/): Massive primary pulls arbitrated by Alpaca (SIP feed), data-quality certificate PASS on C1/C2/C3/C5 (flagged-bar rate 0.0, no bar above 10 bp in the window), window derived mechanically (5.618 years, floor 5.0); the key was exported in CI by an independent Python reference function and cross-checked against an independent vectorised shadow (weights to 1e-15, returns to 1e-12), and the five pre-registered T4 mutants (lookahead peek, extra 1-day delay, lookback off by one, half sizing, equal weight) are each caught by Tier II and III on this window, the Rust ladder reproducing the recorded numbers. No performance band is published (Amendment 14 section 7): replication::admission's 9.7_evidence_strength check therefore holds this entry, served but not admitted, until a separately pre-registered band exists. The Jegadeesh-Titman citation was checked against Crossref on 2026-10-16 (bibliographic record and abstract only; citation_claims carries only the 3- to 12-month holding-period phrase from the abstract, no numbers).",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the compiled reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window fall outside a performance band once one is published; (d) a later decay_check replication run against this same rule_hash fails. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here."
+}

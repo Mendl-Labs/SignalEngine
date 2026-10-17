@@ -48,19 +48,38 @@ fn key_order_and_whitespace_in_the_source_json_do_not_change_the_hash() {
     assert_eq!(canonical_hash(&body), PINNED_BASELINE_HASH);
 }
 
-/// Pinned `entry_hash` of the three seed library entries (same provenance as above).
-const PINNED_ENTRY_HASHES: [(&str, &str); 3] = [
+/// Pinned `entry_hash` of the Engine's three seed library entries, from the verbatim `strategy_library.rs` and
+/// `data/strategy_library/*.json` (Engine `origin/main`, see SOURCE.md). The same values are pinned on the Engine side by
+/// `program/tests/seed_entry_hashes_pinned.rs` (BacktestingEngine), so a difference between the two repos fails in CI on
+/// whichever side drifted. Order is the Engine's `SEED_JSON` order.
+const PINNED_ENTRY_HASHES: [(&str, u32, &str); 3] = [
+    ("etf_trend_faber", 2, "TBD"),
+    ("crypto_trend_100d", 1, "TBD"),
+    ("etf_cross_sectional_momentum", 2, "TBD"),
+];
+
+#[test]
+fn seed_library_entry_hashes_are_pinned() {
+    let lib = seed_library().expect("seed library parses");
+    let got: Vec<(String, u32, String)> = lib.iter().map(|e| (e.id.clone(), e.version, entry_hash(e))).collect();
+    let want: Vec<(String, u32, String)> = PINNED_ENTRY_HASHES.iter().map(|(i, v, h)| (i.to_string(), *v, h.to_string())).collect();
+    assert_eq!(got, want, "a seed entry changed: re-copy from the Engine and re-pin deliberately");
+}
+
+/// The pre-sync library the owner pilot row still pins (`legacy_pilot_library`): these hashes are the pilot's pin and
+/// must never change (the SAME values this file pinned before the Engine sync).
+const PINNED_LEGACY_PILOT_HASHES: [(&str, &str); 3] = [
     ("crypto_trend_100d", "826fb12ec051bcf1b93f8f4d6d5ddca1eeb03875ad0e687c7153be5d83f344f8"),
     ("etf_trend_faber", "b8ddc2ecf3a52cc8a8f0ae772f3d5148f3071217dc085a50b4ec2d9f6f619b86"),
     ("fx_tsmom_12m", "92c0e2b464a10d627bfc68a2b415feff00a09e2e6cfdbefa724f9181515c4dc9"),
 ];
 
 #[test]
-fn seed_library_entry_hashes_are_pinned() {
-    let lib = seed_library().expect("seed library parses");
-    assert_eq!(lib.len(), PINNED_ENTRY_HASHES.len());
-    for (id, want) in PINNED_ENTRY_HASHES {
-        let e = lib.iter().find(|e| e.id == id).unwrap_or_else(|| panic!("no seed entry {id}"));
-        assert_eq!(entry_hash(e), want, "seed entry {id} changed");
+fn the_legacy_pilot_library_hashes_the_owner_pilot_pins_are_unchanged() {
+    let lib = mandate_core::legacy_pilot_library::seed_library().expect("legacy pilot library parses");
+    assert_eq!(lib.len(), PINNED_LEGACY_PILOT_HASHES.len());
+    for (id, want) in PINNED_LEGACY_PILOT_HASHES {
+        let e = lib.iter().find(|e| e.id == id).unwrap_or_else(|| panic!("no legacy entry {id}"));
+        assert_eq!((e.version, mandate_core::legacy_pilot_library::entry_hash(e).as_str()), (1, want), "legacy entry {id} changed");
     }
 }

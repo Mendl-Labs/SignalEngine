@@ -1,13 +1,31 @@
 {
   "id": "etf_trend_faber",
-  "version": 1,
+  "version": 2,
   "name": "ETF trend (Faber 10-month moving average, 5 ETFs)",
   "sources": [
-    "Faber, M., \"A Quantitative Approach to Tactical Asset Allocation\", 2007 (rule as stated in stage1-record replication brief, BRIEF_FOR_AGENT.md, Sleeve 1). Bibliographic details beyond title and year are not in the local files.",
-    "Reference implementation: stage1-record/tool/ticket.py, decide_s1 (independent pandas reimplementation)."
+    "Faber, M., \"A Quantitative Approach to Tactical Asset Allocation\", Journal of Wealth Management, Spring 2007. SSRN abstract_id=962461 (papers.ssrn.com/sol3/papers.cfm?abstract_id=962461). CHECKED against the actual paper text on 2026-09-23 (WP8.2-style citation verification, done by hand, not yet the automated pipeline): confirmed real, confirmed the 10-month-SMA/month-end/long-or-cash rule as stated in rule_text below. See expected_ranges[0].note for what did NOT check out.",
+    "Reference implementation: SignalEngine crates/reference-rules::decide_etf_trend (weightsim_rules::adapters::EtfTrendRule over reference-rules), the same golden-tested Rust reimplementation cited on version 1, now the actual compiled rule this platform's fixed-rule replication endpoint runs and certifies against the embedded replication_ladder answer key (Amendment 11)."
+  ],
+  "citation_claims": [
+    {
+      "source_index": 0,
+      "claim": {
+        "quotes": [
+          "improved the Sharpe Ratio by 0.20"
+        ],
+        "numbers": [
+          {
+            "metric": "Sharpe Ratio improved by",
+            "value": 0.2,
+            "period": "1973-2008"
+          }
+        ],
+        "sample_period": "1973-2008"
+      }
+    }
   ],
   "rule_text": "Universe: SPY, EFA, IEF, DBC, VNQ. At each month-end (the last available trading day of the calendar month), for each ETF: if its month-end close is above the simple average of its last 10 month-end closes, INCLUDING the current month-end close, hold that ETF for the next month at 20% of the sleeve's equity; otherwise hold cash in its place (zero return). Rebalance monthly at the month-end close. A position decided at the close of day t earns returns from the next trading day's close-to-close return onward; a decision uses only data available at the close of the decision day. Long only, no leverage: maximum gross exposure is 100% of sleeve equity (5 x 20%). The reference implementation uses price-only closes (dividends not included), which understates the returns of income-paying ETFs.",
-  "reference_implementation": "stage1-record/tool/ticket.py::decide_s1 (also shadow.py sleeve1). Version pin: none recorded in the local files.",
+  "reference_implementation": "SignalEngine crates/reference-rules::decide_etf_trend, replayed against Massive daily bars (program/tests/fixtures/replication_ladder, Amendment 11, SHA-256 pinned) by weightsim_rules::ladder::replicate. Version pin: weightsim-rules 0.1.0 over reference-rules, Core rev bf05c19b.",
   "instruments": ["SPY", "EFA", "IEF", "DBC", "VNQ"],
   "requirements": {
     "needs_shorting": false,
@@ -20,21 +38,27 @@
     "min_history_years": 0.85,
     "notes": [
       "min_history_years is the history needed to compute the FIRST signal only (10 month-end closes); a meaningful backtest needs far more.",
-      "The published rule rebalances to fixed 20% weights. The platform runs each ETF as an independent sub-account, so weights drift between month-ends: an approximation of the rule, not a block (cross_asset_rebalance = preferred). In the raw-engine test (stage-1 SCORECARD Amendment 8) this sleeve's Sharpe was within 0.05 of the reference but its annualised return was 1.8 points lower.",
-      "Whether live trading is wired for Alpaca (today: no, paper only) is a PLATFORM fact kept in PlatformCapabilities, not in this entry.",
-      "The owner's own config for a $5,000 account noted this sleeve needs fractional shares on Alpaca at that size. No minimum-capital check is derived here."
+      "Whether live trading is wired for Alpaca (today: no, paper only) is a PLATFORM fact kept in PlatformCapabilities, not in this entry."
     ]
   },
   "rebalance": {
     "kind": "monthly",
-    "detail": "At month-end close (last available trading day of the calendar month). Holidays are not modelled in the reference implementation; verify against the exchange calendar."
+    "detail": "Decided at the close of the last bar of each calendar month (last_bar_of_month); the new target is first actionable on the first bar of the following month (operating_procedure.actionable_after), matching a live account's one-session decision-to-action delay (COUNCIL_ETF_TIMING_AND_CADENCE.md Ruling 4). Holidays are not modelled beyond the fixture's own trading calendar."
+  },
+  "operating_procedure": {
+    "decision_schedule": "monthly",
+    "evaluation": "daily",
+    "actionable_after": "first_bar_of_next_month",
+    "rebalance_policy": "on_decision",
+    "expected_delay_bars": 1,
+    "execution_assumption": "next_open",
+    "catch_up": "cap"
   },
   "parameters": {
     "sma_month_ends": 10,
-    "sma_includes_current_month_end": true,
-    "weight_per_etf": 0.2,
-    "cash_return": 0.0,
-    "min_month_end_closes_required": 10
+    "weight_per_instrument": 0.2,
+    "schedule": "last_bar_of_month",
+    "rebalance_policy": "on_decision"
   },
   "expected_ranges": [
     {
@@ -42,8 +66,16 @@
       "low": 0.2,
       "high": 1.0,
       "role": "performance_band",
-      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B: the author's deliberately wide sanity band (set 2026-09-20), NOT a published figure.",
-      "note": "Literature numbers are UNVERIFIED: they came from search summaries of secondary sources and were not checked against Faber (2007): Sharpe ~0.81 (1972-2005) and ~0.68 (2006-2025). Independent reimplementation (gross, zero cost, price-only closes from the platform's Massive candles, 2017-07-03 to 2026-08-31): Sharpe 0.645, CAGR 4.14%, vol 6.63%, max drawdown -8.97%; equal-weight buy-and-hold of the same five ETFs: Sharpe 0.562, max drawdown -26.68%. The band is for NET Sharpe; that run is gross, so a net figure is lower by trading costs. Price-only closes omit dividends (predicted 1.5-2.5 percentage points of CAGR understatement). Post-publication decay (McLean-Pontiff, ~58%, also unverified) means a positive result is an upper bound."
+      "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B: the author's deliberately wide sanity band (set 2026-09-20), NOT a published figure. Recomputed on version 2 by the platform's own certified fixed-rule replication (weightsim_rules::ladder::replicate against program/tests/fixtures/replication_ladder), not merely reimplemented independently as on version 1.",
+      "note": "CHECKED 2026-09-23 against the actual paper text (SSRN 962461, extracted via pypdf): the previously-cited figures 'Sharpe ~0.81 (1972-2005) and ~0.68 (2006-2025)' do NOT appear anywhere in the paper and are now known to be wrong, not merely unverified -- likely misattributed from an unrelated secondary source. What the paper actually reports for its 5-asset-class out-of-sample test (1973-2008, not 1972-2005/2006-2025): 'the timing model increased returns by approximately 20%, decreased volatility by 20%, improved the Sharpe Ratio by 0.20, and reduced the maximum drawdown by nearly 50%' versus buy-and-hold (relative improvements, not absolute Sharpe levels for the timing portfolio -- an absolute figure may exist in the paper's exhibit tables/charts, which did not extract as text and were not checked). The platform's own certified replication (net, certification_flat_10bps_per_side, price-only closes, 2017-07-03 to 2026-08-31): Sharpe 0.610475, CAGR 3.9059%, vol 6.6383%, max drawdown -9.1084%; equal-weight buy-and-hold of the same five ETFs: max drawdown -26.68%. Price-only closes omit dividends (predicted 1.5-2.5 percentage points of CAGR understatement -- see known_deviations). Post-publication decay (McLean-Pontiff, ~58%, still unverified) means a positive result is an upper bound."
+    },
+    {
+      "metric": "sharpe_gross",
+      "low": 0.2,
+      "high": 1.1,
+      "role": "performance_band",
+      "source": "The platform's own certified fixed-rule replication (weightsim_rules::ladder::replicate, zero-cost gross run against program/tests/fixtures/replication_ladder), recomputed by check A6/A8 of the replication label derivation on every read -- WP9.9's gross_and_net_reported_check requires this paired _gross metric beside sharpe_net.",
+      "note": "Certified gross (zero cost, price-only closes, 2017-07-03 to 2026-08-31): Sharpe 0.644879, CAGR 4.1395%, vol 6.6318%, max drawdown -8.9726%. Gross is higher than net by the certification's flat 10 bps per-side accounting cost only (not a realised fill cost -- see known_deviations)."
     },
     {
       "metric": "max_drawdown",
@@ -51,8 +83,20 @@
       "high": 0.25,
       "role": "performance_band",
       "source": "stage1-record SCORECARD_PREREGISTRATION.md, Layer B (drawdown magnitude at most 25%, and shallower than equal-weight buy-and-hold of the same five ETFs).",
-      "note": "Drawdown is stated as a positive fraction. Independent reimplementation over 2017-07-03 to 2026-08-31: 8.97% versus 26.68% for buy-and-hold. One window; not a guarantee."
+      "note": "Drawdown is stated as a positive fraction, net of the certification cost. Certified replication over 2017-07-03 to 2026-08-31: 9.1084% versus 26.68% for equal-weight buy-and-hold of the same five ETFs. One window; not a guarantee."
     }
+  ],
+  "backtest_window": {
+    "start": "2017-07-03",
+    "end": "2026-08-31",
+    "max_observed_drawdown": 0.2668
+  },
+  "known_deviations": [
+    "Price-only closes: dividends are excluded from SPY, EFA, IEF, DBC and VNQ. Predicted to understate CAGR by roughly 1.5 to 2.5 percentage points versus the total-return series of IEF, VNQ and EFA in particular, which pay meaningful income.",
+    "Same-close fills in the certified replication: a decision made at a month-end close is filled at that same close. A live account acts one session later, at the next open (COUNCIL_ETF_TIMING_AND_CADENCE.md Ruling 4: the decision is first actionable on the following month's first bar and fills at that bar's open, per operating_procedure above).",
+    "No lot rounding or minimum tickets: the certified replication trades fractional, continuous weights every month-end. A live account is subject to each venue's lot sizes and minimum order tickets, which this replication does not model.",
+    "Single-vendor daily bars: all five instruments are priced from one vendor's (Massive) daily bars. No cross-vendor reconciliation of the pinned candles was performed beyond the fixture's own SHA-256 pin (program/tests/fixtures/replication_ladder/MANIFEST.json).",
+    "The certified net figure uses a flat 10 bps per-side accounting cost (cost_model_id certification_flat_10bps_per_side), a stated bookkeeping device for comparing gross and net results consistently across rules, not a claim about realised trading costs on any venue."
   ],
   "failure_regimes": [
     "Sideways or choppy markets where prices repeatedly cross the 10-month average (whipsaw). GENERAL property of moving-average trend rules; NOT measured in the local files.",
@@ -62,10 +106,11 @@
   "cost_profile": {
     "turnover_per_year_estimate": null,
     "signal_flips_per_year_shadow": 10.8,
-    "note": "Turnover as a fraction of sleeve equity is NOT recorded in the local files. The independent reimplementation counted 99 asset-level signal flips over 9.16 years (2303 observations at 251.4 per year), about 10.8 per year across the five ETFs (arithmetic on shadow_summary.json). Monthly cadence keeps turnover low; ETF spreads on these five funds are small but were not measured here."
+    "note": "Turnover as a multiple of sleeve equity is NOT recorded in the local files. The platform's certified replication counted 99 asset-level signal flips over 9.160849 years (2303 observations at 251.3959 per year), about 10.8 per year across the five ETFs -- matching version 1's independent-reimplementation count exactly, since both count the same published rule against the same pinned prices. Monthly cadence keeps turnover low; ETF spreads on these five funds are small but were not measured here. The certified net result above uses the certification_flat_10bps_per_side accounting cost, not a measured spread/impact model."
   },
   "evidence": "reference_only",
-  "last_verified": "2026-09-21",
-  "verification_note": "Rule text transcribed from ticket.py decide_s1 (code and docstring) and cross-read against BRIEF_FOR_AGENT.md on 2026-09-21. An independent reimplementation exists (ticket.py, shadow.py); the platform engine has NOT replicated it. Literature figures are UNVERIFIED against the original papers.",
-  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window fall outside the expected ranges above. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here."
+  "last_verified": "2026-09-28",
+  "verification_note": "Rule text transcribed from ticket.py decide_s1 (code and docstring, version 1) and cross-read against BRIEF_FOR_AGENT.md on 2026-09-21; parameters, instruments and schedule re-expressed on version 2 in the compiled rule's own vocabulary (sma_month_ends, weight_per_instrument, schedule, rebalance_policy) and checked to have ZERO drift against weightsim_rules::adapters::EtfTrendRule::declared_parameters() via replication::binding::check_declared_parameters (product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md section 2.3's RULE_DRIFT check). Literature citation (Faber 2007, SSRN 962461) CHECKED against the actual paper text on 2026-09-23: real paper, real rule as described; its specific Sharpe figures were NOT checked previously and, now checked, do not match the paper -- see expected_ranges[0].note. Version 2 replaces version 1's independent-pandas-reimplementation comparison with the platform's OWN certified backtester (weightsim_rules::ladder::replicate/verify), run against the embedded, SHA-pinned answer key -- this is the fixed-rule replication run that the certified agent reviewer reviews and signs (stage T4, sections 2.4/2.6). The served evidence label is never hand-declared here: it is derived at serve time from that signed run plus admission gate 9.10 (robustness floor), so this field's reference_only is only the declared baseline and says nothing about whether a review has happened. Item 2 (LIBRARY_ENTRY_ROBUSTNESS_PLAN.md section 2.2), 2026-09-28: citation_claims above was hand-authored by the same curator (plan's RECOMMENDED option (b), never LLM-extracted), reusing exactly the two facts this codebase already hand-verified against the actual paper text on 2026-09-23 above -- the phrase 'improved the Sharpe Ratio by 0.20' and the 1973-2008 sample window (also see citation_verification::certification::FABER_EXCERPT's own 'Hand-verified' comment, which independently records the same two facts for the WP8 test suite) -- not a fresh PDF re-extraction performed as part of writing this field. Deliberately NOT claimed: the buy/sell rule's exact sentence wording (FABER_EXCERPT's own comment marks that as reconstructed/unverified phrasing, not hand-verified against the real paper) and the retracted 0.81/0.68 absolute Sharpe figures. A real run of generate_library_citation_check against the live papers.ssrn.com URL in sources[0] returns an HTTP 403 Cloudflare bot-challenge page ('Just a moment...') to a non-browser client in this environment, so the automated fetch cannot independently confirm this claim against the live page today -- a disclosed limitation of this entry's citation verification (the claim rests on the 2026-09-23 hand-check of the paper text, not on an automated live fetch), not a pending sign-off; see that binary's own printed output and the PR description.",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the compiled reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window fall outside the expected ranges above; (d) a later decay_check replication run against this same rule_hash fails. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here.",
+  "flagship": true
 }

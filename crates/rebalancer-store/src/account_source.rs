@@ -523,14 +523,30 @@ fn parse_sleeves(plan: &PlanRow) -> Result<Vec<SleeveSpec>, ExclusionReason> {
 
 /// The platform's own library must hold the pinned entry at the pinned hash. Shared by both plan sources: a plan
 /// (of either origin) whose entry drifted from the platform's library is refused, never run on a different rule.
+///
+/// The OWNER PILOT row pins `etf_trend_faber` v1 at the hash of the pre-sync library schema, so its entry resolves
+/// against `legacy_pilot_library` (unchanged bytes, unchanged hash). Proposal plans resolve against the verbatim Engine
+/// copy ([`check_proposal_entry`]).
 fn check_entry(entry_id: &str, entry_version: i32, pinned_hash: &str) -> Result<(), ExclusionReason> {
+    let lib = mandate_core::legacy_pilot_library::seed_library().map_err(|e| ExclusionReason::EntryMismatch(format!("the pilot library did not load: {e}")))?;
+    let ids: Vec<(&str, u32, String)> = lib.iter().map(|e| (e.id.as_str(), e.version, mandate_core::legacy_pilot_library::entry_hash(e))).collect();
+    check_entry_in(&ids, entry_id, entry_version, pinned_hash)
+}
+
+/// [`check_entry`] for a PROPOSAL plan sleeve: the platform's library, the verbatim Engine copy.
+fn check_proposal_entry(entry_id: &str, entry_version: i32, pinned_hash: &str) -> Result<(), ExclusionReason> {
     let lib = seed_library().map_err(|e| ExclusionReason::EntryMismatch(format!("the platform library did not load: {e}")))?;
+    let ids: Vec<(&str, u32, String)> = lib.iter().map(|e| (e.id.as_str(), e.version, entry_hash(e))).collect();
+    check_entry_in(&ids, entry_id, entry_version, pinned_hash)
+}
+
+fn check_entry_in(lib: &[(&str, u32, String)], entry_id: &str, entry_version: i32, pinned_hash: &str) -> Result<(), ExclusionReason> {
     let version = u32::try_from(entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
-    let entry = lib
+    let (_, _, ours) = lib
         .iter()
-        .find(|e| e.id == entry_id && e.version == version)
+        .find(|(id, v, _)| *id == entry_id && *v == version)
         .ok_or_else(|| ExclusionReason::EntryMismatch(format!("the platform has no library entry {entry_id} version {version}")))?;
-    let ours = entry_hash(entry);
+    let ours = ours.clone();
     if ours != pinned_hash {
         return Err(ExclusionReason::EntryMismatch(format!("entry {entry_id} v{version}: the plan pins hash {pinned_hash} but the platform's is {ours}")));
     }
@@ -946,7 +962,7 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
     }
     let (mut sleeves, entries, points, cell_refs) = parse_proposal_sleeves(plan)?;
     for e in &entries {
-        check_entry(&e.entry_id, i32::try_from(e.entry_version).unwrap_or(i32::MAX), &e.entry_hash)?;
+        check_proposal_entry(&e.entry_id, i32::try_from(e.entry_version).unwrap_or(i32::MAX), &e.entry_hash)?;
     }
     // The implementation points, only now that the entries are known to be the platform's own.
     for (spec, point) in sleeves.iter_mut().zip(&points) {
@@ -1244,13 +1260,21 @@ mod tests {
         v
     }
 
-    fn library_hash(id: &str) -> String {
-        let lib = seed_library().unwrap();
-        entry_hash(lib.iter().find(|e| e.id == id && e.version == 1).unwrap())
+    /// The version of `id` the platform's (Engine-synced) library ships.
+    fn library_version(id: &str) -> u32 {
+        seed_library().unwrap().iter().filter(|e| e.id == id).map(|e| e.version).max().unwrap_or_else(|| panic!("{id} is in the library"))
     }
 
+    fn library_hash(id: &str) -> String {
+        let lib = seed_library().unwrap();
+        let v = library_version(id);
+        entry_hash(lib.iter().find(|e| e.id == id && e.version == v).unwrap())
+    }
+
+    /// The OWNER PILOT's pin: `etf_trend_faber` v1 in the legacy pilot library (the hash the live row carries).
     fn entry_hash_v1() -> String {
-        library_hash("etf_trend_faber")
+        let lib = mandate_core::legacy_pilot_library::seed_library().unwrap();
+        mandate_core::legacy_pilot_library::entry_hash(lib.iter().find(|e| e.id == "etf_trend_faber" && e.version == 1).unwrap())
     }
 
     fn plan_body(hash: &str) -> Value {
@@ -1264,7 +1288,7 @@ mod tests {
             "proposal_id": proposal_id.to_string(),
             "capital": {"amount": "5000.00", "ccy": "USD"},
             "risk_scale": risk_scale,
-            "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": 1, "entry_hash": library_hash(id), "weight": w})).collect::<Vec<_>>(),
+            "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": library_version(id), "entry_hash": library_hash(id), "weight": w})).collect::<Vec<_>>(),
         })
     }
 
@@ -2030,7 +2054,7 @@ mod tests {
         let decided = !matches!(status, CellStatus::Preregistered);
         Cell {
             rule_entry_id: "etf_trend_faber".to_string(),
-            rule_entry_version: 1,
+            rule_entry_version: library_version("etf_trend_faber"),
             universe_id: u.id.clone(),
             universe_version: u.version,
             universe_hash: universe_hash(u),
