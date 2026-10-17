@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "ruling": "R41",
+  "preregistered_at": "2026-10-17",
+  "asset_class": "us_etf",
+  "floors": {
+    "min_adv_20d_usd": 10000000,
+    "max_spread_bp": 5
+  },
+  "membership_source": "test fixture, not a real universe",
+  "reconstitution": "none",
+  "data_certificate_ref": "TEST-R22-CERT",
+  "cost_model_id": "certification_flat_10bps_per_side",
+  "id": "TEST-SEC9",
+  "construction_rule": "fixed published set (test fixture)",
+  "slots": [
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLB"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLE"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLF"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLI"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLK"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLP"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLU"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLV"
+    },
+    {
+      "asset_class_slot": "sector",
+      "filled_by": "FIXED-PUBLISHED-SET-v1",
+      "ticker": "XLY"
+    }
+  ]
+}

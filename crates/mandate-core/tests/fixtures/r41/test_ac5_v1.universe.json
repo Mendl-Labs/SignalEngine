@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "ruling": "R41",
+  "preregistered_at": "2026-10-17",
+  "asset_class": "us_etf",
+  "floors": {
+    "min_adv_20d_usd": 10000000,
+    "max_spread_bp": 5
+  },
+  "membership_source": "test fixture, not a real universe",
+  "reconstitution": "none",
+  "data_certificate_ref": "TEST-R22-CERT",
+  "cost_model_id": "certification_flat_10bps_per_side",
+  "id": "TEST-AC5",
+  "construction_rule": "ETF-SLOT-LARGEST-AUM-v1 over a test mapping table",
+  "slot_fill_table_hash": "abababababababababababababababababababababababababababababababab",
+  "slots": [
+    {
+      "asset_class_slot": "us_equity",
+      "filled_by": "ETF-SLOT-LARGEST-AUM-v1",
+      "ticker": "SPY",
+      "aum": {
+        "as_of": "2026-09-30",
+        "issuer_net_assets_usd": 500000000000,
+        "vendor_net_assets_usd": 500000001000,
+        "inception": "2004-01-01"
+      }
+    },
+    {
+      "asset_class_slot": "intl_equity",
+      "filled_by": "ETF-SLOT-LARGEST-AUM-v1",
+      "ticker": "EFA",
+      "aum": {
+        "as_of": "2026-09-30",
+        "issuer_net_assets_usd": 50000000000,
+        "vendor_net_assets_usd": 50000001000,
+        "inception": "2004-01-01"
+      }
+    },
+    {
+      "asset_class_slot": "us_bond",
+      "filled_by": "ETF-SLOT-LARGEST-AUM-v1",
+      "ticker": "IEF",
+      "aum": {
+        "as_of": "2026-09-30",
+        "issuer_net_assets_usd": 30000000000,
+        "vendor_net_assets_usd": 30000001000,
+        "inception": "2004-01-01"
+      }
+    },
+    {
+      "asset_class_slot": "commodity",
+      "filled_by": "ETF-SLOT-LARGEST-AUM-v1",
+      "ticker": "DBC",
+      "aum": {
+        "as_of": "2026-09-30",
+        "issuer_net_assets_usd": 2000000000,
+        "vendor_net_assets_usd": 2000001000,
+        "inception": "2004-01-01"
+      }
+    },
+    {
+      "asset_class_slot": "real_estate",
+      "filled_by": "ETF-SLOT-LARGEST-AUM-v1",
+      "ticker": "VNQ",
+      "aum": {
+        "as_of": "2026-09-30",
+        "issuer_net_assets_usd": 30000000000,
+        "vendor_net_assets_usd": 30000001000,
+        "inception": "2004-01-01"
+      }
+    }
+  ]
+}

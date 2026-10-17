@@ -46,3 +46,29 @@ the committed blob stays LF, hence `--no-filters` on a normalised file, or compa
 
 Change the Engine first. Then re-copy the files, update every hash above, regenerate
 `tests/mandate_unit_tests.rs`, and re-pin `tests/golden.rs` only after reading the diff of the canonical JSON.
+
+
+## R41 cell types (added 2026-10-17; rule x universe cells, certified-envelopes / R41-A)
+
+`src/replication/canon.rs` and `src/replication/universe.rs` are VERBATIM copies from the Engine (`BacktestingEngine`,
+`origin/main` at `07a03267401a6596849056ada0f6892ff769a80f`, PR #301 "R41 slice 2 -- universe, cell and family-ledger types").
+`src/replication/cell.rs` is that file with exactly two edits, both because the Engine's `ROBUST_PREMIA` citation table is
+Engine-only: the `use ...::robust_premia::{premium_documents_universe, ROBUST_PREMIA}` line and the "premium and
+documented_universes" check inside `validate` are removed, and the file's inline `#[cfg(test)]` modules (which build Engine
+`LibraryEntry` JSON and read the premia table) are not copied (replaced by `tests/cell_registry.rs`).
+
+| Item | Engine blob (`origin/main:program/...`) |
+|---|---|
+| `src/replication/canon.rs` | `f663e34b68e28df36301265bff1d854e81725ee1` |
+| `src/replication/universe.rs` | `f8b9648271068d9677f34bbf046c8698198c8b45` |
+| `src/replication/cell.rs` (before the two edits) | `76db6f401bdffe14623f85386ddc7093a89190b8` |
+
+NOT verbatim (new here): `src/replication/mod.rs`, `src/citation_verification/` (only the `AssetClass` enum, so
+`universe.rs` compiles unchanged; its serialised form is the Engine's), `src/cell_registry.rs` (the registry and the
+claim check the rebalancer uses) and `tests/cell_registry.rs`. The fixtures in `tests/fixtures/r41/` are the Engine's
+`program/tests/fixtures/r41/` files, byte for byte; `tests/cell_registry.rs` pins the Engine's universe and cell hashes
+over them, so any drift of the copied canonical-JSON code from the Engine fails a test here.
+
+The embedded universe and cell lists (`EMBEDDED_UNIVERSE_JSON`, `EMBEDDED_CELL_JSON`) are EMPTY, as in the Engine. To
+register a cell, add the sidecars to the Engine first, then copy them into those lists here; nothing is read from the
+environment by the rebalancer (`CellRegistry::platform` uses the embedded lists only).
