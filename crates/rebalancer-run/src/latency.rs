@@ -306,7 +306,7 @@ pub trait LatencyStore {
 /// The instruments a sleeve kind's rule reads (the reference rules' own symbol lists).
 pub fn instruments_for_kind(kind: SleeveKind, quote: &str) -> Vec<Instrument> {
     match kind {
-        SleeveKind::EtfTrend => ETF_SYMBOLS
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => ETF_SYMBOLS
             .iter()
             .map(|s| Instrument {
                 symbol: (*s).to_string(),
@@ -337,7 +337,7 @@ pub fn instruments_for_sleeves<'a>(
             } else {
                 // A sleeve at an envelope point reads ITS instruments (its proxies), not the published ones.
                 let quote = match s.kind {
-                    SleeveKind::EtfTrend => String::new(),
+                    SleeveKind::EtfTrend | SleeveKind::EtfMomentum => String::new(),
                     SleeveKind::CryptoTrend => s.quote.clone(),
                 };
                 s.rule_symbols().into_iter().map(|symbol| Instrument { symbol, kind: s.kind, quote: quote.clone() }).collect()

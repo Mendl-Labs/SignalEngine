@@ -214,7 +214,7 @@ impl DataSource for Vendor<'_> {
     fn sleeve_data(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<SleeveData, DataError> {
         let cutoff = as_of.pred_opt().expect("has a predecessor");
         let (days, cols, syms, window): (&[NaiveDate], &[Vec<f64>], Vec<String>, i64) = match sleeve.kind {
-            SleeveKind::EtfTrend => (&self.world.etf_days, &self.world.etf, ETF_SYMBOLS.iter().map(|s| (*s).to_string()).collect(), self.etf_window_days),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => (&self.world.etf_days, &self.world.etf, ETF_SYMBOLS.iter().map(|s| (*s).to_string()).collect(), self.etf_window_days),
             SleeveKind::CryptoTrend => (&self.world.crypto_days, &self.world.crypto, CRYPTO_SYMBOLS.iter().map(|s| (*s).to_string()).collect(), self.crypto_window_days),
         };
         let hi = days.partition_point(|d| *d <= cutoff);

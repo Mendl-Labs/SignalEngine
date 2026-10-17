@@ -249,7 +249,7 @@ impl SleeveFetcher for AlpacaBarsSource {
 
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         let r = match sleeve.kind {
-            SleeveKind::EtfTrend => self.fetch_etf(&sleeve.rule_symbols(), as_of),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => self.fetch_etf(&sleeve.rule_symbols(), as_of),
             SleeveKind::CryptoTrend => Err(MassiveError::Unsupported { detail: "Alpaca bars serve the ETF sleeve only; the crypto secondary is Kraken".to_string() }),
         };
         r.map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })

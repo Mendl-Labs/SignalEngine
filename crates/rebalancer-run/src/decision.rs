@@ -11,6 +11,13 @@
 //!   `Options::etf_live(as_of)`.
 //! * Crypto trend: yesterday's UTC bar (`as_of - 1`) and `decide_crypto_trend` with `Options::crypto_live(as_of)`.
 //!
+//! * ETF momentum (R41 cells, `Daily` schedule / `OnDecision` rebalance, Amendment 14): every completed daily bar is a
+//!   decision bar. The decision date is the newest bar of the panel (all instruments must share it, and it must be
+//!   strictly before `as_of` and at most `ETF_MAX_STALE_DAYS` old); the weights are Core's pure
+//!   `momentum_rank_weights` over the closes up to it (trailing-126-bar return, ascending-ticker tie-break, linear
+//!   rank weights `(K+1-r)/(K(K+1)/2)`, typed insufficient-history exclusion). The platform acts when this date is
+//!   newer than the last one acted on, exactly like the monthly ETF kind but with a bar, not a month-end, as the clock.
+//!
 //! # The in-tick cache
 //! [`EvalCache`] lives for ONE driver tick (`run_all_due` makes one per call) and is keyed so that a stale answer can
 //! never be served for a different question:
@@ -30,8 +37,10 @@ use std::sync::{Arc, Mutex};
 use chrono::NaiveDate;
 use rebalancer_core::dec_math::MathError;
 use rebalancer_core::planner::SleeveTarget;
+use reference_rules::months::missing_weekdays_between;
+use reference_rules::options::{ETF_MAX_MISSING_WEEKDAYS, ETF_MAX_STALE_DAYS};
 use reference_rules::{
-    data_fingerprint, decide_crypto_trend_with, latest_decision_date, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel, RuleError,
+    data_fingerprint, decide_crypto_trend_with, latest_decision_date, momentum_rank_weights, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel, RuleError, Signal,
 };
 
 use crate::cell_rules::{trend_weight_policy, TrendRuleBackend, TREND_BACKEND};
@@ -76,10 +85,26 @@ impl Evaluation {
     /// The planner target of `sleeve` for this decision.
     pub fn target(&self, sleeve: &SleeveSpec) -> Result<SleeveTarget, MathError> {
         match &self.rule {
+            // Rank weights are K different quotients, so converting each to its SHORTEST decimal can round a few up and push
+            // the sleeve's sum a few 1e-17 above 1 (the planner then refuses the plan: `WeightsExceedOne`). The target
+            // therefore carries each momentum weight floored to 12 decimals, which keeps the sum <= 1 for every K; the
+            // evidence in the run record keeps the rule's own f64 weights.
+            RuleDecision::Etf(d) if self.kind == SleeveKind::EtfMomentum => {
+                let mut floored = d.clone();
+                for i in &mut floored.instruments {
+                    i.weight = floor_weight(i.weight);
+                }
+                SleeveTarget::from_etf(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, &floored)
+            }
             RuleDecision::Etf(d) => SleeveTarget::from_etf(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, d),
             RuleDecision::Crypto(d) => SleeveTarget::from_crypto(&sleeve.id, sleeve.share, &sleeve.venue, &sleeve.asset_class, &sleeve.quote, d),
         }
     }
+}
+
+/// `w` floored to 12 decimals (never up): see [`Evaluation::target`].
+fn floor_weight(w: f64) -> f64 {
+    (w * 1e12).floor() / 1e12
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +178,7 @@ fn newest_bar(panel: &Panel) -> Option<NaiveDate> {
 ///
 /// * ETF: the decision date is the newest completed month-end of the point's own instruments; the tranche does NOT
 ///   move it (it delays ACTING, see `pipeline::step_decisions`).
+/// * ETF momentum: the newest completed bar (see [`decide_momentum`]); a cell has no tranche and no lookback override.
 /// * Crypto (a `Daily` kind): tranche `k` is a LAGGED DECISION, the rule evaluated at yesterday minus `k` days; the
 ///   live options then no longer require the panel to end on the decision date (the bars after it are ignored).
 fn decide(s: &SleeveSpec, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate, RuleDecision), RuleError> {
@@ -163,6 +189,10 @@ fn decide(s: &SleeveSpec, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate,
             let date = latest_decision_date(panel, &refs)?;
             let d = TREND_BACKEND.decide_trend(panel, date, &Options::etf_live(as_of), &refs, s.sma_lookback(), trend_weight_policy(s))?;
             Ok((date, RuleDecision::Etf(d)))
+        }
+        SleeveKind::EtfMomentum => {
+            let d = decide_momentum(panel, &refs, s.sma_lookback(), as_of)?;
+            Ok((d.decision_date, RuleDecision::Etf(d)))
         }
         SleeveKind::CryptoTrend => {
             let yesterday = as_of.pred_opt().unwrap_or(as_of);
@@ -176,6 +206,66 @@ fn decide(s: &SleeveSpec, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate,
             Ok((date, RuleDecision::Crypto(d)))
         }
     }
+}
+
+/// The momentum decision: Core's pure rank weights over the panel's closes up to its newest bar, after the checks a
+/// live panel needs that the simulator never faces (the simulator's history is causal by construction). Reported as an
+/// [`EtfDecision`] so the planner path is the ETF one: `close` is the decision-day close, `sma` the close one lookback
+/// earlier (so the evidence margin is the trailing return in bp), `signal` `Long` iff the instrument holds weight.
+fn decide_momentum(panel: &Panel, symbols: &[&str], lookback: usize, as_of: NaiveDate) -> Result<EtfDecision, RuleError> {
+    let mut series = Vec::with_capacity(symbols.len());
+    for &sym in symbols {
+        let s = panel.get(sym)?;
+        if s.last_date() >= as_of {
+            return Err(RuleError::FormingBar { symbol: sym.to_string(), bar_date: s.last_date(), as_of });
+        }
+        if (as_of - s.last_date()).num_days() > ETF_MAX_STALE_DAYS {
+            return Err(RuleError::StaleData { symbol: sym.to_string(), last_bar: s.last_date(), as_of, max_stale_days: ETF_MAX_STALE_DAYS });
+        }
+        series.push(s);
+    }
+    let Some(date) = series.iter().map(|s| s.last_date()).max() else {
+        return Err(RuleError::EmptySeries { symbol: String::new() });
+    };
+    // The rank reads bars by INDEX (126 back), so the instruments must have traded the same sessions: the newest bar
+    // is shared, and so is every date of the lookback window of each instrument that is long enough to be ranked.
+    let window = lookback + 1;
+    let mut reference: Option<&[NaiveDate]> = None;
+    for s in &series {
+        if s.last_date() != date {
+            return Err(RuleError::DateNotInPanel { symbol: s.symbol().to_string(), date });
+        }
+        if s.len() < window {
+            continue;
+        }
+        let dates = &s.dates()[s.len() - window..];
+        for w in dates.windows(2) {
+            let missing = missing_weekdays_between(w[0], w[1]);
+            if missing > ETF_MAX_MISSING_WEEKDAYS {
+                return Err(RuleError::DataGap { symbol: s.symbol().to_string(), from: w[0], to: w[1], missing, tolerance: ETF_MAX_MISSING_WEEKDAYS, weekdays: true });
+            }
+        }
+        match reference {
+            None => reference = Some(dates),
+            Some(r) => {
+                if let Some(i) = (0..window).find(|&i| r[i] != dates[i]) {
+                    return Err(RuleError::DateNotInPanel { symbol: s.symbol().to_string(), date: r[i] });
+                }
+            }
+        }
+    }
+    let closes: Vec<&[f64]> = series.iter().map(|s| s.closes()).collect();
+    let ranked = momentum_rank_weights(&closes, symbols, lookback);
+    let instruments = series
+        .iter()
+        .zip(&ranked.weights)
+        .map(|(s, &weight)| {
+            let last = s.closes()[s.len() - 1];
+            let base = if s.len() >= window { s.closes()[s.len() - window] } else { last };
+            InstrumentDecision { symbol: s.symbol().to_string(), close: last, sma: base, signal: if weight > 0.0 { Signal::Long } else { Signal::Cash }, weight }
+        })
+        .collect();
+    Ok(EtfDecision { decision_date: date, month_end_dates: Vec::new(), instruments })
 }
 
 fn build(s: &SleeveSpec, as_of: NaiveDate, fetched: &Fetched) -> Result<Evaluation, RuleError> {

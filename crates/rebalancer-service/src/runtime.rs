@@ -80,7 +80,7 @@ pub const PILOT_CRYPTO_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
 /// see [`symbols_for_sleeves`].
 pub fn symbols_for_kind(kind: SleeveKind) -> &'static [&'static str] {
     match kind {
-        SleeveKind::EtfTrend => &PILOT_ETF_SYMBOLS,
+        SleeveKind::EtfTrend | SleeveKind::EtfMomentum => &PILOT_ETF_SYMBOLS,
         SleeveKind::CryptoTrend => &PILOT_CRYPTO_SYMBOLS,
     }
 }
@@ -347,8 +347,9 @@ pub fn pilot_data_source_shadow<'a>(massive: &'a MassiveDataSource, gate: TwoSou
 pub fn shadow_gate(massive: &MassiveDataSource, lookup: impl Fn(&str) -> Option<String>, transport: Arc<dyn HttpTransport>) -> Result<TwoSourceGate<&MassiveDataSource>, String> {
     let alpaca = AlpacaBarsSource::from_lookup(&lookup, transport.clone())
         .map_err(|e| format!("DATA_GATE_SECONDARY_MISSING: the ETF secondary (Alpaca daily bars) needs {} and {}: {e}", market_data::alpaca_bars::ENV_KEY_ID, market_data::alpaca_bars::ENV_KEY_SECRET))?;
+    let alpaca = Arc::new(alpaca);
     let kraken = KrakenOhlcSource::new(transport);
-    Ok(TwoSourceGate::shadow(massive).with_secondary(SleeveKind::EtfTrend, Arc::new(alpaca)).with_secondary(SleeveKind::CryptoTrend, Arc::new(kraken)))
+    Ok(TwoSourceGate::shadow(massive).with_secondary(SleeveKind::EtfTrend, alpaca.clone()).with_secondary(SleeveKind::EtfMomentum, alpaca).with_secondary(SleeveKind::CryptoTrend, Arc::new(kraken)))
 }
 
 // ---------------------------------------------------------------------------------------------------------------

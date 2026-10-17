@@ -46,7 +46,7 @@ impl Policy {
 
     pub fn tolerance(&self, position: BarPosition) -> Tolerance {
         match position {
-            BarPosition::MonthEnd => self.etf_month_end,
+            BarPosition::MonthEnd | BarPosition::DailyClose => self.etf_month_end,
             BarPosition::DecisionDay => self.crypto_decision_day,
             BarPosition::Window => self.crypto_window,
         }

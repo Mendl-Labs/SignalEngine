@@ -193,7 +193,7 @@ impl SleeveFetcher for KrakenOhlcSource {
     fn fetch_sleeve(&self, sleeve: &SleeveSpec, as_of: NaiveDate) -> Result<FetchedSleeve, SleeveError> {
         let r = match sleeve.kind {
             SleeveKind::CryptoTrend => self.fetch_crypto(&sleeve.quote, as_of),
-            SleeveKind::EtfTrend => Err(MassiveError::Unsupported { detail: "Kraken OHLC serves the crypto sleeve only; the ETF secondary is Alpaca".to_string() }),
+            SleeveKind::EtfTrend | SleeveKind::EtfMomentum => Err(MassiveError::Unsupported { detail: "Kraken OHLC serves the crypto sleeve only; the ETF secondary is Alpaca".to_string() }),
         };
         r.map_err(|error| SleeveError { sleeve: sleeve.kind, as_of, error })
     }
