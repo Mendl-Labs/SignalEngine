@@ -51,7 +51,8 @@ pub mod tenants;
 
 pub use account_lock::PgAccountLock;
 pub use account_source::{
-    AccountScope, AccountSourceError, Enumeration, EnvelopeVerifier, Exclusion, ExclusionReason, NoEnvelopes, PilotAccount, PilotAllowList, PgAccountSource, PinnedEntry, PlanExecution, PlanPoint,
+    AccountScope, AccountSourceError, CellVerifier, Enumeration, EnvelopeVerifier, Exclusion, ExclusionReason, NoCells, NoEnvelopes, PilotAccount, PilotAllowList, PgAccountSource, PinnedEntry, PlanCell,
+    PlanExecution, PlanPoint,
 };
 pub use delivery_ledger::PgDeliveryLedger;
 pub use kill_flag::PgKillFlag;

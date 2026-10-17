@@ -384,3 +384,44 @@ fn an_account_whose_proxy_cannot_be_refreshed_gets_no_runtime() {
     let err = connect_account_alpaca_for_sleeves(PAPER_KEY, SECRET, PAPER_BASE_URL, t, None, &[proxy_etf_sleeve()]).unwrap_err();
     assert!(matches!(&err, RuntimeError::AssetRefresh { symbol, .. } if symbol == "IVV"), "{err}");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// R41 cells: the asset refresh covers the cell's whole universe (9 and 11 names), and refuses an unknown one
+// ---------------------------------------------------------------------------------------------------------------
+
+const CELL_SEC9: [&str; 9] = ["XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"];
+const CELL_AC11: [&str; 11] = ["SPY", "EFA", "IEF", "DBC", "VNQ", "IWM", "EEM", "TLT", "LQD", "HYG", "GLD"];
+
+fn cell_etf_sleeve(tickers: &[&str]) -> SleeveSpec {
+    SleeveSpec { instruments: tickers.iter().map(|s| s.to_string()).collect(), ..sleeve("alpaca", "us_etf") }
+}
+
+#[test]
+fn a_cell_account_refreshes_every_instrument_of_its_universe_into_the_verified_asset_table() {
+    for tickers in [&CELL_SEC9[..], &CELL_AC11[..]] {
+        let sleeves = [cell_etf_sleeve(tickers)];
+        assert_eq!(symbols_for_sleeves(&sleeves), tickers.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let t = Arc::new(FakeTransport::new());
+        t.enqueue_json(200, &account_json("PA3TESTFIXT1"));
+        for sym in tickers {
+            t.enqueue_json(200, &asset_json(sym, "us_equity"));
+        }
+        let ok = connect_account_alpaca_for_sleeves(PAPER_KEY, SECRET, PAPER_BASE_URL, t.clone(), None, &sleeves).unwrap();
+        assert_eq!(t.request_count(), 1 + tickers.len(), "one account read and one refresh per instrument");
+        for sym in tickers {
+            assert!(ok.assets().lookup(sym).is_some(), "{sym} is verified into the table");
+        }
+    }
+}
+
+#[test]
+fn a_cell_account_with_an_instrument_the_venue_does_not_know_gets_no_runtime() {
+    let t = Arc::new(FakeTransport::new());
+    t.enqueue_json(200, &account_json("PA3TESTFIXT1"));
+    for sym in &CELL_SEC9[..4] {
+        t.enqueue_json(200, &asset_json(sym, "us_equity"));
+    }
+    t.enqueue_json(404, r#"{"message":"asset not found"}"#); // XLK is unknown to the venue
+    let err = connect_account_alpaca_for_sleeves(PAPER_KEY, SECRET, PAPER_BASE_URL, t, None, &[cell_etf_sleeve(&CELL_SEC9)]).unwrap_err();
+    assert!(matches!(&err, RuntimeError::AssetRefresh { symbol, .. } if symbol == "XLK"), "{err}");
+}

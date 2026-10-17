@@ -69,9 +69,12 @@ use broker_adapters::Dec;
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{Array, BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
+use mandate_core::cell_registry::{CellClaim, CellRefusal, CellRegistry, VerifiedCell};
 use mandate_core::mandate::{canonical_hash, validate_json, AgentAction, AutonomyLevel, MandateBody};
+use mandate_core::replication::cell::WeightPolicy as CellWeightPolicy;
 use mandate_core::strategy_library::{entry_hash, seed_library};
 use rebalancer_core::policy::{MandateEnvelope, MandateStatus};
+use rebalancer_run::cell_rules::sleeve_max_gross;
 use rebalancer_run::data::{SleeveKind, SleeveSpec};
 use rebalancer_run::driver::{AccountSource, ActiveAccount};
 use rebalancer_run::record::ExecutionMode;
@@ -269,6 +272,14 @@ pub enum ExclusionReason {
     /// A sleeve's implementation point is not inside the platform's pre-registered envelope for its entry (or no
     /// envelope is available to prove it is), or is malformed, or names something this runtime cannot run.
     PointOutsideEnvelope(String),
+    /// A cell sleeve (R41 rule x universe) the platform's cell registry did not accept: not registered, or registered
+    /// but not runnable. Never run at the published point instead.
+    CellRefused(CellRefusal),
+    /// A cell sleeve this runtime cannot execute (a rule family without a runtime, a non-ETF cell, a weight policy
+    /// the runtime does not apply, or a malformed instrument list).
+    CellNotExecutable(String),
+    /// The plan's maximum gross exposure, with its cell sleeve(s), would exceed the mandate's `exposure.max_gross`.
+    CellGrossExceedsMandate(String),
 }
 
 impl ExclusionReason {
@@ -296,6 +307,9 @@ impl ExclusionReason {
             ExclusionReason::AmbiguousProposalPlans { .. } => "PILOT_PROPOSAL_PLANS_AMBIGUOUS",
             ExclusionReason::ProposalPlanNotServable { .. } => "PILOT_PROPOSAL_PLAN_NOT_SERVABLE",
             ExclusionReason::PointOutsideEnvelope(_) => "PILOT_POINT_OUTSIDE_ENVELOPE",
+            ExclusionReason::CellRefused(r) => r.code(),
+            ExclusionReason::CellNotExecutable(_) => "PILOT_CELL_NOT_EXECUTABLE",
+            ExclusionReason::CellGrossExceedsMandate(_) => "PILOT_CELL_GROSS_EXCEEDS_MANDATE",
         }
     }
 }
@@ -535,7 +549,7 @@ fn dec_from_f64(name: &str, v: f64) -> Result<Dec, ExclusionReason> {
 /// The sleeves of a proposal plan (`PlanBody`): `share = weight * risk_scale`, kind from [`ENTRY_SLEEVE_KINDS`],
 /// venue/asset class/quote from the kind. Returns the sleeves and the entries they pin, in order.
 /// The sleeves, pinned entries and (frozen) implementation points of one proposal plan, in sleeve order.
-type ParsedProposalSleeves = (Vec<SleeveSpec>, Vec<PinnedEntry>, Vec<Option<PlanPoint>>);
+type ParsedProposalSleeves = (Vec<SleeveSpec>, Vec<PinnedEntry>, Vec<Option<PlanPoint>>, Vec<Option<PlanCell>>);
 
 fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeves, ExclusionReason> {
     let bad = |m: String| ExclusionReason::PlanBodyInvalid(m);
@@ -559,6 +573,7 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeve
     let mut sleeves: Vec<SleeveSpec> = Vec::new();
     let mut entries: Vec<PinnedEntry> = Vec::new();
     let mut points: Vec<Option<PlanPoint>> = Vec::new();
+    let mut cell_refs: Vec<Option<PlanCell>> = Vec::new();
     let mut total = Dec::ZERO;
     for (i, s) in arr.iter().enumerate() {
         let entry_id = s.get("entry_id").and_then(Value::as_str).ok_or_else(|| bad(format!("sleeve {i}: entry_id missing or not a string")))?.to_string();
@@ -572,8 +587,18 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeve
         if sleeves.iter().any(|o| o.id == entry_id) {
             return Err(bad(format!("entry {entry_id} appears twice")));
         }
-        let kind = sleeve_kind_for_entry(&entry_id)
-            .ok_or_else(|| ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: no sleeve kind is registered for this library entry (ENTRY_SLEEVE_KINDS)")))?;
+        let cell_ref = parse_cell_ref(i, s)?;
+        let kind = match (sleeve_kind_for_entry(&entry_id), cell_ref.is_some()) {
+            (Some(k), false) => k,
+            (Some(SleeveKind::EtfTrend), true) => SleeveKind::EtfTrend,
+            (Some(_), true) => return Err(ExclusionReason::CellNotExecutable(format!("sleeve {entry_id}: only long-only ETF cells execute"))),
+            (None, true) => {
+                return Err(ExclusionReason::CellNotExecutable(format!(
+                    "sleeve {entry_id}: no executable rule family is registered for this cell's rule (the momentum family has no runtime yet)"
+                )))
+            }
+            (None, false) => return Err(ExclusionReason::UnsupportedSleeve(format!("sleeve {entry_id}: no sleeve kind is registered for this library entry (ENTRY_SLEEVE_KINDS)"))),
+        };
         let weight = dec_from_f64(&format!("sleeve {entry_id}: weight"), weight_f)?;
         if weight <= Dec::ZERO || weight > one {
             return Err(bad(format!("sleeve {entry_id}: weight {weight} is not in (0, 1]")));
@@ -587,13 +612,18 @@ fn parse_proposal_sleeves(plan: &ProposalPlanRow) -> Result<ParsedProposalSleeve
         // The sleeve id is the entry id: stable, part of the run key and every order tag, unique within the plan.
         sleeves.push(SleeveSpec { id: entry_id.clone(), kind, share, venue: PLAN_VENUE.to_string(), asset_class: asset_class.to_string(), quote: quote.to_string(), instruments: Vec::new(), tranche_sessions: 0, lookback: None });
         let version = u32::try_from(entry_version).map_err(|_| ExclusionReason::EntryMismatch("negative entry version".into()))?;
-        points.push(parse_point(i, &entry_id, version, s)?);
+        let point = parse_point(i, &entry_id, version, s)?;
+        if point.is_some() && cell_ref.is_some() {
+            return Err(bad(format!("sleeve {i}: names both a point and a cell; a sleeve is one or the other")));
+        }
+        points.push(point);
+        cell_refs.push(cell_ref);
         entries.push(PinnedEntry { entry_id, entry_version: version, entry_hash });
     }
     if total > cap {
         return Err(bad(format!("the sleeve weights sum to {total}, above 1")));
     }
-    Ok((sleeves, entries, points))
+    Ok((sleeves, entries, points, cell_refs))
 }
 
 /// A plan sleeve's implementation point, exactly as the Engine froze it in the immutable plan body
@@ -627,6 +657,69 @@ impl EnvelopeVerifier for NoEnvelopes {
             point.entry_id, point.entry_version, point.envelope_hash
         ))
     }
+}
+
+/// Proves a plan sleeve's R41 cell is one the PLATFORM registered (rule entry, universe, cell and weight policy all
+/// equal a registered cell) and hands back the universe's instruments. `Err` is a typed refusal. A verifier must hold
+/// the platform's own sidecars, never anything from the plan.
+pub trait CellVerifier: Send + Sync {
+    fn verify(&self, claim: &CellClaim) -> Result<VerifiedCell, CellRefusal>;
+}
+
+/// The verifier of a build with no registered cells: every cell is refused (`PILOT_CELL_NOT_REGISTERED`). The
+/// default, so a plan that carries no cell reference is the only kind that ever runs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCells;
+
+impl CellVerifier for NoCells {
+    fn verify(&self, claim: &CellClaim) -> Result<VerifiedCell, CellRefusal> {
+        Err(CellRefusal::NotRegistered(format!("this build registers no R41 cells (claimed cell {})", claim.cell_hash)))
+    }
+}
+
+impl CellVerifier for CellRegistry {
+    fn verify(&self, claim: &CellClaim) -> Result<VerifiedCell, CellRefusal> {
+        CellRegistry::verify(self, claim)
+    }
+}
+
+/// A plan sleeve's cell reference, exactly as the plan body carries it. The rule entry is the sleeve's own
+/// `entry_id`/`entry_version`/`entry_hash`; nothing about the universe's instruments comes from the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCell {
+    pub universe_hash: String,
+    pub cell_hash: String,
+    pub weight_policy: CellWeightPolicy,
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The `cell` of one `body.sleeves[i]`: absent or `null` = `None` (not a cell sleeve). Strict: exactly the three
+/// keys `universe_hash`, `cell_hash`, `weight_policy`.
+fn parse_cell_ref(i: usize, s: &Value) -> Result<Option<PlanCell>, ExclusionReason> {
+    let bad = |m: String| ExclusionReason::PlanBodyInvalid(format!("sleeve {i}: cell: {m}"));
+    let c = match s.get("cell") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(c) => c,
+    };
+    let obj = c.as_object().ok_or_else(|| bad("not an object".into()))?;
+    if let Some(extra) = obj.keys().find(|k| !matches!(k.as_str(), "universe_hash" | "cell_hash" | "weight_policy")) {
+        return Err(bad(format!("unknown key {extra:?}")));
+    }
+    let hash = |k: &str| -> Result<String, ExclusionReason> {
+        let h = obj.get(k).and_then(Value::as_str).ok_or_else(|| bad(format!("{k} missing or not a string")))?;
+        if !is_sha256_hex(h) {
+            return Err(bad(format!("{k} is not 64 lowercase hex characters")));
+        }
+        Ok(h.to_string())
+    };
+    let weight_policy = obj
+        .get("weight_policy")
+        .ok_or_else(|| bad("weight_policy missing".into()))
+        .and_then(|v| serde_json::from_value::<CellWeightPolicy>(v.clone()).map_err(|_| bad(format!("weight_policy {v} is not one of fixed_constant, equal_1_over_N"))))?;
+    Ok(Some(PlanCell { universe_hash: hash("universe_hash")?, cell_hash: hash("cell_hash")?, weight_policy }))
 }
 
 /// The `point` of one `body.sleeves[i]`: absent or `null` = `None` (the published point).
@@ -729,6 +822,51 @@ fn apply_point(spec: &mut SleeveSpec, point: &PlanPoint, verifier: &dyn Envelope
     Ok(())
 }
 
+/// Fill a cell sleeve from the platform's registered cell, after proving the plan's reference equals it. The
+/// instruments are the REGISTERED universe's, in slot order; the cell runs at the published timing (no tranche) and
+/// lookback (the cell inherits both from the certified rule).
+fn apply_cell(spec: &mut SleeveSpec, entry: &PinnedEntry, cell: &PlanCell, cells: &dyn CellVerifier) -> Result<(), ExclusionReason> {
+    let claim = CellClaim {
+        rule_entry_id: entry.entry_id.clone(),
+        rule_entry_version: entry.entry_version,
+        rule_entry_hash: entry.entry_hash.clone(),
+        universe_hash: cell.universe_hash.clone(),
+        cell_hash: cell.cell_hash.clone(),
+        weight_policy: cell.weight_policy,
+    };
+    let verified = cells.verify(&claim).map_err(ExclusionReason::CellRefused)?;
+    let not_executable = |m: String| ExclusionReason::CellNotExecutable(format!("sleeve {}: {m}", spec.id));
+    if spec.kind != SleeveKind::EtfTrend {
+        return Err(not_executable("only long-only ETF cells execute".into()));
+    }
+    if verified.weight_policy != CellWeightPolicy::EqualOverN {
+        return Err(not_executable(format!("weight policy {:?} is not applied by this runtime (only equal_1_over_N)", verified.weight_policy)));
+    }
+    if verified.instruments.len() < 5 {
+        return Err(not_executable(format!("a trend cell needs at least 5 instruments, the registered universe has {}", verified.instruments.len())));
+    }
+    for inst in &verified.instruments {
+        if inst.is_empty() || !inst.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.') {
+            return Err(not_executable(format!("'{inst}' is not a plain exchange-traded ticker")));
+        }
+    }
+    spec.instruments = verified.instruments;
+    spec.tranche_sessions = 0;
+    spec.lookback = None;
+    Ok(())
+}
+
+/// The plan's maximum gross exposure (every sleeve at its full long position) must fit the mandate's
+/// `exposure.max_gross`. Evaluated for plans that carry a cell only, so every other plan is judged exactly as before.
+fn check_cell_gross(sleeves: &[SleeveSpec], body: &MandateBody) -> Result<(), ExclusionReason> {
+    let planned: f64 = sleeves.iter().map(sleeve_max_gross).sum();
+    let cap = body.exposure.max_gross;
+    if planned > cap + 1e-9 {
+        return Err(ExclusionReason::CellGrossExceedsMandate(format!("the plan can reach {planned:.6}x gross but the mandate's exposure.max_gross is {cap}")));
+    }
+    Ok(())
+}
+
 fn derive_mode(body: &MandateBody, execution: PlanExecution) -> Result<ExecutionMode, ExclusionReason> {
     match body.autonomy.level {
         AutonomyLevel::L3 => Err(ExclusionReason::AutonomyL3),
@@ -795,7 +933,7 @@ fn evaluate_pilot_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMa
     })
 }
 
-fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, candidates: &[&ProposalPlanRow], verifier: &dyn EnvelopeVerifier) -> Result<PilotAccount, ExclusionReason> {
+fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &CheckedMandate<'_>, candidates: &[&ProposalPlanRow], verifier: &dyn EnvelopeVerifier, cells: &dyn CellVerifier) -> Result<PilotAccount, ExclusionReason> {
     if candidates.len() > 1 {
         return Err(ExclusionReason::AmbiguousProposalPlans { count: candidates.len() });
     }
@@ -806,7 +944,7 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
     if plan.mandate_id != mandate.row.id || plan.mandate_version != mandate.row.version {
         return Err(ExclusionReason::PlanBoundToOtherMandate { plan_version: plan.mandate_version, active_version: mandate.row.version });
     }
-    let (mut sleeves, entries, points) = parse_proposal_sleeves(plan)?;
+    let (mut sleeves, entries, points, cell_refs) = parse_proposal_sleeves(plan)?;
     for e in &entries {
         check_entry(&e.entry_id, i32::try_from(e.entry_version).unwrap_or(i32::MAX), &e.entry_hash)?;
     }
@@ -815,6 +953,16 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
         if let Some(point) = point {
             apply_point(spec, point, verifier)?;
         }
+    }
+    // The R41 cells, only now that the entries are known to be the platform's own. A plan without a cell never
+    // reaches the registry or the gross guard.
+    for ((spec, entry), cell) in sleeves.iter_mut().zip(&entries).zip(&cell_refs) {
+        if let Some(cell) = cell {
+            apply_cell(spec, entry, cell, cells)?;
+        }
+    }
+    if cell_refs.iter().any(Option::is_some) {
+        check_cell_gross(&sleeves, &mandate.body)?;
     }
     // A proposal plan has no `execution` column: it asks for orders exactly when the mandate grants them.
     let execution = if mandate.body.autonomy.level == AutonomyLevel::L2 && mandate.body.autonomy.may.contains(&AgentAction::PlaceOrders) {
@@ -836,7 +984,7 @@ fn evaluate_proposal_plan(target: Target, cred: &CredentialRow, mandate: &Checke
     Ok(PilotAccount { active, origin: PlanOrigin::Proposal, plan_id: plan.id, execution, credential_label: cred.label.clone(), credential_fingerprint: None, entries })
 }
 
-fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier) -> Result<PilotAccount, ExclusionReason> {
+fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier, cells: &dyn CellVerifier) -> Result<PilotAccount, ExclusionReason> {
     let Target { tenant_id, account_id } = target;
     // --- credential: paper Alpaca, enabled, not deleted, of THIS tenant.
     let cred = rows.credentials.iter().find(|c| c.id == account_id && c.tenant_id == tenant_id).ok_or(ExclusionReason::CredentialNotFound)?;
@@ -875,7 +1023,7 @@ fn evaluate_one(target: Target, rows: &Rows, serve_proposal_plans: bool, verifie
     let proposal_plans: Vec<&ProposalPlanRow> = rows.proposal_plans.iter().filter(|p| p.account_id == account_id && p.tenant_id == tenant_id && p.state != "closed").collect();
     match pilot_plan {
         Some(plan) => evaluate_pilot_plan(target, cred, &mandate, plan, !proposal_plans.is_empty()),
-        None if serve_proposal_plans && !proposal_plans.is_empty() => evaluate_proposal_plan(target, cred, &mandate, &proposal_plans, verifier),
+        None if serve_proposal_plans && !proposal_plans.is_empty() => evaluate_proposal_plan(target, cred, &mandate, &proposal_plans, verifier, cells),
         None => Err(ExclusionReason::NoPilotPlan),
     }
 }
@@ -888,10 +1036,16 @@ pub(crate) fn evaluate(targets: &[Target], rows: &Rows, serve_proposal_plans: bo
 }
 
 /// [`evaluate`] with the envelope verifier that proves non-published implementation points.
+#[cfg(test)]
 pub(crate) fn evaluate_with(targets: &[Target], rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier) -> Enumeration {
+    evaluate_with_cells(targets, rows, serve_proposal_plans, verifier, &NoCells)
+}
+
+/// [`evaluate_with`] plus the verifier that proves a plan sleeve's R41 cell is one the platform registered.
+pub(crate) fn evaluate_with_cells(targets: &[Target], rows: &Rows, serve_proposal_plans: bool, verifier: &dyn EnvelopeVerifier, cells: &dyn CellVerifier) -> Enumeration {
     let mut out = Enumeration::default();
     for target in targets {
-        match evaluate_one(*target, rows, serve_proposal_plans, verifier) {
+        match evaluate_one(*target, rows, serve_proposal_plans, verifier, cells) {
             Ok(a) => out.accounts.push(a),
             Err(reason) => out.exclusions.push(Exclusion { account_id: target.account_id, reason }),
         }
@@ -920,6 +1074,7 @@ pub struct PgAccountSource {
     provenance: Option<Arc<PlanProvenanceRegistry>>,
     last_exclusions: Mutex<Vec<Exclusion>>,
     envelopes: Arc<dyn EnvelopeVerifier>,
+    cells: Arc<dyn CellVerifier>,
 }
 
 const PROPOSAL_PLAN_COLUMNS: &str = "id, tenant_id, proposal_id, account_id, mandate_id, mandate_version, mode::text AS mode, state::text AS state, body";
@@ -931,13 +1086,20 @@ impl PgAccountSource {
     }
 
     pub fn with_scope(pool: Pool, scope: AccountScope) -> Result<Self, String> {
-        Ok(Self { bridge: Bridge::new(pool)?, scope, provenance: None, last_exclusions: Mutex::new(Vec::new()), envelopes: Arc::new(NoEnvelopes) })
+        Ok(Self { bridge: Bridge::new(pool)?, scope, provenance: None, last_exclusions: Mutex::new(Vec::new()), envelopes: Arc::new(NoEnvelopes), cells: Arc::new(NoCells) })
     }
 
     /// The verifier that proves a plan sleeve's non-published implementation point is inside the platform's
     /// pre-registered envelope. Without one, [`NoEnvelopes`] refuses every non-published point.
     pub fn with_envelope_verifier(mut self, verifier: Arc<dyn EnvelopeVerifier>) -> Self {
         self.envelopes = verifier;
+        self
+    }
+
+    /// The verifier that proves a plan sleeve's R41 cell is one the platform registered. Without one, [`NoCells`]
+    /// refuses every cell sleeve.
+    pub fn with_cell_verifier(mut self, verifier: Arc<dyn CellVerifier>) -> Self {
+        self.cells = verifier;
         self
     }
 
@@ -1032,7 +1194,7 @@ impl PgAccountSource {
     /// runs nothing this tick), never an empty list dressed up as success.
     pub fn enumerate(&self) -> Result<Enumeration, AccountSourceError> {
         let (targets, rows) = self.fetch()?;
-        let result = evaluate_with(&targets, &rows, self.scope.serves_proposal_plans(), self.envelopes.as_ref());
+        let result = evaluate_with_cells(&targets, &rows, self.scope.serves_proposal_plans(), self.envelopes.as_ref(), self.cells.as_ref());
         *self.last_exclusions.lock().unwrap_or_else(|e| e.into_inner()) = result.exclusions.clone();
         if let Some(reg) = &self.provenance {
             reg.set_all(result.accounts.iter().map(|a| (a.active.account_id.clone(), PlanProvenance { origin: a.origin, plan_id: a.plan_id, venue_environment: VenueEnvironment::Paper })));
@@ -1841,5 +2003,260 @@ mod tests {
         assert_eq!(sleeve_kind_for_entry("crypto_trend_100d"), Some(SleeveKind::CryptoTrend));
         assert_eq!(sleeve_kind_for_entry("fx_tsmom_12m"), None, "FX has no runnable sleeve kind in this service");
         assert_eq!(sleeve_kind_for_entry(""), None);
+    }
+
+    // ----- R41 cells (rule x universe) -----------------------------------------------------------------------------
+
+    use mandate_core::replication::cell::{cell_hash, AdmissionReason, Cell, CellStatus, EnvelopeRef};
+    use mandate_core::replication::universe::{parse_universe, universe_hash, Slot, Universe};
+
+    const CELL_FULL: [&str; 4] = ["place_orders", "cancel_orders", "halt", "flatten"];
+
+    fn sec9() -> Universe {
+        parse_universe(include_str!("../../mandate-core/tests/fixtures/r41/test_sec9_v1.universe.json")).unwrap()
+    }
+
+    /// 11 slots: the fixture's 5 plus six fixed-set ETFs (a test universe, not a real R41 universe).
+    fn ac11() -> Universe {
+        let mut u = parse_universe(include_str!("../../mandate-core/tests/fixtures/r41/test_ac5_v1.universe.json")).unwrap();
+        u.id = "TEST-AC11".to_string();
+        for t in ["IWM", "EEM", "TLT", "LQD", "HYG", "GLD"] {
+            u.slots.push(Slot { asset_class_slot: format!("slot_{t}"), filled_by: "fixed-set".to_string(), ticker: t.to_string(), aum: None });
+        }
+        u
+    }
+
+    fn cell_of(u: &Universe, policy: CellWeightPolicy, status: CellStatus) -> Cell {
+        let decided = !matches!(status, CellStatus::Preregistered);
+        Cell {
+            rule_entry_id: "etf_trend_faber".to_string(),
+            rule_entry_version: 1,
+            universe_id: u.id.clone(),
+            universe_version: u.version,
+            universe_hash: universe_hash(u),
+            family_id: "TEST-FAMILY".to_string(),
+            premium_ref: "trend_time_series_momentum".to_string(),
+            weight_policy: policy,
+            n: (policy == CellWeightPolicy::EqualOverN).then_some(u.n() as u32),
+            derived_weight: policy.derive(u.n()),
+            envelope_ref: EnvelopeRef { envelope_id: "test.envelope".to_string(), envelope_hash: "cd".repeat(32) },
+            cost_model_id: u.cost_model_id.clone(),
+            ruling: Some("R41".to_string()),
+            preregistered_at: Some("2026-10-17".to_string()),
+            status,
+            evaluation_refs: if decided { vec!["run-1".to_string()] } else { vec![] },
+            admission: matches!(status, CellStatus::Admitted | CellStatus::PaperOnly | CellStatus::Held).then(|| AdmissionReason {
+                t_months: 96,
+                power_at_sr_0_5: 0.38,
+                family_n: 4,
+                expected_spurious: 0.05 * 4.0,
+                rho_to_canonical: Some(0.8),
+                reason: "test".to_string(),
+            }),
+        }
+    }
+
+    fn registry_of(pairs: &[(&Universe, &Cell)]) -> CellRegistry {
+        let universes: BTreeMap<String, Universe> = pairs.iter().map(|(u, _)| (u.key(), (*u).clone())).collect();
+        CellRegistry::from_parts(&universes, pairs.iter().map(|(_, c)| (*c).clone()).collect(), &seed_library().unwrap()).unwrap()
+    }
+
+    fn cell_ref_json(c: &Cell, policy: &str) -> Value {
+        json!({"universe_hash": c.universe_hash, "cell_hash": cell_hash(c), "weight_policy": policy})
+    }
+
+    /// A proposal plan whose ETF trend sleeve (weight 1.0, risk scale 1.0) is the cell `c`.
+    fn cell_rows(c: &Cell) -> Rows {
+        let mut rows = proposal_rows("L2", &CELL_FULL, 1.0, &[("etf_trend_faber", 1.0)]);
+        rows.proposal_plans[0].body["sleeves"][0]["cell"] = cell_ref_json(c, "equal_1_over_N");
+        rows
+    }
+
+    fn evaluate_cells(rows: &Rows, cells: &dyn CellVerifier) -> Enumeration {
+        let targets = targets_for(&AccountScope::PilotAndProposals { pilot: Some(allow()) }, &rows.proposal_plans);
+        evaluate_with_cells(&targets, rows, true, &NoEnvelopes, cells)
+    }
+
+    fn refused_with(rows: &Rows, cells: &dyn CellVerifier) -> ExclusionReason {
+        let e = evaluate_cells(rows, cells);
+        assert!(e.accounts.is_empty(), "served: {:?}", e.accounts);
+        assert_eq!(e.exclusions.len(), 1, "{:?}", e.exclusions);
+        e.exclusions.into_iter().next().unwrap().reason
+    }
+
+    #[test]
+    fn a_registered_cell_sleeve_runs_on_the_registered_universes_instruments_for_9_and_11_names() {
+        for (u, n) in [(sec9(), 9usize), (ac11(), 11)] {
+            let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+            let reg = registry_of(&[(&u, &c)]);
+            let e = evaluate_cells(&cell_rows(&c), &reg);
+            assert!(e.exclusions.is_empty(), "N = {n}: {:?}", e.exclusions);
+            let s = &e.accounts[0].active.sleeves[0];
+            assert_eq!(s.kind, SleeveKind::EtfTrend);
+            assert_eq!(s.id, "etf_trend_faber");
+            assert_eq!(s.instruments, u.slots.iter().map(|x| x.ticker.clone()).collect::<Vec<_>>(), "the instruments are the platform's universe, in slot order");
+            assert_eq!(s.instruments.len(), n);
+            assert_eq!((s.tranche_sessions, s.lookback), (0, None), "the cell inherits the certified timing and lookback");
+            assert!(!s.is_published_point());
+            assert_eq!((s.venue.as_str(), s.asset_class.as_str()), ("alpaca", "us_etf"));
+            assert_eq!(s.share, Dec::parse("1").unwrap());
+        }
+    }
+
+    #[test]
+    fn an_unregistered_cell_is_refused_with_the_typed_code_and_never_run_at_the_published_point() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let rows = cell_rows(&c);
+        // The default build (no registry), an empty registry and a registry holding some OTHER cell all refuse.
+        let other = ac11();
+        let other_cell = cell_of(&other, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        for verifier in [&NoCells as &dyn CellVerifier, &CellRegistry::empty(), &registry_of(&[(&other, &other_cell)])] {
+            let reason = refused_with(&rows, verifier);
+            assert_eq!(reason.code(), "PILOT_CELL_NOT_REGISTERED", "{reason:?}");
+            assert!(matches!(reason, ExclusionReason::CellRefused(_)));
+        }
+        // A claim that differs from the registered cell in ANY component is the same refusal.
+        let reg = registry_of(&[(&u, &c)]);
+        assert!(evaluate_cells(&rows, &reg).exclusions.is_empty());
+        for tamper in [
+            |v: &mut Value| v["universe_hash"] = json!("0".repeat(64)),
+            |v: &mut Value| v["cell_hash"] = json!("0".repeat(64)),
+            |v: &mut Value| v["weight_policy"] = json!("fixed_constant"),
+        ] {
+            let mut rows = cell_rows(&c);
+            tamper(&mut rows.proposal_plans[0].body["sleeves"][0]["cell"]);
+            assert_eq!(refused_with(&rows, &reg).code(), "PILOT_CELL_NOT_REGISTERED");
+        }
+        let mut rows = cell_rows(&c);
+        rows.proposal_plans[0].body["sleeves"][0]["entry_hash"] = json!("1".repeat(64));
+        assert_eq!(refused_with(&rows, &reg).code(), "PILOT_ENTRY_MISMATCH", "a drifted rule entry is refused before the cell is looked at");
+    }
+
+    #[test]
+    fn a_registered_but_unadmitted_cell_is_not_runnable() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Held);
+        let reg = registry_of(&[(&u, &c)]);
+        assert_eq!(refused_with(&cell_rows(&c), &reg).code(), "PILOT_CELL_NOT_RUNNABLE");
+    }
+
+    #[test]
+    fn plans_without_a_cell_are_served_identically_whatever_the_cell_verifier_is() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &c)]);
+        let rows = proposal_rows("L2", &CELL_FULL, 0.8, &[("etf_trend_faber", 0.6), ("crypto_trend_100d", 0.4)]);
+        let plain = evaluate_serving(&rows);
+        assert!(plain.exclusions.is_empty(), "{:?}", plain.exclusions);
+        assert_eq!(evaluate_cells(&rows, &reg), plain, "a populated registry changes nothing for a plan with no cell");
+        assert_eq!(evaluate_cells(&rows, &NoCells), plain);
+        assert!(plain.accounts[0].active.sleeves.iter().all(|s| s.is_published_point()));
+        // A `cell: null` is the same as no cell key.
+        let mut with_null = rows.clone();
+        with_null.proposal_plans[0].body["sleeves"][0]["cell"] = Value::Null;
+        assert_eq!(evaluate_cells(&with_null, &reg), plain);
+        // The owner pilot plan never reads a cell key: it is served at the published point, exactly as before.
+        let mut pilot = happy_rows("L2", "paper_orders");
+        let before = evaluate_pilot(&pilot);
+        pilot.plans[0].body["sleeves"][0]["cell"] = cell_ref_json(&c, "equal_1_over_N");
+        let after = evaluate_pilot(&pilot);
+        assert_eq!(before, after);
+        assert!(after.exclusions.is_empty() && after.accounts[0].active.sleeves[0].is_published_point());
+        // A plan with a cell and a published sleeve side by side: only the cell sleeve is filled.
+        let mut mixed = proposal_rows("L2", &CELL_FULL, 1.0, &[("etf_trend_faber", 0.5), ("crypto_trend_100d", 0.5)]);
+        mixed.proposal_plans[0].body["sleeves"][0]["cell"] = cell_ref_json(&c, "equal_1_over_N");
+        let e = evaluate_cells(&mixed, &reg);
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        let sleeves = &e.accounts[0].active.sleeves;
+        assert_eq!((sleeves[0].instruments.len(), sleeves[1].is_published_point()), (9, true));
+    }
+
+    #[test]
+    fn a_cell_of_a_rule_family_or_asset_class_this_runtime_cannot_execute_is_refused_with_its_own_code() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &c)]);
+        // Momentum: its entry has no sleeve kind (no runtime for the rank-weighted family yet).
+        let mut rows = cell_rows(&c);
+        rows.proposal_plans[0].body["sleeves"][0]["entry_id"] = json!("etf_cross_sectional_momentum");
+        let r = refused_with(&rows, &reg);
+        assert_eq!(r.code(), "PILOT_CELL_NOT_EXECUTABLE");
+        assert!(matches!(&r, ExclusionReason::CellNotExecutable(m) if m.contains("momentum")), "{r:?}");
+        // A crypto entry: long-only ETF cells only.
+        let mut rows = proposal_rows("L2", &CELL_FULL, 1.0, &[("crypto_trend_100d", 1.0)]);
+        rows.proposal_plans[0].body["sleeves"][0]["cell"] = cell_ref_json(&c, "equal_1_over_N");
+        let r = refused_with(&rows, &reg);
+        assert!(matches!(&r, ExclusionReason::CellNotExecutable(m) if m.contains("ETF")), "{r:?}");
+        // A registered cell under a weight policy this runtime does not apply (the fixed 0.20 on nine names is 180% gross).
+        let fixed = cell_of(&u, CellWeightPolicy::FixedConstant, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &fixed)]);
+        let mut rows = cell_rows(&fixed);
+        rows.proposal_plans[0].body["sleeves"][0]["cell"] = cell_ref_json(&fixed, "fixed_constant");
+        let r = refused_with(&rows, &reg);
+        assert!(matches!(&r, ExclusionReason::CellNotExecutable(m) if m.contains("equal_1_over_N")), "{r:?}");
+    }
+
+    #[test]
+    fn a_sleeve_names_a_point_or_a_cell_never_both() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &c)]);
+        let mut rows = cell_rows(&c);
+        rows.proposal_plans[0].body["sleeves"][0]["point"] = point_json(&PUBLISHED_ETFS, 0, json!({"sma_month_ends": 10}));
+        assert!(matches!(refused_with(&rows, &reg), ExclusionReason::PlanBodyInvalid(m) if m.contains("both a point and a cell")));
+    }
+
+    #[test]
+    fn a_malformed_cell_reference_is_a_plan_body_error() {
+        let u = sec9();
+        let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+        let reg = registry_of(&[(&u, &c)]);
+        let bad = |cell: Value| {
+            let mut rows = cell_rows(&c);
+            rows.proposal_plans[0].body["sleeves"][0]["cell"] = cell;
+            match refused_with(&rows, &reg) {
+                ExclusionReason::PlanBodyInvalid(m) => m,
+                other => panic!("expected PlanBodyInvalid, got {other:?}"),
+            }
+        };
+        assert!(bad(json!("a string")).contains("not an object"));
+        assert!(bad(json!({"cell_hash": cell_hash(&c), "weight_policy": "equal_1_over_N"})).contains("universe_hash missing"));
+        assert!(bad(json!({"universe_hash": "abc", "cell_hash": cell_hash(&c), "weight_policy": "equal_1_over_N"})).contains("64 lowercase hex"));
+        assert!(bad(json!({"universe_hash": c.universe_hash, "cell_hash": cell_hash(&c), "weight_policy": "equal_1_over_N", "instruments": ["SPY"]})).contains("unknown key"));
+        assert!(bad(json!({"universe_hash": c.universe_hash, "cell_hash": cell_hash(&c), "weight_policy": "half"})).contains("weight_policy"));
+    }
+
+    /// The same cell plan under a mandate whose `exposure.max_gross` is `cap`.
+    fn cell_rows_with_max_gross(c: &Cell, cap: f64) -> Rows {
+        let mut rows = cell_rows(c);
+        let mut body = mandate_body("L2", &CELL_FULL);
+        body["exposure"]["max_gross"] = json!(cap);
+        body["exposure"]["max_net"] = json!(cap);
+        body["exposure"]["max_asset_class"] = json!({"crypto_spot": cap.min(0.4)});
+        let parsed: MandateBody = serde_json::from_value(body.clone()).expect("a valid mandate");
+        rows.mandates[0].body = body;
+        rows.mandates[0].body_hash = canonical_hash(&parsed);
+        rows
+    }
+
+    #[test]
+    fn a_cell_plan_whose_max_gross_would_exceed_the_mandate_is_refused_and_one_over_n_keeps_it_at_100_percent() {
+        for u in [sec9(), ac11()] {
+            let c = cell_of(&u, CellWeightPolicy::EqualOverN, CellStatus::Admitted);
+            let reg = registry_of(&[(&u, &c)]);
+            // 1/N keeps max gross at the sleeve's share (100% here): a mandate that allows 1.0 serves it ...
+            let e = evaluate_cells(&cell_rows_with_max_gross(&c, 1.0), &reg);
+            assert!(e.exclusions.is_empty(), "N = {}: {:?}", u.n(), e.exclusions);
+            // ... and one that allows only half the account refuses it, with a typed reason.
+            let rows = cell_rows_with_max_gross(&c, 0.5);
+            let r = refused_with(&rows, &reg);
+            assert_eq!(r.code(), "PILOT_CELL_GROSS_EXCEEDS_MANDATE", "{r:?}");
+            // The same mandate does not stop a plan with NO cell: the guard is for cell plans only.
+            let mut plain = proposal_rows("L2", &CELL_FULL, 1.0, &[("etf_trend_faber", 1.0)]);
+            plain.mandates[0] = rows.mandates[0].clone();
+            let e = evaluate_serving(&plain);
+            assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        }
     }
 }

@@ -8,3 +8,9 @@
 
 pub mod mandate;
 pub mod strategy_library;
+// R41 (rule x universe cells): the canonical hash, universe and cell types copied from the Engine (see SOURCE.md),
+// a stand-in for the one Engine type they need, and the registry the rebalancer verifies a plan sleeve against.
+// All inert: the embedded universe and cell lists are empty.
+pub mod cell_registry;
+pub mod citation_verification;
+pub mod replication;

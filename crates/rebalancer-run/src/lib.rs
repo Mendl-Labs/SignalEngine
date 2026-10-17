@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod broker;
+pub mod cell_rules;
 pub mod clock;
 pub mod data;
 pub mod decision;

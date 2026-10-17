@@ -335,6 +335,20 @@ fn run_service() {
             std::process::exit(1);
         }
     };
+    // --- R41 cells (rule x universe): the platform's registered cells. The embedded lists are EMPTY today, so no plan
+    // sleeve that carries a cell reference can run until a cell is registered in code; a plan with no cell reference
+    // never reaches the registry. A defect in the compiled-in sidecars fails closed (an empty registry refuses every cell).
+    let pg_source = {
+        let registry = match mandate_core::cell_registry::CellRegistry::platform() {
+            Ok(r) => r,
+            Err(e) => {
+                log(format!("the R41 cell registry did not load ({e}); every cell sleeve will be refused"));
+                mandate_core::cell_registry::CellRegistry::empty()
+            }
+        };
+        log(format!("R41 cell registry: {} registered cell(s)", registry.len()));
+        pg_source.with_cell_verifier(Arc::new(registry))
+    };
     // --- The reconciliation write-back for proposal plans (flag on only).
     let reconciliation = if pilot.serve_proposal_plans {
         match PgPlanReconciliation::new(pool) {

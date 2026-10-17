@@ -31,9 +31,10 @@ use chrono::NaiveDate;
 use rebalancer_core::dec_math::MathError;
 use rebalancer_core::planner::SleeveTarget;
 use reference_rules::{
-    data_fingerprint, decide_crypto_trend_with, decide_etf_trend_with, latest_decision_date, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel, RuleError,
+    data_fingerprint, decide_crypto_trend_with, latest_decision_date, CryptoDecision, EtfDecision, InstrumentDecision, Options, Panel, RuleError,
 };
 
+use crate::cell_rules::{trend_weight_policy, TrendRuleBackend, TREND_BACKEND};
 use crate::data::{DataError, DataGateReport, DataSource, SleeveData, SleeveKind, SleeveSpec};
 use crate::record::InstrumentEvidence;
 
@@ -160,7 +161,7 @@ fn decide(s: &SleeveSpec, panel: &Panel, as_of: NaiveDate) -> Result<(NaiveDate,
     match s.kind {
         SleeveKind::EtfTrend => {
             let date = latest_decision_date(panel, &refs)?;
-            let d = decide_etf_trend_with(panel, date, &Options::etf_live(as_of), &refs, s.sma_lookback())?;
+            let d = TREND_BACKEND.decide_trend(panel, date, &Options::etf_live(as_of), &refs, s.sma_lookback(), trend_weight_policy(s))?;
             Ok((date, RuleDecision::Etf(d)))
         }
         SleeveKind::CryptoTrend => {

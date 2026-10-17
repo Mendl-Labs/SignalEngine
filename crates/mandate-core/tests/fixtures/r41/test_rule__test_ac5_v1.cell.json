@@ -1,0 +1,21 @@
+{
+  "rule_entry_id": "test_rule",
+  "rule_entry_version": 1,
+  "universe_id": "TEST-AC5",
+  "universe_version": 1,
+  "universe_hash": "6a6f5b38cfbda82827ea1fafc8b036cca90675b1562636cc54c3db41ce4efe21",
+  "family_id": "TEST-FAMILY",
+  "premium_ref": "trend_time_series_momentum",
+  "weight_policy": "equal_1_over_N",
+  "n": 5,
+  "derived_weight": 0.2,
+  "envelope_ref": {
+    "envelope_id": "test_rule.envelope",
+    "envelope_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+  },
+  "cost_model_id": "certification_flat_10bps_per_side",
+  "ruling": "R41",
+  "preregistered_at": "2026-10-17",
+  "status": "preregistered",
+  "evaluation_refs": []
+}
