@@ -8,6 +8,8 @@
 
 pub mod legacy_pilot_library;
 pub mod mandate;
+// The Engine file is copied verbatim and the Engine does not gate on this lint; allow it here rather than edit the copy.
+#[allow(clippy::if_same_then_else)]
 pub mod strategy_library;
 // R41 (rule x universe cells): the canonical hash, universe and cell types copied from the Engine (see SOURCE.md),
 // a stand-in for the one Engine type they need, and the registry the rebalancer verifies a plan sleeve against.
