@@ -3,7 +3,10 @@
 # ==============================================================================
 # S-10 of product-mandate/PAPER_PILOT_DRAGONSTONE_PLAN.md. Deliberately NOT part of
 # k8s/signal-engine-helm -- see Chart.yaml's description for why. This chart deploys exactly ONE
-# pod, serving exactly ONE allow-listed (tenant, account) pair, paper-only, always.
+# pod, paper-only, always. It serves either the one allow-listed owner (tenant, account) pair
+# (default), or, with serveProposalPlans=true (+ credentialBroker.enabled=true), the approved paper
+# strategy_plans of every tenant (the pilot pair then optional). The standard install is:
+#   helm upgrade --install rebalancer-pilot ./k8s/rebalancer-helm -n <ns> #     --set image.repository=ghcr.io/mendl-labs/signal-engine-rebalancer --set-string image.tag=<sha> #     --set 'imagePullSecrets[0].name=ghcr-secret' #     --set serveProposalPlans=true --set credentialBroker.enabled=true
 #
 # Recommended namespace: signalengine-rebalancer-pilot (a dedicated namespace, separate from
 # `signalengine`/`signalengine-qa`, so this pilot's RBAC/network/resource blast radius never
@@ -32,6 +35,12 @@ image:
   # silently falling back to :latest, which that workflow never pushes.
   tag: ""
 
+# The image is private (ghcr.io). The pull Secret must exist in THIS release namespace; copy it from the namespace that
+# already has it (never printed):
+#   kubectl get secret ghcr-secret -n signalengine -o json \
+#     | jq 'del(.metadata.namespace,.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp,.metadata.ownerReferences)' \
+#     | kubectl apply -n <ns> -f -
+# then pass it at install time: --set 'imagePullSecrets[0].name=ghcr-secret'. Not defaulted on purpose.
 imagePullSecrets: []
   # - name: ghcr-secret
 
@@ -75,6 +84,7 @@ secrets:
   database:
     secretName: rebalancer-pilot-db
     key: url
+  # Only needed when a pilot pair is configured (always with serveProposalPlans=false; optional with it on).
   # PILOT_ALPACA_KEY_ID / PILOT_ALPACA_KEY_SECRET, two keys ("keyId", "keySecret") in one
   # Secret. Get the id/secret from Alpaca's own paper-trading dashboard; verify the fingerprint
   # with `rebalancer-service print-fingerprint` (this same image, run with that one argument)
@@ -99,6 +109,47 @@ secrets:
 extraEnv: []
   # - name: RUST_LOG
   #   value: "info"
+
+# Secret-backed env for anything extraEnv (name/value only, so the value would sit in the Helm release) cannot carry.
+# Rendered as valueFrom.secretKeyRef; the Secret must already exist in the release namespace. The same refusals apply
+# as for extraEnv (CREDENTIALS_ENCRYPTION_KEY, REBALANCER_SERVE_PROPOSAL_PLANS), and the paper-only interlock,
+# CREDENTIAL_MODE, live-venue keys (ALPACA_LIVE*, OANDA_*, KRAKEN_*) and every env this chart manages are reserved.
+# Prefer the dedicated blocks below (alerts, heartbeat, dataGate) for the known variables.
+extraEnvFromSecrets: []
+  # - name: SOME_ENV
+  #   secretName: some-secret
+  #   key: some-key
+
+# ==============================================================================
+# Optional alert / heartbeat / data-gate credentials (all OFF unless secretName is set)
+# ==============================================================================
+# Alert delivery (email via Resend). ALERTS_ENABLED=true is rendered only with alerts.enabled=true, which requires
+# alerts.secretName. The Secret holds two keys:
+#   kubectl create secret generic rebalancer-alerts -n <ns> \
+#     --from-literal=resendApiKey='...' --from-literal=fromEmail='alerts@example.com'
+# Delivery also needs a verified alert_channels row and the alert_* grants in databaseschema-internal role.sql.
+alerts:
+  enabled: false
+  secretName: ""
+  resendApiKeyKey: resendApiKey
+  fromEmailKey: fromEmail
+
+# Dead-man's heartbeat (HEARTBEAT_URL, a healthchecks-style ping URL; it is a bearer-like capability, so it lives in a
+# Secret). One key:
+#   kubectl create secret generic rebalancer-heartbeat -n <ns> --from-literal=url='https://...'
+heartbeat:
+  secretName: ""
+  urlKey: url
+
+# Platform market-data keys for DATA_GATE_MODE=shadow (ALPACA_DATA_KEY_ID / ALPACA_DATA_KEY_SECRET): a DATA key, never a
+# brokerage key. Setting this does NOT turn the gate on; DATA_GATE_MODE stays off unless you set it via extraEnv
+# (the MASSIVE_API_KEY the pod always needs is `secrets.massive`, above). Two keys:
+#   kubectl create secret generic rebalancer-data-keys -n <ns> \
+#     --from-literal=keyId='...' --from-literal=keySecret='...'
+dataGate:
+  secretName: ""
+  keyIdKey: keyId
+  keySecretKey: keySecret
 
 # ==============================================================================
 # Pod / container configuration

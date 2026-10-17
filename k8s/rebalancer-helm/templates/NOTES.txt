@@ -1,44 +1,79 @@
 rebalancer-helm deployed: {{ include "rebalancer-helm.fullname" . }} (namespace {{ .Release.Namespace }})
 
-This is the paper-pilot rebalancer driver loop (crates/rebalancer-service), NOT the main
-SignalEngine service. It serves exactly ONE allow-listed (tenant, account) pair:
+This is the paper rebalancer driver loop (crates/rebalancer-service), NOT the main SignalEngine service. It is
+paper-only, always (REBALANCER_PAPER_ONLY is hardcoded in this chart, not configurable), single replica, Recreate.
+{{- if eq (toString .Values.serveProposalPlans) "true" }}
+
+Mode: serveProposalPlans=true. It serves the approved paper strategy_plans of every tenant (a new approved plan gets a
+runtime within about REBALANCER_REENUMERATE_SECS, default 300, no restart). Tenant paper keys arrive through the
+credential broker ({{ .Values.credentialBroker.secretName }}); this pod holds no brokerage key of its own and never
+CREDENTIALS_ENCRYPTION_KEY.
+{{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
+The owner pilot pair is also served:
   tenant:  {{ .Values.pilot.tenantId }}
   account: {{ .Values.pilot.accountId }}
-in paper-only mode, always (REBALANCER_PAPER_ONLY is hardcoded in this chart, not configurable).
+{{- else }}
+No owner pilot pair is configured (proposal plans only); "no account is eligible yet" at start is normal.
+{{- end }}
+{{- else }}
+
+Mode: owner pilot only. It serves exactly ONE allow-listed (tenant, account) pair:
+  tenant:  {{ .Values.pilot.tenantId }}
+  account: {{ .Values.pilot.accountId }}
+{{- end }}
 
 Check it's running and ticking:
   kubectl -n {{ .Release.Namespace }} get pods -l {{ include "rebalancer-helm.selectorLabels" . }}
   kubectl -n {{ .Release.Namespace }} logs -l {{ include "rebalancer-helm.selectorLabels" . }} -f
 
-Every log line is prefixed "rebalancer-service:" (main.rs's own log() helper) -- heartbeats print
-once per tick (default every {{ .Values.pilot.tickSecs }}s) even when nothing is due to run.
+Every log line is prefixed "rebalancer-service:" (main.rs's own log() helper) -- heartbeats print once per tick
+(default every {{ .Values.pilot.tickSecs }}s) even when nothing is due to run.
+{{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
 
-Before this pair can ever be eligible, the owner-authored `rebalancer_pilot_plans` /
-`mandate_events` rows must already exist in Postgres. Print the SQL template (no network call, no
-database connection) with:
+Owner pilot only: before the pair can be eligible, the owner-authored `rebalancer_pilot_plans` / `mandate_events` rows
+must exist in Postgres. Print the SQL template (no network call, no database connection) with:
   kubectl -n {{ .Release.Namespace }} run rebalancer-pilot-template --rm -it --restart=Never \
     --image={{ .Values.image.repository }}:{{ .Values.image.tag }} \
     --command -- rebalancer-service pilot-template
 
-And confirm the connected paper Alpaca key's fingerprint (never prints the key itself) BEFORE
-authoring that row's credential_fingerprint column, using the same Alpaca secret this Deployment
-uses:
+And confirm the connected paper Alpaca key's fingerprint (never prints the key itself) BEFORE authoring that row's
+credential_fingerprint column, using the same Alpaca secret this Deployment uses:
   kubectl -n {{ .Release.Namespace }} run rebalancer-pilot-fingerprint --rm -it --restart=Never \
     --image={{ .Values.image.repository }}:{{ .Values.image.tag }} \
     --env="PILOT_ALPACA_KEY_ID=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secrets.alpaca.secretName }} -o jsonpath='{.data.{{ .Values.secrets.alpaca.keyIdKey }}}' | base64 -d)" \
     --env="PILOT_ALPACA_KEY_SECRET=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.secrets.alpaca.secretName }} -o jsonpath='{.data.{{ .Values.secrets.alpaca.keySecretKey }}}' | base64 -d)" \
     --command -- rebalancer-service print-fingerprint
-
-Required Secrets in this namespace (this chart never creates them -- see values.yaml's own
-`secrets` section for exactly which keys each one needs):
-  - {{ .Values.secrets.database.secretName }}
-  - {{ .Values.secrets.alpaca.secretName }}
-  - {{ .Values.secrets.massive.secretName }}
-{{- if .Values.imagePullSecrets }}
-  - {{ range .Values.imagePullSecrets }}{{ .name }} {{ end }}(image pull secret)
 {{- end }}
 
-This chart deploys nothing to a real cluster by itself -- it only renders manifests for whatever
-`helm install`/`helm upgrade` command you run it with. See
-.github/workflows/rebalancer-service-image.yml's own build-summary step for the exact
-`helm upgrade --install` invocation this pilot is meant to be deployed with.
+Required Secrets in this namespace (this chart never creates them -- see values.yaml's own `secrets` section for the keys):
+  - {{ .Values.secrets.database.secretName }} (key {{ .Values.secrets.database.key }}): DATABASE_URL, plain postgres:// (no TLS)
+  - {{ .Values.secrets.massive.secretName }} (key {{ .Values.secrets.massive.key }}): MASSIVE_API_KEY
+{{- if .Values.credentialBroker.enabled }}
+  - {{ .Values.credentialBroker.secretName }} (keys {{ .Values.credentialBroker.urlKey }}, {{ .Values.credentialBroker.tokenKey }}): credential broker URL and bearer token
+{{- end }}
+{{- if eq (include "rebalancer-helm.pilotPresent" .) "true" }}
+  - {{ .Values.secrets.alpaca.secretName }} (keys {{ .Values.secrets.alpaca.keyIdKey }}, {{ .Values.secrets.alpaca.keySecretKey }}): owner pilot paper Alpaca key (only with a pilot pair)
+{{- end }}
+{{- if .Values.alerts.secretName }}
+  - {{ .Values.alerts.secretName }} (keys {{ .Values.alerts.resendApiKeyKey }}, {{ .Values.alerts.fromEmailKey }}): RESEND_API_KEY, ALERT_FROM_EMAIL
+{{- end }}
+{{- if .Values.heartbeat.secretName }}
+  - {{ .Values.heartbeat.secretName }} (key {{ .Values.heartbeat.urlKey }}): HEARTBEAT_URL
+{{- end }}
+{{- if .Values.dataGate.secretName }}
+  - {{ .Values.dataGate.secretName }} (keys {{ .Values.dataGate.keyIdKey }}, {{ .Values.dataGate.keySecretKey }}): ALPACA_DATA_KEY_ID, ALPACA_DATA_KEY_SECRET
+{{- end }}
+{{- range .Values.extraEnvFromSecrets }}
+  - {{ .secretName }} (key {{ .key }}): {{ .name }}
+{{- end }}
+{{- if .Values.imagePullSecrets }}
+  - {{ range .Values.imagePullSecrets }}{{ .name }} {{ end }}(image pull secret; copy it into this namespace, see values.yaml)
+{{- else }}
+  - an image pull Secret (ghcr), if the image is private: copy it into this namespace and pass --set 'imagePullSecrets[0].name=<name>'
+{{- end }}
+
+The database role must hold the grants in databaseschema-internal scripts/rebalancer_pilot_ledger/role.sql (including the
+rebalancer_bar_* tables the latency recorder uses, and alert_* when ALERTS_ENABLED).
+
+This chart deploys nothing by itself -- it only renders manifests for whatever `helm install`/`helm upgrade` you run.
+The image workflow (.github/workflows/rebalancer-service-image.yml) prints the install command in its build summary.

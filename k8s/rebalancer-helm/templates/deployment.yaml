@@ -58,6 +58,7 @@ spec:
           env:
             {{- include "rebalancer-helm.validatedExtraEnv" . }}
             {{- include "rebalancer-helm.validatedProposalPlans" . }}
+            {{- include "rebalancer-helm.validatedSecretEnv" . }}
             {{- range .Values.extraEnv }}
             - name: {{ .name }}
               value: {{ .value | quote }}
@@ -148,6 +149,51 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.massive.secretName }}
                   key: {{ .Values.secrets.massive.key }}
+
+            # --- Optional Secret-backed env (all off unless the matching secretName is set; Secrets are created
+            # out of band, the chart never contains a value). See values.yaml.
+            {{- if .Values.alerts.enabled }}
+            - name: ALERTS_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.alerts.secretName }}
+            - name: RESEND_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.alerts.secretName }}
+                  key: {{ .Values.alerts.resendApiKeyKey }}
+            - name: ALERT_FROM_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.alerts.secretName }}
+                  key: {{ .Values.alerts.fromEmailKey }}
+            {{- end }}
+            {{- if .Values.heartbeat.secretName }}
+            - name: HEARTBEAT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.heartbeat.secretName }}
+                  key: {{ .Values.heartbeat.urlKey }}
+            {{- end }}
+            {{- if .Values.dataGate.secretName }}
+            - name: ALPACA_DATA_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.dataGate.secretName }}
+                  key: {{ .Values.dataGate.keyIdKey }}
+            - name: ALPACA_DATA_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.dataGate.secretName }}
+                  key: {{ .Values.dataGate.keySecretKey }}
+            {{- end }}
+            {{- range .Values.extraEnvFromSecrets }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .key }}
+            {{- end }}
 
             # --- DELIBERATELY ABSENT: CREDENTIALS_ENCRYPTION_KEY is never defined here, in any
             # form. rebalancer-service's own startup check refuses to run if this variable is
