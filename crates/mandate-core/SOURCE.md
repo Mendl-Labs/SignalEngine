@@ -1,5 +1,48 @@
 # Source of the copied files
 
+## CURRENT sync (2026-10-17): Engine `origin/main` `d219b8638f4620b128f844483b85423f8142a6da`
+
+`src/mandate.rs`, `src/strategy_library.rs` and `data/strategy_library/*.json` (+ `test_fixtures/`) are VERBATIM copies
+(byte for byte) of the Engine's files at that commit. `src/mandate.rs` was already identical (same blob); `strategy_library.rs`
+is the Engine's current file (it was a 2026-09-21 copy that lacked `AgentVerified`, `citation_claims`, `operating_procedure`,
+`backtest_window`, `known_deviations`, `flagship`, and shipped `etf_trend_faber` v1 / `fx_tsmom_12m`; the Engine now ships
+`etf_trend_faber` v2, `crypto_trend_100d` v1 and `etf_cross_sectional_momentum` v2, and no FX entry).
+
+| Item | Engine blob (`origin/main:<path>`) |
+|---|---|
+| `program/src/mandate.rs` blob | `f72d3d7120b881c85b76b7d0e8267d13dd166d6c` |
+| `program/src/strategy_library.rs` blob | `3fb255b207797708501348ee451c4bbc3609da3c` |
+| `program/data/strategy_library/etf_trend_faber.json` blob | `d63ccbf3bf50c9aba7796df2743d05fd8cda9bc0` |
+| `program/data/strategy_library/crypto_trend_100d.json` blob | `b30e688c0f27904542deeb2cf833e2bf24092a17` |
+| `program/data/strategy_library/etf_cross_sectional_momentum.json` blob | `df6657cf6996f9ffbd15ac7b3165960fba866e15` |
+| `program/data/strategy_library/test_fixtures/etf_trend_faber.json` blob | `f5caa6fa25d6809ee7e481b6815c88db2fe379d4` |
+| `program/data/strategy_library/test_fixtures/crypto_trend_100d.json` blob | `c29dc8420eb968198f9fac841012d47a52db3809` |
+| `program/data/strategy_library/test_fixtures/fx_tsmom_12m.json` blob | `02926e470cb606fd2a03e06880096a6792fb4ae1` |
+
+Verify (blobs are over the LF content; this repo has `core.autocrlf=true`): `git -C BacktestingEngine rev-parse origin/main:program/src/strategy_library.rs`
+against `git hash-object --no-filters crates/mandate-core/src/strategy_library.rs`.
+
+The Engine-only files `*.envelope.json`, `etf_trend_faber_citation_check.json` and `universe_rules/` are not copied (the
+embedded seed does not read them).
+
+### Cross-repo parity
+
+`tests/golden.rs::seed_library_entry_hashes_are_pinned` pins `entry_hash` of the three seed entries. The Engine pins the
+SAME three values in `program/tests/seed_entry_hashes_pinned.rs` (BacktestingEngine), so drift on either side fails CI there
+or here. Update both together.
+
+### Legacy pilot library (NOT synced, deliberately)
+
+`src/legacy_pilot_library.rs` + `data/legacy_pilot_library/*.json` are the previous copy (Engine `feat/strategy-library`
+`ad1bf5105d6be8705d20b5e90d41bdef0609b2b2`, blobs below), byte for byte except the `include_str!` paths. The owner pilot row
+pins `etf_trend_faber` VERSION 1 at the hash computed over that schema (`b8ddc2ec...9b86`); the Engine no longer ships v1,
+so the pilot's entry check resolves against this module and its pinned hash is unchanged. Proposal plans use the synced
+library. Delete the module together with the pilot row.
+
+---
+
+# Historical: the 2026-09-21 copy (now `legacy_pilot_library`)
+
 `src/mandate.rs`, `src/strategy_library.rs` and `data/strategy_library/*.json` are VERBATIM copies (byte for byte,
 no edits) from the Engine repository (`C:\Users\ikenn\Projects\TradingPlatform\BacktestingEngine`, local branch
 `feat/strategy-library`, not merged to a shared branch at the time of copying).

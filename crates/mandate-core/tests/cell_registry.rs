@@ -18,6 +18,8 @@ const SEC9_HASH: &str = "5640a303ff3bf03078aa7ef14af5a5e8a8b984906bfcbe189c5fc7d
 const CELL_HASH: &str = "d6037f98b0b86f8fa570a161c029ce44cb8dbeb91b2637d850c4bd54b4ee129e";
 
 const RULE: &str = "etf_trend_faber";
+/// The Engine ships `etf_trend_faber` at v2 (v1 was retired from its library).
+const RULE_VERSION: u32 = 2;
 
 fn sec9() -> Universe {
     parse_universe(SEC9_JSON).unwrap()
@@ -38,7 +40,7 @@ fn cell_for(u: &Universe, policy: WeightPolicy, status: CellStatus) -> Cell {
     let decided = !matches!(status, CellStatus::Preregistered);
     Cell {
         rule_entry_id: RULE.to_string(),
-        rule_entry_version: 1,
+        rule_entry_version: RULE_VERSION,
         universe_id: u.id.clone(),
         universe_version: u.version,
         universe_hash: universe_hash(u),
@@ -70,7 +72,7 @@ fn registry(universes: &[Universe], cells: Vec<Cell>) -> Result<CellRegistry, St
 }
 
 fn rule_hash() -> String {
-    entry_hash(seed_library().unwrap().iter().find(|e| e.id == RULE && e.version == 1).unwrap())
+    entry_hash(seed_library().unwrap().iter().find(|e| e.id == RULE && e.version == RULE_VERSION).unwrap())
 }
 
 fn claim_for(c: &Cell, u: &Universe) -> CellClaim {
@@ -135,7 +137,7 @@ fn every_component_of_the_claim_must_equal_the_registered_cell() {
     bad(&|x| x.universe_hash = "0".repeat(64));
     bad(&|x| x.rule_entry_hash = "0".repeat(64));
     bad(&|x| x.rule_entry_id = "crypto_trend_100d".to_string());
-    bad(&|x| x.rule_entry_version = 2);
+    bad(&|x| x.rule_entry_version = RULE_VERSION + 1);
     bad(&|x| x.weight_policy = WeightPolicy::FixedConstant);
 }
 

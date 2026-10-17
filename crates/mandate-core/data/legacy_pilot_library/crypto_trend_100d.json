@@ -1,0 +1,62 @@
+{
+  "id": "crypto_trend_100d",
+  "version": 1,
+  "name": "Crypto trend (BTC and ETH above 100-day average, long only)",
+  "sources": [
+    "Liu, Y. and Tsyvinski, A., \"Risks and Returns of Cryptocurrency\", 2021: documented only IN SPIRIT (per stage1-record BRIEF_FOR_AGENT.md, Sleeve 3). The specific 100-day moving-average rule is a simple trend rule, not a result taken from that paper.",
+    "Reference implementation: stage1-record/tool/ticket.py, decide_s3 (independent pandas reimplementation)."
+  ],
+  "rule_text": "Universe: BTC/USD and ETH/USD (daily closes). Each day, for each coin: if its close is above the simple average of its last 100 daily closes, INCLUDING today's close, hold that coin long at 50% of the sleeve's equity; otherwise hold cash in its place. Rebalance daily at the close. A position decided at the close of day t earns returns from the next trading day's close-to-close return onward; a decision uses only data available at the close of the decision day, and a bar that is still forming is never used. Long only, no leverage: maximum gross exposure is 100% of sleeve equity (2 x 50%).",
+  "reference_implementation": "stage1-record/tool/ticket.py::decide_s3 (also shadow.py sleeve3). Version pin: none recorded in the local files.",
+  "instruments": ["BTC/USD", "ETH/USD"],
+  "requirements": {
+    "needs_shorting": false,
+    "min_leverage_gross": 1.0,
+    "needs_portfolio_vol_target": false,
+    "max_abs_weight_per_instrument": 0.5,
+    "cross_asset_rebalance": "preferred",
+    "asset_classes": ["crypto_spot"],
+    "venues_supported": ["kraken"],
+    "min_history_years": 0.3,
+    "notes": [
+      "min_history_years is the history needed to compute the FIRST signal only (100 daily closes); a meaningful backtest needs far more.",
+      "Only Kraken is listed. Other crypto exchanges are deliberately not listed because live wiring and BTC/USD, ETH/USD pair availability could not be confirmed from the local files; add them once confirmed.",
+      "The published rule rebalances daily to fixed 50/50 weights. The platform runs each coin as an independent sub-account, so weights drift: an approximation of the rule, not a block (cross_asset_rebalance = preferred). In the raw-engine test (stage-1 SCORECARD Amendment 8) engine results differed materially from the reference for this sleeve (engine semantics plus costs)."
+    ]
+  },
+  "rebalance": {
+    "kind": "daily",
+    "detail": "Daily at the close of the (UTC) daily bar. Crypto trades every day, so no month-end or holiday handling is needed."
+  },
+  "parameters": {
+    "sma_days": 100,
+    "sma_includes_today": true,
+    "weight_per_coin": 0.5,
+    "cash_return": 0.0,
+    "min_daily_closes_required": 100
+  },
+  "expected_ranges": [
+    {
+      "metric": "sharpe_gross",
+      "low": null,
+      "high": null,
+      "role": "performance_band",
+      "source": "No band. The scorecard's |Sharpe| <= 2 canary was WITHDRAWN for this sleeve (SCORECARD_PREREGISTRATION.md, Amendment 1), and no literature figure for this exact rule is in the local files.",
+      "note": "Window-specific reference only, NOT an expectation for other windows: independent reimplementation (gross, zero cost, 2016-01-01 to 2020-12-31, a crypto bull market): Sharpe 2.10, CAGR 218.2%, vol 65.3%, max drawdown -50.82%; 50/50 BTC/ETH buy-and-hold over the same window: Sharpe 1.85. Look-ahead canary for that window only: proper 1-day lag 2.10, 2-day lag 2.16, same-day peek 3.39 (a result near 3.4 means the test is peeking, near 2.1 means it is correct). Do not read these as a track record."
+    }
+  ],
+  "failure_regimes": [
+    "Bull-market dependence: over 2016-2020 the rule's Sharpe (2.10) was close to buy-and-hold (1.85) for the same basket; the payoff shape is a crypto bull-market outcome, not evidence of edge going forward.",
+    "Deep drawdowns: the independent reimplementation had volatility 65.3% and max drawdown -50.82% over 2016-2020, far beyond a typical 10-20% drawdown ladder without scaling down.",
+    "Sideways or choppy markets where prices repeatedly cross the 100-day average (whipsaw). GENERAL property of moving-average trend rules; NOT measured in the local files."
+  ],
+  "cost_profile": {
+    "turnover_per_year_estimate": null,
+    "signal_flips_per_year_shadow": 27.6,
+    "note": "Turnover as a fraction of sleeve equity is NOT recorded in the local files. The independent reimplementation counted 138 asset-level signal flips over 5.0 years (1827 observations at 365.5 per year), about 27.6 per year across the two coins (arithmetic on shadow_summary.json). Daily rebalancing to 50/50 adds small drift-correction trades not counted as flips. Costs were not modelled in that run (gross)."
+  },
+  "evidence": "reference_only",
+  "last_verified": "2026-09-21",
+  "verification_note": "Rule text transcribed from ticket.py decide_s3 (code and docstring) and cross-read against BRIEF_FOR_AGENT.md on 2026-09-21. An independent reimplementation exists (ticket.py, shadow.py); the platform engine has NOT replicated it (a first product-path run hand-built a different 16-coin basket, and the raw engine cannot rebalance 50/50 across coins). The cited paper covers crypto returns generally, not this exact rule, and it was not consulted: the citation itself is UNVERIFIED.",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window are persistently worse than the reference replay. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here."
+}

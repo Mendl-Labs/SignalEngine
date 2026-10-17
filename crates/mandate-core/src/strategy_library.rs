@@ -23,8 +23,10 @@
 //!
 //! Conventions: ratios are fractions (0.10 = 10%); drawdowns are positive
 //! magnitudes; a "gross multiple" is a multiple of sleeve (or account) equity.
-//! Only `crate::mandate` and plain dependencies are used, so the module
-//! compiles inside the Engine and in a small isolated test crate alike.
+//! Only `super::mandate` (T4b: was `crate::mandate`, changed so this file resolves identically whether it is a
+//! top-level child of the real Engine crate or path-included one level deeper by
+//! `program/tests/repl_include/mod.rs` -- see `program/tests/replication_tamper.rs`) and plain dependencies are
+//! used, so the module compiles inside the Engine and in a small isolated test crate alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,7 +34,12 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mandate::{LadderRung, MandateBody};
+// `super::mandate`, not `crate::mandate`: this module is always exactly one level below whatever its crate root is
+// (`program/src/lib.rs`'s top-level `pub mod strategy_library;` in the real Engine binary; `program/tests/repl_include/mod.rs`'s
+// top-level `pub mod strategy_library;` when this file is path-included by `program/tests/replication_tamper.rs`,
+// T4b) -- `super::` reaches the same sibling `mandate` module either way, so this file needs no change depending on
+// which tree includes it. `super::mandate` == `crate::mandate` in the real crate.
+use super::mandate::{LadderRung, MandateBody};
 
 /// Version of the library entry schema.
 pub const LIBRARY_SCHEMA_VERSION: u32 = 1;
@@ -61,11 +68,133 @@ pub const MIN_FIT_SCALE: f64 = 1e-6;
 pub enum Evidence {
     /// The platform engine reproduced the reference within tolerance.
     ReplicatedOnPlatform,
+    /// AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2: a genuinely new, fifth label -- never a field alongside the
+    /// other four, and never a reuse of `ReplicatedOnPlatform`'s meaning. Reachable ONLY via
+    /// `TransitionCause::AgentVerifiedReplication`, itself reachable only from `derive_evidence` when a stored
+    /// review's `reviewer_kind: Agent` comes from an identity in `agent_review::certified::CERTIFIED_AGENT_REVIEWER_IDENTITIES`.
+    /// A customer must always be able to tell an agent-verified entry from a human-verified one: this label
+    /// serializes as `"agent_verified"`, never `"replicated_on_platform"`, and the two are never directly
+    /// interchangeable (no transition edge in either direction between them -- see
+    /// [`evidence_transition_allowed`]'s doc comment).
+    AgentVerified,
     /// A reference implementation exists elsewhere; the platform has not
     /// replicated it.
     ReferenceOnly,
     /// No independent implementation has been checked.
     Unverified,
+    /// WP9.3: the rule needs something today's platform cannot do (shorting,
+    /// joint vol-targeting, cross-asset rebalance, a live-ready venue) --
+    /// parked, not silently downgraded to an approximation. A separate
+    /// terminal state from the other three: it says "the platform can't run
+    /// this," not "how much evidence exists that the rule works."
+    PlatformCapabilityBlocked,
+}
+
+/// WP9.4 (IMPLEMENTATION_PLAN.md): is moving an entry from `from` to `to` a
+/// valid state transition. Enforces `unverified -> reference_only ->
+/// replicated_on_platform`, in order -- no entry may jump straight from
+/// `unverified` to `replicated_on_platform`, and nothing may move backward
+/// except an explicit demotion (a decayed entry dropping back to
+/// `reference_only`, caught by WP9.6's monitor -- allowed, since a human/the
+/// monitor demoting something is different from an unearned promotion).
+/// `PlatformCapabilityBlocked` is reachable from either of the other two
+/// non-replicated states and is terminal until the platform gap closes, at
+/// which point it re-enters at `unverified` (a capability existing again
+/// doesn't un-verify anything that was already checked before the block).
+pub fn evidence_transition_allowed(from: Evidence, to: Evidence) -> bool {
+    use Evidence::*;
+    match (from, to) {
+        // No-op: staying put is always fine.
+        (a, b) if a == b => true,
+        // Forward progress, one step at a time.
+        (Unverified, ReferenceOnly) => true,
+        // T4, stage T4b (`product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md` section 2.4): `reference_only ->
+        // replicated_on_platform` is no longer a valid transition WITHOUT a cause -- see
+        // [`evidence_transition_allowed_with`], the only way this promotion is ever allowed, and only when the cause
+        // is a genuine [`TransitionCause::VerifiedReplication`]. This function stays the CAUSE-LESS form used
+        // everywhere a promotion is never in question (curation edits, decay, capability changes); it now correctly
+        // refuses the one transition that always needed independent evidence behind it.
+        // (ReferenceOnly, ReplicatedOnPlatform) was `true` here before T4b; see the updated test below.
+        // The one explicitly-allowed backward move: decay demotes, never
+        // silently deletes.
+        (ReplicatedOnPlatform, ReferenceOnly) => true,
+        // AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2: the same demotion, for the agent-verified label. There is
+        // deliberately NO (AgentVerified, ReplicatedOnPlatform) edge or its reverse in either direction here or in
+        // `evidence_transition_allowed_with`: a human independently re-reviewing an agent-verified entry produces a
+        // NEW promotion (ReferenceOnly -> ReplicatedOnPlatform, cause VerifiedReplication, from the same underlying
+        // run), never a same-label mutation of AgentVerified -- this keeps the historical record honest ("this entry
+        // was once agent-verified, then a human independently verified it too" is two distinct facts, not one edited
+        // field).
+        (AgentVerified, ReferenceOnly) => true,
+        // Platform-blocked is reachable any time the platform turns out not
+        // to support what the rule needs, and clears back to Unverified (not
+        // straight to ReferenceOnly/ReplicatedOnPlatform) once the gap closes.
+        (Unverified, PlatformCapabilityBlocked) => true,
+        (ReferenceOnly, PlatformCapabilityBlocked) => true,
+        (PlatformCapabilityBlocked, Unverified) => true,
+        // Everything else -- straight to ReplicatedOnPlatform from
+        // Unverified, straight from PlatformCapabilityBlocked to a verified
+        // state, ReplicatedOnPlatform demoted more than one step, etc. -- is
+        // not a valid single transition.
+        _ => false,
+    }
+}
+
+/// Why a call site believes an evidence transition is legitimate (T4b, design section 2.4: "`evidence_transition_allowed`
+/// gains a sibling `evidence_transition_allowed_with(from, to, cause: TransitionCause)`"). A plain marker, not a
+/// value carrying the verification itself -- the caller (`replication::evidence::derive_evidence`, the only real
+/// caller) must already have PERFORMED the verification before it can even construct a
+/// `replication::evidence::VerifiedReplication` to promote from; this enum exists so the promotion rule itself
+/// (`evidence_transition_allowed_with`) can require that a cause was given, without `strategy_library.rs` needing to
+/// name `replication`'s types to do it (keeping this module's own stated invariant: "Only `crate::mandate` and plain
+/// dependencies are used").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionCause {
+    /// A person edited the embedded JSON in a reviewed PR (the `unverified -> reference_only` path, and any other
+    /// hand-curated move).
+    Curation,
+    /// `replication::evidence::derive_evidence` is promoting `reference_only -> replicated_on_platform` on the
+    /// strength of an already-verified `replication::evidence::VerifiedReplication`. The ONLY cause that unlocks
+    /// that one transition.
+    VerifiedReplication,
+    /// AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2: `replication::evidence::derive_evidence` is promoting
+    /// `reference_only -> agent_verified` on the strength of a `StoredReview{reviewer_kind: Agent}` from a
+    /// certified agent-reviewer identity. The ONLY cause that unlocks that one transition -- mirrors
+    /// `VerifiedReplication` exactly, for the sibling label.
+    AgentVerifiedReplication,
+    /// A `decay_check` run (or a revoked review) is demoting `replicated_on_platform -> reference_only`.
+    Decay,
+    /// The platform gained or lost a capability (`platform_capability_blocked` in or out).
+    CapabilityChange,
+}
+
+/// [`evidence_transition_allowed`], but able to allow `reference_only -> replicated_on_platform` when (and only
+/// when) `cause` proves that transition was backed by real, independent verification, not a curator's or an agent's
+/// say-so. Every other pair is identical to the cause-less form.
+pub fn evidence_transition_allowed_with(from: Evidence, to: Evidence, cause: TransitionCause) -> bool {
+    if from == Evidence::ReferenceOnly && to == Evidence::ReplicatedOnPlatform {
+        return matches!(cause, TransitionCause::VerifiedReplication);
+    }
+    // AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2: the sibling promotion, gated on its own distinct cause. Note
+    // this is `ReferenceOnly -> AgentVerified` only -- there is no `ReplicatedOnPlatform -> AgentVerified` or
+    // `AgentVerified -> ReplicatedOnPlatform` edge anywhere in this function or the cause-less form.
+    if from == Evidence::ReferenceOnly && to == Evidence::AgentVerified {
+        return matches!(cause, TransitionCause::AgentVerifiedReplication);
+    }
+    evidence_transition_allowed(from, to)
+}
+
+/// A tiny, plain provenance marker `intake_gate` accepts in place of a full
+/// `replication::evidence::VerifiedReplication` (T4b, design section 2.4 item 5: "`intake_gate` gains
+/// `Option<&VerifiedReplication>`"). `intake_gate`'s OWN verdict never changes shape because of this parameter --
+/// WP9.5 still requires a human sign-off before `replicated_on_platform`, so `intake_gate` never returns that label
+/// regardless of what it is given here; the parameter is informational provenance only (surfaced on
+/// [`IntakeVerdict::verified_replication`]), and keeping it a plain struct (rather than the concrete
+/// `replication::evidence::VerifiedReplication`) keeps this module free of any dependency on `replication`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedReplicationProvenance {
+    pub run_id: String,
+    pub reviewed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +385,88 @@ pub struct CostProfile {
     pub note: String,
 }
 
+/// How a decision made by the rule becomes an action, as DATA rather than prose (stage T4, design section 2.3;
+/// `COUNCIL_ETF_TIMING_AND_CADENCE.md` Ruling 10: "Operating procedure as data; single source of truth" -- "Library
+/// entry version 2 (new `rule_hash`) carries `operating_procedure`... The pipeline and weightsim read the same
+/// fields... Deliberately not a mandate field. Two enum variants and integers only, no scheduling DSL."). Present
+/// only on a version-2-or-later entry (`#[serde(default)]`, `Option`) so every existing entry's serialisation,
+/// `entry_hash` and `rule_hash` are byte-identical to before this field existed; when present it participates in
+/// [`crate::replication::binding::rule_hash`] (design section 2.3: "operating_procedure (only when present)").
+/// Two-valued/integer fields only, deliberately no scheduling DSL, per the ruling's own last sentence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatingProcedure {
+    /// When a NEW decision is made: `"monthly"` or `"daily"` (mirrors `Rebalance.kind`, but as the compiled rule's
+    /// own vocabulary rather than the mandate-facing one).
+    pub decision_schedule: String,
+    /// How often the standing decision is checked/replayed even when it does not change: `"daily"` for both compiled
+    /// library rules today.
+    pub evaluation: String,
+    /// When a decision made at a bar's close may first be acted on: `"first_bar_of_next_month"` (ETF, monthly) or
+    /// `"next_bar"` (crypto, daily).
+    pub actionable_after: String,
+    /// `"on_decision"` (trade only when the target changes, units drift between decisions) or `"every_bar"` (trade
+    /// back to the standing target every bar) -- the compiled rule's `rebalance_policy()`.
+    pub rebalance_policy: String,
+    /// The pre-registered live delay, in bars, between a decision and the bar it is acted on (Ruling 4: "ETF
+    /// `execution_delay_bars = 1`... crypto `0` plus slippage").
+    pub expected_delay_bars: u32,
+    /// How a delayed decision is actually filled once it IS acted on: `"next_open"` (unassisted) or `"assisted"`
+    /// (a human acts within the window, adding latency).
+    pub execution_assumption: String,
+    /// How a missed decision (an outage, a paused account) is made up: `"cap"` (act on the newest decision only,
+    /// never queue and replay every missed one) is the only value either compiled rule uses today.
+    pub catch_up: String,
+}
+
+/// One human-stated numeric fact a cited source ("`sources[source_index]`") is claimed to say -- item 2 of
+/// `product-mandate/LIBRARY_ENTRY_ROBUSTNESS_PLAN.md` (section 2.2). Field-for-field identical to
+/// `citation_verification::verify::NumericClaim`'s own shape (`metric`, `value`, `period`), DUPLICATED here rather
+/// than imported: `strategy_library.rs`'s own module doc comment requires this file to compile using only
+/// `super::mandate`/plain dependencies (so `program/tests/repl_include/mod.rs` can path-include it without also
+/// mirroring the much larger `citation_verification` tree), and `citation_verification` is not mirrored there.
+/// `library_citation::check::library_citation_check` converts this to the real
+/// `citation_verification::verify::NumericClaim` field-by-field before calling `verify_claim` -- see that module's
+/// own doc comment for why this is safe (identical JSON shape, proven by a round-trip test).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryNumericClaim {
+    /// Free-text metric name, e.g. "Sharpe Ratio improvement over buy-and-hold".
+    pub metric: String,
+    pub value: f64,
+    /// Optional period the number applies to, e.g. "1973-2008".
+    #[serde(default)]
+    pub period: Option<String>,
+}
+
+/// What a `LibrarySourceClaim` claims its cited source says -- field-for-field identical to
+/// `citation_verification::verify::CitationClaim` (`quotes`, `numbers`, `sample_period`); see
+/// [`LibraryNumericClaim`]'s doc comment for exactly why this is a duplicate type rather than an import.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryCitationClaim {
+    #[serde(default)]
+    pub quotes: Vec<String>,
+    #[serde(default)]
+    pub numbers: Vec<LibraryNumericClaim>,
+    #[serde(default)]
+    pub sample_period: Option<String>,
+}
+
+/// A human-authored, checkable claim about one of this entry's own `sources` -- item 2 of
+/// `product-mandate/LIBRARY_ENTRY_ROBUSTNESS_PLAN.md` (section 2.2), the plan's own recommended shape and its
+/// RECOMMENDED option (b) for who authors it: "Human-authored at entry-curation time... the same human who writes
+/// `rule_text` and merges the entry (the existing trust root T4 already relies on for every other library fact)".
+/// Deliberately NOT LLM-extracted (WP8.3's `ClaimExtractor`/`extract.rs` is not used here, and never will be by this
+/// field: an extraction step that could itself hallucinate a quote would undermine the point of verifying it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarySourceClaim {
+    /// Index into this entry's own `sources` -- which cited source this claim is about.
+    pub source_index: usize,
+    pub claim: LibraryCitationClaim,
+}
+
 /// One curated strategy. Parameters are fixed at the published values: the
 /// agent chooses among entries, it never tunes one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -267,6 +478,17 @@ pub struct LibraryEntry {
     pub name: String,
     /// Source citations as plain strings.
     pub sources: Vec<String>,
+    /// Item 2 (`product-mandate/LIBRARY_ENTRY_ROBUSTNESS_PLAN.md` section 2.2): human-authored, structured, checkable
+    /// claims about what specific entries of `sources` (by index) say. `#[serde(default)]` so every existing entry
+    /// (including `etf_trend_faber` before this field existed) parses unchanged, and `skip_serializing_if` so an
+    /// entry that never sets it re-serialises byte-identically -- `entry_hash` of such an entry is therefore
+    /// unaffected by this field's addition (mirrors `operating_procedure`'s own precedent exactly, see that field's
+    /// doc comment below). Disclosure-only, like `operating_procedure`'s binding into `rule_hash`, but this field
+    /// participates in NEITHER `rule_hash` nor `claim_hash` nor `entry_hash`'s label-relevant meaning: it is read
+    /// only by `library_citation::check::library_citation_check`, never by `replication::evidence`/`admission`/
+    /// `binding`, and never gates anything (see `program/tests/library_citation.rs`'s own source-scan test).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citation_claims: Vec<LibrarySourceClaim>,
     /// The exact, unambiguous rule.
     pub rule_text: String,
     /// Where the reference implementation lives and its pin.
@@ -276,9 +498,26 @@ pub struct LibraryEntry {
     pub instruments: Vec<String>,
     pub requirements: Requirements,
     pub rebalance: Rebalance,
+    /// COUNCIL Ruling 10 (`operating_procedure`, [`OperatingProcedure`]): present only on a version-2-or-later entry.
+    /// `#[serde(default)]` so every existing (version-1) entry still parses with no field at all, and
+    /// `skip_serializing_if` so its own re-serialisation stays byte-identical -- `entry_hash` of a version-1 entry is
+    /// therefore unaffected by this field's addition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operating_procedure: Option<OperatingProcedure>,
     pub parameters: BTreeMap<String, serde_json::Value>,
     /// The first entry is the primary one.
     pub expected_ranges: Vec<ExpectedRange>,
+    /// WP9.8 (IMPLEMENTATION_PLAN.md): the window the independent-replication
+    /// backtest actually ran over, as structured data a check can read.
+    pub backtest_window: BacktestWindow,
+    /// WP9.9 (IMPLEMENTATION_PLAN.md): every deviation between what the
+    /// platform will actually run and what the rule as published specifies
+    /// (an approximated `cross_asset_rebalance`, a capped weight/leverage,
+    /// anything `eligibility()` would flag as an advisory rather than a hard
+    /// block). Explicitly empty (`[]`), never omitted, when there is truly
+    /// nothing to disclose -- matches this file's existing "never a guess,
+    /// never a silent default" convention (see `ExpectedRange`'s doc comment).
+    pub known_deviations: Vec<String>,
     pub failure_regimes: Vec<String>,
     pub cost_profile: CostProfile,
     pub evidence: Evidence,
@@ -287,6 +526,52 @@ pub struct LibraryEntry {
     /// What exactly was and was not verified on that date.
     pub verification_note: String,
     pub retirement_rule: String,
+    /// Whether this entry is shown to the free, paper-only "Observer" tier -- a small, deliberately curated
+    /// subset (the most-vetted, longest-track-record entries), never the full library every paying tier sees.
+    /// `#[serde(default)]` so every existing entry parses unchanged (defaults to `false`), and
+    /// `skip_serializing_if = "is_false"` so a non-flagship entry (the common case) re-serialises byte-identically
+    /// to before this field existed -- `entry_hash`/`rule_hash` of such an entry are therefore unaffected, mirroring
+    /// `operating_procedure`'s and `citation_claims`'s own precedent exactly (see their doc comments above). Only a
+    /// human/curator decision may set this `true`; `library_curation::draft::draft_from_candidate` always sets it
+    /// `false` -- an autonomous draft never earns flagship status on its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flagship: bool,
+}
+
+/// `skip_serializing_if` helper for [`LibraryEntry::flagship`]: `true` (skip) exactly when the value is the
+/// default `false`, so the common case re-serialises with no `flagship` key at all.
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// The independent-replication backtest's own window, as structured data --
+/// added for WP9.8 (IMPLEMENTATION_PLAN.md). Before this, a window's dates and
+/// whether it covered a real down-period lived only as prose inside an
+/// `ExpectedRange.note`, which a function can't check. One window per entry:
+/// in practice every existing entry's ranges came from the same single
+/// independent-reimplementation run, so a per-range window would be spurious
+/// precision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacktestWindow {
+    /// `YYYY-MM-DD`.
+    pub start: String,
+    /// `YYYY-MM-DD`.
+    pub end: String,
+    /// The largest peak-to-trough decline of the underlying BUY-AND-HOLD
+    /// benchmark (not the strategy's own drawdown) actually observed in this
+    /// window, as a positive fraction (0.15 = 15%). Deliberately the
+    /// benchmark's number, not the strategy's: a working trend/timing rule is
+    /// SUPPOSED to have a smaller drawdown than buy-and-hold by ducking out of
+    /// downturns, so using the strategy's own number here would perversely
+    /// penalise the best-performing strategies for successfully avoiding
+    /// losses (etf_trend_faber's own drawdown was only 8.97% in a window that
+    /// included COVID and the 2022 bear market -- its point was avoiding that
+    /// fall, not that the window lacked one; the benchmark's 26.68% is what
+    /// shows the window had real stress to be tested against). `None` when
+    /// genuinely not measured -- never a guess, same convention as
+    /// `ExpectedRange`.
+    pub max_observed_drawdown: Option<f64>,
 }
 
 /// SHA-256 (hex) of the canonical serialization, so a proposal can record which
@@ -298,8 +583,35 @@ pub fn entry_hash(e: &LibraryEntry) -> String {
 
 /// Sanity-check a curated entry; empty result = well-formed. This checks the
 /// SHAPE of the record (curation slips), not the truth of its numbers.
+///
+/// Stage T4, slice T4a (`product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md` section 2.4, "How `validate_entry`, the
+/// loader and the intake gate reject a typed label"): `replicated_on_platform` is a DERIVED label (design section
+/// 2.4/4.1-4.2) -- as of T4a there is no verified-replication pipeline to derive it from at all (that is T4b/T4d), so
+/// no entry may declare it by hand, unconditionally. This is the safe, honest interim named in the BUILD instructions:
+/// it makes hand-typing the label an explicit, loud validation failure starting now, rather than waiting for the full
+/// pipeline to exist. `seed_library()` calls this on every embedded entry (also T4a), so a seed file that declares the
+/// label can never ship.
 pub fn validate_entry(e: &LibraryEntry) -> Vec<String> {
     let mut v = Vec::new();
+    if e.evidence == Evidence::ReplicatedOnPlatform {
+        v.push(
+            "evidence: \"replicated_on_platform\" cannot be declared by hand; it is derived from a verified \
+             replication run, and the replication pipeline (stage T4b/T4d) does not exist yet -- no entry may \
+             declare this label until then"
+                .to_string(),
+        );
+    }
+    // AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2: mirrors the `ReplicatedOnPlatform` rejection exactly, for the
+    // sibling label. This applies uniformly to embedded seed entries and drafted entries alike -- the draft path
+    // never declares anything above `ReferenceOnly`, so this is defense-in-depth, not a live gap it closes.
+    if e.evidence == Evidence::AgentVerified {
+        v.push(
+            "evidence: \"agent_verified\" cannot be declared by hand; it is derived from a certified agent \
+             reviewer's signed review, and no entry may declare this label until a real replication run and review \
+             have earned it"
+                .to_string(),
+        );
+    }
     let id_ok = !e.id.is_empty() && e.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if !id_ok {
         v.push(format!("id {:?} must be lowercase letters, digits and underscores", e.id));
@@ -369,32 +681,641 @@ pub fn validate_entry(e: &LibraryEntry) -> Vec<String> {
     if NaiveDate::parse_from_str(&e.last_verified, "%Y-%m-%d").is_err() {
         v.push(format!("last_verified {:?} must be a YYYY-MM-DD date", e.last_verified));
     }
+    match (
+        NaiveDate::parse_from_str(&e.backtest_window.start, "%Y-%m-%d"),
+        NaiveDate::parse_from_str(&e.backtest_window.end, "%Y-%m-%d"),
+    ) {
+        (Ok(start), Ok(end)) if start > end => {
+            v.push(format!("backtest_window.start {:?} is after backtest_window.end {:?}", e.backtest_window.start, e.backtest_window.end));
+        }
+        (Ok(_), Ok(_)) => {}
+        _ => v.push("backtest_window.start and .end must both be YYYY-MM-DD dates".to_string()),
+    }
+    if e.backtest_window.max_observed_drawdown.is_some_and(|d| !d.is_finite() || d < 0.0) {
+        v.push("backtest_window.max_observed_drawdown must be a non-negative number when present".to_string());
+    }
+    if e.known_deviations.iter().any(|s| s.trim().is_empty()) {
+        v.push("known_deviations must not contain a blank entry (omit it from the list instead)".to_string());
+    }
     v
+}
+
+// ---------------------------------------------------------------------------
+// WP9.7-9.9 intake gate (IMPLEMENTATION_PLAN.md): explicit, numeric checks
+// that replace "a human judges if it's good enough" with policy an agent can
+// run mechanically. Pure functions, same as `validate_entry` above -- these
+// check the QUALITY of what a candidate claims, not its shape. Run once at
+// candidate intake (see the "First-content cut line" in the plan); WP9.5's
+// staged autonomy determines how much of the result is trusted unattended.
+// ---------------------------------------------------------------------------
+
+/// The floor an `ExpectedRange`'s `low` must clear, as a `PerformanceBand`
+/// (not merely an `IntegrityBound`), to auto-clear WP9.7. Calibrated to
+/// `etf_trend_faber`'s own existing band (0.2), not an arbitrary number.
+pub const MIN_PERFORMANCE_BAND_LOW: f64 = 0.2;
+
+/// Minimum backtest window length, in years, for WP9.8.
+pub const MIN_BACKTEST_WINDOW_YEARS: f64 = 5.0;
+
+/// Minimum real peak-to-trough decline a backtest window must contain for
+/// WP9.8 -- catches a candidate tested only in a rising market (the exact
+/// failure mode `crypto_trend_100d`'s own 2016-2020-only window has).
+pub const MIN_REQUIRED_DRAWDOWN_COVERAGE: f64 = 0.15;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateResult {
+    pub passes: bool,
+    pub reason: String,
+}
+
+impl GateResult {
+    fn pass(reason: impl Into<String>) -> Self {
+        Self { passes: true, reason: reason.into() }
+    }
+    fn fail(reason: impl Into<String>) -> Self {
+        Self { passes: false, reason: reason.into() }
+    }
+}
+
+/// WP9.7: does the primary expected range represent a real, positive
+/// performance expectation, strong enough to auto-clear -- not merely an
+/// integrity bound (a sanity check that a result isn't a look-ahead artifact,
+/// which says nothing about whether the strategy is actually any good).
+pub fn evidence_strength_check(entry: &LibraryEntry) -> GateResult {
+    let Some(primary) = entry.expected_ranges.first() else {
+        return GateResult::fail("no expected_ranges at all -- nothing to judge evidence strength from");
+    };
+    match primary.role {
+        RangeRole::IntegrityBound => GateResult::fail(format!(
+            "primary range ({}) is only an integrity bound, not a performance expectation -- \
+             does not auto-clear without an explicit, logged owner override",
+            primary.metric
+        )),
+        RangeRole::PerformanceBand => match primary.low {
+            Some(low) if low >= MIN_PERFORMANCE_BAND_LOW => {
+                GateResult::pass(format!("performance band low={low} >= floor {MIN_PERFORMANCE_BAND_LOW}"))
+            }
+            Some(low) => GateResult::fail(format!("performance band low={low} is below the {MIN_PERFORMANCE_BAND_LOW} floor")),
+            None => GateResult::fail("performance band has no low bound to check at all"),
+        },
+    }
+}
+
+/// WP9.8: is the backtest window long enough, AND does it actually contain a
+/// real down-period for the asset class -- not just a long span that happens
+/// to avoid every drawdown. Length alone is not sufficient (see this
+/// function's second check); a long window that is all one regime still fails.
+pub fn representativeness_check(entry: &LibraryEntry) -> GateResult {
+    let w = &entry.backtest_window;
+    let (start, end) = match (
+        NaiveDate::parse_from_str(&w.start, "%Y-%m-%d"),
+        NaiveDate::parse_from_str(&w.end, "%Y-%m-%d"),
+    ) {
+        (Ok(s), Ok(e)) => (s, e),
+        _ => return GateResult::fail("backtest_window.start/end are not both valid YYYY-MM-DD dates"),
+    };
+    let years = (end - start).num_days() as f64 / 365.25;
+    if years < MIN_BACKTEST_WINDOW_YEARS {
+        return GateResult::fail(format!(
+            "backtest window is {years:.1} years, below the {MIN_BACKTEST_WINDOW_YEARS}-year minimum"
+        ));
+    }
+    let dd_pct = |x: f64| x * 100.0;
+    match w.max_observed_drawdown {
+        Some(dd) if dd >= MIN_REQUIRED_DRAWDOWN_COVERAGE => GateResult::pass(format!(
+            "{years:.1}-year window, includes a {:.1}% drawdown >= the {:.0}% minimum",
+            dd_pct(dd),
+            dd_pct(MIN_REQUIRED_DRAWDOWN_COVERAGE)
+        )),
+        Some(dd) => GateResult::fail(format!(
+            "{years:.1}-year window is long enough, but its largest observed drawdown ({:.1}%) is below the \
+             {:.0}% minimum -- likely tested only in one favourable regime",
+            dd_pct(dd),
+            dd_pct(MIN_REQUIRED_DRAWDOWN_COVERAGE)
+        )),
+        None => GateResult::fail("backtest_window.max_observed_drawdown is not recorded -- cannot confirm regime coverage"),
+    }
+}
+
+/// WP9.9: any approximation between what the platform will actually run and
+/// what the rule as published specifies must be disclosed structurally, not
+/// left to a reader to find in free text. This checks presence, not writing
+/// quality -- `eligibility()`'s advisories are the mechanical signal that a
+/// deviation exists; the human sign-off step (not this function) judges
+/// whether the disclosure text itself is honest and clear.
+pub fn disclosure_check(entry: &LibraryEntry, platform: &PlatformCapabilities) -> GateResult {
+    let advisories_exist = {
+        // A neutral, always-permitted mandate, matching WP9.3's own intake-time
+        // use of eligibility() -- this checks the RULE's fit against the
+        // platform in general, not against any one user's mandate. The
+        // allow-list is built from the entry's OWN instruments: an empty
+        // instrument_allow means "nothing is allowed" (fail-closed, see
+        // eligibility()'s own InstrumentsNotAllowed check), not "everything."
+        let permissive = mandate_allowing_everything(&entry.instruments);
+        let elig = eligibility(entry, &permissive, platform);
+        elig.reasons.iter().any(|r| r.origin == Origin::Advisory)
+    };
+    match (advisories_exist, entry.known_deviations.is_empty()) {
+        (true, true) => GateResult::fail(
+            "eligibility() found at least one advisory-level approximation, but known_deviations is empty -- \
+             the deviation must be disclosed structurally, not left implicit",
+        ),
+        (true, false) => GateResult::pass(format!("{} known_deviations entries disclosed", entry.known_deviations.len())),
+        (false, _) => GateResult::pass("no advisory-level approximation found; nothing required to disclose"),
+    }
+}
+
+/// A mandate permitting everything a rule could need, purely so
+/// `disclosure_check` can ask "does the PLATFORM approximate this rule,"
+/// independent of any one user's actual limits. Values are deliberately
+/// maximal/unconstrained, not a real account -- do not reuse this as a real
+/// mandate anywhere outside this intake-time check.
+fn mandate_allowing_everything(instruments: &[String]) -> MandateBody {
+    serde_json::from_value(serde_json::json!({
+        "basis": {
+            "capital_source": "own",
+            "jurisdiction": "US-GA",
+            "acknowledgements": []
+        },
+        "capital": { "allocated": { "amount": "1000000.00", "ccy": "USD" }, "min_cash_reserve": 0.0 },
+        "universe": {
+            "venues": ["alpaca", "kraken", "oanda"],
+            "asset_classes": ["us_etf", "crypto_spot", "fx"],
+            "instrument_allow": instruments,
+            "instrument_deny": [],
+            "shorting": true, "derivatives": true, "leverage_max_gross": 100.0
+        },
+        "exposure": {
+            "max_position": 100.0, "max_asset_class": {},
+            "max_gross": 100.0, "max_net": 100.0,
+            "max_order_notional": { "amount": "1000000.00", "ccy": "USD" },
+            "max_orders_per_day": 100000, "max_turnover_per_day": 100.0
+        },
+        "loss": {
+            "daily_loss_limit": 1.0,
+            "drawdown_ladder": [{ "at": 0.99, "action": "halt_flatten" }],
+            "resume_after_halt": "human_only"
+        },
+        "autonomy": {
+            "level": "L3",
+            "may": ["place_orders", "cancel_orders", "resize_within_limits", "rebalance", "halt", "flatten"],
+            "needs_confirmation": [],
+            "never": ["change_limits", "resume_after_halt", "change_credentials", "withdraw"]
+        },
+        "reporting": { "digest": "daily", "alert_channels": ["email"] }
+    }))
+    .expect("hand-built permissive mandate fixture parses")
+}
+
+// ---------------------------------------------------------------------------
+// WP9.2 automated replication checks (IMPLEMENTATION_PLAN.md): the checks
+// that were already specced before this session's WP9.7-9.9 additions, but
+// never built. Pure functions, same discipline as everything else in this
+// file -- these take already-computed signals/results as input; producing
+// those (running a candidate's reference implementation against real data)
+// is a separate, not-yet-built concern (see IMPLEMENTATION_PLAN.md's note on
+// where the real backtesting infra needs to be invoked).
+// ---------------------------------------------------------------------------
+
+pub const SIGNAL_AGREEMENT_FLOOR: f64 = 0.98;
+
+/// Absolute tolerance comparing two implementations' per-bar signals. Two
+/// independent implementations of the SAME unambiguous rule text should
+/// compute near-identical numbers -- this only absorbs float rounding, not
+/// real implementation disagreement.
+const SIGNAL_AGREEMENT_TOLERANCE: f64 = 1e-6;
+
+/// WP9.2: what fraction of bars do two independent implementations of the
+/// same rule agree on. `None` at a bar means "flat" (no position); `Some(w)`
+/// is a signed weight. Both series must be the same length and bar-aligned
+/// by the caller -- this function has no notion of time itself.
+pub fn signal_agreement(a: &[Option<f64>], b: &[Option<f64>]) -> GateResult {
+    if a.len() != b.len() {
+        return GateResult::fail(format!("signal series have different lengths ({} vs {})", a.len(), b.len()));
+    }
+    if a.is_empty() {
+        return GateResult::fail("signal series are empty -- nothing to compare");
+    }
+    let agree = a
+        .iter()
+        .zip(b.iter())
+        .filter(|(x, y)| match (x, y) {
+            (None, None) => true,
+            (Some(p), Some(q)) => (p - q).abs() <= SIGNAL_AGREEMENT_TOLERANCE,
+            _ => false,
+        })
+        .count();
+    let fraction = agree as f64 / a.len() as f64;
+    let pct = |f: f64| f * 100.0;
+    if fraction >= SIGNAL_AGREEMENT_FLOOR {
+        GateResult::pass(format!(
+            "{agree}/{} bars agree ({:.1}%) >= the {:.0}% floor",
+            a.len(),
+            pct(fraction),
+            pct(SIGNAL_AGREEMENT_FLOOR)
+        ))
+    } else {
+        GateResult::fail(format!(
+            "only {agree}/{} bars agree ({:.1}%), below the {:.0}% floor",
+            a.len(),
+            pct(fraction),
+            pct(SIGNAL_AGREEMENT_FLOOR)
+        ))
+    }
+}
+
+/// WP9.2: a signal function must not change its decision at bar `t` when
+/// bars after `t` are removed -- the exact defect that failed 7 of 24 trials
+/// in the raw-engine baseline (CERTIFICATION.md). Takes the signal FUNCTION
+/// itself, not just its output over one fixed series: only re-running it
+/// against a genuinely shorter series can catch an implementation that reads
+/// `all_prices[t+1]`, a centered window, or `all_prices.len()` to sneak in
+/// future information a plain output-comparison would never expose.
+pub fn causality_by_truncation_check<F>(prices: &[f64], signal_at: F) -> GateResult
+where
+    F: Fn(&[f64], usize) -> Option<f64>,
+{
+    if prices.len() < 2 {
+        return GateResult::fail("need at least 2 bars to check causality by truncation");
+    }
+    let violations: Vec<usize> = (0..prices.len())
+        .filter(|&t| {
+            let full = signal_at(prices, t);
+            let truncated = signal_at(&prices[..=t], t);
+            match (full, truncated) {
+                (None, None) => false,
+                (Some(a), Some(b)) => (a - b).abs() > SIGNAL_AGREEMENT_TOLERANCE,
+                _ => true,
+            }
+        })
+        .collect();
+    if violations.is_empty() {
+        GateResult::pass(format!("signal at every one of {} bars is unchanged when later bars are removed", prices.len()))
+    } else {
+        GateResult::fail(format!(
+            "signal changed when later bars were removed at {} of {} bars (first: bar {}) -- look-ahead",
+            violations.len(),
+            prices.len(),
+            violations[0]
+        ))
+    }
+}
+
+/// WP9.2: sizing must be set explicitly, never silently defaulted by a
+/// reference implementation. Checks `parameters` for at least one
+/// sizing-shaped key (naming convention: contains "weight", "sizing",
+/// "target" or "leverage") whose value is a concrete number, not absent or
+/// null.
+pub fn explicit_sizing_check(entry: &LibraryEntry) -> GateResult {
+    let sizing_keys: Vec<&String> = entry
+        .parameters
+        .keys()
+        .filter(|k| {
+            let k = k.as_str();
+            k.contains("weight") || k.contains("sizing") || k.contains("target") || k.contains("leverage")
+        })
+        .collect();
+    if sizing_keys.is_empty() {
+        return GateResult::fail("parameters has no sizing-shaped key (weight/sizing/target/leverage) at all");
+    }
+    // At least one matching key must be a concrete number -- NOT every one:
+    // a descriptive key can legitimately share the naming pattern without
+    // being a number itself (fx_tsmom_12m's own "weighting":
+    // "inverse_volatility (direction / sigma)" describes the sizing METHOD
+    // in prose, while "sleeve_vol_target"/"max_abs_weight" carry the actual
+    // numbers -- requiring every match to be numeric penalised the entry for
+    // documenting itself clearly).
+    let numeric: Vec<String> =
+        sizing_keys.iter().filter(|k| entry.parameters[k.as_str()].is_number()).map(|k| k.to_string()).collect();
+    if numeric.is_empty() {
+        return GateResult::fail(format!(
+            "sizing-shaped key(s) {sizing_keys:?} exist but none is a concrete number"
+        ));
+    }
+    GateResult::pass(format!("{} numeric sizing parameter(s) explicitly set: {:?}", numeric.len(), numeric))
+}
+
+/// WP9.2: both gross and net results must be reported -- net-only hides how
+/// much of the edge is cost; gross-only overstates what's actually
+/// achievable. Checked by metric naming (a `_gross`/`_net` suffix).
+pub fn gross_and_net_reported_check(entry: &LibraryEntry) -> GateResult {
+    let has_gross = entry.expected_ranges.iter().any(|r| r.metric.ends_with("_gross"));
+    let has_net = entry.expected_ranges.iter().any(|r| r.metric.ends_with("_net"));
+    match (has_gross, has_net) {
+        (true, true) => GateResult::pass("both a _gross and a _net metric are reported"),
+        (true, false) => GateResult::fail("only a gross metric is reported -- costs are not shown"),
+        (false, true) => {
+            GateResult::fail("only a net metric is reported -- the pre-cost edge is not shown, can't tell how much is cost")
+        }
+        (false, false) => GateResult::fail("neither metric is explicitly labeled _gross or _net -- ambiguous which this is"),
+    }
+}
+
+/// WP9.2: does a freshly-measured result fall inside the entry's own stated
+/// range for that metric. `None` when the entry has no range for this metric
+/// at all -- distinct from failing, since there is nothing to check against.
+pub fn falls_inside_expected_range(entry: &LibraryEntry, metric: &str, measured_value: f64) -> Option<GateResult> {
+    let range = entry.expected_ranges.iter().find(|r| r.metric == metric)?;
+    if !range.is_informative() {
+        return Some(GateResult::pass(format!("{metric} range has no bounds set -- nothing to fail against")));
+    }
+    Some(if range.contains(measured_value) {
+        GateResult::pass(format!("{metric}={measured_value} is inside the stated range"))
+    } else {
+        GateResult::fail(format!(
+            "{metric}={measured_value} is OUTSIDE the stated range [{:?}, {:?}] -- tagged outside_expected_range, \
+             blocked pending an explicit owner override",
+            range.low, range.high
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Intake gate: ties every WP9.2/9.7-9.9 check into one verdict. This is the
+// review packet described in the "how does the human sign-off actually
+// work" discussion -- every field here is exactly what a reviewer needs to
+// see, structured, not a transcript they have to comb through.
+// ---------------------------------------------------------------------------
+
+/// Replication evidence a caller has already measured (running a candidate's
+/// two independent implementations against real data is a separate, not-yet-
+/// built concern -- this struct is the boundary: everything on the other
+/// side of it is "given these measurements," not "go measure them").
+///
+/// UPDATE 2026-09-23: for `etf_trend_faber` and `crypto_trend_100d`
+/// specifically, "go measure them" is no longer entirely separate --
+/// `SignalEngine/crates/reference-rules` already has a real Rust
+/// implementation of both rules (`decide_etf_trend`, `decide_crypto_trend`)
+/// and a golden test (`tests/golden.rs`) that replays them against real
+/// historical prices (`tests/data/ladder_candles.csv`, SHA-pinned) and
+/// compares to the original stage1-record shadow signals -- the actual
+/// independent second implementation these entries were built from. Verified
+/// running for real today, in this session, not assumed: `cargo test --test
+/// golden -- --nocapture`, 6/6 passed --
+/// `S1 ETF trend (explicit mode): 555/555 signals agree over 111 month-ends`,
+/// `S3 crypto trend (reference semantics): 3654/3654 agree over 1827 days`.
+/// That crate lives in a different repo with no existing dependency edge to
+/// this one, so this module doesn't import it -- a real cross-repo
+/// dependency is a bigger decision than one function needs. Test fixtures
+/// below transcribe that REAL, already-measured result (100% agreement, not
+/// assumed) rather than a synthetic stand-in, with this comment as the
+/// paper trail for where the number actually came from.
+pub struct ReplicationEvidence {
+    pub signal_a: Vec<Option<f64>>,
+    pub signal_b: Vec<Option<f64>>,
+    /// The metric name and measured value to check against `expected_ranges`
+    /// -- typically the entry's own primary metric, freshly measured.
+    pub measured_metric: String,
+    pub measured_value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntakeVerdict {
+    /// The evidence label this candidate has EARNED, purely from the checks
+    /// -- what a human still has to decide (per the "why not let the agent
+    /// decide" discussion) is whether to actually apply it; this is not a
+    /// bypass of that step.
+    pub earned_evidence: Evidence,
+    pub checks: Vec<(&'static str, GateResult)>,
+    /// T4b, design section 2.4 item 5: informational provenance only, passed straight through from `intake_gate`'s
+    /// own new parameter. Never affects `earned_evidence` (see [`VerifiedReplicationProvenance`]'s doc comment).
+    pub verified_replication: Option<VerifiedReplicationProvenance>,
+}
+
+impl IntakeVerdict {
+    /// Every check that failed, for a reviewer who only wants the problems.
+    pub fn failures(&self) -> impl Iterator<Item = (&'static str, &GateResult)> {
+        self.checks.iter().filter(|(_, r)| !r.passes).map(|(name, r)| (*name, r))
+    }
+}
+
+/// Run every WP9.2/9.7-9.9 check and produce one verdict. Does NOT write
+/// anything or move an entry's real `evidence` field -- that write, and the
+/// one remaining human sign-off before `ReplicatedOnPlatform`, both happen
+/// outside this pure function (see WP9.5's staged autonomy).
+pub fn intake_gate(
+    entry: &LibraryEntry,
+    platform: &PlatformCapabilities,
+    replication: &ReplicationEvidence,
+    verified_replication: Option<VerifiedReplicationProvenance>,
+) -> IntakeVerdict {
+    let mut checks: Vec<(&'static str, GateResult)> = Vec::new();
+
+    // WP9.3: does the platform even support what the rule needs -- for
+    // INTAKE purposes, "can it run at all" means "can it run in PAPER,"
+    // not "can it go live." `blocked_by_platform()` is deliberately
+    // broader (it also fires on a live-only block, e.g. a venue like
+    // Alpaca not being live-ready yet -- correct for a per-user eligibility
+    // check, wrong here: a paper-only rule should still be able to earn
+    // reference_only, since paper trading is how a strategy gets proven out
+    // before going live in the first place). `eligible_paper` is the field
+    // purpose-built for exactly this distinction.
+    let permissive = mandate_allowing_everything(&entry.instruments);
+    let elig = eligibility(entry, &permissive, platform);
+    let platform_ok = elig.eligible_paper;
+    checks.push((
+        "9.3_platform_capability",
+        if platform_ok {
+            GateResult::pass("platform supports everything this rule needs in paper mode (or only advisory-level approximations)")
+        } else {
+            GateResult::fail(format!(
+                "platform cannot run this rule even in paper mode: {}",
+                elig.reasons.iter().filter(|r| r.origin == Origin::Platform).map(|r| r.message.clone()).collect::<Vec<_>>().join("; ")
+            ))
+        },
+    ));
+
+    // WP9.2: the four mechanical replication checks.
+    checks.push(("9.2_signal_agreement", signal_agreement(&replication.signal_a, &replication.signal_b)));
+    checks.push(("9.2_explicit_sizing", explicit_sizing_check(entry)));
+    checks.push(("9.2_gross_and_net_reported", gross_and_net_reported_check(entry)));
+    checks.push((
+        "9.2_falls_inside_expected_range",
+        falls_inside_expected_range(entry, &replication.measured_metric, replication.measured_value)
+            .unwrap_or_else(|| GateResult::fail(format!("entry has no expected_ranges entry for metric {:?} at all", replication.measured_metric))),
+    ));
+
+    // WP9.7-9.9.
+    checks.push(("9.7_evidence_strength", evidence_strength_check(entry)));
+    checks.push(("9.8_representativeness", representativeness_check(entry)));
+    checks.push(("9.9_disclosure", disclosure_check(entry, platform)));
+
+    let earned_evidence = if !platform_ok {
+        Evidence::PlatformCapabilityBlocked
+    } else if checks.iter().filter(|(name, _)| *name != "9.3_platform_capability").all(|(_, r)| r.passes) {
+        // All of WP9.2/9.7-9.9 clean -- earns reference_only. Note this
+        // function never returns ReplicatedOnPlatform: per WP9.5, that label
+        // is never auto-cleared, only reference_only is (partial autonomy).
+        Evidence::ReferenceOnly
+    } else {
+        Evidence::Unverified
+    };
+
+    IntakeVerdict { earned_evidence, checks, verified_replication }
+}
+
+// ---------------------------------------------------------------------------
+// WP8.5/9.5 calibration harness (IMPLEMENTATION_PLAN.md): a checker earns no
+// autonomy until its OWN accuracy is measured against cases whose correct
+// answer is already known -- this is that measurement, not the trust
+// decision itself (that's still WP9.5's staged autonomy unlock, elsewhere).
+// ---------------------------------------------------------------------------
+
+/// One case in a known-answer set: a candidate whose CORRECT `intake_gate`
+/// outcome is already known, either by construction (a deliberately
+/// corrupted copy of a real entry) or because a human already checked it by
+/// hand (a real entry). The known-answer SET itself (which real/synthetic
+/// cases to use) is a caller concern, not this module's -- this only
+/// provides the case shape and the measurement.
+pub struct CalibrationCase {
+    pub name: String,
+    pub entry: LibraryEntry,
+    pub replication: ReplicationEvidence,
+    pub expected_evidence: Evidence,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibrationReport {
+    pub total: usize,
+    pub correct: usize,
+    /// The gate was MORE generous than the known-correct answer -- a real
+    /// safety concern (something that should have stayed back earned more
+    /// trust than it should have).
+    pub false_accepts: Vec<String>,
+    /// The gate was MORE strict than the known-correct answer -- a cost
+    /// concern, not a safety one (a genuinely good candidate held back).
+    pub false_rejects: Vec<String>,
+}
+
+impl CalibrationReport {
+    pub fn pass_rate(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.correct as f64 / self.total as f64
+    }
+
+    /// Wilson 95% confidence interval on the pass rate, same style as
+    /// `CERTIFICATION.md`'s existing ladder for reporting a checker's own
+    /// measured accuracy (not a promise the checker is trustworthy at that
+    /// rate -- WP9.5's autonomy unlock is a separate decision on top of this
+    /// number, not automatic once it looks good).
+    pub fn confidence_interval(&self) -> (f64, f64) {
+        wilson_95(self.correct, self.total)
+    }
+}
+
+/// Wilson 95% interval for a binomial proportion. Same formula as
+/// `meta_portfolio_service::placebo_suite`'s own -- that module isn't
+/// crate-visible from here, so re-derived rather than imported; both are
+/// small, standard, and independently testable.
+fn wilson_95(k: usize, n: usize) -> (f64, f64) {
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let (k, n, z) = (k as f64, n as f64, 1.96_f64);
+    let p = k / n;
+    let d = 1.0 + z * z / n;
+    let c = p + z * z / (2.0 * n);
+    let h = z * ((p * (1.0 - p) + z * z / (4.0 * n)) / n).sqrt();
+    (((c - h) / d).max(0.0), ((c + h) / d).min(1.0))
+}
+
+/// How "generous" an `Evidence` label is, purely for calibration's
+/// over-vs-under classification. `PlatformCapabilityBlocked` is not on this
+/// ladder -- it's a different DIMENSION (can the platform even run it),
+/// not more or less evidence -- so any mismatch involving it is classified
+/// separately, in `run_calibration`, not ranked here.
+fn evidence_rank(e: Evidence) -> u8 {
+    match e {
+        Evidence::Unverified => 0,
+        Evidence::ReferenceOnly => 1,
+        // `ReplicatedOnPlatform` and `AgentVerified` share a rank here on purpose: this ladder measures HOW MUCH
+        // evidence a label represents, and the two are not more/less evidence than each other -- only WHO verified
+        // differs (L1, AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2), which this calibration ladder does not
+        // (and must not) collapse into "more generous." `intake_gate` itself never produces either as `got` (its
+        // own doc comment), so this arm is exercised only via a calibration case's aspirational `want`.
+        Evidence::ReplicatedOnPlatform | Evidence::AgentVerified => 2,
+        Evidence::PlatformCapabilityBlocked => u8::MAX, // unreachable: handled before this is called
+    }
+}
+
+/// Run `intake_gate` against a known-answer set and measure its accuracy.
+pub fn run_calibration(cases: &[CalibrationCase], platform: &PlatformCapabilities) -> CalibrationReport {
+    let mut correct = 0;
+    let mut false_accepts = Vec::new();
+    let mut false_rejects = Vec::new();
+    for case in cases {
+        let got = intake_gate(&case.entry, platform, &case.replication, None).earned_evidence;
+        let want = case.expected_evidence;
+        if got == want {
+            correct += 1;
+        } else if got == Evidence::PlatformCapabilityBlocked || want == Evidence::PlatformCapabilityBlocked {
+            false_accepts.push(case.name.clone());
+        } else if evidence_rank(got) > evidence_rank(want) {
+            false_accepts.push(case.name.clone());
+        } else {
+            false_rejects.push(case.name.clone());
+        }
+    }
+    CalibrationReport { total: cases.len(), correct, false_accepts, false_rejects }
 }
 
 // ---------------------------------------------------------------------------
 // Seed entries (embedded JSON; facts only from the stage-1 record files)
 // ---------------------------------------------------------------------------
 
+/// The real, shipped library content. Empty from 2026-09-23 until stage T4, slice T4e
+/// (`product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md` section 3.3 "T4e: the first entry"), which adds ONE entry:
+/// `etf_trend_faber` at version 2, re-issued in the compiled rule's own parameter vocabulary (so it passes
+/// [`crate::replication::binding::check_declared_parameters`] with ZERO drift, unlike the version-1 fixture that
+/// still lives under `test_fixtures/` purely as realistic test data -- see `tests::TEST_FIXTURE_JSON` below) and
+/// carrying `operating_procedure` (COUNCIL Ruling 10). Its declared `evidence` stays `reference_only`: T4e ships the
+/// entry and a path-A run GENERATOR (`program/src/bin/generate_replication_run.rs`) that can produce a genuine,
+/// self-verifying run against the embedded answer key, but deliberately ships NO human review (see that binary's own
+/// doc comment and `program/data/replication_runs/README.md`) -- so `GET /api/library` serves this entry at
+/// `reference_only` until the repo owner supplies one. `fx_tsmom_12m` is not re-issued here (FX has no compiled rule
+/// at all today -- `platform_capability_blocked`) and stays out of `SEED_JSON`.
+///
+/// `crypto_trend_100d` (added 2026-10-09): the v1 fixture's 2016-2020 window failed WP9.8 representativeness by a
+/// hair (4.9993 years, just under the 5.0-year floor) -- the fix this doc comment used to point at ("extend the
+/// window by a few weeks of real data") was already done, separately, on 2026-10-04 (Amendment 13,
+/// `program/tests/fixtures/replication_ladder_crypto_evidence/`, PR #213): a real, pre-registered, PASS-verdict
+/// data-quality-certified fixture over 2020-03-16..2026-10-03 (6.549 years). That fixture's own final step --
+/// drafting this entry from it -- was never done until now; nothing in this crate referenced it before this entry.
+/// No performance band is published (council rulings R22/R23, Amendment 13 section 7: a deliberate policy choice
+/// given the window is still only one crypto cycle, not a failed check) -- see the entry's own `expected_ranges[0]`
+/// and `verification_note` for the exact reasoning and the real certified numbers.
 const SEED_JSON: [(&str, &str); 3] = [
     ("etf_trend_faber", include_str!("../data/strategy_library/etf_trend_faber.json")),
-    ("fx_tsmom_12m", include_str!("../data/strategy_library/fx_tsmom_12m.json")),
     ("crypto_trend_100d", include_str!("../data/strategy_library/crypto_trend_100d.json")),
+    ("etf_cross_sectional_momentum", include_str!("../data/strategy_library/etf_cross_sectional_momentum.json")),
 ];
 
 /// Parse the embedded seed entries. Fails (rather than panics) if an embedded
-/// file is malformed or its id disagrees with its file name.
+/// file is malformed, its id disagrees with its file name, or it fails
+/// [`validate_entry`] (stage T4a: this was previously never checked here at
+/// all -- `product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md` section 2.4 names
+/// this exact gap: "`seed_library()` ... does not call `validate_entry`" --
+/// so a malformed or label-declaring embedded entry now fails loudly instead
+/// of shipping silently.)
 pub fn seed_library() -> Result<Vec<LibraryEntry>, String> {
-    SEED_JSON
-        .iter()
-        .map(|(name, json)| {
-            let e: LibraryEntry = serde_json::from_str(json).map_err(|err| format!("{name}: {err}"))?;
-            if e.id != *name {
-                return Err(format!("{name}: id {:?} does not match its file name", e.id));
-            }
-            Ok(e)
-        })
-        .collect()
+    SEED_JSON.iter().map(|(name, json)| parse_seed_entry(name, json)).collect()
+}
+
+/// One `(name, json)` pair of [`seed_library`]'s loop body, factored out so a test can exercise it directly against a
+/// hand-built entry (proving the loud rejection of a malformed or label-declaring entry) without `SEED_JSON` itself
+/// needing to be non-empty.
+fn parse_seed_entry(name: &str, json: &str) -> Result<LibraryEntry, String> {
+    let e: LibraryEntry = serde_json::from_str(json).map_err(|err| format!("{name}: {err}"))?;
+    if e.id != name {
+        return Err(format!("{name}: id {:?} does not match its file name", e.id));
+    }
+    let violations = validate_entry(&e);
+    if !violations.is_empty() {
+        return Err(format!("{name}: fails validate_entry: {}", violations.join("; ")));
+    }
+    Ok(e)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +1451,11 @@ impl Eligibility {
 
 /// Instrument names compare case-insensitively and ignore `/`, `-`, `_` and
 /// spaces, so `BTC/USD`, `btc-usd` and `BTCUSD` are the same instrument.
-fn norm_symbol(s: &str) -> String {
+///
+/// `pub(crate)` (not `pub`) since `replication::binding`'s entry-versus-compiled-rule drift check (T4a) reuses this
+/// EXACT normalization to compare a `LibraryEntry`'s `instruments` against a compiled rule's universe, rather than
+/// inventing a second, possibly-diverging one.
+pub(crate) fn norm_symbol(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '/' | '-' | '_' | ' ')).flat_map(char::to_uppercase).collect()
 }
 
@@ -1047,7 +1972,7 @@ impl SelectionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mandate::{self, LadderAction};
+    use super::super::mandate::{self, LadderAction}; // T4b: was `crate::mandate`; see the module-level comment above.
     use serde_json::json;
 
     // Copied from mandate.rs tests; ONLY change: instrument_allow lists all
@@ -1102,8 +2027,26 @@ mod tests {
         mandate_with(|_| {})
     }
 
+    /// Realistic fixture data for exercising `eligibility()`/`fit_scale_to_ladder()`
+    /// against genuine strategy shapes (real shorting/leverage/asset-class
+    /// requirements) -- NOT the shipped library, which is deliberately empty
+    /// (see `SEED_JSON`'s doc comment above). Same 3 files as before this
+    /// module's content was cleared, just no longer wired to `seed_library()`.
+    const TEST_FIXTURE_JSON: [(&str, &str); 3] = [
+        ("etf_trend_faber", include_str!("../data/strategy_library/test_fixtures/etf_trend_faber.json")),
+        ("fx_tsmom_12m", include_str!("../data/strategy_library/test_fixtures/fx_tsmom_12m.json")),
+        ("crypto_trend_100d", include_str!("../data/strategy_library/test_fixtures/crypto_trend_100d.json")),
+    ];
+
     fn lib() -> Vec<LibraryEntry> {
-        seed_library().expect("seed library parses")
+        TEST_FIXTURE_JSON
+            .iter()
+            .map(|(name, json)| {
+                let e: LibraryEntry = serde_json::from_str(json).expect("fixture parses");
+                assert_eq!(&e.id, name, "fixture id matches its file name");
+                e
+            })
+            .collect()
     }
 
     fn entry(id: &str) -> LibraryEntry {
@@ -1173,14 +2116,107 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------ T4a: a hand-typed label is rejected
+
+    /// Mutant target: "`validate_entry` stops rejecting the declared label".
+    #[test]
+    fn validate_entry_rejects_a_hand_typed_replicated_on_platform_label_even_when_otherwise_valid() {
+        for e in lib() {
+            assert_eq!(validate_entry(&e), Vec::<String>::new(), "{} starts valid", e.id);
+            let mut declared = e.clone();
+            declared.evidence = Evidence::ReplicatedOnPlatform;
+            let violations = validate_entry(&declared);
+            assert_eq!(violations.len(), 1, "{}: {violations:?}", e.id);
+            assert!(violations[0].contains("replicated_on_platform"), "{}: {violations:?}", e.id);
+        }
+    }
+
+    /// The rejection fires independently of every other violation: an otherwise-garbage entry that ALSO declares the
+    /// label still names the label violation (it is not swallowed or short-circuited by earlier checks).
+    #[test]
+    fn validate_entry_rejects_the_label_alongside_other_violations() {
+        let mut e = entry("etf_trend_faber");
+        e.evidence = Evidence::ReplicatedOnPlatform;
+        e.name = "   ".to_string(); // also blank -- a second, unrelated violation
+        e.version = 0; // a third
+        let violations = validate_entry(&e);
+        assert!(violations.iter().any(|v| v.contains("replicated_on_platform")), "{violations:?}");
+        assert!(violations.len() >= 3, "{violations:?}");
+    }
+
+    // ---------------------------------------------------- L1: a hand-typed agent_verified label is rejected too
+
+    /// AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2, mirrors
+    /// `validate_entry_rejects_a_hand_typed_replicated_on_platform_label_even_when_otherwise_valid` exactly for the
+    /// sibling label. Mutant target: "`validate_entry` stops rejecting a declared `agent_verified` label".
+    #[test]
+    fn validate_entry_rejects_a_hand_typed_agent_verified_label_even_when_otherwise_valid() {
+        for e in lib() {
+            assert_eq!(validate_entry(&e), Vec::<String>::new(), "{} starts valid", e.id);
+            let mut declared = e.clone();
+            declared.evidence = Evidence::AgentVerified;
+            let violations = validate_entry(&declared);
+            assert_eq!(violations.len(), 1, "{}: {violations:?}", e.id);
+            assert!(violations[0].contains("agent_verified"), "{}: {violations:?}", e.id);
+        }
+    }
+
+    /// The two rejection clauses are independent: declaring BOTH `ReplicatedOnPlatform` and (impossible on a single
+    /// field, but exercised via two separate entries) each label alone produces exactly its own violation string,
+    /// never the other's -- proving the two clauses never get conflated with each other.
+    #[test]
+    fn validate_entry_agent_verified_and_replicated_on_platform_rejections_are_distinct_messages() {
+        let mut replicated = entry("etf_trend_faber");
+        replicated.evidence = Evidence::ReplicatedOnPlatform;
+        let replicated_violations = validate_entry(&replicated);
+        assert!(replicated_violations.iter().any(|v| v.contains("replicated_on_platform")));
+        assert!(!replicated_violations.iter().any(|v| v.contains("agent_verified")));
+
+        let mut agent = entry("etf_trend_faber");
+        agent.evidence = Evidence::AgentVerified;
+        let agent_violations = validate_entry(&agent);
+        assert!(agent_violations.iter().any(|v| v.contains("agent_verified")));
+        assert!(!agent_violations.iter().any(|v| v.contains("replicated_on_platform")));
+    }
+
+    /// Mutant target: "`seed_library` stops calling `validate_entry`". `SEED_JSON` itself is empty (nothing to load
+    /// in production today), so this exercises `parse_seed_entry` -- `seed_library`'s own per-entry loop body --
+    /// directly against a hand-built JSON string, exactly as `seed_library` would if `SEED_JSON` were non-empty.
+    #[test]
+    fn parse_seed_entry_rejects_a_declared_replicated_on_platform_label() {
+        let mut v: serde_json::Value = serde_json::from_str(TEST_FIXTURE_JSON[0].1).expect("fixture parses");
+        v["evidence"] = json!("replicated_on_platform");
+        let json = serde_json::to_string(&v).expect("re-serializes");
+        let err = parse_seed_entry("etf_trend_faber", &json).expect_err("must fail loudly, not load silently");
+        assert!(err.contains("fails validate_entry"), "{err}");
+        assert!(err.contains("replicated_on_platform"), "{err}");
+    }
+
+    /// The id-mismatch and JSON-parse checks `seed_library` already had keep working through the refactor into
+    /// `parse_seed_entry`.
+    #[test]
+    fn parse_seed_entry_still_rejects_id_mismatch_and_bad_json() {
+        assert!(parse_seed_entry("wrong_name", TEST_FIXTURE_JSON[0].1).is_err());
+        assert!(parse_seed_entry("etf_trend_faber", "{ not json").is_err());
+    }
+
     #[test]
     fn every_seed_is_reference_only_with_a_caveat_about_the_literature() {
         for e in lib() {
             assert_eq!(e.evidence, Evidence::ReferenceOnly, "{}", e.id);
             assert_eq!(e.version, 1);
-            assert_eq!(e.last_verified, "2026-09-21");
+            // All 3 got a real, dated citation check on 2026-09-23 (see
+            // sources[0]); rule-text transcription itself is still dated
+            // 2026-09-21 -- last_verified reflects the more recent of the two.
+            assert_eq!(e.last_verified, "2026-09-23", "{}", e.id);
             assert!(e.verification_note.contains("NOT replicated"), "{}", e.id);
-            assert!(e.verification_note.contains("UNVERIFIED"), "{}", e.id);
+            // fx and crypto's citations remain genuinely unverified against
+            // the original claim; etf's was actually checked and found
+            // wrong (a real, checked "no," stronger than lingering
+            // uncertainty) -- both are honest states, not the same one.
+            let honestly_uncertain_or_checked =
+                e.verification_note.contains("UNVERIFIED") || e.verification_note.contains("CHECKED");
+            assert!(honestly_uncertain_or_checked, "{}: {}", e.id, e.verification_note);
         }
     }
 
@@ -2240,5 +3276,716 @@ mod tests {
             rule: "Choose every eligible entry.".into(),
         };
         assert_eq!(r.validate(&map, 4), vec![]);
+    }
+
+    // -----------------------------------------------------------------
+    // WP9.7-9.9 intake gate (IMPLEMENTATION_PLAN.md)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evidence_strength_etf_passes_at_its_own_published_floor() {
+        let r = evidence_strength_check(&entry("etf_trend_faber"));
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn evidence_strength_fx_fails_integrity_bound_only() {
+        let r = evidence_strength_check(&entry("fx_tsmom_12m"));
+        assert!(!r.passes);
+        assert!(r.reason.contains("integrity bound"), "{}", r.reason);
+    }
+
+    #[test]
+    fn evidence_strength_crypto_fails_no_low_bound() {
+        // crypto's own performance_band was explicitly withdrawn (low/high
+        // both null) -- a different failure reason than fx's, but the same
+        // "does not auto-clear" outcome.
+        let r = evidence_strength_check(&entry("crypto_trend_100d"));
+        assert!(!r.passes);
+        assert!(r.reason.contains("no low bound"), "{}", r.reason);
+    }
+
+    #[test]
+    fn representativeness_etf_passes_on_the_benchmarks_real_drawdown() {
+        // etf_trend_faber's OWN drawdown was only 8.97% -- that's the rule
+        // successfully ducking out of COVID/2022, not evidence the window
+        // lacked stress. The benchmark's 26.68% is what proves it.
+        let r = representativeness_check(&entry("etf_trend_faber"));
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn representativeness_fx_passes_length_and_drawdown() {
+        let r = representativeness_check(&entry("fx_tsmom_12m"));
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn representativeness_crypto_fails_by_a_hair_on_window_length() {
+        // A real, precise finding (2026-09-23): crypto_trend_100d's real
+        // window (2016-01-01 to 2020-12-31) is 4.9993 years by exact day
+        // count -- fractionally under the 5-year minimum. Not the
+        // "bull-market, no real drawdown" failure mode this check mainly
+        // exists to catch (its 50.82% drawdown clears that easily) -- a
+        // separate, narrower gap. Worth fixing on the real entry (extend
+        // the window by a few weeks of real data) rather than lowering the
+        // threshold to fit this one case.
+        let r = representativeness_check(&entry("crypto_trend_100d"));
+        assert!(!r.passes, "expected a real 4.9993-year window to fail the 5.0-year minimum");
+        assert!(r.reason.contains("below the"), "{}", r.reason);
+    }
+
+    #[test]
+    fn representativeness_check_rejects_a_short_window_regardless_of_drawdown() {
+        let mut e = entry("etf_trend_faber");
+        e.backtest_window = BacktestWindow {
+            start: "2024-01-01".into(),
+            end: "2024-06-01".into(),
+            max_observed_drawdown: Some(0.5), // severe, but the window itself is too short
+        };
+        let r = representativeness_check(&e);
+        assert!(!r.passes);
+        assert!(r.reason.contains("below the"), "{}", r.reason);
+    }
+
+    #[test]
+    fn representativeness_check_rejects_a_long_window_with_no_real_drawdown() {
+        let mut e = entry("etf_trend_faber");
+        e.backtest_window = BacktestWindow {
+            start: "2010-01-01".into(),
+            end: "2025-01-01".into(),
+            max_observed_drawdown: Some(0.03), // long window, but a suspiciously calm one
+        };
+        let r = representativeness_check(&e);
+        assert!(!r.passes);
+        assert!(r.reason.contains("likely tested only"), "{}", r.reason);
+    }
+
+    #[test]
+    fn disclosure_etf_passes_with_its_real_known_deviation() {
+        let caps = current_platform_capabilities();
+        let r = disclosure_check(&entry("etf_trend_faber"), &caps);
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn disclosure_check_rejects_an_approximation_with_no_disclosure() {
+        let caps = current_platform_capabilities();
+        let mut e = entry("etf_trend_faber");
+        e.known_deviations = vec![]; // strip the real disclosure this entry actually has
+        let r = disclosure_check(&e, &caps);
+        assert!(!r.passes, "an undisclosed approximation must not pass");
+        assert!(r.reason.contains("must be disclosed"), "{}", r.reason);
+    }
+
+    #[test]
+    fn disclosure_check_passes_a_rule_with_no_approximation_to_disclose() {
+        // crypto_trend_100d's ONLY platform gap is the same sub-account drift
+        // as etf's; give it a mandate/platform combo where that's already
+        // disclosed, confirming the pass path isn't vacuous.
+        let caps = current_platform_capabilities();
+        let r = disclosure_check(&entry("crypto_trend_100d"), &caps);
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    // -----------------------------------------------------------------
+    // WP9.2 automated replication checks (IMPLEMENTATION_PLAN.md)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn signal_agreement_identical_series_is_100_percent() {
+        let a = vec![None, Some(0.2), Some(0.2), None];
+        let r = signal_agreement(&a, &a);
+        assert!(r.passes, "{}", r.reason);
+        assert!(r.reason.contains("4/4"), "{}", r.reason);
+    }
+
+    #[test]
+    fn signal_agreement_below_floor_fails() {
+        // 1 of 4 bars differs -- 75%, below the 98% floor.
+        let a = vec![None, Some(0.2), Some(0.2), None];
+        let b = vec![None, Some(0.2), Some(0.5), None];
+        let r = signal_agreement(&a, &b);
+        assert!(!r.passes);
+        assert!(r.reason.contains("3/4"), "{}", r.reason);
+    }
+
+    #[test]
+    fn signal_agreement_rejects_mismatched_lengths() {
+        let r = signal_agreement(&[None, Some(0.1)], &[None]);
+        assert!(!r.passes);
+        assert!(r.reason.contains("different lengths"), "{}", r.reason);
+    }
+
+    #[test]
+    fn causality_by_truncation_passes_a_genuinely_causal_signal() {
+        // A real trailing-average rule: only ever looks at prices[..=t].
+        let prices = vec![1.0, 2.0, 3.0, 2.5, 4.0, 3.5];
+        let causal = |series: &[f64], t: usize| -> Option<f64> {
+            let window = &series[..=t.min(series.len() - 1)];
+            let avg = window.iter().sum::<f64>() / window.len() as f64;
+            Some(avg)
+        };
+        let r = causality_by_truncation_check(&prices, causal);
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn causality_by_truncation_catches_a_look_ahead_bug() {
+        // A buggy rule that peeks one bar ahead when it's available -- exactly
+        // the class of defect this check exists to catch.
+        let prices = vec![1.0, 2.0, 3.0, 2.5, 4.0, 3.5];
+        let peeks_ahead = |series: &[f64], t: usize| -> Option<f64> {
+            if t + 1 < series.len() {
+                Some(series[t + 1]) // uses tomorrow's price -- a real look-ahead
+            } else {
+                Some(series[t])
+            }
+        };
+        let r = causality_by_truncation_check(&prices, peeks_ahead);
+        assert!(!r.passes, "a look-ahead bug must be caught, not passed");
+        assert!(r.reason.contains("look-ahead"), "{}", r.reason);
+    }
+
+    #[test]
+    fn explicit_sizing_all_three_real_entries_pass() {
+        for id in ["etf_trend_faber", "fx_tsmom_12m", "crypto_trend_100d"] {
+            let r = explicit_sizing_check(&entry(id));
+            assert!(r.passes, "{id}: {}", r.reason);
+        }
+    }
+
+    #[test]
+    fn explicit_sizing_check_rejects_no_sizing_parameter_at_all() {
+        let mut e = entry("etf_trend_faber");
+        e.parameters = BTreeMap::from([("sma_month_ends".to_string(), json!(10))]);
+        let r = explicit_sizing_check(&e);
+        assert!(!r.passes);
+        assert!(r.reason.contains("no sizing-shaped key"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gross_and_net_etf_fails_net_only() {
+        // etf_trend_faber's real metric is "sharpe_net" -- no gross figure at all.
+        let r = gross_and_net_reported_check(&entry("etf_trend_faber"));
+        assert!(!r.passes);
+        assert!(r.reason.contains("only a net metric"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gross_and_net_crypto_fails_gross_only() {
+        // crypto_trend_100d's real metric is "sharpe_gross" -- no net figure.
+        let r = gross_and_net_reported_check(&entry("crypto_trend_100d"));
+        assert!(!r.passes);
+        assert!(r.reason.contains("only a gross metric"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gross_and_net_fx_fails_unlabeled() {
+        // fx_tsmom_12m's real metrics are "sharpe" and "realised_annual_volatility"
+        // -- neither is labeled gross or net at all.
+        let r = gross_and_net_reported_check(&entry("fx_tsmom_12m"));
+        assert!(!r.passes);
+        assert!(r.reason.contains("ambiguous"), "{}", r.reason);
+    }
+
+    #[test]
+    fn gross_and_net_reported_check_passes_when_both_present() {
+        let mut e = entry("etf_trend_faber");
+        e.expected_ranges.push(ExpectedRange {
+            metric: "sharpe_gross".to_string(),
+            low: Some(0.3),
+            high: Some(1.1),
+            role: RangeRole::PerformanceBand,
+            source: "test fixture".to_string(),
+            note: "test fixture".to_string(),
+        });
+        let r = gross_and_net_reported_check(&e);
+        assert!(r.passes, "{}", r.reason);
+    }
+
+    #[test]
+    fn falls_inside_expected_range_etf_real_number_passes() {
+        // etf_trend_faber's own real reimplementation Sharpe was 0.645, inside its [0.2, 1.0] band.
+        let r = falls_inside_expected_range(&entry("etf_trend_faber"), "sharpe_net", 0.645);
+        assert!(r.is_some());
+        assert!(r.unwrap().passes);
+    }
+
+    #[test]
+    fn falls_inside_expected_range_flags_an_out_of_band_result() {
+        let r = falls_inside_expected_range(&entry("etf_trend_faber"), "sharpe_net", 5.0);
+        let r = r.expect("range exists");
+        assert!(!r.passes);
+        assert!(r.reason.contains("OUTSIDE"), "{}", r.reason);
+    }
+
+    #[test]
+    fn falls_inside_expected_range_is_none_for_an_unlisted_metric() {
+        assert!(falls_inside_expected_range(&entry("etf_trend_faber"), "not_a_real_metric", 1.0).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // WP9.4 evidence-label state machine
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evidence_transition_allows_the_forward_path_one_step_at_a_time() {
+        use Evidence::*;
+        assert!(evidence_transition_allowed(Unverified, ReferenceOnly));
+    }
+
+    /// T4, stage T4b (design section 2.4): UPDATED from T4a's behaviour, per the plan's explicit instruction --
+    /// "the cause-less form now returns false for `(ReferenceOnly, ReplicatedOnPlatform)` and the one existing test
+    /// that asserts the old behaviour ... is updated in the same PR." Promotion is now reachable ONLY through
+    /// [`evidence_transition_allowed_with`] with a genuine [`TransitionCause::VerifiedReplication`] -- see the tests
+    /// below. Mutant target: "the cause-less form still allows `(ReferenceOnly, ReplicatedOnPlatform)`" (this WOULD
+    /// let a curator promote an entry by editing declared JSON alone, exactly what T4 exists to prevent).
+    #[test]
+    fn evidence_transition_no_longer_allows_reference_only_to_replicated_without_a_cause() {
+        assert!(!evidence_transition_allowed(Evidence::ReferenceOnly, Evidence::ReplicatedOnPlatform));
+    }
+
+    #[test]
+    fn evidence_transition_rejects_skipping_straight_to_replicated() {
+        assert!(!evidence_transition_allowed(Evidence::Unverified, Evidence::ReplicatedOnPlatform));
+    }
+
+    /// T20: `evidence_transition_allowed_with` allows `reference_only -> replicated_on_platform` ONLY under
+    /// `TransitionCause::VerifiedReplication`, and is identical to the cause-less form for every other pair.
+    #[test]
+    fn evidence_transition_allowed_with_gates_promotion_on_a_genuine_cause() {
+        use Evidence::*;
+        assert!(evidence_transition_allowed_with(ReferenceOnly, ReplicatedOnPlatform, TransitionCause::VerifiedReplication));
+        for cause in [TransitionCause::Curation, TransitionCause::Decay, TransitionCause::CapabilityChange] {
+            assert!(
+                !evidence_transition_allowed_with(ReferenceOnly, ReplicatedOnPlatform, cause),
+                "{cause:?} must not unlock promotion"
+            );
+        }
+        // Every other pair matches the cause-less form regardless of cause.
+        for (from, to) in [
+            (Unverified, ReferenceOnly),
+            (ReplicatedOnPlatform, ReferenceOnly),
+            (Unverified, PlatformCapabilityBlocked),
+            (PlatformCapabilityBlocked, ReferenceOnly),
+        ] {
+            for cause in [TransitionCause::Curation, TransitionCause::VerifiedReplication, TransitionCause::Decay, TransitionCause::CapabilityChange] {
+                assert_eq!(evidence_transition_allowed_with(from, to, cause), evidence_transition_allowed(from, to), "{from:?}->{to:?} under {cause:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_transition_allows_decay_demotion_but_not_a_bigger_backward_jump() {
+        assert!(evidence_transition_allowed(Evidence::ReplicatedOnPlatform, Evidence::ReferenceOnly));
+        assert!(!evidence_transition_allowed(Evidence::ReplicatedOnPlatform, Evidence::Unverified));
+    }
+
+    // ---------------------------------------------------- L1: agent_verified state-machine tests
+
+    /// AUTONOMOUS_LIBRARY_CURATION_PLAN.md section 2.2 / section 4's test plan: exhaustively mirrors
+    /// `evidence_transition_allowed_with_gates_promotion_on_a_genuine_cause` for the sibling label --
+    /// `(ReferenceOnly, AgentVerified, AgentVerifiedReplication)` is the ONLY triple that succeeds for that pair,
+    /// including the "wrong cause" case `(ReferenceOnly, AgentVerified, VerifiedReplication)`, the mirror image of
+    /// the existing T4b test for the human path.
+    #[test]
+    fn evidence_transition_allowed_with_gates_agent_verified_promotion_on_a_genuine_cause() {
+        use Evidence::*;
+        assert!(evidence_transition_allowed_with(ReferenceOnly, AgentVerified, TransitionCause::AgentVerifiedReplication));
+        for cause in [
+            TransitionCause::Curation,
+            TransitionCause::VerifiedReplication, // the wrong cause -- must not unlock this promotion either
+            TransitionCause::Decay,
+            TransitionCause::CapabilityChange,
+        ] {
+            assert!(
+                !evidence_transition_allowed_with(ReferenceOnly, AgentVerified, cause),
+                "{cause:?} must not unlock agent_verified promotion"
+            );
+        }
+        // And the reverse: AgentVerifiedReplication must not unlock the HUMAN promotion either -- the two causes
+        // are never interchangeable.
+        assert!(!evidence_transition_allowed_with(ReferenceOnly, ReplicatedOnPlatform, TransitionCause::AgentVerifiedReplication));
+    }
+
+    /// Every `(from, to, cause)` triple involving `AgentVerified` that ISN'T the one promotion above matches the
+    /// cause-less form regardless of cause -- the same exhaustive-equivalence style as
+    /// `evidence_transition_allowed_with_gates_promotion_on_a_genuine_cause`.
+    #[test]
+    fn evidence_transition_allowed_with_agent_verified_other_pairs_match_causeless_form() {
+        use Evidence::*;
+        for (from, to) in [
+            (AgentVerified, ReferenceOnly),
+            (AgentVerified, Unverified),
+            (AgentVerified, PlatformCapabilityBlocked),
+            (AgentVerified, ReplicatedOnPlatform),
+            (ReplicatedOnPlatform, AgentVerified),
+            (Unverified, AgentVerified),
+            (PlatformCapabilityBlocked, AgentVerified),
+        ] {
+            for cause in [
+                TransitionCause::Curation,
+                TransitionCause::VerifiedReplication,
+                TransitionCause::AgentVerifiedReplication,
+                TransitionCause::Decay,
+                TransitionCause::CapabilityChange,
+            ] {
+                assert_eq!(
+                    evidence_transition_allowed_with(from, to, cause),
+                    evidence_transition_allowed(from, to),
+                    "{from:?}->{to:?} under {cause:?}"
+                );
+            }
+        }
+    }
+
+    /// The demotion mirrors `ReplicatedOnPlatform`'s exactly, and -- the load-bearing negative assertion --
+    /// `AgentVerified` and `ReplicatedOnPlatform` are NEVER directly reachable from each other in either direction,
+    /// under the cause-less form.
+    #[test]
+    fn evidence_transition_allows_agent_verified_demotion_but_never_a_direct_edge_to_or_from_replicated_on_platform() {
+        assert!(evidence_transition_allowed(Evidence::AgentVerified, Evidence::ReferenceOnly));
+        assert!(!evidence_transition_allowed(Evidence::AgentVerified, Evidence::Unverified));
+        assert!(!evidence_transition_allowed(Evidence::AgentVerified, Evidence::ReplicatedOnPlatform));
+        assert!(!evidence_transition_allowed(Evidence::ReplicatedOnPlatform, Evidence::AgentVerified));
+    }
+
+    #[test]
+    fn evidence_transition_platform_blocked_reenters_at_unverified_not_a_verified_state() {
+        assert!(evidence_transition_allowed(Evidence::Unverified, Evidence::PlatformCapabilityBlocked));
+        assert!(evidence_transition_allowed(Evidence::PlatformCapabilityBlocked, Evidence::Unverified));
+        assert!(!evidence_transition_allowed(Evidence::PlatformCapabilityBlocked, Evidence::ReferenceOnly));
+        assert!(!evidence_transition_allowed(Evidence::PlatformCapabilityBlocked, Evidence::ReplicatedOnPlatform));
+    }
+
+    #[test]
+    fn evidence_transition_staying_put_is_always_allowed() {
+        for e in [
+            Evidence::Unverified,
+            Evidence::ReferenceOnly,
+            Evidence::ReplicatedOnPlatform,
+            Evidence::AgentVerified,
+            Evidence::PlatformCapabilityBlocked,
+        ] {
+            assert!(evidence_transition_allowed(e, e));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Intake gate (aggregate)
+    // -----------------------------------------------------------------
+
+    /// Two identical (fully-agreeing) synthetic signal series, paired with a
+    /// measured metric/value -- a stand-in for "two independent
+    /// implementations that agree," which this test module has no real
+    /// engine to produce.
+    fn agreeing_replication(metric: &str, value: f64) -> ReplicationEvidence {
+        let signal = vec![Some(0.2); 20];
+        ReplicationEvidence { signal_a: signal.clone(), signal_b: signal, measured_metric: metric.to_string(), measured_value: value }
+    }
+
+    #[test]
+    fn intake_gate_etf_earns_reference_only_except_for_the_known_gross_net_gap() {
+        let caps = current_platform_capabilities();
+        let e = entry("etf_trend_faber");
+        let evidence = agreeing_replication("sharpe_net", 0.645);
+        let verdict = intake_gate(&e, &caps, &evidence, None);
+        // etf_trend_faber passes everything EXCEPT gross_and_net (it only
+        // reports sharpe_net) -- so it does NOT earn reference_only yet, and
+        // that failure is exactly, only, the gross/net one.
+        assert_eq!(verdict.earned_evidence, Evidence::Unverified);
+        let failures: Vec<&str> = verdict.failures().map(|(name, _)| name).collect();
+        assert_eq!(failures, vec!["9.2_gross_and_net_reported"], "{:?}", verdict.checks);
+    }
+
+    #[test]
+    fn intake_gate_fx_is_platform_capability_blocked() {
+        // fx_tsmom_12m needs joint vol-targeting and cross-asset rebalance the
+        // platform doesn't have -- this must dominate the verdict regardless
+        // of how its other checks come out.
+        let caps = current_platform_capabilities();
+        let e = entry("fx_tsmom_12m");
+        let evidence = agreeing_replication("sharpe", -0.064);
+        let verdict = intake_gate(&e, &caps, &evidence, None);
+        assert_eq!(verdict.earned_evidence, Evidence::PlatformCapabilityBlocked);
+    }
+
+    #[test]
+    fn intake_gate_a_fully_clean_synthetic_candidate_earns_reference_only() {
+        // Take etf_trend_faber and fix the one real gap (add a matching
+        // _gross metric) to confirm the pass path genuinely reaches
+        // reference_only, not just that failures are detected.
+        let caps = current_platform_capabilities();
+        let mut e = entry("etf_trend_faber");
+        e.expected_ranges.push(ExpectedRange {
+            metric: "sharpe_gross".to_string(),
+            low: Some(0.3),
+            high: Some(1.1),
+            role: RangeRole::PerformanceBand,
+            source: "test fixture".to_string(),
+            note: "test fixture".to_string(),
+        });
+        let evidence = agreeing_replication("sharpe_net", 0.645);
+        let verdict = intake_gate(&e, &caps, &evidence, None);
+        assert_eq!(verdict.earned_evidence, Evidence::ReferenceOnly, "{:?}", verdict.checks);
+        assert_eq!(verdict.failures().count(), 0);
+    }
+
+    #[test]
+    fn intake_gate_etf_with_real_cross_repo_replication_evidence_earns_reference_only() {
+        // Unlike every other test in this file, the 100%-agreement signal
+        // here is NOT synthetic -- it transcribes a real, verified result
+        // (see ReplicationEvidence's doc comment): SignalEngine's
+        // reference-rules crate's golden test, run for real on 2026-09-23,
+        // `S1 ETF trend (explicit mode): 555/555 signals agree over 111
+        // month-ends`. 555 identical values stands in for "555 matched
+        // decisions, all agreeing" -- signal_agreement() only needs to know
+        // they matched, not each decision's actual value, so this is an
+        // honest, minimal encoding of that real result, not a shortcut
+        // around measuring it.
+        let caps = current_platform_capabilities();
+        let mut e = entry("etf_trend_faber");
+        e.expected_ranges.push(ExpectedRange {
+            metric: "sharpe_gross".to_string(),
+            low: Some(0.3),
+            high: Some(1.1),
+            role: RangeRole::PerformanceBand,
+            source: "test fixture (the real gap this entry still needs closed, separate from replication)".to_string(),
+            note: "test fixture".to_string(),
+        });
+        let real_signal = vec![Some(1.0); 555];
+        let evidence = ReplicationEvidence {
+            signal_a: real_signal.clone(),
+            signal_b: real_signal,
+            measured_metric: "sharpe_net".to_string(),
+            measured_value: 0.645, // the entry's own real independent-reimplementation figure
+        };
+        let verdict = intake_gate(&e, &caps, &evidence, None);
+        assert_eq!(verdict.earned_evidence, Evidence::ReferenceOnly, "{:?}", verdict.checks);
+        let signal_check = verdict.checks.iter().find(|(name, _)| *name == "9.2_signal_agreement").unwrap();
+        assert!(signal_check.1.reason.contains("555/555"), "{}", signal_check.1.reason);
+    }
+
+    #[test]
+    fn intake_gate_disagreeing_implementations_block_earning_reference_only() {
+        let caps = current_platform_capabilities();
+        let mut e = entry("etf_trend_faber");
+        e.expected_ranges.push(ExpectedRange {
+            metric: "sharpe_gross".to_string(),
+            low: Some(0.3),
+            high: Some(1.1),
+            role: RangeRole::PerformanceBand,
+            source: "test fixture".to_string(),
+            note: "test fixture".to_string(),
+        });
+        let evidence = ReplicationEvidence {
+            signal_a: vec![Some(0.2); 20],
+            signal_b: vec![Some(0.9); 20], // wildly different -- a real disagreement
+            measured_metric: "sharpe_net".to_string(),
+            measured_value: 0.645,
+        };
+        let verdict = intake_gate(&e, &caps, &evidence, None);
+        assert_eq!(verdict.earned_evidence, Evidence::Unverified);
+        assert!(verdict.failures().any(|(name, _)| name == "9.2_signal_agreement"));
+    }
+
+    // -----------------------------------------------------------------
+    // WP8.5/9.5 calibration harness
+    // -----------------------------------------------------------------
+
+    /// The known-answer set: the 3 real entries (their correct answer
+    /// established by hand in the tests above) plus deliberately corrupted
+    /// copies of each, one corruption per case, so a failure here points at
+    /// exactly which check's accuracy is in question. This is a SAMPLE known-
+    /// answer set for measuring the checker itself -- not the production
+    /// candidate list (which is empty; see `SEED_JSON`'s doc comment).
+    fn known_answer_set() -> Vec<CalibrationCase> {
+        let mut cases = Vec::new();
+
+        // --- etf_trend_faber: real entry, one real gap (gross/net) away from ReferenceOnly.
+        cases.push(CalibrationCase {
+            name: "etf_real_as_is".to_string(),
+            entry: entry("etf_trend_faber"),
+            replication: agreeing_replication("sharpe_net", 0.645),
+            expected_evidence: Evidence::Unverified, // fails 9.2_gross_and_net_reported today
+        });
+        {
+            let mut e = entry("etf_trend_faber");
+            e.expected_ranges.push(ExpectedRange {
+                metric: "sharpe_gross".to_string(),
+                low: Some(0.3),
+                high: Some(1.1),
+                role: RangeRole::PerformanceBand,
+                source: "test fixture".to_string(),
+                note: "test fixture".to_string(),
+            });
+            cases.push(CalibrationCase {
+                name: "etf_with_gross_metric_added".to_string(),
+                entry: e,
+                replication: agreeing_replication("sharpe_net", 0.645),
+                expected_evidence: Evidence::ReferenceOnly, // now genuinely clean
+            });
+        }
+        {
+            let mut e = entry("etf_trend_faber");
+            e.expected_ranges.push(ExpectedRange {
+                metric: "sharpe_gross".to_string(),
+                low: Some(0.3),
+                high: Some(1.1),
+                role: RangeRole::PerformanceBand,
+                source: "test fixture".to_string(),
+                note: "test fixture".to_string(),
+            });
+            let bad_replication = ReplicationEvidence {
+                signal_a: vec![Some(0.2); 20],
+                signal_b: vec![Some(0.9); 20], // disagreeing implementations
+                measured_metric: "sharpe_net".to_string(),
+                measured_value: 0.645,
+            };
+            cases.push(CalibrationCase {
+                name: "etf_with_disagreeing_implementations".to_string(),
+                entry: e,
+                replication: bad_replication,
+                expected_evidence: Evidence::Unverified, // must be caught, not passed
+            });
+        }
+        {
+            let mut e = entry("etf_trend_faber");
+            e.known_deviations = vec![]; // strip its real, disclosed deviation
+            cases.push(CalibrationCase {
+                name: "etf_with_undisclosed_approximation".to_string(),
+                entry: e,
+                replication: agreeing_replication("sharpe_net", 0.645),
+                expected_evidence: Evidence::Unverified, // must be caught, not passed
+            });
+        }
+
+        // --- fx_tsmom_12m: real entry, platform-blocked.
+        cases.push(CalibrationCase {
+            name: "fx_real_as_is".to_string(),
+            entry: entry("fx_tsmom_12m"),
+            replication: agreeing_replication("sharpe", -0.064),
+            expected_evidence: Evidence::PlatformCapabilityBlocked,
+        });
+
+        // --- crypto_trend_100d: real entry, no low bound set.
+        cases.push(CalibrationCase {
+            name: "crypto_real_as_is".to_string(),
+            entry: entry("crypto_trend_100d"),
+            replication: agreeing_replication("sharpe_gross", 2.10),
+            expected_evidence: Evidence::Unverified,
+        });
+        {
+            let mut e = entry("crypto_trend_100d");
+            e.expected_ranges[0].low = Some(0.5); // give it a real floor
+            e.expected_ranges.push(ExpectedRange {
+                metric: "sharpe_net".to_string(),
+                low: Some(0.4),
+                high: Some(2.0),
+                role: RangeRole::PerformanceBand,
+                source: "test fixture".to_string(),
+                note: "test fixture".to_string(),
+            });
+            // Also extend the window: crypto's REAL window (2016-01-01 to
+            // 2020-12-31) is 4.9993 years by exact day count -- a hair
+            // under the 5-year minimum, a separate real finding (see the
+            // representativeness tests). Extending it here isolates what
+            // THIS case is actually testing (the evidence-strength fix)
+            // from that unrelated, already-covered gap.
+            e.backtest_window.end = "2021-06-01".to_string();
+            cases.push(CalibrationCase {
+                name: "crypto_with_a_real_band_and_net_metric".to_string(),
+                entry: e,
+                replication: agreeing_replication("sharpe_gross", 2.10),
+                expected_evidence: Evidence::ReferenceOnly,
+            });
+        }
+
+        // --- A representativeness-specific failure, isolated from every other check
+        // (not yet covered by calibration -- only unit-tested on its own until now).
+        {
+            let mut e = entry("etf_trend_faber");
+            e.expected_ranges.push(ExpectedRange {
+                metric: "sharpe_gross".to_string(),
+                low: Some(0.3),
+                high: Some(1.1),
+                role: RangeRole::PerformanceBand,
+                source: "test fixture".to_string(),
+                note: "test fixture".to_string(),
+            });
+            e.backtest_window = BacktestWindow {
+                start: "2024-01-01".to_string(),
+                end: "2024-06-01".to_string(),
+                max_observed_drawdown: Some(0.5), // severe, but the window itself is too short
+            };
+            cases.push(CalibrationCase {
+                name: "etf_with_too_short_a_window".to_string(),
+                entry: e,
+                replication: agreeing_replication("sharpe_net", 0.645),
+                expected_evidence: Evidence::Unverified,
+            });
+        }
+
+        // --- etf_trend_faber with REAL cross-repo replication evidence (not synthetic
+        // -- see ReplicationEvidence's doc comment and the golden test it cites), folded
+        // into the formal known-answer set rather than left as a one-off test.
+        {
+            let mut e = entry("etf_trend_faber");
+            e.expected_ranges.push(ExpectedRange {
+                metric: "sharpe_gross".to_string(),
+                low: Some(0.3),
+                high: Some(1.1),
+                role: RangeRole::PerformanceBand,
+                source: "test fixture (the real gap this entry still needs closed, separate from replication)".to_string(),
+                note: "test fixture".to_string(),
+            });
+            let real_signal = vec![Some(1.0); 555];
+            cases.push(CalibrationCase {
+                name: "etf_with_real_golden_test_replication_evidence".to_string(),
+                entry: e,
+                replication: ReplicationEvidence {
+                    signal_a: real_signal.clone(),
+                    signal_b: real_signal,
+                    measured_metric: "sharpe_net".to_string(),
+                    measured_value: 0.645,
+                },
+                expected_evidence: Evidence::ReferenceOnly,
+            });
+        }
+
+        cases
+    }
+
+    #[test]
+    fn calibration_known_answer_set_measures_a_real_pass_rate() {
+        let caps = current_platform_capabilities();
+        let cases = known_answer_set();
+        let report = run_calibration(&cases, &caps);
+        assert_eq!(report.total, 9);
+        // The whole point: every corrupted case must be CAUGHT (a false
+        // accept would mean the gate can be fooled), so this must be 100%
+        // on this known-answer set before the gate earns any trust at all --
+        // WP9.5's autonomy unlock still needs a MUCH larger set than 9
+        // before that trust is real, this just proves the measurement
+        // itself works and the gate isn't trivially foolable.
+        assert_eq!(report.false_accepts, Vec::<String>::new(), "{:?}", report);
+        assert_eq!(report.correct, 9, "{:?}", report);
+        assert_eq!(report.pass_rate(), 1.0);
+        let (lo, _hi) = report.confidence_interval();
+        // 9/9 with n=9 still has a wide interval -- exactly why WP9.5 needs
+        // a much bigger known-answer set before trusting this for real.
+        assert!(lo < 1.0, "a 7-case sample must not claim certainty");
+    }
+
+    #[test]
+    fn wilson_95_matches_known_reference_values() {
+        // Same reference values as meta_portfolio_service::placebo_suite's
+        // own test for the same formula.
+        let (lo, hi) = wilson_95(0, 400);
+        assert!(lo < 0.001 && hi < 0.02, "{lo} {hi}");
+        let (lo, hi) = wilson_95(20, 400);
+        assert!((0.03..0.08).contains(&lo), "{lo}");
+        assert!((0.07..0.12).contains(&hi), "{hi}");
     }
 }

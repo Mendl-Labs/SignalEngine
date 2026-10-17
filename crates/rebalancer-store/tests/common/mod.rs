@@ -334,12 +334,13 @@ pub struct ProposalAccount {
 /// The Engine's `PlanBody` (`BacktestingEngine/program/src/proposals.rs`), with the platform's entry hashes.
 pub fn proposal_plan_body(proposal_id: Uuid, risk_scale: f64, sleeves: &[(&str, f64)]) -> Value {
     let lib = seed_library().unwrap();
-    let hash = |id: &str| entry_hash(lib.iter().find(|e| e.id == id && e.version == 1).unwrap_or_else(|| panic!("{id} v1 in the seed library")));
+    let version = |id: &str| lib.iter().filter(|e| e.id == id).map(|e| e.version).max().unwrap_or_else(|| panic!("{id} in the seed library"));
+    let hash = |id: &str| entry_hash(lib.iter().find(|e| e.id == id && e.version == version(id)).unwrap());
     json!({
         "proposal_id": proposal_id.to_string(),
         "capital": {"amount": "5000.00", "ccy": "USD"},
         "risk_scale": risk_scale,
-        "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": 1, "entry_hash": hash(id), "weight": w})).collect::<Vec<_>>(),
+        "sleeves": sleeves.iter().map(|(id, w)| json!({"entry_id": id, "entry_version": version(id), "entry_hash": hash(id), "weight": w})).collect::<Vec<_>>(),
     })
 }
 
@@ -354,11 +355,12 @@ pub fn ack_json() -> Value {
     })
 }
 
-/// The library entry hash of `etf_trend_faber` v1 (what the platform itself computes) and a plan body around it.
+/// The library entry hash of `etf_trend_faber` v1 in the LEGACY PILOT library (what the owner pilot row pins) and a
+/// plan body around it.
 pub fn pilot_plan_body(venue: &str, kind: &str) -> (String, Value) {
-    let lib = seed_library().unwrap();
-    let entry = lib.iter().find(|e| e.id == "etf_trend_faber" && e.version == 1).expect("etf_trend_faber v1 in the seed library");
-    let hash = entry_hash(entry);
+    let lib = mandate_core::legacy_pilot_library::seed_library().unwrap();
+    let entry = lib.iter().find(|e| e.id == "etf_trend_faber" && e.version == 1).expect("etf_trend_faber v1 in the legacy pilot library");
+    let hash = mandate_core::legacy_pilot_library::entry_hash(entry);
     let body = json!({"sleeves": [{
         "sleeve_id": "etf", "entry_id": "etf_trend_faber", "entry_version": 1, "entry_hash": hash,
         "kind": kind, "share": "1.0", "venue": venue, "asset_class": "us_etf", "quote": ""
