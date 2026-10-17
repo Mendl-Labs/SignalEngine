@@ -5,22 +5,17 @@
 //! the Phase 4 implementation points hold `ETF_WEIGHT_PER_INSTRUMENT` = 0.20 per name, which IS `1.0 / 5.0` bit for
 //! bit, so on a five-instrument universe the two policies are the same number.
 //!
-//! # The seam (STUB until BacktestingCore ships the weight policy)
-//! The Core change that adds `WeightPolicy::{FixedConstant, EqualOverN}` to the reference rules is a separate,
-//! not-yet-merged Core PR. This crate must not pin a Core commit that is not merged, so the rule is reached through
-//! [`TrendRuleBackend`] and [`LocalTrendBackend`] implements it over the CURRENTLY pinned `decide_etf_trend_with`:
-//! the SIGNALS are Core's (one implementation, exact-arithmetic comparison, month-end and gap checks), only the
-//! weight of a `Long` instrument is set to `1.0 / N` here. When the Core PR merges and the pin is bumped, replace
-//! the body of [`LocalTrendBackend::decide_trend`] with the Core call carrying the policy; nothing else changes, and
-//! the tests below (5-instrument identity, signals untouched) are the contract the Core call must keep.
+//! # The seam
+//! The rule is reached through [`TrendRuleBackend`]; [`CoreTrendBackend`] calls BacktestingCore's
+//! `decide_etf_trend_with_weight` (PR #73, pinned at its merge commit) with the weight the policy derives for the
+//! universe (`1 / N` under [`WeightPolicy::EqualOverN`], the Core `weightsim-rules` policy of the same name; the
+//! constant under [`WeightPolicy::FixedConstant`]). Signals, month-end and gap checks are Core's, one
+//! implementation; a non-`Long` instrument carries weight 0.0.
 //!
-//! Momentum cells (linear rank weights) are NOT executable yet: see `rebalancer-store`'s account source, which
-//! refuses them with a typed reason. `reference_rules::MomentumRankWeighted::rank` needs a `weightsim::HistoryView`,
-//! which only the simulator can build, and a daily-decision ETF sleeve kind needs its own data window and gate
-//! comparison (market-data), so it is a separate change.
+//! Momentum cells (linear rank weights) are NOT executable here: see `rebalancer-store`'s account source.
 
 use chrono::NaiveDate;
-use reference_rules::{decide_etf_trend_with, EtfDecision, Options, Panel, RuleError, Signal, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
+use reference_rules::{decide_etf_trend_with_weight, EtfDecision, Options, Panel, RuleError, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 
 use crate::data::{SleeveKind, SleeveSpec};
 
@@ -59,25 +54,18 @@ pub trait TrendRuleBackend: Send + Sync {
     fn decide_trend(&self, panel: &Panel, decision_date: NaiveDate, opts: &Options, symbols: &[&str], sma_month_ends: usize, policy: WeightPolicy) -> Result<EtfDecision, RuleError>;
 }
 
-/// The backend over the currently pinned Core: Core's signals, `1 / N` applied here. See the module doc.
+/// The backend over the pinned Core: `decide_etf_trend_with_weight` with the policy's per-instrument weight.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct LocalTrendBackend;
+pub struct CoreTrendBackend;
 
-impl TrendRuleBackend for LocalTrendBackend {
+impl TrendRuleBackend for CoreTrendBackend {
     fn decide_trend(&self, panel: &Panel, decision_date: NaiveDate, opts: &Options, symbols: &[&str], sma_month_ends: usize, policy: WeightPolicy) -> Result<EtfDecision, RuleError> {
-        let mut d = decide_etf_trend_with(panel, decision_date, opts, symbols, sma_month_ends)?;
-        if policy == WeightPolicy::EqualOverN {
-            let n = d.instruments.len();
-            for i in &mut d.instruments {
-                i.weight = if i.signal == Signal::Long { long_weight(WeightPolicy::EqualOverN, n, i.weight) } else { 0.0 };
-            }
-        }
-        Ok(d)
+        decide_etf_trend_with_weight(panel, decision_date, opts, symbols, sma_month_ends, long_weight(policy, symbols.len(), ETF_WEIGHT_PER_INSTRUMENT))
     }
 }
 
 /// The backend the pipeline uses.
-pub static TREND_BACKEND: LocalTrendBackend = LocalTrendBackend;
+pub static TREND_BACKEND: CoreTrendBackend = CoreTrendBackend;
 
 /// The maximum gross exposure of one sleeve as a fraction of the ACCOUNT's capital: its share times the gross its rule
 /// can reach (every instrument `Long`). Trend ETF: `trend_max_gross` over the sleeve's instruments (the published five
@@ -107,7 +95,7 @@ pub fn trend_max_gross(policy: WeightPolicy, n: usize, fixed_constant: f64) -> f
 mod tests {
     use super::*;
     use chrono::{Datelike, Weekday};
-    use reference_rules::{PriceSeries, ETF_SMA_MONTH_ENDS};
+    use reference_rules::{decide_etf_trend_with, PriceSeries, Signal, ETF_SMA_MONTH_ENDS};
 
     fn spec(instruments: &[&str]) -> SleeveSpec {
         SleeveSpec {
@@ -179,7 +167,7 @@ mod tests {
             let cell = TREND_BACKEND.decide_trend(&p, date, &opts, &refs, ETF_SMA_MONTH_ENDS, WeightPolicy::EqualOverN).unwrap();
             assert_eq!(core.instruments.len(), n);
             for (a, b) in core.instruments.iter().zip(&cell.instruments) {
-                assert_eq!((&a.symbol, a.close.to_bits(), a.sma.to_bits(), a.signal), (&b.symbol, b.close.to_bits(), b.sma.to_bits(), b.signal), "signals and evidence are Core's, untouched");
+                assert_eq!((&a.symbol, a.close.to_bits(), a.sma.to_bits(), a.signal), (&b.symbol, b.close.to_bits(), b.sma.to_bits(), b.signal), "signals and evidence are the unweighted rule's, untouched");
                 let want = if a.signal == Signal::Long { (1.0_f64 / n as f64).to_bits() } else { 0.0_f64.to_bits() };
                 assert_eq!(b.weight.to_bits(), want, "{} at N = {n}", b.symbol);
             }

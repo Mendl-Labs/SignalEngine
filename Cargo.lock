@@ -3738,12 +3738,12 @@ dependencies = [
 [[package]]
 name = "reference-rules"
 version = "0.0.1"
-source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=e82ed83ace41e0d87c3ceec069e374fae55b6ea7#e82ed83ace41e0d87c3ceec069e374fae55b6ea7"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=9943b51e5266f117bc9189f52f0609e5bdb3321b#9943b51e5266f117bc9189f52f0609e5bdb3321b"
 dependencies = [
  "chrono",
  "hex",
  "sha2 0.10.9",
- "weightsim 0.3.0 (git+https://github.com/Mendl-Labs/BacktestingCore?rev=e82ed83ace41e0d87c3ceec069e374fae55b6ea7)",
+ "weightsim 0.3.0 (git+https://github.com/Mendl-Labs/BacktestingCore?rev=9943b51e5266f117bc9189f52f0609e5bdb3321b)",
 ]
 
 [[package]]
@@ -5368,7 +5368,7 @@ source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=e558995c279b3d39
 [[package]]
 name = "weightsim"
 version = "0.3.0"
-source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=e82ed83ace41e0d87c3ceec069e374fae55b6ea7#e82ed83ace41e0d87c3ceec069e374fae55b6ea7"
+source = "git+https://github.com/Mendl-Labs/BacktestingCore?rev=9943b51e5266f117bc9189f52f0609e5bdb3321b#9943b51e5266f117bc9189f52f0609e5bdb3321b"
 
 [[package]]
 name = "whoami"
