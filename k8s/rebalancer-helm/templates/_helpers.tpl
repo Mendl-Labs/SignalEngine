@@ -147,3 +147,40 @@ REBALANCER_SERVE_PROPOSAL_PLANS=true the service cannot decrypt tenant credentia
 {{- end -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Validates the Secret-backed optional env: extraEnvFromSecrets (generic), alerts, heartbeat and dataGate. Renders nothing;
+only fails. Rules: every extraEnvFromSecrets entry needs name, secretName and key; the name may not be the tenant
+master key, the proposal-plans flag, the paper-only interlock, CREDENTIAL_MODE, a live-venue key (ALPACA_LIVE*, OANDA_*,
+KRAKEN_*), nor any env this chart already manages itself (use the dedicated value instead). alerts.enabled=true needs
+alerts.secretName (ALERTS_ENABLED=true without a RESEND_API_KEY/ALERT_FROM_EMAIL source only records sender_disabled).
+*/}}
+{{- define "rebalancer-helm.validatedSecretEnv" -}}
+{{- $reserved := list "CREDENTIALS_ENCRYPTION_KEY" "REBALANCER_SERVE_PROPOSAL_PLANS" "REBALANCER_PAPER_ONLY" "CREDENTIAL_MODE" "DATABASE_URL" "MASSIVE_API_KEY" "PILOT_TENANT_ID" "PILOT_ACCOUNT_ID" "PILOT_ALPACA_KEY_ID" "PILOT_ALPACA_KEY_SECRET" "REBALANCER_CREDENTIAL_BROKER_URL" "CREDENTIAL_BROKER_SERVICE_TOKEN" "REBALANCER_TICK_SECS" "ALERTS_ENABLED" "RESEND_API_KEY" "ALERT_FROM_EMAIL" "HEARTBEAT_URL" "ALPACA_DATA_KEY_ID" "ALPACA_DATA_KEY_SECRET" "POD_NAME" "POD_NAMESPACE" -}}
+{{- range $i, $e := .Values.extraEnvFromSecrets }}
+{{- if or (not $e.name) (not $e.secretName) (not $e.key) }}
+{{- fail (printf "extraEnvFromSecrets[%d] needs name, secretName and key." $i) }}
+{{- end }}
+{{- if eq $e.name "CREDENTIALS_ENCRYPTION_KEY" }}
+{{- fail "extraEnvFromSecrets must not set CREDENTIALS_ENCRYPTION_KEY: rebalancer-service refuses to start if this variable is present in its environment at all (see PilotConfig::from_lookup's FORBIDDEN_ENV check)." }}
+{{- end }}
+{{- if eq $e.name "REBALANCER_SERVE_PROPOSAL_PLANS" }}
+{{- fail "extraEnvFromSecrets must not set REBALANCER_SERVE_PROPOSAL_PLANS: use the serveProposalPlans value, which also enforces the credential-broker requirement." }}
+{{- end }}
+{{- if or (has $e.name $reserved) (regexMatch "^(ALPACA_LIVE|OANDA_|KRAKEN_)" $e.name) }}
+{{- fail (printf "extraEnvFromSecrets[%d]: %s is reserved (managed by this chart, a safety interlock, or a live-venue credential this pod must never hold); use the dedicated value (alerts, heartbeat, dataGate, secrets, credentialBroker) where one exists." $i $e.name) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.alerts.enabled (not .Values.alerts.secretName) }}
+{{- fail "alerts.enabled=true requires alerts.secretName (a Secret holding the Resend API key and the from-address; see values.yaml)." }}
+{{- end }}
+{{- if and .Values.alerts.secretName (or (not .Values.alerts.resendApiKeyKey) (not .Values.alerts.fromEmailKey)) }}
+{{- fail "alerts.secretName requires alerts.resendApiKeyKey and alerts.fromEmailKey." }}
+{{- end }}
+{{- if and .Values.heartbeat.secretName (not .Values.heartbeat.urlKey) }}
+{{- fail "heartbeat.secretName requires heartbeat.urlKey." }}
+{{- end }}
+{{- if and .Values.dataGate.secretName (or (not .Values.dataGate.keyIdKey) (not .Values.dataGate.keySecretKey)) }}
+{{- fail "dataGate.secretName requires dataGate.keyIdKey and dataGate.keySecretKey." }}
+{{- end }}
+{{- end }}
