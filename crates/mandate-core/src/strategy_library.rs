@@ -1459,6 +1459,23 @@ pub(crate) fn norm_symbol(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '/' | '-' | '_' | ' ')).flat_map(char::to_uppercase).collect()
 }
 
+/// Bare crypto base symbols that stand for their USD pair when a library entry names the compiled rule's own
+/// universe (`crypto_trend_100d` declares `BTC` and `ETH`, exactly as `weightsim-rules` does, while mandates name the
+/// tradable pairs `BTC/USD` and `ETH/USD`). A DOCUMENTED alias, one direction only: an ENTRY's bare base symbol also
+/// matches the mandate's `<BASE>/USD`. `BTC/EUR`, `BTC/USDT` and every non-crypto symbol are not aliased, and a
+/// mandate's bare `BTC` does not allow a pair-named entry instrument.
+const CRYPTO_BASE_SYMBOLS: [&str; 2] = ["BTC", "ETH"];
+
+/// Is `sym` (an entry instrument) in `set` (a normalised mandate allow- or deny-list), directly or through the
+/// bare-crypto-base alias above?
+pub(crate) fn symbol_in(set: &BTreeSet<String>, sym: &str) -> bool {
+    let n = norm_symbol(sym);
+    if set.contains(&n) {
+        return true;
+    }
+    CRYPTO_BASE_SYMBOLS.contains(&n.as_str()) && set.contains(&format!("{n}USD"))
+}
+
 fn norm_venue(s: &str) -> String {
     s.trim().to_lowercase()
 }
@@ -1553,7 +1570,7 @@ pub fn eligibility(entry: &LibraryEntry, mandate: &MandateBody, platform: &Platf
 
     let allow: BTreeSet<String> = u.instrument_allow.iter().map(|s| norm_symbol(s)).collect();
     let deny: BTreeSet<String> = u.instrument_deny.iter().map(|s| norm_symbol(s)).collect();
-    let not_allowed: Vec<String> = entry.instruments.iter().filter(|s| !allow.contains(&norm_symbol(s))).cloned().collect();
+    let not_allowed: Vec<String> = entry.instruments.iter().filter(|s| !symbol_in(&allow, s)).cloned().collect();
     if !not_allowed.is_empty() {
         let which = if not_allowed.len() == entry.instruments.len() {
             "none of them are".to_string()
@@ -1566,7 +1583,7 @@ pub fn eligibility(entry: &LibraryEntry, mandate: &MandateBody, platform: &Platf
             format!("{name} needs all of its instruments, but {which} in the mandate's allow-list; missing: {}.", quoted(&not_allowed)),
         );
     }
-    let denied: Vec<String> = entry.instruments.iter().filter(|s| deny.contains(&norm_symbol(s))).cloned().collect();
+    let denied: Vec<String> = entry.instruments.iter().filter(|s| symbol_in(&deny, s)).cloned().collect();
     if !denied.is_empty() {
         push(
             ReasonCode::InstrumentDenied,
@@ -2779,6 +2796,40 @@ mod tests {
         let mut m = base_mandate();
         m.universe.instrument_allow.clear();
         assert!(!elig(&entry("crypto_trend_100d"), &m).eligible_paper);
+    }
+
+    /// The shipped `crypto_trend_100d` v2 declares the compiled rule's bare `BTC`/`ETH`; mandates name the USD pairs.
+    #[test]
+    fn a_bare_crypto_base_in_the_entry_matches_the_mandates_usd_pair_and_nothing_else() {
+        let mut e = entry("crypto_trend_100d");
+        e.instruments = vec!["BTC".to_string(), "ETH".to_string()];
+        // a mandate allowing only the USD pairs still makes the entry eligible
+        let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!(["BTC/USD", "ETH/USD"]));
+        assert!(elig(&e, &m).eligible_live, "{:?}", elig(&e, &m).reasons);
+        let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!(["btc-usd", "ETHUSD"]));
+        assert!(elig(&e, &m).eligible_live);
+        // a mandate allowing only SPY does not
+        let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!(["SPY"]));
+        assert_eq!(codes(&elig(&e, &m)), [ReasonCode::InstrumentsNotAllowed]);
+        // a mandate allowing BTC/EUR (or the USDT pair) does not
+        for other in ["BTC/EUR", "BTC/USDT"] {
+            let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!([other, "ETH/USD"]));
+            assert_eq!(codes(&elig(&e, &m)), [ReasonCode::InstrumentsNotAllowed], "{other}");
+        }
+        // only one coin allowed
+        let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!(["BTC/USD"]));
+        assert_eq!(codes(&elig(&e, &m)), [ReasonCode::InstrumentsNotAllowed]);
+        // deny follows the same alias
+        let m = mandate_with(|v| v["universe"]["instrument_deny"] = json!(["eth/usd"]));
+        assert_eq!(codes(&elig(&e, &m)), [ReasonCode::InstrumentDenied]);
+        // the alias is one way: a bare BTC in the MANDATE does not allow a pair-named entry instrument
+        let pair_entry = entry("crypto_trend_100d");
+        let m = mandate_with(|v| v["universe"]["instrument_allow"] = json!(["BTC", "ETH"]));
+        assert_eq!(codes(&elig(&pair_entry, &m)), [ReasonCode::InstrumentsNotAllowed]);
+        // symbol_in itself
+        let set: BTreeSet<String> = ["BTCUSD".to_string(), "SPY".to_string()].into_iter().collect();
+        assert!(symbol_in(&set, "BTC") && symbol_in(&set, "btc/usd") && symbol_in(&set, "SPY"));
+        assert!(!symbol_in(&set, "ETH") && !symbol_in(&set, "SPYUSD") && !symbol_in(&set, "SOL"));
     }
 
     #[test]
