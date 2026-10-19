@@ -220,12 +220,20 @@ startupProbe:
   failureThreshold: 12
   successThreshold: 1
 
+# Liveness is PROGRESS-based, not just process-exists: the tick loop writes a heartbeat file (unix
+# time, REBALANCER_LIVENESS_FILE, default /tmp/rebalancer-last-tick) at the start and end of every
+# tick, and the probe runs `rebalancer-service liveness-check <staleSeconds>` (a subcommand of the
+# binary itself; no shell needed), which fails if the file is missing or older than the threshold.
+# This is what restarts a pod that is Running but frozen (2026-10-19: 8h stuck after tick 1).
+# The threshold actually used is max(staleSeconds, 3 x pilot.tickSecs), so a longer tick interval
+# never trips the probe. The root filesystem is read-only, so the chart mounts an emptyDir at /tmp
+# for the heartbeat file whenever this is enabled. Set enabled=false to drop the probe and mount.
 livenessProbe:
-  exec:
-    command: ["/bin/sh", "-c", "pgrep -f rebalancer-service"]
-  initialDelaySeconds: 10
-  periodSeconds: 15
-  timeoutSeconds: 5
+  enabled: true
+  staleSeconds: 900
+  initialDelaySeconds: 120
+  periodSeconds: 60
+  timeoutSeconds: 10
   failureThreshold: 3
   successThreshold: 1
 

@@ -216,9 +216,19 @@ spec:
           startupProbe:
             {{- toYaml .Values.startupProbe | nindent 12 }}
           {{- end }}
-          {{- if .Values.livenessProbe }}
+          {{- if .Values.livenessProbe.enabled }}
+          {{- $stale := max (int .Values.livenessProbe.staleSeconds) (mul 3 (int .Values.pilot.tickSecs)) }}
           livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
+            exec:
+              command: ["/usr/local/bin/rebalancer-service", "liveness-check", {{ $stale | quote }}]
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+          volumeMounts:
+            - name: liveness-tmp
+              mountPath: /tmp
           {{- end }}
           {{- if .Values.readinessProbe }}
           readinessProbe:
@@ -226,6 +236,12 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.livenessProbe.enabled }}
+      volumes:
+        - name: liveness-tmp
+          emptyDir:
+            sizeLimit: 1Mi
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

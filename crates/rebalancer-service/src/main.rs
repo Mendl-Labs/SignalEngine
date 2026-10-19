@@ -77,7 +77,7 @@
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use broker_adapters::alpaca::PAPER_BASE_URL;
 use broker_adapters::transport::reqwest_transport::ReqwestTransport;
@@ -96,6 +96,7 @@ use rebalancer_run::stores::Notifier;
 use rebalancer_service::broker_credentials::{BrokerConfig, HttpBrokerCredentials};
 use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
 use rebalancer_service::fleet::{connect_account, reenumerate_secs_from_lookup, Fleet, ReenumerateSchedule, DEFAULT_REENUMERATE_SECS};
+use rebalancer_service::liveness;
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
 use rebalancer_service::runtime::{connect_account_alpaca_for_sleeves, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
@@ -163,11 +164,35 @@ fn main() {
     match args.next().as_deref() {
         Some("print-fingerprint") => cmd_print_fingerprint(),
         Some("pilot-template") => cmd_pilot_template(),
+        Some("liveness-check") => cmd_liveness_check(args.next().as_deref()),
         Some(other) => {
-            eprintln!("rebalancer-service: unknown subcommand {other:?} (expected: print-fingerprint, pilot-template, or no argument to run the service)");
+            eprintln!("rebalancer-service: unknown subcommand {other:?} (expected: print-fingerprint, pilot-template, liveness-check, or no argument to run the service)");
             std::process::exit(2);
         }
         None => run_service(),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Writes the heartbeat file for the liveness probe. A failure is logged and otherwise ignored: it must never abort or
+/// delay a tick (the probe then reports the loop stale, which is the correct, visible consequence).
+fn beat(path: &std::path::Path) {
+    if let Err(e) = liveness::write_heartbeat(path, unix_now()) {
+        log(format!("liveness heartbeat write to {} failed ({e}); continuing", path.display()));
+    }
+}
+
+/// `rebalancer-service liveness-check [stale_secs]`: the Kubernetes liveness probe. Exit 0 when the heartbeat file is
+/// fresh, 1 otherwise. `stale_secs` defaults to max(900, 3 x REBALANCER_TICK_SECS).
+fn cmd_liveness_check(arg: Option<&str>) {
+    let path = liveness::liveness_path(std::env::var(liveness::ENV_LIVENESS_FILE).ok().as_deref());
+    let stale = arg.and_then(|a| a.trim().parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or_else(|| liveness::stale_secs_for_tick(tick_secs()));
+    if let Err(e) = liveness::check_file(&path, unix_now(), stale) {
+        eprintln!("rebalancer-service: liveness check failed: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -571,9 +596,11 @@ fn run_service() {
         _ => None,
     };
 
+    let liveness_path = liveness::liveness_path(std::env::var(liveness::ENV_LIVENESS_FILE).ok().as_deref());
     let mut tick_no: u64 = 0;
     loop {
         tick_no += 1;
+        beat(&liveness_path);
         // One line per tick, before any work, so a stall inside a tick is visible as "tick N: start" with no "tick N: done".
         log(format!("tick {tick_no}: start; fleet size {}", fleet.len()));
         let outcome = match kill_flag_or_heartbeat(&kill_flag) {
@@ -625,6 +652,7 @@ fn run_service() {
             }
         }
         log(format!("tick {tick_no}: done ({outcome:?}); fleet size {}; next tick in {tick_secs}s", fleet.len()));
+        beat(&liveness_path);
         clock.sleep_secs(tick_secs);
     }
 }
