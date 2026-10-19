@@ -125,7 +125,12 @@ impl Clock for SystemClock {
 }
 
 fn tick_secs() -> u64 {
-    std::env::var("REBALANCER_TICK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TICK_SECS)
+    parse_tick_secs(std::env::var("REBALANCER_TICK_SECS").ok().as_deref())
+}
+
+/// Unset, blank, non-numeric or zero is the default (a zero sleep would spin the loop); otherwise the trimmed value.
+fn parse_tick_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(DEFAULT_TICK_SECS)
 }
 
 fn log(msg: impl std::fmt::Display) {
@@ -566,7 +571,11 @@ fn run_service() {
         _ => None,
     };
 
+    let mut tick_no: u64 = 0;
     loop {
+        tick_no += 1;
+        // One line per tick, before any work, so a stall inside a tick is visible as "tick N: start" with no "tick N: done".
+        log(format!("tick {tick_no}: start; fleet size {}", fleet.len()));
         let outcome = match kill_flag_or_heartbeat(&kill_flag) {
             Ok(true) => {
                 log("kill flag is SET: skipping this tick (no run attempted)");
@@ -615,6 +624,7 @@ fn run_service() {
                 None => {}
             }
         }
+        log(format!("tick {tick_no}: done ({outcome:?}); fleet size {}; next tick in {tick_secs}s", fleet.len()));
         clock.sleep_secs(tick_secs);
     }
 }
@@ -722,6 +732,7 @@ fn run_tick(
             return TickOutcome::Failed;
         }
     };
+    log(format!("tick: {} account(s) due, {} runtime(s) in the fleet", due.len(), runtimes.len()));
     if due.is_empty() {
         log("heartbeat: 0 accounts due");
         return TickOutcome::Ran;
@@ -800,4 +811,18 @@ fn observe_tick(cfg: &ObserverConfig, recorder: &LatencyRecorder<'_>, accounts: 
 
 fn uuid_or_nil(s: &str) -> uuid::Uuid {
     s.parse().unwrap_or(uuid::Uuid::nil())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tick_secs_defaults_on_unset_blank_garbage_or_zero() {
+        for raw in [None, Some(""), Some("   "), Some("abc"), Some("-5"), Some("0"), Some("1.5")] {
+            assert_eq!(parse_tick_secs(raw), 300, "{raw:?}");
+        }
+        assert_eq!(parse_tick_secs(Some("60")), 60);
+        assert_eq!(parse_tick_secs(Some(" 45 ")), 45);
+    }
 }
