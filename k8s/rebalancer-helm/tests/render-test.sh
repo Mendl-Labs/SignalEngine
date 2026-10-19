@@ -65,7 +65,8 @@ refuse "secret env: missing key" "needs name, secretName and key" "${SPP[@]}" --
 # --- Progress-based liveness probe (heartbeat file written by the tick loop)
 ok "liveness probe default" "${SPP[@]}"
 has "livenessProbe:"; has '"liveness-check", "900"'; has "initialDelaySeconds: 120"; has "periodSeconds: 60"; has "failureThreshold: 3"
-has "name: liveness-tmp"; has "mountPath: /tmp"; has "emptyDir:"ok "liveness stale derived from a long tick (3 x 600 > 900)" "${SPP[@]}" --set pilot.tickSecs=600
+has "name: liveness-tmp"; has "mountPath: /tmp"; has "emptyDir:"
+ok "liveness stale derived from a long tick (3 x 600 > 900)" "${SPP[@]}" --set pilot.tickSecs=600
 has '"liveness-check", "1800"'
 ok "liveness staleSeconds raised above 3 x tick" "${SPP[@]}" --set livenessProbe.staleSeconds=2400
 has '"liveness-check", "2400"'
