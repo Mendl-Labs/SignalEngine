@@ -191,9 +191,9 @@ fn every_served_account_gets_the_same_venue_mode_and_asset_class_checks_and_one_
     let mut bad = account(OTHER_TENANT, OTHER_ACCOUNT, ExecutionMode::Live);
     bad.sleeves = vec![sleeve("alpaca", "fx_spot")];
     assert_eq!(err_code(&source(vec![bad], flag_on_no_pilot())), "PILOT_ASSET_CLASS_NOT_ALLOWED");
-    let mut bad = account(OTHER_TENANT, OTHER_ACCOUNT, ExecutionMode::Live);
-    bad.mandate = mandate_body(&["alpaca", "oanda"]);
-    assert_eq!(err_code(&source(vec![bad], flag_on_no_pilot())), "PILOT_VENUE_NOT_ALLOWED");
+    let mut ok = account(OTHER_TENANT, OTHER_ACCOUNT, ExecutionMode::Live);
+    ok.mandate = mandate_body(&["alpaca", "oanda", "kraken"]);
+    assert!(source(vec![ok], flag_on_no_pilot()).active_accounts().is_ok(), "mandate-only venues do not block an alpaca-only plan");
     let mut bad = account(OTHER_TENANT, OTHER_ACCOUNT, ExecutionMode::Live);
     bad.sleeves = vec![];
     assert_eq!(err_code(&source(vec![bad], flag_on_no_pilot())), "PILOT_NO_SLEEVES");
