@@ -261,9 +261,10 @@ fn a_non_alpaca_sleeve_or_mandate_venue_or_an_account_without_sleeves_is_refused
         let mut a = account(TENANT, ACCOUNT, ExecutionMode::Assisted);
         a.sleeves = vec![sleeve("alpaca"), sleeve(venue)];
         assert_eq!(err_code(&source(vec![a])), "PILOT_VENUE_NOT_ALLOWED", "sleeve venue {venue:?}");
+        // A venue merely named in the mandate's allowed universe does not block a plan that trades only alpaca.
         let mut a = account(TENANT, ACCOUNT, ExecutionMode::Assisted);
         a.mandate = mandate_body(&["alpaca", venue]);
-        assert_eq!(err_code(&source(vec![a])), "PILOT_VENUE_NOT_ALLOWED", "mandate venue {venue:?}");
+        assert!(source(vec![a]).active_accounts().is_ok(), "mandate venue {venue:?} must not block an alpaca-only plan");
     }
     let mut a = account(TENANT, ACCOUNT, ExecutionMode::Assisted);
     a.sleeves = vec![];

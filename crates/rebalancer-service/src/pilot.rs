@@ -273,11 +273,10 @@ impl<S: AccountSource> PilotAccountSource<S> {
                 return Err(PilotRefusal::AssetClassNotAllowed { asset_class: s.asset_class.clone() });
             }
         }
-        for v in &a.mandate.universe.venues {
-            if !v.trim().eq_ignore_ascii_case(PILOT_VENUE) {
-                return Err(PilotRefusal::VenueNotAllowed { what: "the mandate universe", venue: v.clone() });
-            }
-        }
+        // The interlock applies to what the approved plan will TRADE (every sleeve, checked above), not to the venues the
+        // mandate merely permits: a default mandate names kraken/oanda too, and a plan whose sleeves are all on alpaca
+        // can never place an order there. The mandate stays the pipeline guard's input (it can only deny more), so an
+        // order on a venue outside the mandate is still refused downstream.
         Ok(())
     }
 
