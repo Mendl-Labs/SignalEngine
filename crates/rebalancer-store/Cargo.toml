@@ -33,7 +33,7 @@ futures-util = { version = "0.3", features = ["async-await-macro"] }
 # rebalancer-run/src/lib.rs's own module doc). diesel-async's client is async, so each store
 # here owns a dedicated current-thread Tokio runtime and bridges into it with `block_on` at the
 # trait-method boundary; nothing above this crate needs to know it exists. See src/pg.rs.
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 
 [dev-dependencies]
 fake-broker = { path = "../fake-broker" }
