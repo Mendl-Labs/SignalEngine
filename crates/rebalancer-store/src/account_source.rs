@@ -2027,7 +2027,24 @@ mod tests {
         let e = evaluate_serving_with(&rows, &Verdict(true));
         assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
         let s = &e.accounts[0].active.sleeves[0];
-        assert_eq!((s.instruments.len(), s.tranche_sessions, s.lookback), (0, 1, Some(90)), "the published pairs stay unfilled");
+        // crypto_trend_100d v2 publishes the compiled rule's bare BASE symbols (BTC, ETH), so the USD PAIRS are no longer
+        // byte-equal to the published slots: they are carried explicitly (still validated as BASE/USD, which is what the
+        // runtime serves) instead of being left to the published default. The refusal above is unchanged.
+        assert_eq!(
+            (s.instruments.clone(), s.tranche_sessions, s.lookback),
+            (vec!["BTC/USD".to_string(), "ETH/USD".to_string()], 1, Some(90))
+        );
+        // The published slots themselves (BTC, ETH) stay unfilled, and a mixed quote is still refused.
+        rows.proposal_plans[0].body["sleeves"][0]["point"] =
+            json!({"envelope_hash": "e".repeat(64), "tranche_sessions": 1, "instruments": ["BTC", "ETH"], "parameters": {"sma_days": 90}, "cell_key": "crypto_trend_100d|abc|t1|90"});
+        let e = evaluate_serving_with(&rows, &Verdict(true));
+        assert!(e.exclusions.is_empty(), "{:?}", e.exclusions);
+        assert_eq!(e.accounts[0].active.sleeves[0].instruments.len(), 0, "the published slots stay unfilled");
+        rows.proposal_plans[0].body["sleeves"][0]["point"] =
+            json!({"envelope_hash": "e".repeat(64), "tranche_sessions": 1, "instruments": ["BTC/USD", "ETH/USDT"], "parameters": {"sma_days": 90}, "cell_key": "crypto_trend_100d|abc|t1|90"});
+        let e = evaluate_serving_with(&rows, &Verdict(true));
+        assert!(e.accounts.is_empty());
+        assert!(matches!(&e.exclusions[0].reason, ExclusionReason::PointOutsideEnvelope(m) if m.contains("quote substitution")), "{:?}", e.exclusions);
     }
 
     #[test]
