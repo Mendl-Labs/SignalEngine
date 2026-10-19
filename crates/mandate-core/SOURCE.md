@@ -115,3 +115,27 @@ over them, so any drift of the copied canonical-JSON code from the Engine fails 
 The embedded universe and cell lists (`EMBEDDED_UNIVERSE_JSON`, `EMBEDDED_CELL_JSON`) are EMPTY, as in the Engine. To
 register a cell, add the sidecars to the Engine first, then copy them into those lists here; nothing is read from the
 environment by the rebalancer (`CellRegistry::platform` uses the embedded lists only).
+
+## Re-sync 2026-10-18 (Engine `origin/main` acb0820f, after PRs #311 and #312)
+
+`src/strategy_library.rs` and `data/strategy_library/crypto_trend_100d.json` were re-copied verbatim with
+`git show origin/main:program/<path>`; every other copied file is unchanged (blobs compared equal).
+
+| Item | Blob |
+|---|---|
+| `program/src/strategy_library.rs` | `afdb563f495a295326756992128df5099a93fc2a` |
+| `program/data/strategy_library/crypto_trend_100d.json` | `935ff276f903e2892737b992d444d976fc7b0cf3` |
+
+What changed in the copy:
+
+- `crypto_trend_100d` is now **v2** (evidence window 2020-03-16..2026-10-03, instruments `BTC`/`ETH` and parameters exactly
+  the compiled rule's, `sharpe_net` declared, no band). Its `entry_hash` is
+  `843a1bae14489f3f017f9d60b7145dab66695f185abfc630f87a5bf5dd9268a6` (pinned in `tests/golden.rs` and, identically, in
+  the Engine's `program/tests/seed_entry_hashes_pinned.rs`).
+- `strategy_library::symbol_in` (new, verbatim from the Engine): an ENTRY's bare `BTC`/`ETH` also matches the mandate's
+  `<BASE>/USD` in the eligibility allow/deny checks. Covered by `tests/crypto_alias.rs` here.
+- The Engine's R38 envelope `crypto_trend_100d.envelope.json` (hash `aaa37add59c8161cb22c47082d60dca9147392e7e2ec8229cbbfc3a579ba82d7`)
+  is Engine-only: this crate carries no envelope files, so there is nothing to copy for it.
+
+The rebalancer IMAGE must be rebuilt after this merges (the proposal-plan entry hash the rebalancer enforces, PILOT_ENTRY_MISMATCH, is
+computed from this crate's embedded library).
