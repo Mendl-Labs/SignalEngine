@@ -62,4 +62,14 @@ refuse "secret env: paper-only interlock" "is reserved" "${SPP[@]}" --set 'extra
 refuse "secret env: live venue key" "is reserved" "${SPP[@]}" --set 'extraEnvFromSecrets[0].name=OANDA_API_KEY' --set 'extraEnvFromSecrets[0].secretName=s' --set 'extraEnvFromSecrets[0].key=k'
 refuse "secret env: chart-managed name" "is reserved" "${SPP[@]}" --set 'extraEnvFromSecrets[0].name=DATABASE_URL' --set 'extraEnvFromSecrets[0].secretName=s' --set 'extraEnvFromSecrets[0].key=k'
 refuse "secret env: missing key" "needs name, secretName and key" "${SPP[@]}" --set 'extraEnvFromSecrets[0].name=X_Y' --set 'extraEnvFromSecrets[0].secretName=s'
+# --- Progress-based liveness probe (heartbeat file written by the tick loop)
+ok "liveness probe default" "${SPP[@]}"
+has "livenessProbe:"; has '"liveness-check", "900"'; has "initialDelaySeconds: 120"; has "periodSeconds: 60"; has "failureThreshold: 3"
+has "name: liveness-tmp"; has "mountPath: /tmp"; has "emptyDir:"
+ok "liveness stale derived from a long tick (3 x 600 > 900)" "${SPP[@]}" --set pilot.tickSecs=600
+has '"liveness-check", "1800"'
+ok "liveness staleSeconds raised above 3 x tick" "${SPP[@]}" --set livenessProbe.staleSeconds=2400
+has '"liveness-check", "2400"'
+ok "liveness disabled renders no liveness probe, mount or volume" "${SPP[@]}" --set livenessProbe.enabled=false
+lacks "livenessProbe:"; lacks "liveness-check"; lacks "liveness-tmp"; lacks "emptyDir:"; has "startupProbe:"; has "readinessProbe:"
 exit $fail

@@ -6,6 +6,7 @@ pub mod credentials;
 pub mod excluded;
 pub mod fleet;
 pub mod kill_drill;
+pub mod liveness;
 pub mod observer;
 pub mod pilot;
 pub mod runtime;
