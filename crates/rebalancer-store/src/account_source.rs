@@ -325,6 +325,9 @@ impl ExclusionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exclusion {
+    /// The tenant of the target that was refused (R47: an alert about an excluded account that still holds positions
+    /// must reach that tenant's channels).
+    pub tenant_id: Uuid,
     pub account_id: Uuid,
     pub reason: ExclusionReason,
 }
@@ -1089,7 +1092,7 @@ pub(crate) fn evaluate_with_cells(targets: &[Target], rows: &Rows, serve_proposa
     for target in targets {
         match evaluate_one(*target, rows, serve_proposal_plans, verifier, cells) {
             Ok(a) => out.accounts.push(a),
-            Err(reason) => out.exclusions.push(Exclusion { account_id: target.account_id, reason }),
+            Err(reason) => out.exclusions.push(Exclusion { tenant_id: target.tenant_id, account_id: target.account_id, reason }),
         }
     }
     out
@@ -1678,7 +1681,7 @@ mod tests {
         let both = PilotAllowList::new(TENANT, [ACCOUNT, OTHER_ACCOUNT, Uuid::from_u128(0x102)]).unwrap();
         let e = evaluate(&both.targets().collect::<Vec<_>>(), &rows, false);
         assert_eq!(e.accounts.len(), 2);
-        assert_eq!(e.exclusions, vec![Exclusion { account_id: Uuid::from_u128(0x102), reason: ExclusionReason::CredentialNotFound }]);
+        assert_eq!(e.exclusions, vec![Exclusion { tenant_id: TENANT, account_id: Uuid::from_u128(0x102), reason: ExclusionReason::CredentialNotFound }]);
         // The allow-list's tenant is the only tenant: a different list tenant finds nothing.
         let wrong = PilotAllowList::new(OTHER_TENANT, [ACCOUNT]).unwrap();
         assert_eq!(evaluate(&wrong.targets().collect::<Vec<_>>(), &rows, false).exclusions[0].reason, ExclusionReason::CredentialNotFound);
@@ -1876,7 +1879,7 @@ mod tests {
         let targets = targets_for(&scope, &rows.proposal_plans);
         let e = evaluate(&targets, &rows, true);
         assert_eq!(e.accounts.len(), 1);
-        assert_eq!(e.exclusions, vec![Exclusion { account_id: OTHER_ACCOUNT, reason: ExclusionReason::CredentialNotFound }]);
+        assert_eq!(e.exclusions, vec![Exclusion { tenant_id: TENANT, account_id: OTHER_ACCOUNT, reason: ExclusionReason::CredentialNotFound }]);
 
         // The pilot scope never targets a proposal account, whatever the database holds.
         assert_eq!(targets_for(&AccountScope::Pilot(allow()), &rows.proposal_plans), vec![Target { tenant_id: TENANT, account_id: ACCOUNT }]);

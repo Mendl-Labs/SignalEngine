@@ -78,6 +78,8 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "ALERT_HEARTBEAT_FAILED",
             // added by W9.2 (the two-source data gate, shadow mode; appended, nothing renumbered)
             "ALERT_DATA_GATE_SHADOW_REFUSE",
+            // added by R47 (an excluded account that still holds positions; appended, nothing renumbered)
+            "ACCOUNT_EXCLUDED_WITH_POSITIONS",
         ]
     );
     assert_eq!(

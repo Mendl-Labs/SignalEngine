@@ -95,6 +95,7 @@ use rebalancer_run::record::{Alert, AlertCode, AlertSeverity};
 use rebalancer_run::stores::Notifier;
 use rebalancer_service::broker_credentials::{BrokerConfig, HttpBrokerCredentials};
 use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvider, ServiceCredentials, TenantCredentialsNotBuilt, ENV_ALPACA_KEY_ID, ENV_ALPACA_KEY_SECRET};
+use rebalancer_service::excluded::{check_excluded, ExclusionIo, Outcome};
 use rebalancer_service::fleet::{connect_account, reenumerate_secs_from_lookup, Fleet, ReenumerateSchedule, DEFAULT_REENUMERATE_SECS};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
@@ -382,6 +383,8 @@ fn run_service() {
     for excluded in &enumeration.exclusions {
         log(format!("account {} excluded at startup: {}", excluded.account_id, excluded.reason.code()));
     }
+    // R47 (HOLD): an excluded account that still holds positions is alerted on, never ignored and never sold.
+    alert_excluded_with_positions(&enumeration.exclusions, &run_store, &state_store, &notifier, Utc::now());
     // With proposal plans served, zero eligible accounts is a normal state (nothing approved yet): the loop below
     // re-enumerates every REBALANCER_REENUMERATE_SECS and builds a runtime when a plan appears. Flag off: unchanged.
     if enumeration.accounts.is_empty() && pilot.serve_proposal_plans {
@@ -585,7 +588,7 @@ fn run_service() {
                 if let Some(schedule) = reenumerate_schedule.as_mut() {
                     let now = clock.now();
                     if schedule.due(now) {
-                        reenumerate_fleet(accounts.inner(), &mut fleet, &credentials, &transport, &tenants, &notifier, now);
+                        reenumerate_fleet(accounts.inner(), &mut fleet, &credentials, &transport, &tenants, &notifier, &run_store, &state_store, now);
                     }
                 }
                 let tick_outcome = {
@@ -632,6 +635,7 @@ fn run_service() {
 /// One re-enumeration cycle (proposal plans served): enumerate the eligible accounts afresh and reconcile the fleet.
 /// A failed enumeration keeps the current runtimes; one account's failed credential fetch or connect is logged,
 /// alerted once per failure streak and retried with backoff, and never stops another account.
+#[allow(clippy::too_many_arguments)]
 fn reenumerate_fleet(
     source: &PgAccountSource,
     fleet: &mut Fleet<PilotAlpaca>,
@@ -639,6 +643,8 @@ fn reenumerate_fleet(
     transport: &Arc<dyn HttpTransport>,
     tenants: &Arc<AccountTenants>,
     notifier: &PgNotifier,
+    run_store: &PgRunStore,
+    state_store: &PgStateStore,
     now: DateTime<Utc>,
 ) {
     let enumeration = match source.enumerate() {
@@ -651,6 +657,7 @@ fn reenumerate_fleet(
     for excluded in &enumeration.exclusions {
         log(format!("account {} excluded: {}", excluded.account_id, excluded.reason.code()));
     }
+    alert_excluded_with_positions(&enumeration.exclusions, run_store, state_store, notifier, now);
     let report = fleet.reconcile(&enumeration.accounts, now, |account| {
         connect_account(account, credentials, |keys, acct| {
             let alpaca = connect_account_alpaca_for_sleeves(&keys.key_id, &keys.secret, PAPER_BASE_URL, transport.clone(), acct.credential_fingerprint.as_deref(), &acct.active.sleeves)?;
@@ -698,6 +705,49 @@ fn reenumerate_fleet(
     log(report.summary_line(fleet.len()));
     if fleet.is_empty() {
         log("heartbeat: no account runtime yet; serving proposal plans, waiting for an eligible account");
+    }
+}
+
+/// The Postgres reads and the one write behind [`check_excluded`] (R47). Read-only against the run and state stores;
+/// the only write is the alert row.
+struct PgExclusionIo<'a> {
+    run_store: &'a PgRunStore,
+    state_store: &'a PgStateStore,
+    notifier: &'a PgNotifier,
+}
+
+impl ExclusionIo for PgExclusionIo<'_> {
+    fn last_snapshot(&self, account_id: &str) -> Result<Option<rebalancer_run::record::SnapshotSummary>, String> {
+        use rebalancer_run::stores::RunStore;
+        self.run_store.last_snapshot(account_id).map_err(|e| e.to_string())
+    }
+    fn high_water_mark(&self, account_id: &str) -> Option<f64> {
+        use rebalancer_risk::store::StateStore;
+        self.state_store.load(account_id).ok().flatten().and_then(|s| s.hwm()).map(|h| h.to_f64())
+    }
+    fn prior_alerts(&self, account_id: &str, prefix: &str) -> Result<Vec<(String, DateTime<Utc>)>, String> {
+        self.notifier.alerts_with_key_prefix(account_id, AlertCode::AccountExcludedWithPositions.as_str(), prefix)
+    }
+    fn raise(&self, tenant_id: uuid::Uuid, alert: &Alert) -> Result<(), String> {
+        self.notifier.notify_for_tenant(alert, tenant_id)
+    }
+}
+
+/// After an enumeration: for each excluded account, raise `ACCOUNT_EXCLUDED_WITH_POSITIONS` (Critical) when it holds
+/// positions or open orders, at first sight and again at 1, 7 and 30 days. Never trades; failures are logged and
+/// retried on the next enumeration.
+fn alert_excluded_with_positions(exclusions: &[rebalancer_store::Exclusion], run_store: &PgRunStore, state_store: &PgStateStore, notifier: &PgNotifier, now: DateTime<Utc>) {
+    if exclusions.is_empty() {
+        return;
+    }
+    let io = PgExclusionIo { run_store, state_store, notifier };
+    for c in check_excluded(&io, exclusions, now) {
+        match c.outcome {
+            Outcome::Raised { bucket } => log(format!("account {} excluded ({}) with positions: ACCOUNT_EXCLUDED_WITH_POSITIONS raised (day {bucket})", c.account_id, c.reason_code)),
+            Outcome::AlreadyRaised => {}
+            Outcome::Flat => log(format!("account {} excluded ({}): holds no positions, no alert", c.account_id, c.reason_code)),
+            Outcome::Failed(e) => log(format!("account {} excluded ({}): ACCOUNT_EXCLUDED_WITH_POSITIONS check failed: {e}; will retry at the next enumeration", c.account_id, c.reason_code)),
+        }
     }
 }
 

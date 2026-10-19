@@ -27,6 +27,42 @@ impl PgNotifier {
     }
 }
 
+impl PgNotifier {
+    /// Every alert already stored for `(account_id, code)` whose `dedupe_key` starts with `prefix`, as
+    /// `(dedupe_key, at)`. R47 uses this as its "first seen" record: the first alert of an exclusion IS the anchor, so
+    /// no new table is needed. A plain prefix compare (`left(..) = ..`), not `LIKE`, so `_` in a code is literal.
+    pub fn alerts_with_key_prefix(&self, account_id: &str, code: &str, prefix: &str) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>, String> {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)]
+            dedupe_key: String,
+            #[diesel(sql_type = Timestamptz)]
+            at: chrono::DateTime<chrono::Utc>,
+        }
+        let (account_id, code, prefix) = (account_id.to_string(), code.to_string(), prefix.to_string());
+        self.bridge.block_on(move |mut conn| async move {
+            let rows: Vec<Row> = diesel::sql_query(
+                "SELECT dedupe_key, at FROM rebalancer_alerts \
+                 WHERE account_id = $1 AND code = $2 AND left(dedupe_key, char_length($3)) = $3",
+            )
+            .bind::<Text, _>(&account_id)
+            .bind::<Text, _>(&code)
+            .bind::<Text, _>(&prefix)
+            .get_results(&mut conn)
+            .await
+            .map_err(|e| format!("NOTIFIER_UNAVAILABLE: {e}"))?;
+            Ok(rows.into_iter().map(|r| (r.dedupe_key, r.at)).collect())
+        })
+    }
+
+    /// Persist `alert` under an explicit tenant (an excluded account has no entry in the `AccountTenants` registry,
+    /// which is filled from the due scan). Same INSERT as `notify`.
+    pub fn notify_for_tenant(&self, alert: &Alert, tenant_id: uuid::Uuid) -> Result<(), String> {
+        self.tenants.register(&alert.account_id, tenant_id);
+        <Self as Notifier>::notify(self, alert)
+    }
+}
+
 impl Notifier for PgNotifier {
     fn notify(&self, alert: &Alert) -> Result<(), String> {
         let tenant_id = self.tenants.get(&alert.account_id);

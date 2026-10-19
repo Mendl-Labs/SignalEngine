@@ -145,7 +145,7 @@ fn an_allow_listed_id_that_does_not_exist_is_reported_not_silently_dropped() {
     let ghost = Uuid::new_v4();
     let e = source(&db, PilotAllowList::new(tenant, [ghost]).unwrap()).enumerate().unwrap();
     assert!(e.accounts.is_empty());
-    assert_eq!(e.exclusions, vec![rebalancer_store::Exclusion { account_id: ghost, reason: rebalancer_store::ExclusionReason::CredentialNotFound }]);
+    assert_eq!(e.exclusions, vec![rebalancer_store::Exclusion { tenant_id: tenant, account_id: ghost, reason: rebalancer_store::ExclusionReason::CredentialNotFound }]);
 }
 
 #[test]
