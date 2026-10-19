@@ -24,6 +24,7 @@ pub fn what_to_do(code: &str) -> Option<&'static str> {
         "ALERT_RUN_FAILED" => Some("What to do: the run failed closed and traded nothing. Read the run record's outcome code; if it persists past the retry window, the decision is being missed and needs a person."),
         "ALERT_DECISION_NOT_ACTED" => Some("What to do: a planned order was not carried out, so the decision stays pending and is planned again next run. Check the placed orders in the run record for a venue refusal or guard denial."),
         "ALERT_HEARTBEAT_FAILED" => Some("What to do: the service could not reach its external monitor; the monitor will page as if the service were down. Check network egress from the service and the monitor URL."),
+        "ACCOUNT_EXCLUDED_WITH_POSITIONS" => Some("What to do: this account is no longer being managed, but its positions are being HELD, not sold: nothing has been liquidated and nothing will be. New orders are blocked and the old limits no longer run. Approve a new proposal for the account or sign off on the holdings; until then this alert repeats at 1, 7 and 30 days."),
         _ => None,
     }
 }
@@ -89,6 +90,16 @@ mod tests {
         assert!(r.body.contains("2026-10-02T15:00:07+00:00"));
         assert!(r.body.contains("acct-1:halt"));
         assert!(!r.body.contains('<'), "plain text, no markup: {}", r.body);
+    }
+
+    #[test]
+    fn the_excluded_with_positions_alert_says_held_not_sold_and_what_to_approve() {
+        let r = render(&alert("ACCOUNT_EXCLUDED_WITH_POSITIONS"), Severity::Critical);
+        assert_eq!(r.subject, "[Mendl Labs] critical ACCOUNT_EXCLUDED_WITH_POSITIONS acct-1");
+        assert!(r.body.contains("What to do:"), "{}", r.body);
+        assert!(r.body.contains("HELD, not sold"), "{}", r.body);
+        assert!(r.body.contains("Approve a new proposal"), "{}", r.body);
+        assert!(r.body.contains("sign off"), "{}", r.body);
     }
 
     #[test]

@@ -45,7 +45,7 @@ impl Severity {
     /// confined to tenant channels because nobody added it here.
     pub fn fallback_for_code(code: &str) -> Severity {
         match code.trim() {
-            "ALERT_HALT" | "ALERT_FLATTEN_INCOMPLETE" | "ALERT_RUN_FAILED" => Severity::Critical,
+            "ALERT_HALT" | "ALERT_FLATTEN_INCOMPLETE" | "ALERT_RUN_FAILED" | "ACCOUNT_EXCLUDED_WITH_POSITIONS" => Severity::Critical,
             "ALERT_STILL_HALTED" | "ALERT_MANDATE_UNUSABLE" | "ALERT_DECISION_NOT_ACTED" | "ALERT_HEARTBEAT_FAILED" => Severity::Warning,
             _ => Severity::Warning,
         }
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn every_pipeline_code_has_a_fallback_and_unknown_codes_fail_towards_warning() {
-        let critical = ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED"];
+        let critical = ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ACCOUNT_EXCLUDED_WITH_POSITIONS"];
         for c in AlertCode::ALL {
             let want = if critical.contains(&c.as_str()) { Severity::Critical } else { Severity::Warning };
             assert_eq!(Severity::fallback_for_code(c.as_str()), want, "{}", c.as_str());
@@ -120,6 +120,14 @@ mod tests {
         assert_eq!(delivery_severity("ALERT_HALT", "info"), Severity::Info);
         assert_eq!(delivery_severity("ALERT_HALT", "garbage"), Severity::Critical);
         assert_eq!(delivery_severity("ALERT_MANDATE_UNUSABLE", ""), Severity::Warning);
+    }
+
+    #[test]
+    fn an_excluded_account_with_positions_is_critical_even_when_the_stored_severity_is_unusable() {
+        assert_eq!(Severity::fallback_for_code("ACCOUNT_EXCLUDED_WITH_POSITIONS"), Severity::Critical);
+        assert_eq!(delivery_severity("ACCOUNT_EXCLUDED_WITH_POSITIONS", "garbage"), Severity::Critical);
+        assert_eq!(delivery_severity("ACCOUNT_EXCLUDED_WITH_POSITIONS", "critical"), Severity::Critical);
+        assert!(channel_applies(ChannelScope::Platform, Severity::fallback_for_code("ACCOUNT_EXCLUDED_WITH_POSITIONS")));
     }
 
     #[test]

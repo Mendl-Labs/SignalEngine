@@ -144,10 +144,16 @@ pub enum AlertCode {
     /// only, or the secondary was unavailable. Warning; one per (sleeve, instrument, date) so the owner sees exactly
     /// what enforce mode would do. The run itself proceeded on the primary panel.
     DataGateShadowRefuse,
+    /// R47 (HOLD policy): an account the rebalancer EXCLUDES (its plan is missing, ambiguous, bound to another
+    /// mandate, its entry hash mismatches, or any other `ExclusionReason`) still holds positions or open orders.
+    /// Nothing runs for it (no ladder, daily-loss limit or reconciliation), so the platform HOLDS the positions
+    /// under the old limits, blocks new orders and tells a person. Critical; raised at first sight and again at 1,
+    /// 7 and 30 days, showing the current drawdown. It never sells anything.
+    AccountExcludedWithPositions,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 9] = [
+    pub const ALL: [AlertCode; 10] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
@@ -157,6 +163,7 @@ impl AlertCode {
         AlertCode::LatencyRecorderFailed,
         AlertCode::HeartbeatFailed,
         AlertCode::DataGateShadowRefuse,
+        AlertCode::AccountExcludedWithPositions,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -170,6 +177,7 @@ impl AlertCode {
             AlertCode::LatencyRecorderFailed => "ALERT_LATENCY_RECORDER_FAILED",
             AlertCode::HeartbeatFailed => "ALERT_HEARTBEAT_FAILED",
             AlertCode::DataGateShadowRefuse => "ALERT_DATA_GATE_SHADOW_REFUSE",
+            AlertCode::AccountExcludedWithPositions => "ACCOUNT_EXCLUDED_WITH_POSITIONS",
         }
     }
 }
