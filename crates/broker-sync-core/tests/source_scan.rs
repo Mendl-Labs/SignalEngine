@@ -61,7 +61,7 @@ fn scanned_files() -> Vec<PathBuf> {
             collect(&p, &mut files);
         }
     }
-    files.retain(|f| !f.file_name().is_some_and(|n| n.to_string_lossy() == "source_scan.rs"));
+    files.retain(|f| f.file_name().is_none_or(|n| n.to_string_lossy() != "source_scan.rs"));
     files.sort();
     files
 }
@@ -107,7 +107,7 @@ fn the_scanner_itself_detects_a_planted_violation() {
     fs::create_dir_all(&dir).expect("temp dir");
     let planted = dir.join("planted.rs");
     fs::write(&planted, "fn oops(a: &dyn Adapter) { a.place_order(); }").expect("write planted file");
-    let found = hits(&[planted.clone()], FORBIDDEN_ORDER_APIS);
+    let found = hits(std::slice::from_ref(&planted), FORBIDDEN_ORDER_APIS);
     let _ = fs::remove_dir_all(&dir);
     assert_eq!(found.len(), 1, "scanner missed a planted place_order: {found:?}");
 }
