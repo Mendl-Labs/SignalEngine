@@ -18,6 +18,7 @@ members = [
     "crates/signaldispatcher",
     "crates/pythonbridge-worker",
     "crates/broker-adapters",
+    "crates/broker-sync-core",
     "crates/fake-broker",
     "crates/mandate-core",
     "crates/rebalancer-core",
