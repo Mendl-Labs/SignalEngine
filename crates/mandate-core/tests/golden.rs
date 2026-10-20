@@ -54,8 +54,8 @@ fn key_order_and_whitespace_in_the_source_json_do_not_change_the_hash() {
 /// whichever side drifted. Order is the Engine's `SEED_JSON` order.
 const PINNED_ENTRY_HASHES: [(&str, u32, &str); 3] = [
     ("etf_trend_faber", 2, "ac1d40c85c13378097ae821a62507fefc6ea5edc3f8efd42864c37a573fd015f"),
-    ("crypto_trend_100d", 2, "843a1bae14489f3f017f9d60b7145dab66695f185abfc630f87a5bf5dd9268a6"),
-    ("etf_cross_sectional_momentum", 2, "22e148b9dd234fea3062c4209c7e4dac8c1294357b2bcd470af4501adc872d40"),
+    ("crypto_trend_100d", 2, "155714130c283c8e901c47e7f8b1805733c475ad16387b71e03b3293097d7991"),
+    ("etf_cross_sectional_momentum", 2, "bcac9efb72dc947e846a80fef6b9b0b4d33123eeb5ad3e1f1ab1291e1f7ca347"),
 ];
 
 #[test]

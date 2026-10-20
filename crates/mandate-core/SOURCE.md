@@ -139,3 +139,21 @@ What changed in the copy:
 
 The rebalancer IMAGE must be rebuilt after this merges (the proposal-plan entry hash the rebalancer enforces, PILOT_ENTRY_MISMATCH, is
 computed from this crate's embedded library).
+
+## Re-sync 2026-10-19 (Engine PR "R45-E", branch fix/seed-entries-band-wording)
+
+Text-only reword of `verification_note` in two seed entries (no declared band is not a non-admissibility finding; the
+platform derives a conservative band per R45-v1). Re-copied verbatim; all other copied files unchanged.
+
+| Item | Blob |
+|---|---|
+| `program/data/strategy_library/crypto_trend_100d.json` | `aea6bd04f5215f69f0f27cf8fad486f4ddcda47e` |
+| `program/data/strategy_library/etf_cross_sectional_momentum.json` | `b7948493bc736198d2c55e622aed96a748bc2513` |
+
+`entry_hash` (pinned in `tests/golden.rs` and in the Engine's `seed_entry_hashes_pinned.rs`):
+
+- `crypto_trend_100d` v2: `843a1bae…` -> `155714130c283c8e901c47e7f8b1805733c475ad16387b71e03b3293097d7991`
+- `etf_cross_sectional_momentum` v2: `22e148b9…` -> `bcac9efb72dc947e846a80fef6b9b0b4d33123eeb5ad3e1f1ab1291e1f7ca347`
+
+`rule_hash` and `claim_hash` are unchanged (neither covers `verification_note`). The rebalancer image must be rebuilt
+after this merges (proposal plans pin `entry_hash`).
