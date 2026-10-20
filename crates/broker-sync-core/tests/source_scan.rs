@@ -100,7 +100,7 @@ fn no_broker_sync_crate_touches_credential_or_master_key_code() {
     // Shipped code only (src and Cargo.toml): tests must build a fake-transport adapter, which needs a test credential
     // constant, so test files are exempt from this one check (the order-API scan above still covers them).
     let shipped: Vec<PathBuf> =
-        scanned_files().into_iter().filter(|f| !f.display().to_string().replace('\', "/").contains("/tests/")).collect();
+        scanned_files().into_iter().filter(|f| !f.display().to_string().replace('\\', "/").contains("/tests/")).collect();
     let found = hits(&shipped, FORBIDDEN_CREDENTIAL_CODE);
     assert!(found.is_empty(), "credential-handling code referenced from the read-only sync code: {found:?}");
 }
