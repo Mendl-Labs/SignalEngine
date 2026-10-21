@@ -9,6 +9,11 @@
 //!   be trimmed. It is still subject to the universe checks, the price checks, the daily order count and the daily
 //!   turnover, EXCEPT when the account is halted or the mandate is expired: then reducing orders skip the count and
 //!   turnover limits too, and every non-reducing order is denied (`ACCOUNT_HALTED`, `MANDATE_EXPIRED`; spec B3/B4).
+//! * **Covers a loss rung requires (R61).** A BUY that covers a short (no larger than the short held) and that the
+//!   caller marks `ProposedOrder::loss_rung_cover` also skips the order-count and turnover limits, so a squeeze on a
+//!   normal-status account cannot leave a losing short open because the day's turnover is used up. The exemption is
+//!   only that: the flag is ignored on a sell, on a buy larger than the short (it would pass through zero, so it is
+//!   not reducing and is checked in full), and on a buy with no short; every other guard still applies.
 //! * **No usable mandate denies everything, including reductions:** invalid mandate, no envelope, status other than
 //!   Active, or not yet effective (`MANDATE_INVALID`, `MANDATE_NOT_ACTIVE`). Flattening is a separate path (WP4.5).
 //! * **Fail closed on data:** missing/non-positive/stale/future-dated price, non-positive equity, currency
@@ -223,6 +228,12 @@ pub struct ProposedOrder {
     pub est_fee: Dec,
     pub uses_margin: bool,
     pub is_derivative: bool,
+    /// The caller says a mandate loss rung (shrink, short loss limit, halt) REQUIRES this order. It matters only to a
+    /// BUY that covers an existing short (`quantity <= |short held|`): such an order skips the daily order-count and
+    /// turnover limits, as a reducing order of a halted account does. On any other order it changes nothing (a sell,
+    /// an order that would pass through zero, an order that opens or grows a position, or a buy with no short to
+    /// cover): every guard applies to it as if the flag were false. Default `false`; the planner never sets it.
+    pub loss_rung_cover: bool,
 }
 
 /// What has already been done today (the account-local day is chosen by the caller).
@@ -614,8 +625,12 @@ fn check_inner(
         }
     }
 
-    // Churn limits: skipped only for reducing orders in a state that forces de-risking.
-    if !((account.halted || expired) && reducing) {
+    // Churn limits: skipped only for reducing orders in a state that forces de-risking, and for a cover a loss rung
+    // requires. The cover exemption is deliberately narrow: a BUY (`reducing` already means it is no larger than the
+    // short held, so it can reach zero and never pass it) that the caller tags as required by a loss rung. A normal
+    // cover (part of a trend flip) stays limited, and so does every other guard (universe, price, mandate state).
+    let required_cover = order.loss_rung_cover && order.side == Side::Buy && reducing;
+    if !((account.halted || expired) && reducing) && !required_cover {
         if u64::from(day.orders_today) + 1 > u64::from(limits.max_orders_per_day) {
             deny(
                 reasons,

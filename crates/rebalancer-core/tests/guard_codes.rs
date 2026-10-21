@@ -434,6 +434,82 @@ fn max_turnover_boundary() {
     assert_allowed(&PreTradeGuard::check(&p, &halted, &sell("SPY", "10", "100"), &with("1500.01")));
 }
 
+/// The same order, marked as required by a mandate loss rung.
+fn rung(mut o: rebalancer_core::guard::ProposedOrder) -> rebalancer_core::guard::ProposedOrder {
+    o.loss_rung_cover = true;
+    o
+}
+
+#[test]
+fn a_cover_required_by_a_loss_rung_skips_the_turnover_limit_but_a_normal_cover_does_not() {
+    let p = policy(); // turnover 0.5 * 5000 = 2500
+    let short = account("5000", "5100", vec![pos("SPY", "-10", "-1000")]);
+    let with = |t: &str| DayCounters { orders_today: 1, turnover_today: d(t) };
+    let cover = buy("SPY", "10", "100"); // 1000, reaches exactly zero
+    // Within the limit both pass.
+    assert_allowed(&PreTradeGuard::check(&p, &short, &cover, &with("1500")));
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(cover.clone()), &with("1500")));
+    // Over the limit: a normal cover (part of a trend flip) is still denied, the rung-required one passes.
+    assert_only(&PreTradeGuard::check(&p, &short, &cover, &with("1500.01")), DenialCode::MaxTurnoverPerDay);
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(cover.clone()), &with("1500.01")));
+    // Even with the whole day's turnover already far past the limit.
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(cover), &with("999999")));
+}
+
+#[test]
+fn a_cover_required_by_a_loss_rung_skips_the_order_count_limit_but_a_normal_cover_does_not() {
+    let p = policy(); // 20 orders a day
+    let short = account("5000", "5100", vec![pos("SPY", "-10", "-1000")]);
+    let with = |n: u32| DayCounters { orders_today: n, turnover_today: Dec::ZERO };
+    let cover = buy("SPY", "4", "100");
+    assert_only(&PreTradeGuard::check(&p, &short, &cover, &with(20)), DenialCode::MaxOrdersPerDay);
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(cover.clone()), &with(20)));
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(cover), &with(u32::MAX)));
+}
+
+#[test]
+fn the_loss_rung_cover_flag_buys_nothing_beyond_a_cover() {
+    let p = policy();
+    let over = DayCounters { orders_today: 20, turnover_today: d("2450") }; // both churn limits are used up (a 100 order tips the turnover over 2500)
+    let short = account("5000", "5100", vec![pos("SPY", "-10", "-1000")]);
+    // An order that would flip through zero (buys 15 against a short of 10) is not a cover: it is checked in full,
+    // flag or no flag.
+    let flip = buy("SPY", "15", "100");
+    let v = PreTradeGuard::check(&p, &short, &rung(flip.clone()), &over);
+    assert_eq!(codes(&v), codes(&PreTradeGuard::check(&p, &short, &flip, &over)), "the flag changes nothing");
+    assert!(v.has(DenialCode::MaxOrdersPerDay) && v.has(DenialCode::MaxTurnoverPerDay), "{:?}", v.reasons);
+    // One unit past zero is enough to lose the exemption; exactly zero keeps it.
+    assert_allowed(&PreTradeGuard::check(&p, &short, &rung(buy("SPY", "10", "100")), &over));
+    assert!(!PreTradeGuard::check(&p, &short, &rung(buy("SPY", "10.000001", "100")), &over).allow);
+    // A buy with no short to cover (opening or growing a long) is denied as usual.
+    let v = PreTradeGuard::check(&p, &flat(), &rung(buy("SPY", "1", "100")), &over);
+    assert!(v.has(DenialCode::MaxOrdersPerDay) && v.has(DenialCode::MaxTurnoverPerDay), "{:?}", v.reasons);
+    let long = account("5000", "4000", vec![pos("SPY", "10", "1000")]);
+    assert!(!PreTradeGuard::check(&p, &long, &rung(buy("SPY", "1", "100")), &over).allow);
+    // A flagged SELL (even of a held long) is not a cover and keeps the churn limits.
+    assert_only(&PreTradeGuard::check(&p, &long, &rung(sell("SPY", "1", "100")), &DayCounters { orders_today: 20, turnover_today: Dec::ZERO }), DenialCode::MaxOrdersPerDay);
+    // Opening a short stays forbidden (and denied for churn) with the flag set.
+    let v = PreTradeGuard::check(&p, &flat(), &rung(sell("SPY", "1", "100")), &over);
+    assert!(v.has(DenialCode::ShortingForbidden) && v.has(DenialCode::MaxOrdersPerDay), "{:?}", v.reasons);
+}
+
+#[test]
+fn a_loss_rung_cover_still_meets_every_other_guard() {
+    let p = policy();
+    let over = DayCounters { orders_today: 20, turnover_today: d("999999") };
+    // Instrument off the allow list: still denied (the exemption is churn limits only).
+    let off_list = account("5000", "5100", vec![pos("QQQ", "-1", "-100")]);
+    assert_only(&PreTradeGuard::check(&p, &off_list, &rung(buy("QQQ", "1", "100")), &over), DenialCode::InstrumentNotAllowed);
+    // No price: still denied.
+    let short = account("5000", "5100", vec![pos("SPY", "-10", "-1000")]);
+    let mut no_price = rung(buy("SPY", "1", "100"));
+    no_price.price = None;
+    assert_only(&PreTradeGuard::check(&p, &short, &no_price, &over), DenialCode::PriceMissing);
+    // A mandate that is not active denies everything, covers included.
+    let inactive = Policy::compile(&body_with(|_| {})).with_envelope(MandateEnvelope { status: MandateStatus::Revoked, ..active_envelope() });
+    assert_only(&PreTradeGuard::check(&inactive, &short, &rung(buy("SPY", "1", "100")), &over), DenialCode::MandateNotActive);
+}
+
 #[test]
 fn cash_reserve_boundary_includes_fees() {
     let p = policy(); // reserve 5% of 5000 = 250

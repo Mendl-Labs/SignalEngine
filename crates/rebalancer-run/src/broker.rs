@@ -271,9 +271,10 @@ impl Broker for AlpacaBroker<'_> {
 /// The OANDA FX margin account. Configure the adapter with `with_own_tag_prefix(OWN_TAG_PREFIX)` so foreign orders come
 /// back with `tag: None`. Never run against a real OANDA account: see `broker_adapters::oanda`.
 ///
-/// `flatten` (the kill path) works on this broker for LONG positions only: it sells the held units with ordinary
-/// market orders, and it reports a short as `FLATTEN_SHORT_HELD` and leaves it alone (its spot-shaped rule "never open
-/// a short"). Closing a short needs OANDA's position-close endpoint, which the `Broker` trait has no method for.
+/// `flatten` (the kill path) closes both sides with ordinary market orders: it buys to cover every short FIRST (a buy of
+/// exactly the short's units, rounded down, so it can reach zero and never pass it), then sells the held longs. It
+/// does not use OANDA's position-close endpoint (the `Broker` trait has no method for it); a short that a market buy
+/// cannot close is reported as not flat.
 pub struct OandaBroker<'a> {
     pub adapter: &'a OandaAdapter,
     pub asset_class: String,

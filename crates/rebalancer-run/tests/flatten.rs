@@ -11,7 +11,7 @@ use fake_broker::scenarios as sc;
 use fake_broker::{FillPolicy, OrderRule};
 use rebalancer_run::broker::Broker;
 use rebalancer_run::flatten::{
-    cancel_own_open_orders, flatten, flatten_tag, FlattenCode, FlattenOutcome, FlattenReport, FlattenSpec, FlattenVerdict,
+    cancel_own_open_orders, flatten, flatten_cover_tag, flatten_tag, FlattenCode, FlattenOutcome, FlattenReport, FlattenSpec, FlattenVerdict,
     FLATTEN_TAG_PREFIX,
 };
 
@@ -166,19 +166,22 @@ fn only_the_mandates_universe_is_sold() {
 }
 
 #[test]
-fn a_short_position_is_never_touched_and_escalates() {
+fn a_short_that_a_spot_broker_keeps_reporting_is_covered_once_then_escalates_and_the_long_is_still_sold() {
+    // Spot has no shorts, so this snapshot is a lie that never goes away. Flatten (cover first) buys back the short it
+    // first saw ONCE, then refuses to keep buying every round and escalates. The long is still flattened.
     let env = Env::new();
     env.hold("BTC", "0.05");
     let real = env.broker();
     let lying = DistortingBroker {
         inner: &real,
         distort: Box::new(|s| {
+            s.holdings.retain(|h| h.symbol != "ETH/USD");
             s.holdings.push(rebalancer_run::view::Holding {
                 symbol: "ETH/USD".into(),
                 asset_class: "crypto_spot".into(),
-                quantity: d("-2"),
+                quantity: d("-0.01"),
                 mark: Some(d("3000")),
-                market_value: d("-6000"),
+                market_value: d("-30"),
             });
         }),
     };
@@ -186,8 +189,23 @@ fn a_short_position_is_never_touched_and_escalates() {
     assert_eq!(r.verdict, FlattenVerdict::HaltAndAlert);
     assert!(r.has(FlattenCode::ShortHeld), "{}", r.summary());
     assert!(!r.verified_flat);
-    assert!(env.rig.handle.orders(ACCOUNT).iter().all(|o| o.pair != "ETH/USD"), "no order on the short instrument");
+    let eth_buys = env.rig.handle.orders(ACCOUNT).iter().filter(|o| o.pair == "ETH/USD" && o.side == Side::Buy).count();
+    assert_eq!(eth_buys, 1, "bought back the first-seen short once and never again: {}", r.summary());
     assert_eq!(env.bal("BTC"), d("0"), "the long was still flattened");
+    // The cover went out before the sell.
+    let sides: Vec<Side> = env.rig.handle.orders(ACCOUNT).iter().map(|o| o.side).collect();
+    assert_eq!(sides.first(), Some(&Side::Buy), "{sides:?}");
+}
+
+#[test]
+fn cover_tags_are_deterministic_prefixed_and_never_equal_to_a_sell_tag() {
+    let c = flatten_cover_tag("acct-1", KEY, "BTC/USD", 1);
+    assert_eq!(c, flatten_cover_tag("acct-1", KEY, "BTC/USD", 1), "deterministic");
+    assert!(c.starts_with(FLATTEN_TAG_PREFIX) && c.starts_with("rb1:fl:20260921T150000Z:BTCUSD:1:"), "{c}");
+    assert!(c.len() < 128);
+    assert_ne!(c, flatten_tag("acct-1", KEY, "BTC/USD", 1), "a cover and a sell of one symbol and index differ");
+    let tags: std::collections::BTreeSet<String> = (1..=25).map(|k| flatten_cover_tag("acct-1", KEY, "BTC/USD", k)).collect();
+    assert_eq!(tags.len(), 25);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
