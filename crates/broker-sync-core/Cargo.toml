@@ -1,0 +1,11 @@
+[package]
+name = "broker-sync-core"
+description = "Read-only broker account reader for the Mendl Labs dashboard sync (ruling R54, PR 1): a reader trait with NO order-placing method, a normalised account snapshot, Alpaca adapter reuse, in-memory fakes and a source-scan test. No DB, no pod, no network code of its own."
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+broker-adapters = { path = "../broker-adapters" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+thiserror = "2"
