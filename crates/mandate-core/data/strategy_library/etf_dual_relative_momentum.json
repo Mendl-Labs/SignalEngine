@@ -1,0 +1,130 @@
+{
+  "id": "etf_dual_relative_momentum",
+  "version": 1,
+  "name": "Dual momentum, SPY/EFA/AGG variant (after Antonacci)",
+  "sources": [
+    "Antonacci, G., \"Dual Momentum Investing: An Innovative Strategy for Higher Returns with Lower Risk\", McGraw-Hill, 2014 (book). NOT verifiable through Crossref (a Crossref search for the title and author returned the author's SSRN working papers but no record of the book), and the book text was NOT read for this entry. Cited as the origin of the dual-momentum idea only; every statement about what the book says is unverified. This entry's rule is a variant of it, not the book's strategy (see known_deviations).",
+    "Antonacci, G., \"Risk Premia Harvesting Through Dual Momentum\", SSRN working paper, 2012, DOI 10.2139/ssrn.2042750 (https://doi.org/10.2139/ssrn.2042750). Title, author, year and abstract were CHECKED on 2026-10-17 against the Crossref record of that DOI (type posted-content, publisher Elsevier BV). The abstract says that both absolute and relative momentum can enhance returns, that absolute momentum does far more to lessen volatility and drawdown, and that combining absolute and relative momentum gives the best results. The full text was NOT read for this entry; the paper supports only the general idea of combining the two kinds of momentum, not this rule's SPY/EFA/AGG universe, its zero threshold or its month-end timing.",
+    "Moskowitz, T. J., Ooi, Y. H. and Pedersen, L. H., \"Time series momentum\", Journal of Financial Economics 104(2), May 2012, 228-250, DOI 10.1016/j.jfineco.2011.11.003 (https://doi.org/10.1016/j.jfineco.2011.11.003). Bibliographic details (title, authors, journal, volume, issue, pages, year) were CHECKED on 2026-10-17 against the Crossref record of that DOI. Crossref carries no abstract for it and the full text was NOT read for this entry: it is cited for the existence of a time-series (absolute) momentum effect, which is what the rule's SPY gate borrows, and supports nothing numeric here.",
+    "Reference implementation: BacktestingCore reference-rules::DualMomentumGemRule (weightsim::WeightRule id \"dual_momentum_gem\"), run by weightsim_rules::adapters::DualMomentumGemAdapter (ladder sleeve S6, BacktestingCore PR #76, merged) against the SHA-256-pinned replication_ladder_gem_evidence answer key (Amendment 16, dual_relative_momentum_evidence_v1): key exported 2026-10-20 by export_key.py from the certified local bars (independent Python reference function plus a vectorised shadow, agreement to 1e-15 on weights and 1e-12 on returns), MANIFEST sha256 281c7b8b0a9239997e13f66e70427b7769c6d84642327bb64d8045998265f3f6, candles sha256 a486c4f83e78996fa591ac1e281fe151db3996e20adcf2da84896f717684e6e3."
+  ],
+  "citation_claims": [
+    {
+      "source_index": 1,
+      "claim": {
+        "quotes": [
+          "combining absolute and relative momentum gives the best results"
+        ],
+        "numbers": [],
+        "sample_period": null
+      }
+    },
+    {
+      "source_index": 2,
+      "claim": {
+        "quotes": [
+          "Time series momentum"
+        ],
+        "numbers": [],
+        "sample_period": null
+      }
+    }
+  ],
+  "rule_text": "Universe: SPY, EFA, AGG. At each month-end (the last available trading day of the calendar month): compute the trailing 12-month total return of SPY (current month-end close divided by the close 12 month-ends earlier, minus 1). If that return is positive, hold whichever of SPY or EFA has the higher trailing 12-month return, 100% of the sleeve; otherwise (zero or negative) hold AGG, 100% of the sleeve. An exact tie between the SPY and EFA returns goes to EFA (the alphabetically earlier ticker). Exactly one of SPY, EFA or AGG is held at a time, never a blend. Rebalance monthly at the month-end close. A position decided at the close of day t earns returns from the next trading day's close-to-close return onward; a decision uses only data available at the close of the decision day. Long only, no leverage: maximum gross exposure is 100% of sleeve equity.",
+  "reference_implementation": "weightsim_rules::ladder rule id \"dual_momentum_gem\" (S6), the compiled rule replication::registry::certified_key_bars resolves against the SHA-256-pinned replication_ladder_gem_evidence answer key (Amendment 16) over reference-rules::DualMomentumGemRule. Until the GEM ladder digest is measured and allow-listed, certified_key_bars refuses this entry as not certified.",
+  "instruments": [
+    "SPY",
+    "EFA",
+    "AGG"
+  ],
+  "requirements": {
+    "needs_shorting": false,
+    "min_leverage_gross": 1.0,
+    "needs_portfolio_vol_target": false,
+    "max_abs_weight_per_instrument": 1.0,
+    "cross_asset_rebalance": "preferred",
+    "asset_classes": [
+      "us_etf"
+    ],
+    "venues_supported": [
+      "alpaca"
+    ],
+    "min_history_years": 1.0833333333333333,
+    "notes": [
+      "min_history_years is the history needed to compute the FIRST signal only (13 month-end closes: a 12-month trailing window plus the current month-end); a meaningful backtest needs far more.",
+      "Uses plain \"positive\" as the absolute-momentum gate threshold, not a risk-free/T-bill rate -- the simpler, more commonly cited formulation of Antonacci's rule and the one ROBUST_PREMIA's own note states; this platform does not model a separate T-bill series.",
+      "Drafted from library_curation::draft::RuleTemplate::DualRelativeMomentum -- structural fields are template-fixed, matched here exactly to avoid RULE_DRIFT against the compiled rule."
+    ]
+  },
+  "rebalance": {
+    "kind": "monthly",
+    "detail": "Decided at the close of the last bar of each calendar month; the new target is first actionable on the first bar of the following month."
+  },
+  "operating_procedure": {
+    "decision_schedule": "monthly",
+    "evaluation": "daily",
+    "actionable_after": "first_bar_of_next_month",
+    "rebalance_policy": "on_decision",
+    "expected_delay_bars": 1,
+    "execution_assumption": "next_open",
+    "catch_up": "cap"
+  },
+  "parameters": {
+    "trailing_months": 12,
+    "month_ends_needed": 13,
+    "schedule": "last_bar_of_month",
+    "rebalance_policy": "on_decision",
+    "max_weight_per_instrument": 1.0
+  },
+  "expected_ranges": [
+    {
+      "metric": "sharpe_gross",
+      "low": null,
+      "high": null,
+      "role": "performance_band",
+      "source": "No band, deliberately. Amendment 16 section 7 (program/tests/fixtures/replication_ladder_gem_evidence/AMENDMENT_16.md): no performance band is authored or predicted for this entry. Any band is the platform-derived one of council ruling R45 (formula R45-v1), computed only after a certified run exists, only if the T5 cost identity passed, with the documenting-sample end dates for Antonacci (2014) and Moskowitz-Ooi-Pedersen (2012) entered page-cited (missing means fail-closed, h = 0.58).",
+      "note": "Window-specific reference only, NOT an expectation for other windows. Answer key (Amendment 16, dual_relative_momentum_evidence_v1, exported 2026-10-20 from the certified bars; reproduced by the compiled Rust ladder): counted window 2021-05-03 to 2026-10-16 (entry month-end 2021-04-30; mechanical start 2021-04-07), 5.454 years, 1372 daily bars, 67 month-end decisions (SPY 43, EFA 12, AGG 12), price-only closes: gross Sharpe 0.653493, CAGR 8.8894%, vol 14.6758%, max drawdown -22.0668%; net (certification_flat_10bps_per_side) Sharpe 0.625866, CAGR 8.4538%, vol 14.6853%, max drawdown -22.6921%. These are the first numbers anyone saw for this rule: Amendment 16 offered no prior estimate. No buy-and-hold comparison has been measured for this window."
+    },
+    {
+      "metric": "sharpe_net",
+      "low": null,
+      "high": null,
+      "role": "performance_band",
+      "source": "No band, deliberately (see expected_ranges[0].source). Declared so that gross AND net are both reported (WP9.9 gross_and_net_reported_check, check A9); recomputed from the platform's own certified replication of the evidence window on every read.",
+      "note": "Window-specific reference only, NOT an expectation for other windows. Net of the certification_flat_10bps_per_side accounting cost (not a realised fill cost); the certified figures, gross and net, are recorded in expected_ranges[0].note."
+    }
+  ],
+  "backtest_window": {
+    "start": "2021-05-03",
+    "end": "2026-10-16",
+    "max_observed_drawdown": 0.226920719013
+  },
+  "known_deviations": [
+    "Price-only unadjusted closes: dividends and bond coupons are excluded from SPY, EFA and AGG. AGG's return is mostly income, so its price-only series understates a bond holding, and the SPY gate ignores dividends.",
+    "No lot rounding or minimum tickets: the compiled rule trades a full 100% switch between SPY, EFA and AGG at each month-end.",
+    "The absolute-momentum gate uses plain zero as the threshold (\"positive\" trailing SPY return), not a risk-free/T-bill rate.",
+    "The gate tests SPY's own 12-month price return, not the selected winner's excess return over T-bills: in a period with SPY <= 0 < EFA this rule holds AGG where Antonacci's dual momentum would hold the foreign equity winner. This entry is therefore a rules-based variant of dual momentum as specified here, not Antonacci's GEM.",
+    "Proxy universe: SPY for US equities, EFA (developed ex-US, no emerging markets) in place of MSCI ACWI ex-US, and AGG in place of the US aggregate bond index.",
+    "The evidence window is 5.45 years (the vendor's rolling data floor), with 67 monthly decisions and 11 switches: low statistical power and a single regime path.",
+    "The documented momentum premia are subject to post-publication decay.",
+    "The mechanical window start (Amendment 16 section 3) is 2021-04-07; the rule decides only at month-ends, so the first position is entered at the month-end 2021-04-30 and the certified return series starts 2021-05-03 (the bar after the first fill, the ladder's counting convention). The 5.0-year and 60-decision floors are met on that counted span.",
+    "Same-close fills in the answer key: a decision made at a month-end close is filled at that same close. A live account acts one session later (operating_procedure.execution_assumption next_open).",
+    "C4 venue check (derived/data_quality_certificate.json): the Stooq corroboration was not available, so the primary-vs-arbiter (Massive unadjusted vs Alpaca SIP raw) comparison is the only cross-vendor check; it passed with no bar above 10 bp inside the window (six 10-30 bp exceptions on SPY inside the warm-up are listed).",
+    "The certified net figure uses a flat 10 bps per-side accounting cost (cost_model_id certification_flat_10bps_per_side), a stated bookkeeping device, not a claim about realised trading costs on any venue.",
+    "The vendor closes the key was computed from are not in the repository (owner decision, vendor licence questions open); the key, its manifest and the candles sha256 are. The Rust ladder reproduction and the allow-listed digest are pending the candles source wiring."
+  ],
+  "failure_regimes": [
+    "Whipsaw around the absolute-momentum gate: a SPY trailing return hovering near zero can flip the sleeve between equities and AGG repeatedly without a real trend developing.",
+    "A sharp, fast equity reversal inside a single month is not seen until the next month-end decision -- monthly rebalancing can hold a losing position for weeks after a regime change.",
+    "Persistently close SPY/EFA trailing returns can cause frequent switching between the two in stage 2, raising turnover without a clear momentum edge."
+  ],
+  "cost_profile": {
+    "turnover_per_year_estimate": 4.22,
+    "signal_flips_per_year_shadow": null,
+    "note": "Measured by the answer key (key/key_metrics.json): turnover_sum_x_equity 22.0229 after the entry plus the entry itself (1.0) over 5.453799 years, Q = 4.2214 times sleeve equity per year, under the pre-registered ceiling of 8.0 (Amendment 16 section 6A); 22 asset-level sign flips (11 full switches) over 67 decisions; cost_sum_x_equity 0.022023 at the certification_flat_10bps_per_side accounting cost; cost identity |D - Dhat| = 1.8e-4 against a 10% tolerance of 2.3e-3. ETF spreads on these three funds are small but were not measured here. Council ruling R50 asked a 25 bp per-side re-test for the crypto entry only."
+  },
+  "evidence": "reference_only",
+  "last_verified": "2026-10-20",
+  "verification_note": "Rule text, parameters, requirements, rebalance and operating_procedure are copied verbatim from library_curation::draft::RuleTemplate::DualRelativeMomentum to guarantee zero drift against the compiled DualMomentumGemAdapter, whose declared parameters are exactly trailing_months, month_ends_needed, schedule, rebalance_policy and max_weight_per_instrument. Backtest window and every performance number come from Amendment 16's pre-registered evidence fixture (program/tests/fixtures/replication_ladder_gem_evidence/): Massive unadjusted primary pulls arbitrated by Alpaca (SIP, raw), data-quality certificate PASS on C1/C2/C3/C5 (flagged-bar rate 0.0 in the window), window derived mechanically (warm-up 260 days, one shift; 5.525 years mechanical, 5.454 counted); the key was exported on the owner's machine by the independent Python reference function and cross-checked against an independent vectorised shadow (weights to 1e-15, returns to 1e-12); the five pre-registered T4 mutants (lookahead peek, extra 1-day delay, lookback off by one, inverted relative pick, gate always open) are each caught by Tier II, none is data-equivalent (divergences 11, 11, 10, 55, 12), and the T0 pre-checks all pass. The compiled Rust ladder reproduces the key and the certified digests are allow-listed (Amendment 16). No performance band is declared: the platform derives a conservative band per R45-v1 from its own certified run, and admission uses it; a derived low bound below the floor routes to paper-only. Citations: the Antonacci 2012 SSRN working paper and Moskowitz-Ooi-Pedersen 2012 were checked against Crossref on 2026-10-17 (bibliographic record; the Antonacci abstract supplies the quoted claim; Crossref carries no abstract for MOP, whose claim quotes only the title); the Antonacci 2014 book could not be verified and was not read.",
+  "retirement_rule": "Flag to the inbox for a human decision (the agent may not remove it on its own) when any of: (a) the monthly fidelity check finds signal agreement with the compiled reference implementation below 0.98; (b) the sleeve's own replayed drawdown reaches the mandate's first drawdown rung; (c) realised net results over a full evaluation window fall outside a performance band once one is derived (council ruling R45); (d) a later decay_check replication run against this same rule_hash fails. The window length and any numeric tolerance for (c) must be set by the owner before go-live; none is assumed here."
+}

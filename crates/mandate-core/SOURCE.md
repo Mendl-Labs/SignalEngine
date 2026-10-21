@@ -157,3 +157,25 @@ platform derives a conservative band per R45-v1). Re-copied verbatim; all other 
 
 `rule_hash` and `claim_hash` are unchanged (neither covers `verification_note`). The rebalancer image must be rebuilt
 after this merges (proposal plans pin `entry_hash`).
+
+## Re-sync 2026-10-21 (Engine PR "R45-F", branch fix/r45f-net-range-declaration; GEM seeded)
+
+Two things in one verbatim re-copy: (1) R45-F, a declaration-only correction (a null-bound `sharpe_net` range added after the
+gross range of `etf_cross_sectional_momentum` v2 and `etf_dual_relative_momentum` v1, plus GEM's stale pre-certification text
+reworded; no rule, parameter, instrument or window change); (2) the Engine's GEM seeding (#331), which this crate had not yet
+received: `src/strategy_library.rs` gains the fourth `SEED_JSON` entry and `etf_dual_relative_momentum.json` is new here.
+Merge only after Engine PR #333 merges. Rebuild the rebalancer image after this merges.
+
+| Item | Blob |
+|---|---|
+| `program/src/strategy_library.rs` | `9455acba46ced3fd4ebf6378275da9945d390883` |
+| `program/data/strategy_library/etf_cross_sectional_momentum.json` | `5942f4724ceb519332383ba47c16791a9b975fa8` |
+| `program/data/strategy_library/etf_dual_relative_momentum.json` | `915dcda6bfcfe48f7b7968ddb600dc5c720fae2e` |
+
+`entry_hash` (pinned in `tests/golden.rs` and in the Engine's `seed_entry_hashes_pinned.rs`):
+
+- `etf_cross_sectional_momentum` v2: `bcac9efb...` -> `43ca4eaf53e2372f4d7ee13038f285bf284dffb858958f89b0c9d7be7b272f41`
+- `etf_dual_relative_momentum` v1 (new here): `c661113773307ff3e698791c8fb2d75858331d32f18c6de6722ce51fb3bf78ab`
+- `etf_trend_faber` v2 and `crypto_trend_100d` v2 unchanged.
+
+`rule_hash` is unchanged; `claim_hash` moves for the two entries (it covers `expected_ranges`).

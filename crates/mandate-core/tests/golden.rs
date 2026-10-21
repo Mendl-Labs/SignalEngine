@@ -52,10 +52,11 @@ fn key_order_and_whitespace_in_the_source_json_do_not_change_the_hash() {
 /// `data/strategy_library/*.json` (Engine `origin/main` at acb0820f, see SOURCE.md; crypto_trend_100d v2 after Engine #311/#312). The same values are pinned on the Engine side by
 /// `program/tests/seed_entry_hashes_pinned.rs` (BacktestingEngine), so a difference between the two repos fails in CI on
 /// whichever side drifted. Order is the Engine's `SEED_JSON` order.
-const PINNED_ENTRY_HASHES: [(&str, u32, &str); 3] = [
+const PINNED_ENTRY_HASHES: [(&str, u32, &str); 4] = [
     ("etf_trend_faber", 2, "ac1d40c85c13378097ae821a62507fefc6ea5edc3f8efd42864c37a573fd015f"),
     ("crypto_trend_100d", 2, "155714130c283c8e901c47e7f8b1805733c475ad16387b71e03b3293097d7991"),
-    ("etf_cross_sectional_momentum", 2, "bcac9efb72dc947e846a80fef6b9b0b4d33123eeb5ad3e1f1ab1291e1f7ca347"),
+    ("etf_cross_sectional_momentum", 2, "43ca4eaf53e2372f4d7ee13038f285bf284dffb858958f89b0c9d7be7b272f41"),
+    ("etf_dual_relative_momentum", 1, "c661113773307ff3e698791c8fb2d75858331d32f18c6de6722ce51fb3bf78ab"),
 ];
 
 #[test]
