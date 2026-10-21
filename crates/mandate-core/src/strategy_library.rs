@@ -1286,10 +1286,12 @@ pub fn run_calibration(cases: &[CalibrationCase], platform: &PlatformCapabilitie
 /// No performance band is published (council rulings R22/R23, Amendment 13 section 7: a deliberate policy choice
 /// given the window is still only one crypto cycle, not a failed check) -- see the entry's own `expected_ranges[0]`
 /// and `verification_note` for the exact reasoning and the real certified numbers.
-const SEED_JSON: [(&str, &str); 3] = [
+const SEED_JSON: [(&str, &str); 4] = [
     ("etf_trend_faber", include_str!("../data/strategy_library/etf_trend_faber.json")),
     ("crypto_trend_100d", include_str!("../data/strategy_library/crypto_trend_100d.json")),
     ("etf_cross_sectional_momentum", include_str!("../data/strategy_library/etf_cross_sectional_momentum.json")),
+    // Amendment 16: `etf_dual_relative_momentum` v1, certified in its own fixture set (GEM, sleeve S6), no performance band.
+    ("etf_dual_relative_momentum", include_str!("../data/strategy_library/etf_dual_relative_momentum.json")),
 ];
 
 /// Parse the embedded seed entries. Fails (rather than panics) if an embedded

@@ -73,6 +73,14 @@
       "role": "performance_band",
       "source": "No band, deliberately. Amendment 14 section 7 (program/tests/fixtures/replication_ladder_momentum_evidence/AMENDMENT_14.md): no performance band is offered for customer-facing display; that is a separate, later, separately pre-registered decision, and council rulings R22/R23 (expected ranges come from the certified window only) apply as for crypto_trend_100d. A single ~5.6-year window is one regime sequence, not several independent ones.",
       "note": "Window-specific reference only, NOT an expectation for other windows. Certified replication (Amendment 14, etf_cross_sectional_momentum_evidence_v1, 2021-03-01 to 2026-10-13, 5.618 years, 1413 daily bars, price-only closes): gross Sharpe 0.670904, CAGR 7.1639%, vol 11.2591%, max drawdown -19.0050%; net (certification_flat_10bps_per_side) Sharpe 0.536536, CAGR 5.5612%, vol 11.2726%, max drawdown -19.7468%. These are the first numbers anyone saw for this rule: Amendment 14 offered no prior estimate. No buy-and-hold comparison has been measured for this window."
+    },
+    {
+      "metric": "sharpe_net",
+      "low": null,
+      "high": null,
+      "role": "performance_band",
+      "source": "No band, deliberately (see expected_ranges[0].source). Declared so that gross AND net are both reported (WP9.9 gross_and_net_reported_check, check A9); recomputed from the platform's own certified replication of the evidence window on every read.",
+      "note": "Window-specific reference only, NOT an expectation for other windows. Net of the certification_flat_10bps_per_side accounting cost (not a realised fill cost); the certified figures, gross and net, are recorded in expected_ranges[0].note."
     }
   ],
   "backtest_window": {
