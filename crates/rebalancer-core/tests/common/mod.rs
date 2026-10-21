@@ -108,6 +108,7 @@ pub fn order(symbol: &str, side: broker_adapters::Side, qty: &str, price: &str) 
         est_fee: Dec::ZERO,
         uses_margin: false,
         is_derivative: false,
+        loss_rung_cover: false,
     }
 }
 

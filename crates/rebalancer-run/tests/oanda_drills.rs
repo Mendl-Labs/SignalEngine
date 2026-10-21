@@ -1,10 +1,10 @@
 //! Kill / flatten drills against the fake OANDA exchange (real `OandaAdapter`, real `OandaBroker`, the EXISTING
-//! `rebalancer_run::flatten`): sizing, cancels, unknown outcomes, and idempotence across a crash at EVERY call boundary.
+//! `rebalancer_run::flatten`): sizing, cancels, unknown outcomes, covering shorts before selling longs, and idempotence
+//! across a crash at EVERY call boundary.
 //!
 //! Scope, stated plainly: this exercises the flatten (kill) path. The rest of the existing drills (`run_once`, the
 //! planner, reconciliation) are spot-shaped and are NOT run against OANDA here: see `oanda_view.rs` and the notes in
-//! `rebalancer_run::broker::OandaBroker`. FX shorts cannot be flattened by this code (it refuses to trade a short);
-//! that is asserted below as the honest current behaviour, not hidden.
+//! `rebalancer_run::broker::OandaBroker`. An FX short IS flattened: it is bought back first (R61), then the longs are sold.
 
 mod common;
 
@@ -19,7 +19,7 @@ use fake_broker::Fault;
 use rebalancer_core::venue::{OandaRules, VenueRuleBook};
 use rebalancer_run::broker::{Broker, OandaBroker};
 use rebalancer_run::clock::ManualClock;
-use rebalancer_run::flatten::{flatten, FlattenCode, FlattenOutcome, FlattenReport, FlattenSpec, FlattenVerdict};
+use rebalancer_run::flatten::{flatten, flatten_cover_tag, flatten_tag, FlattenCode, FlattenOutcome, FlattenReport, FlattenSpec, FlattenVerdict};
 
 const KEY: &str = "20260921T150000Z";
 
@@ -131,19 +131,75 @@ fn flatten_cancels_our_resting_orders_and_leaves_foreign_ones_alone() {
 }
 
 #[test]
-fn a_short_is_reported_and_left_alone_never_traded() {
-    // Honest current behaviour: flatten's rule is "never open a short", so it cannot close one. The long is flattened;
-    // the short is a coded, blocking-for-verification failure and the verdict is HALT_AND_ALERT.
+fn a_mixed_book_covers_the_short_first_then_sells_the_long_and_reaches_flat() {
+    // R61: a short's loss has no ceiling, so it is bought back BEFORE any long is sold. EUR/USD sorts before GBP/USD,
+    // so a sells-first (or symbol-order) implementation would trade EUR_USD first and fail the order assertion.
     let env = OEnv::new();
     env.hold("EUR_USD", "5000");
     env.hold("GBP_USD", "-3000");
     let r = flat(&env);
+    assert_eq!(r.verdict, FlattenVerdict::Flat, "{}", r.summary());
+    assert!(r.verified_flat && r.failures.is_empty() && r.residual.is_empty() && r.dust.is_empty(), "{}", r.summary());
+    assert_eq!((env.units("EUR_USD"), env.units("GBP_USD")), (Dec::ZERO, Dec::ZERO));
+    let fills = env.rig.handle.fills();
+    assert_eq!(fills.len(), 2, "one order per instrument");
+    assert_eq!((fills[0].instrument.as_str(), fills[0].units), ("GBP_USD", d("3000")), "the cover goes first, as a buy of exactly the short");
+    assert_eq!((fills[1].instrument.as_str(), fills[1].units), ("EUR_USD", d("-5000")), "then the long is sold");
+    // The report says which side each order was on, covers first.
+    let sides: Vec<(&str, Side)> = r.orders.iter().map(|o| (o.symbol.as_str(), o.side)).collect();
+    assert_eq!(sides, [("GBP/USD", Side::Buy), ("EUR/USD", Side::Sell)]);
+    let cover = &r.orders[0];
+    assert_eq!((cover.quantity, cover.executed_quantity, cover.outcome), (d("3000"), d("3000"), FlattenOutcome::Filled));
+    assert!(cover.tag.starts_with("rb1:fl:20260921T150000Z:GBPUSD:1:"), "{}", cover.tag);
+    assert_ne!(cover.tag, flatten_tag("acct-fx", KEY, "GBP/USD", 1), "a cover never shares a tag with a sell");
+    assert_eq!(cover.tag, flatten_cover_tag("acct-fx", KEY, "GBP/USD", 1));
+    // Every order was a market order, and every one reduced a position toward zero.
+    let orders = env.rig.handle.orders();
+    assert!(orders.iter().all(|o| o.limit_price.is_none() && o.time_in_force == "FOK"), "{orders:?}");
+    env.rig.handle.assert_invariants();
+}
+
+#[test]
+fn a_short_only_book_is_bought_back_to_flat_without_going_long() {
+    let env = OEnv::new();
+    env.hold("GBP_USD", "-3000");
+    env.hold("USD_JPY", "-2500");
+    let r = flat(&env);
+    assert_eq!(r.verdict, FlattenVerdict::Flat, "{}", r.summary());
+    assert!(r.verified_flat && r.failures.is_empty() && r.residual.is_empty());
+    assert_eq!((env.units("GBP_USD"), env.units("USD_JPY")), (Dec::ZERO, Dec::ZERO), "flat, not long");
+    assert!(r.orders.iter().all(|o| o.side == Side::Buy));
+    let fills = env.rig.handle.fills();
+    let bought = |inst: &str| fills.iter().filter(|f| f.instrument == inst).fold(Dec::ZERO, |a, f| a.checked_add(f.units).unwrap());
+    assert_eq!((bought("GBP_USD"), bought("USD_JPY")), (d("3000"), d("2500")), "exactly the short, once");
+    env.rig.handle.assert_invariants();
+}
+
+#[test]
+fn a_broker_that_keeps_reporting_a_short_after_it_was_covered_is_not_bought_without_limit() {
+    // The exchange fills the cover, but every read still shows the old short (a lying or lagging broker). Flatten may
+    // buy back at most the short it first saw, then stops and escalates; it must not keep buying every round.
+    let env = OEnv::new();
+    let real = env.broker();
+    let lying = DistortingBroker {
+        inner: &real,
+        distort: Box::new(|s| {
+            s.holdings.retain(|h| h.symbol != "GBP/USD");
+            s.holdings.push(rebalancer_run::view::Holding {
+                symbol: "GBP/USD".into(),
+                asset_class: "fx_spot".into(),
+                quantity: d("-1000"),
+                mark: Some(d("1.27")),
+                market_value: d("-1270"),
+            });
+        }),
+    };
+    let r = run_flatten(&env, &lying, KEY);
     assert_eq!(r.verdict, FlattenVerdict::HaltAndAlert, "{}", r.summary());
-    assert!(r.has(FlattenCode::ShortHeld));
-    assert!(!r.verified_flat);
-    assert_eq!(env.units("EUR_USD"), Dec::ZERO);
-    assert_eq!(env.units("GBP_USD"), d("-3000"), "the short is untouched");
-    assert_eq!(env.sells_applied(), 1);
+    assert!(r.has(FlattenCode::ShortHeld) && !r.verified_flat, "{}", r.summary());
+    let buys: Vec<_> = r.orders.iter().filter(|o| o.side == Side::Buy).collect();
+    assert_eq!(buys.len(), 1, "one cover only: {}", r.summary());
+    assert_eq!(env.units("GBP_USD"), d("1000"), "bought the first-seen short once, and no more");
 }
 
 #[test]
@@ -264,6 +320,62 @@ fn flatten_is_idempotent_across_a_crash_at_every_call_boundary() {
             assert_eq!(sold("EUR_USD"), d("-10000"), "{crash:?}");
             assert_eq!(sold("USD_JPY"), d("-2500"), "{crash:?}");
             assert_eq!(env.rig.handle.orders().iter().filter(|o| o.client_id.is_some()).count(), 2, "{crash:?}: one order per instrument");
+            env.rig.handle.assert_invariants();
+        }
+    }
+    assert!(crashed >= total_calls as usize, "the drill really crashed the process ({crashed} crashes over {total_calls} boundaries)");
+}
+
+/// A book with a long and two shorts: the cover-first path under the same crash-at-every-boundary drill as the sells.
+fn mixed_book(env: &OEnv) {
+    env.hold("EUR_USD", "10000");
+    env.hold("USD_JPY", "-2500");
+    env.hold("GBP_USD", "-1500");
+}
+
+#[test]
+fn a_mixed_long_short_flatten_is_idempotent_across_a_crash_at_every_call_boundary_and_never_double_covers() {
+    let total_calls = {
+        let env = OEnv::new();
+        mixed_book(&env);
+        let b = env.broker();
+        let cb = CrashingBroker::new(&b, None);
+        let r = run_flatten(&env, &cb, KEY);
+        assert_eq!(r.verdict, FlattenVerdict::Flat, "{}", r.summary());
+        cb.call_count()
+    };
+    assert!(total_calls >= 12, "{total_calls}");
+
+    let mut crashed = 0;
+    for n in 1..=total_calls {
+        for crash in [CrashAt::Before(n), CrashAt::After(n)] {
+            let env = OEnv::new();
+            mixed_book(&env);
+            let first = {
+                let b = env.broker();
+                let cb = CrashingBroker::new(&b, Some(crash));
+                catch_unwind(AssertUnwindSafe(|| run_flatten(&env, &cb, KEY)))
+            };
+            if first.is_err() {
+                crashed += 1;
+            }
+            // the restarted process (same attempt key) finishes the job with a fresh adapter
+            let mut env = env;
+            env.rig.restart_adapter();
+            let r = flat(&env);
+            assert_eq!(r.verdict, FlattenVerdict::Flat, "{crash:?}: {}", r.summary());
+            assert_eq!(
+                (env.units("EUR_USD"), env.units("USD_JPY"), env.units("GBP_USD")),
+                (Dec::ZERO, Dec::ZERO, Dec::ZERO),
+                "{crash:?}: flat, never long in a covered pair and never short in a sold one"
+            );
+            // Net units traded across both attempts is exactly the opposite of what was held: nothing covered or sold twice.
+            let fills = env.rig.handle.fills();
+            let net = |inst: &str| fills.iter().filter(|f| f.instrument == inst).fold(Dec::ZERO, |a, f| a.checked_add(f.units).unwrap());
+            assert_eq!(net("EUR_USD"), d("-10000"), "{crash:?}");
+            assert_eq!(net("USD_JPY"), d("2500"), "{crash:?}");
+            assert_eq!(net("GBP_USD"), d("1500"), "{crash:?}");
+            assert_eq!(env.rig.handle.orders().iter().filter(|o| o.client_id.is_some()).count(), 3, "{crash:?}: one order per instrument");
             env.rig.handle.assert_invariants();
         }
     }

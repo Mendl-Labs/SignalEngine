@@ -1,19 +1,27 @@
-//! Flatten: cancel our open orders, sell every long instrument in the mandate's universe down to dust, verify flat.
-//! Used for the `halt_flatten` rung and the daily-loss halt. It is the ONLY code allowed to send orders while the
-//! account is halting, and it only ever sends SELL orders of quantities the broker says are currently held.
+//! Flatten: cancel our open orders, buy to cover every short and sell every long instrument in the mandate's
+//! universe down to dust, verify flat. Used for the `halt_flatten` rung and the daily-loss halt. It is the ONLY code
+//! allowed to send orders while the account is halting, and it only ever sends orders that REDUCE a position toward
+//! zero, of quantities the broker says are currently held: a SELL of a long, or a BUY that covers a short.
 //!
 //! # Guarantees
-//! * **Sized exactly to what is held.** Each sell is `round_quantity(held)` from a FRESH read taken after our open
-//!   orders were cancelled and settled. It is never larger than the holding, so flatten can never open a short
-//!   (spot has no shorts; a pre-existing short is reported as a failure and left alone). Sub-minimum dust that the
-//!   venue's rules refuse is REPORTED, never sent.
+//! * **Covers first, then sells.** A short's loss has no ceiling and a long's does, so every short is covered before
+//!   any long is sold (R61). A book with no short behaves exactly as before: the same orders, the same tags.
+//! * **Sized exactly to what is held.** Each order is `round_quantity(held)` (the magnitude of the position) from a
+//!   FRESH read taken after our open orders were cancelled and settled. It is never larger than the position, so
+//!   flatten can never open or flip a position (a cover is rounded DOWN too, so it never buys past zero). Sub-minimum
+//!   dust that the venue's rules refuse is REPORTED, never sent.
+//! * **A cover is bounded per call.** Within one call the total quantity bought to cover a symbol never exceeds the
+//!   short first seen for it. If the broker keeps reporting a short after that much was bought, flatten stops buying
+//!   and reports `FLATTEN_SHORT_HELD` (a broker whose reads and fills disagree must not be traded against without
+//!   limit).
 //! * **Deterministic tags per flatten attempt.** `flatten_tag(account, attempt_key, symbol, k)` is
-//!   `rb1:fl:<attempt>:<SYMBOL>:<k>:<hash>`. The caller derives `attempt_key` from the halt (its timestamp), so a
-//!   second call after a crash uses the same tags. The index `k` is the first one the broker has NO order for
+//!   `rb1:fl:<attempt>:<SYMBOL>:<k>:<hash>` (a cover uses `flatten_cover_tag`: the same shape with a different hash,
+//!   so a cover and a sell of one symbol never share a tag). The caller derives `attempt_key` from the halt (its
+//!   timestamp), so a second call after a crash uses the same tags. The index `k` is the first one the broker has NO order for
 //!   (looked up by tag before every placement): an order that exists is never re-sent under its own tag.
-//! * **Idempotent across a crash at any point.** Because every sell is sized from a fresh read, a call that finds
-//!   the job half done sells only what is still held; an asset already sold has nothing left to sell, so nothing is
-//!   sold twice (crash-at-every-call-boundary is drilled).
+//! * **Idempotent across a crash at any point.** Because every order is sized from a fresh read, a call that finds
+//!   the job half done trades only what is still held; a position already closed has nothing left, so nothing is
+//!   traded twice (crash-at-every-call-boundary is drilled, for sells and for covers).
 //! * **Unknown outcomes are looked up, not retried blindly.** After `UnknownOutcome` the order is looked up by tag;
 //!   found means adopted and settled, not found allows exactly one further attempt with the same tag.
 //! * **Cancels are settled and their reports read**: `cancel_and_settle` returns the order's final state; an order
@@ -23,11 +31,11 @@
 //!   account was verified flat (dust aside) AND no blocking failure occurred. Nothing is silently skipped.
 //! * **Only our orders are cancelled.** Foreign open orders are listed and left alone.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use broker_adapters::{BrokerError, Dec, OrderReport, OrderRequest, OrderStatus, PlaceOutcome, Side};
 use chrono::{DateTime, Utc};
-use rebalancer_core::dec_math::div_floor;
+use rebalancer_core::dec_math::{add, div_floor, neg, sub};
 use rebalancer_core::venue::{SizeRefusal, VenueRuleBook};
 use sha2::{Digest, Sha256};
 
@@ -40,7 +48,16 @@ pub const FLATTEN_TAG_PREFIX: &str = "rb1:fl:";
 
 /// `rb1:fl:<attempt>:<SYMBOL>:<k>:<16 hex of SHA-256 over the full identity>`.
 pub fn flatten_tag(account: &str, attempt_key: &str, symbol: &str, k: u32) -> String {
-    let identity = format!("flatten:{account}:{attempt_key}:{symbol}:sell:{k}");
+    leg_tag(account, attempt_key, symbol, "sell", k)
+}
+
+/// The tag of a buy-to-cover order: [`flatten_tag`]'s shape with `cover` in the hashed identity.
+pub fn flatten_cover_tag(account: &str, attempt_key: &str, symbol: &str, k: u32) -> String {
+    leg_tag(account, attempt_key, symbol, "cover", k)
+}
+
+fn leg_tag(account: &str, attempt_key: &str, symbol: &str, leg: &str, k: u32) -> String {
+    let identity = format!("flatten:{account}:{attempt_key}:{symbol}:{leg}:{k}");
     let hash = hex::encode(Sha256::digest(identity.as_bytes()));
     let attempt: String = attempt_key.chars().filter(|c| c.is_ascii_alphanumeric()).take(20).collect();
     let readable: String = symbol.chars().filter(char::is_ascii_alphanumeric).take(10).collect::<String>().to_uppercase();
@@ -154,6 +171,8 @@ pub enum FlattenOutcome {
 pub struct FlattenOrder {
     pub tag: String,
     pub symbol: String,
+    /// `Sell` closes a long; `Buy` covers a short.
+    pub side: Side,
     /// The quantity sent (rounded down from the holding).
     pub quantity: Dec,
     pub broker_order_id: Option<String>,
@@ -273,6 +292,8 @@ struct Flattener<'a> {
     orders: Vec<FlattenOrder>,
     failures: Vec<FlattenFailure>,
     foreign: BTreeSet<String>,
+    /// The short (magnitude) first seen for each symbol in this call: the most a cover may ever buy back.
+    first_short: BTreeMap<String, Dec>,
 }
 
 impl Flattener<'_> {
@@ -354,9 +375,12 @@ impl Flattener<'_> {
     }
 
     /// The first tag index with no order at the broker; `None` when the lookup failed or every index is taken.
-    fn free_tag(&mut self, symbol: &str) -> Option<String> {
+    fn free_tag(&mut self, symbol: &str, side: Side) -> Option<String> {
         for k in 1..=self.spec.max_tag_index {
-            let tag = flatten_tag(self.spec.account_id, self.spec.attempt_key, symbol, k);
+            let tag = match side {
+                Side::Buy => flatten_cover_tag(self.spec.account_id, self.spec.attempt_key, symbol, k),
+                Side::Sell => flatten_tag(self.spec.account_id, self.spec.attempt_key, symbol, k),
+            };
             match self.broker.find_by_tag(&tag) {
                 Ok(found) if found.is_empty() => return Some(tag),
                 Ok(_) => continue,
@@ -370,7 +394,7 @@ impl Flattener<'_> {
         None
     }
 
-    fn record_report(&mut self, tag: &str, symbol: &str, qty: Dec, report: &OrderReport, adopted: bool) {
+    fn record_report(&mut self, tag: &str, symbol: &str, side: Side, qty: Dec, report: &OrderReport, adopted: bool) {
         let outcome = if report.status == OrderStatus::Filled {
             FlattenOutcome::Filled
         } else if report.executed_quantity.is_positive() {
@@ -383,6 +407,7 @@ impl Flattener<'_> {
         self.orders.push(FlattenOrder {
             tag: tag.to_string(),
             symbol: symbol.to_string(),
+            side,
             quantity: qty,
             broker_order_id: Some(report.broker_order_id.clone()),
             outcome,
@@ -395,10 +420,11 @@ impl Flattener<'_> {
         });
     }
 
-    fn record_unsent(&mut self, tag: &str, symbol: &str, qty: Dec, outcome: FlattenOutcome) {
+    fn record_unsent(&mut self, tag: &str, symbol: &str, side: Side, qty: Dec, outcome: FlattenOutcome) {
         self.orders.push(FlattenOrder {
             tag: tag.to_string(),
             symbol: symbol.to_string(),
+            side,
             quantity: qty,
             broker_order_id: None,
             outcome,
@@ -411,62 +437,104 @@ impl Flattener<'_> {
         });
     }
 
-    fn settle_and_record(&mut self, tag: &str, symbol: &str, qty: Dec, id: &str, adopted: bool) {
+    fn settle_and_record(&mut self, tag: &str, symbol: &str, side: Side, qty: Dec, id: &str, adopted: bool) {
         match self.settle(id) {
-            Ok(report) => self.record_report(tag, symbol, qty, &report, adopted),
+            Ok(report) => self.record_report(tag, symbol, side, qty, &report, adopted),
             Err(e) if Self::is_anomaly(&e) => {
                 self.fail(FlattenCode::DuplicateFillAnomaly, format!("order {id}: {e}"));
-                self.record_unsent(tag, symbol, qty, FlattenOutcome::Unsettled);
+                self.record_unsent(tag, symbol, side, qty, FlattenOutcome::Unsettled);
             }
             Err(e) => {
                 self.fail(FlattenCode::OrderUnsettled, format!("order {id}: could not read its final state: {e}"));
-                self.record_unsent(tag, symbol, qty, FlattenOutcome::Unsettled);
+                self.record_unsent(tag, symbol, side, qty, FlattenOutcome::Unsettled);
             }
         }
     }
 
+    /// Quantity already bought back for `symbol` in this call: what executed, plus the whole size of any order whose
+    /// end state is not known (it may still fill).
+    fn cover_quantity_used(&self, symbol: &str) -> Dec {
+        let mut total = Dec::ZERO;
+        for o in self.orders.iter().filter(|o| o.side == Side::Buy && o.symbol.eq_ignore_ascii_case(symbol)) {
+            let counted = if o.outcome == FlattenOutcome::Unsettled { o.quantity } else { o.executed_quantity };
+            total = add(total, counted).unwrap_or(total);
+        }
+        total
+    }
+
+    /// Buy back (part of) a short, bounded by the short first seen for the symbol in this call (see the module docs).
+    fn cover(&mut self, symbol: &str, qty: Dec, price: Dec) {
+        let key = symbol.to_uppercase();
+        let first = *self.first_short.entry(key.clone()).or_insert(qty);
+        let used = self.cover_quantity_used(symbol);
+        let allowance = sub(first, used).unwrap_or(Dec::ZERO);
+        if !allowance.is_positive() {
+            self.fail(FlattenCode::ShortHeld, format!("{key}: a short is still reported after {used} was bought to cover {first}; not buying more"));
+            return;
+        }
+        let mut qty = qty;
+        if qty > allowance {
+            // Re-round the smaller wish so the venue still accepts it; never above the allowance.
+            let rules = self.spec.venue_rules.get(self.broker.venue());
+            match rules.map(|r| r.round_quantity(symbol, Side::Buy, allowance, price)) {
+                Some(Ok(q)) if q <= allowance => qty = q,
+                _ => {
+                    self.fail(FlattenCode::ShortHeld, format!("{key}: the remaining cover allowance {allowance} cannot be sized; not buying more"));
+                    return;
+                }
+            }
+        }
+        self.place_leg(symbol, Side::Buy, qty, price);
+    }
+
     fn sell(&mut self, symbol: &str, qty: Dec, price: Dec) {
-        let Some(tag) = self.free_tag(symbol) else { return };
-        let mut req = OrderRequest::market(&tag, symbol, Side::Sell, qty);
+        self.place_leg(symbol, Side::Sell, qty, price);
+    }
+
+    /// Send one market order that reduces a position (`Sell` of a long, `Buy` to cover a short) and settle it.
+    fn place_leg(&mut self, symbol: &str, side: Side, qty: Dec, price: Dec) {
+        let verb = if side == Side::Buy { "cover" } else { "sell" };
+        let Some(tag) = self.free_tag(symbol, side) else { return };
+        let mut req = OrderRequest::market(&tag, symbol, side, qty);
         req.reference_price = Some(price);
         for attempt in 1..=2 {
             match self.broker.place(&req) {
                 Ok(PlaceOutcome::Accepted { broker_order_id, .. }) => {
-                    self.settle_and_record(&tag, symbol, qty, &broker_order_id, false);
+                    self.settle_and_record(&tag, symbol, side, qty, &broker_order_id, false);
                     return;
                 }
                 Ok(PlaceOutcome::ValidatedOnly { .. }) => {
                     self.fail(FlattenCode::OrderNotSent, format!("{symbol}: the broker only validated the order"));
-                    self.record_unsent(&tag, symbol, qty, FlattenOutcome::NotSent);
+                    self.record_unsent(&tag, symbol, side, qty, FlattenOutcome::NotSent);
                     return;
                 }
                 Ok(PlaceOutcome::Rejected { errors, .. }) => {
                     let codes = errors.iter().map(|e| e.code.clone()).collect::<Vec<_>>().join(", ");
-                    self.fail(FlattenCode::OrderRejected, format!("{symbol}: the broker rejected the sell: {codes}"));
-                    self.record_unsent(&tag, symbol, qty, FlattenOutcome::Rejected);
+                    self.fail(FlattenCode::OrderRejected, format!("{symbol}: the broker rejected the {verb}: {codes}"));
+                    self.record_unsent(&tag, symbol, side, qty, FlattenOutcome::Rejected);
                     return;
                 }
                 Ok(PlaceOutcome::UnknownOutcome { reason, .. }) => match self.broker.find_by_tag(&tag) {
                     Ok(found) if !found.is_empty() => {
                         let id = found[0].broker_order_id.clone();
-                        self.settle_and_record(&tag, symbol, qty, &id, true);
+                        self.settle_and_record(&tag, symbol, side, qty, &id, true);
                         return;
                     }
                     Ok(_) if attempt == 1 => continue, // verified nothing exists: one more try with the same tag
                     Ok(_) => {
                         self.fail(FlattenCode::OrderNotSent, format!("{symbol}: outcome unknown ({reason}) and no order exists after {attempt} attempts"));
-                        self.record_unsent(&tag, symbol, qty, FlattenOutcome::UnknownNotFound);
+                        self.record_unsent(&tag, symbol, side, qty, FlattenOutcome::UnknownNotFound);
                         return;
                     }
                     Err(e) => {
                         self.fail(FlattenCode::LookupFailed, format!("{symbol}: outcome unknown ({reason}) and the lookup failed ({e}); not retrying"));
-                        self.record_unsent(&tag, symbol, qty, FlattenOutcome::UnknownNotFound);
+                        self.record_unsent(&tag, symbol, side, qty, FlattenOutcome::UnknownNotFound);
                         return;
                     }
                 },
                 Err(e) => {
-                    self.fail(FlattenCode::OrderNotSent, format!("{symbol}: the sell was not sent: {e}"));
-                    self.record_unsent(&tag, symbol, qty, FlattenOutcome::NotSent);
+                    self.fail(FlattenCode::OrderNotSent, format!("{symbol}: the {verb} was not sent: {e}"));
+                    self.record_unsent(&tag, symbol, side, qty, FlattenOutcome::NotSent);
                     return;
                 }
             }
@@ -474,9 +542,11 @@ impl Flattener<'_> {
     }
 }
 
-/// What a fresh snapshot says to sell: (symbol, quantity, price), plus dust, holdings outside the universe, and the
-/// problems that stop a holding from being sold at all.
+/// What a fresh snapshot says to trade: covers of shorts and sells of longs as (symbol, quantity magnitude, price),
+/// plus dust, holdings outside the universe, and the problems that stop a holding from being closed at all.
 struct SellPlan {
+    /// Buy-to-cover orders, one per short. Always placed BEFORE any sell.
+    covers: Vec<(String, Dec, Dec)>,
     sells: Vec<(String, Dec, Dec)>,
     dust: Vec<DustRecord>,
     unmanaged: Vec<DustRecord>,
@@ -487,6 +557,7 @@ fn plan_sells(spec: &FlattenSpec<'_>, venue: &str, snap: &BrokerSnapshot) -> Sel
     let rules = spec.venue_rules.get(venue);
     let mut holdings: Vec<&Holding> = snap.holdings.iter().collect();
     holdings.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    let mut covers = Vec::new();
     let mut sells = Vec::new();
     let mut dust = Vec::new();
     let mut unmanaged = Vec::new();
@@ -501,25 +572,41 @@ fn plan_sells(spec: &FlattenSpec<'_>, venue: &str, snap: &BrokerSnapshot) -> Sel
             unmanaged.push(DustRecord { symbol: sym, quantity: h.quantity, reason: "not in the mandate's universe: left alone".to_string() });
             continue;
         }
-        if h.quantity.is_negative() {
-            block(FlattenCode::ShortHeld, format!("{sym}: a short position of {} exists; flatten never trades it", h.quantity));
-            continue;
-        }
-        let (Some(rules), Some(price)) = (rules, price_of(h)) else {
-            block(FlattenCode::CannotSize, format!("{sym}: no venue rules or no price to size a sell of {}", h.quantity));
-            continue;
-        };
-        match rules.round_quantity(&h.symbol, Side::Sell, h.quantity, price) {
-            Ok(q) => {
-                if q > h.quantity {
-                    block(FlattenCode::CannotSize, format!("{sym}: venue rounding produced {q}, more than the {} held", h.quantity));
+        // The order that closes this position: a sell of a long, or a buy that covers a short. Its size is the
+        // MAGNITUDE of the position, rounded down, so it can reach zero but never pass it.
+        let short = h.quantity.is_negative();
+        let (side, held) = if short {
+            match neg(h.quantity) {
+                Ok(m) => (Side::Buy, m),
+                Err(_) => {
+                    block(FlattenCode::CannotSize, format!("{sym}: the short of {} cannot be sized", h.quantity));
                     continue;
                 }
-                if q < h.quantity {
-                    let rest = rebalancer_core::dec_math::sub(h.quantity, q).unwrap_or(h.quantity);
+            }
+        } else {
+            (Side::Sell, h.quantity)
+        };
+        let verb = if short { "cover" } else { "sell" };
+        let (Some(rules), Some(price)) = (rules, price_of(h)) else {
+            block(FlattenCode::CannotSize, format!("{sym}: no venue rules or no price to size a {verb} of {held}"));
+            continue;
+        };
+        match rules.round_quantity(&h.symbol, side, held, price) {
+            Ok(q) => {
+                if q > held {
+                    block(FlattenCode::CannotSize, format!("{sym}: venue rounding produced {q}, more than the {held} held"));
+                    continue;
+                }
+                if q < held {
+                    let rest = sub(held, q).unwrap_or(held);
+                    let rest = if short { neg(rest).unwrap_or(rest) } else { rest };
                     dust.push(DustRecord { symbol: sym.clone(), quantity: rest, reason: "below the venue's lot precision after rounding down".to_string() });
                 }
-                sells.push((h.symbol.clone(), q, price));
+                if short {
+                    covers.push((h.symbol.clone(), q, price));
+                } else {
+                    sells.push((h.symbol.clone(), q, price));
+                }
             }
             Err(SizeRefusal::RoundsToZero | SizeRefusal::BelowMinQuantity { .. } | SizeRefusal::BelowMinCost { .. }) => {
                 dust.push(DustRecord { symbol: sym, quantity: h.quantity, reason: "below the venue's minimum order: reported, not sent".to_string() });
@@ -527,14 +614,22 @@ fn plan_sells(spec: &FlattenSpec<'_>, venue: &str, snap: &BrokerSnapshot) -> Sel
             Err(other) => block(FlattenCode::CannotSize, format!("{sym}: {other}")),
         }
     }
-    SellPlan { sells, dust, unmanaged, blockers }
+    SellPlan { covers, sells, dust, unmanaged, blockers }
 }
 
+/// The price to size an order at: the broker's mark, else the value per unit (magnitudes, so a short works too).
 fn price_of(h: &Holding) -> Option<Dec> {
     match h.mark {
         Some(m) if m.is_positive() => Some(m),
-        _ if h.quantity.is_positive() && h.market_value.is_positive() => div_floor(h.market_value, h.quantity, 8).ok().filter(|p| p.is_positive()),
-        _ => None,
+        _ => {
+            // Value and quantity must agree in sign (a long is positive/positive, a short negative/negative).
+            let (value, qty) = if h.quantity.is_negative() { (neg(h.market_value).ok()?, neg(h.quantity).ok()?) } else { (h.market_value, h.quantity) };
+            if qty.is_positive() && value.is_positive() {
+                div_floor(value, qty, 8).ok().filter(|p| p.is_positive())
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -552,7 +647,16 @@ pub fn cancel_own_open_orders(
     let mut spec = FlattenSpec::new("cleanup", "cleanup", &universe, &rules, known_order_ids);
     spec.max_polls = max_polls;
     spec.poll_secs = poll_secs;
-    let mut f = Flattener { broker, clock, spec: &spec, cancels: Vec::new(), orders: Vec::new(), failures: Vec::new(), foreign: BTreeSet::new() };
+    let mut f = Flattener {
+        broker,
+        clock,
+        spec: &spec,
+        cancels: Vec::new(),
+        orders: Vec::new(),
+        failures: Vec::new(),
+        foreign: BTreeSet::new(),
+        first_short: BTreeMap::new(),
+    };
     f.cancel_own_open_orders();
     (f.cancels, f.failures, f.foreign.into_iter().collect())
 }
@@ -561,7 +665,16 @@ pub fn cancel_own_open_orders(
 /// coded failure in the report.
 pub fn flatten(broker: &dyn Broker, clock: &dyn Clock, spec: &FlattenSpec<'_>) -> FlattenReport {
     let started_at = clock.now();
-    let mut f = Flattener { broker, clock, spec, cancels: Vec::new(), orders: Vec::new(), failures: Vec::new(), foreign: BTreeSet::new() };
+    let mut f = Flattener {
+        broker,
+        clock,
+        spec,
+        cancels: Vec::new(),
+        orders: Vec::new(),
+        failures: Vec::new(),
+        foreign: BTreeSet::new(),
+        first_short: BTreeMap::new(),
+    };
     let mut dust: Vec<DustRecord> = Vec::new();
     let mut unmanaged: Vec<DustRecord> = Vec::new();
     let mut rounds = 0;
@@ -581,8 +694,12 @@ pub fn flatten(broker: &dyn Broker, clock: &dyn Clock, spec: &FlattenSpec<'_>) -
         let plan = plan_sells(spec, broker.venue(), &snap);
         dust = plan.dust;
         unmanaged = plan.unmanaged;
-        if plan.sells.is_empty() {
+        if plan.covers.is_empty() && plan.sells.is_empty() {
             break;
+        }
+        // Covers first: a short's loss has no ceiling, a long's does.
+        for (symbol, qty, price) in plan.covers {
+            f.cover(&symbol, qty, price);
         }
         for (symbol, qty, price) in plan.sells {
             f.sell(&symbol, qty, price);
@@ -598,6 +715,10 @@ pub fn flatten(broker: &dyn Broker, clock: &dyn Clock, spec: &FlattenSpec<'_>) -
             let plan = plan_sells(spec, broker.venue(), &snap);
             dust = plan.dust;
             unmanaged = plan.unmanaged;
+            for (symbol, qty, _) in plan.covers {
+                let short = neg(qty).unwrap_or(qty);
+                residual.push(DustRecord { symbol: symbol.to_uppercase(), quantity: short, reason: "short still open after flatten".to_string() });
+            }
             for (symbol, qty, _) in plan.sells {
                 residual.push(DustRecord { symbol: symbol.to_uppercase(), quantity: qty, reason: "still held after flatten".to_string() });
             }

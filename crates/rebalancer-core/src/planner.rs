@@ -787,6 +787,8 @@ impl OrderPlanner {
                 est_fee: fee,
                 uses_margin: false,
                 is_derivative: false,
+                // The planner's orders are never loss-rung covers (the exemption is for the loss-rung path only).
+                loss_rung_cover: false,
             };
             let verdict = if signed_plan {
                 // Margin use is DATA derived from the simulated account, not a constant.
