@@ -17,7 +17,8 @@
 //! for exactly the fields `RunStore`'s OTHER methods (`in_flight`, `known_order_ids`, `day_counters`,
 //! `last_snapshot`, `summaries`) actually read -- the run key, lease/attempt state, outcome, mandate
 //! metadata, both broker snapshots, and the placed orders' operationally load-bearing fields (tag,
-//! symbol, side, quantities, phase, outcome, broker id, executed quantity) -- and reconstructs those
+//! symbol, side, quantities, phase, outcome, broker id, executed quantity; plus, write-only, the venue's
+//! average fill price and fee beside the decision `price`) -- and reconstructs those
 //! fields faithfully in `get()`/`Begin::AlreadyDone` too. The "narrative" fields that exist for a human
 //! reading a finished run (recon reports, the risk decision, targets, plan/replan detail, tickets,
 //! cleanup, flatten report, alerts, the step log) are captured in full via `record_debug`
@@ -186,8 +187,27 @@ fn snapshot_from_json(v: &Value) -> Result<SnapshotSummary, String> {
     })
 }
 
+/// The venue's average fill price and fee for this order, from its latest report that executed something.
+/// Alpaca (`filled_avg_price`) and Kraken report a cumulative average, so the latest such report is the whole
+/// order's average. `(None, None)` when nothing executed or the venue reported no price.
+fn fill_of(p: &PlacedOrder) -> (Option<Dec>, Option<Dec>) {
+    p.reports
+        .iter()
+        .rev()
+        .find(|r| r.executed_quantity.is_positive() && r.avg_price.is_some())
+        .map(|r| (r.avg_price, r.fee))
+        .unwrap_or((None, None))
+}
+
 /// Only the fields `known_order_ids`/`day_counters`/a useful `get()` need; see the module docs.
+///
+/// `price` is the DECISION price (the reference price the plan sized the order at), unchanged in meaning since
+/// the first row. `avg_fill_price` and `fee` (R70 D5 / P0-06) are additive and write-only here: they are the
+/// venue's reported average fill price and fee (`null` when nothing executed or the venue reported none), so a
+/// reader can show the decision price beside the fill price. Rows written before they existed simply lack the
+/// keys; `placed_from_json` never reads them, and other readers must treat a missing key like `null`.
 fn placed_to_json(p: &PlacedOrder) -> Value {
+    let (avg_fill_price, fee) = fill_of(p);
     json!({
         "phase": phase_to_str(p.phase),
         "tag": p.tag,
@@ -198,6 +218,8 @@ fn placed_to_json(p: &PlacedOrder) -> Value {
         "outcome": placed_outcome_to_str(p.outcome),
         "broker_order_id": p.broker_order_id,
         "executed_quantity": p.executed_quantity.to_string(),
+        "avg_fill_price": crate::json::opt_dec_to_json(avg_fill_price),
+        "fee": crate::json::opt_dec_to_json(fee),
     })
 }
 
@@ -213,7 +235,8 @@ fn placed_from_json(v: &Value) -> Result<PlacedOrder, String> {
         outcome: placed_outcome_from_str(v["outcome"].as_str().ok_or("placed.outcome missing")?)?,
         broker_order_id: v["broker_order_id"].as_str().map(str::to_string),
         // `status`/`reports`/`anomalies`/`detail` are narrative-only for this store's documented scope
-        // cut (see the module docs): not persisted, defaulted on read.
+        // cut (see the module docs): not persisted, defaulted on read. `avg_fill_price`/`fee` (when the row
+        // has them) are for readers of the JSON column; they are not parsed back, so old rows read the same.
         status: None,
         executed_quantity: dec(&v["executed_quantity"])?,
         reports: Vec::new(),
@@ -933,6 +956,120 @@ impl RunStore for PgRunStore {
             ReadOutcome::Fault(LedgerFault::Missing) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::missing_message(account_id, sleeve_id))),
             ReadOutcome::Fault(LedgerFault::ForeignTenant) => Err(RunStoreError::DecisionLedgerUnavailable(ledger::foreign_tenant_message(account_id, sleeve_id))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broker_adapters::{OrderKind, OrderReport, OrderStatus};
+
+    fn d(s: &str) -> Dec {
+        Dec::parse(s).unwrap()
+    }
+
+    fn report(executed: &str, status: OrderStatus, avg_price: Option<&str>, fee: Option<&str>) -> OrderReport {
+        OrderReport {
+            broker_order_id: "B1".into(),
+            userref: None,
+            tag: Some("rb1:t".into()),
+            symbol: "DBC".into(),
+            side: Some(Side::Buy),
+            kind: Some(OrderKind::Market),
+            status,
+            raw_status: "raw".into(),
+            reason: None,
+            quantity: d("259"),
+            executed_quantity: d(executed),
+            avg_price: avg_price.map(d),
+            cost: None,
+            fee: fee.map(d),
+            financing: 0.0,
+            open_time: None,
+            close_time: None,
+        }
+    }
+
+    fn placed(outcome: PlacedOutcome, executed: &str, reports: Vec<OrderReport>) -> PlacedOrder {
+        PlacedOrder {
+            phase: Phase::Buys,
+            tag: "rb1:t".into(),
+            symbol: "DBC".into(),
+            side: Side::Buy,
+            planned_quantity: d("259"),
+            price: d("21.5"),
+            outcome,
+            broker_order_id: Some("B1".into()),
+            status: None,
+            executed_quantity: d(executed),
+            reports,
+            anomalies: Vec::new(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_filled_order_keeps_its_fill_price_and_fee_beside_the_decision_price() {
+        let p = placed(PlacedOutcome::Filled, "259", vec![report("259", OrderStatus::Filled, Some("21.53"), Some("0.12"))]);
+        let v = placed_to_json(&p);
+        assert_eq!(v["price"], json!(d("21.5").to_string()), "price stays the decision price");
+        assert_eq!(v["avg_fill_price"], json!(d("21.53").to_string()));
+        assert_eq!(v["fee"], json!(d("0.12").to_string()));
+    }
+
+    #[test]
+    fn the_latest_executing_report_gives_the_whole_orders_average() {
+        let p = placed(
+            PlacedOutcome::Filled,
+            "259",
+            vec![
+                report("100", OrderStatus::PartiallyFilled, Some("21.40"), None),
+                report("259", OrderStatus::Filled, Some("21.47"), None),
+            ],
+        );
+        let v = placed_to_json(&p);
+        assert_eq!(v["avg_fill_price"], json!(d("21.47").to_string()));
+        assert!(v["fee"].is_null(), "a venue that reports no fee stores null, not zero");
+    }
+
+    #[test]
+    fn nothing_executed_or_no_reported_price_stores_null_not_a_made_up_price() {
+        let not_sent = placed(PlacedOutcome::NotSent, "0", vec![]);
+        let cancelled = placed(PlacedOutcome::NothingExecuted, "0", vec![report("0", OrderStatus::Canceled, None, None)]);
+        let no_price = placed(PlacedOutcome::Filled, "259", vec![report("259", OrderStatus::Filled, None, None)]);
+        for p in [not_sent, cancelled, no_price] {
+            let v = placed_to_json(&p);
+            assert!(v["avg_fill_price"].is_null(), "{v}");
+            assert!(v["fee"].is_null(), "{v}");
+            assert_eq!(v["price"], json!(d("21.5").to_string()));
+        }
+    }
+
+    #[test]
+    fn new_rows_and_old_rows_without_the_fill_keys_both_read_back() {
+        let p = placed(PlacedOutcome::Filled, "259", vec![report("259", OrderStatus::Filled, Some("21.53"), Some("0.12"))]);
+        let new_row = placed_to_json(&p);
+        let mut old_row = new_row.clone();
+        let obj = old_row.as_object_mut().unwrap();
+        obj.remove("avg_fill_price");
+        obj.remove("fee");
+        let mut null_row = new_row.clone();
+        null_row["avg_fill_price"] = Value::Null;
+        null_row["fee"] = Value::Null;
+        for row in [&new_row, &old_row, &null_row] {
+            let back = placed_from_json(row).unwrap();
+            assert_eq!(back.tag, p.tag);
+            assert_eq!(back.symbol, p.symbol);
+            assert_eq!(back.side, p.side);
+            assert_eq!(back.phase, p.phase);
+            assert_eq!(back.planned_quantity, p.planned_quantity);
+            assert_eq!(back.price, p.price);
+            assert_eq!(back.outcome, p.outcome);
+            assert_eq!(back.broker_order_id, p.broker_order_id);
+            assert_eq!(back.executed_quantity, p.executed_quantity);
+        }
+        let all = placed_vec_from_json(&Value::Array(vec![old_row, new_row])).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
 
