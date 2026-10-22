@@ -6,7 +6,14 @@
 global:
   environment: prod
 
-replicaCount: 1
+# PARKED (R74 A3a, 2026-10-22): the old "deployed strategies" live path is
+# scaled to zero in production. The paper rebalancer (k8s/rebalancer-helm,
+# release rebalancer-pilot) runs Dragonstone and shares no runtime code or
+# messages with this pod. CI's prod deploy job still runs `helm upgrade` on
+# every merge to main; with 0 here it keeps the Deployment at 0 pods.
+# Unpark: set this back to 1 (or `kubectl scale --replicas=1`, which the next
+# merge would undo). Gating the CI deploy job itself is R74 A3b, a later PR.
+replicaCount: 0
 
 image:
   pullPolicy: IfNotPresent

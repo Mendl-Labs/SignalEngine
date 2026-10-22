@@ -121,6 +121,11 @@ jobs:
             helm template signal-engine k8s/signal-engine-helm -f k8s/signal-engine-helm/$V \
               --set image.repository=example/signal-engine --set image.tag=ci > /dev/null
           done
+          # R74 A3a: the old live path stays parked (0 replicas) in production.
+          helm template signal-engine k8s/signal-engine-helm -f k8s/signal-engine-helm/values-prod.yaml \
+            --set image.repository=example/signal-engine --set image.tag=ci \
+            --show-only templates/deployment.yaml | grep -qE '^  replicas: 0$' \
+            || { echo "::error::values-prod.yaml must render the signal-engine Deployment with replicas: 0 (R74 A3a)"; exit 1; }
 
       - name: Check for Skip Tests Flag
         id: check-skip
