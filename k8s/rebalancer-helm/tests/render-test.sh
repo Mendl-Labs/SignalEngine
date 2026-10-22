@@ -20,6 +20,8 @@ refuse() { # name, expected-substring, args...
 }
 has()  { grep -qF -- "$1" <<<"$RENDERED" || { echo "FAIL missing: $1"; fail=1; }; }
 lacks(){ grep -qF -- "$1" <<<"$RENDERED" && { echo "FAIL unexpected: $1"; fail=1; }; }
+# optional_ref ENV: the secretKeyRef of env ENV is marked optional (the pod starts without the Secret).
+optional_ref(){ grep -F -A5 -- "- name: $1" <<<"$RENDERED" | grep -qF "optional: true" || { echo "FAIL $1: secretKeyRef is not optional"; fail=1; }; }
 PILOT=(--set pilot.tenantId=$T --set pilot.accountId=$A)
 BROKER=(--set credentialBroker.enabled=true)
 
@@ -40,11 +42,19 @@ refuse "extraEnv encryption key" "CREDENTIALS_ENCRYPTION_KEY" --set serveProposa
 refuse "extraEnv serve flag" "use the serveProposalPlans value" "${PILOT[@]}" --set 'extraEnv[0].name=REBALANCER_SERVE_PROPOSAL_PLANS' --set-string 'extraEnv[0].value=true'
 # --- Secret-backed optional env (D1)
 SPP=(--set serveProposalPlans=true "${BROKER[@]}")
-ok "default: no optional secret env" "${SPP[@]}"
-lacks "name: RESEND_API_KEY"; lacks "name: ALERT_FROM_EMAIL"; lacks "name: HEARTBEAT_URL"; lacks "name: ALPACA_DATA_KEY_ID"; lacks "name: ALERTS_ENABLED"
-ok "alerts from a Secret" "${SPP[@]}" --set alerts.enabled=true --set alerts.secretName=rebalancer-alerts
+# P0-04: alerts and heartbeat are ON by default, wired to OPTIONAL Secret refs (the pod starts without the Secrets).
+ok "default: alerts and heartbeat on, optional Secret refs" "${SPP[@]}"
 has "name: ALERTS_ENABLED"; has "name: RESEND_API_KEY"; has "name: ALERT_FROM_EMAIL"; has "name: rebalancer-alerts"; has "key: resendApiKey"; has "key: fromEmail"
-ok "heartbeat from a Secret" "${SPP[@]}" --set heartbeat.secretName=rebalancer-heartbeat
+has "name: HEARTBEAT_URL"; has "name: rebalancer-heartbeat"; has "key: url"
+optional_ref RESEND_API_KEY; optional_ref ALERT_FROM_EMAIL; optional_ref HEARTBEAT_URL
+lacks "name: ALPACA_DATA_KEY_ID"; lacks "name: DATA_GATE_MODE"
+ok "default with the owner pilot pair: same alert and heartbeat env" "${PILOT[@]}"
+has "name: ALERTS_ENABLED"; has "name: HEARTBEAT_URL"; optional_ref HEARTBEAT_URL
+ok "opt-out: alerts and heartbeat off renders none of their env" "${SPP[@]}" --set alerts.enabled=false --set alerts.secretName= --set heartbeat.secretName=
+lacks "name: RESEND_API_KEY"; lacks "name: ALERT_FROM_EMAIL"; lacks "name: HEARTBEAT_URL"; lacks "name: ALPACA_DATA_KEY_ID"; lacks "name: ALERTS_ENABLED"
+ok "alerts from a custom Secret" "${SPP[@]}" --set alerts.enabled=true --set alerts.secretName=my-alerts
+has "name: ALERTS_ENABLED"; has "name: RESEND_API_KEY"; has "name: my-alerts"; lacks "name: rebalancer-alerts"
+ok "heartbeat only (alerts off)" "${SPP[@]}" --set alerts.enabled=false --set alerts.secretName= --set heartbeat.secretName=rebalancer-heartbeat
 has "name: HEARTBEAT_URL"; has "name: rebalancer-heartbeat"; lacks "name: ALERTS_ENABLED"
 ok "data keys from a Secret" "${SPP[@]}" --set dataGate.secretName=rebalancer-data-keys
 has "name: ALPACA_DATA_KEY_ID"; has "name: ALPACA_DATA_KEY_SECRET"; has "name: rebalancer-data-keys"; lacks "name: DATA_GATE_MODE"
@@ -52,7 +62,7 @@ ok "extraEnvFromSecrets generic" "${SPP[@]}" --set 'extraEnvFromSecrets[0].name=
 has "name: SOME_TOKEN"; has "name: some-secret"; has "key: tok"
 ok "imagePullSecrets rendered" "${SPP[@]}" --set 'imagePullSecrets[0].name=ghcr-secret'
 has "imagePullSecrets:"; has "name: ghcr-secret"
-refuse "alerts.enabled without a Secret" "alerts.enabled=true requires alerts.secretName" "${SPP[@]}" --set alerts.enabled=true
+refuse "alerts.enabled without a Secret" "alerts.enabled=true requires alerts.secretName" "${SPP[@]}" --set alerts.enabled=true --set alerts.secretName=
 refuse "alerts keys empty" "alerts.secretName requires" "${SPP[@]}" --set alerts.secretName=x --set alerts.fromEmailKey=
 refuse "heartbeat key empty" "heartbeat.secretName requires" "${SPP[@]}" --set heartbeat.secretName=x --set heartbeat.urlKey=
 refuse "data keys key empty" "dataGate.secretName requires" "${SPP[@]}" --set dataGate.secretName=x --set dataGate.keySecretKey=

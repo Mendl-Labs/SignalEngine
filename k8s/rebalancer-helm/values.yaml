@@ -121,24 +121,29 @@ extraEnvFromSecrets: []
   #   key: some-key
 
 # ==============================================================================
-# Optional alert / heartbeat / data-gate credentials (all OFF unless secretName is set)
+# Alert delivery and heartbeat (ON by default, P0-04), optional data-gate credentials (OFF unless secretName is set)
 # ==============================================================================
-# Alert delivery (email via Resend). ALERTS_ENABLED=true is rendered only with alerts.enabled=true, which requires
-# alerts.secretName. The Secret holds two keys:
+# Alert delivery (email via Resend). ON by default: ALERTS_ENABLED=true is rendered with alerts.enabled=true, which
+# requires alerts.secretName. The Secret holds two keys and is created by the owner, never by this chart:
 #   kubectl create secret generic rebalancer-alerts -n <ns> \
 #     --from-literal=resendApiKey='...' --from-literal=fromEmail='alerts@example.com'
+# The Secret reference is OPTIONAL (secretKeyRef optional: true): if the Secret or a key is missing the pod still
+# starts, RESEND_API_KEY / ALERT_FROM_EMAIL are simply unset, and the service logs that deliveries are recorded with
+# error=sender_disabled and NOT sent (alerts still land in rebalancer_alerts). Create the Secret to make it send.
 # Delivery also needs a verified alert_channels row and the alert_* grants in databaseschema-internal role.sql.
 alerts:
-  enabled: false
-  secretName: ""
+  enabled: true
+  secretName: rebalancer-alerts
   resendApiKeyKey: resendApiKey
   fromEmailKey: fromEmail
 
 # Dead-man's heartbeat (HEARTBEAT_URL, a healthchecks-style ping URL; it is a bearer-like capability, so it lives in a
-# Secret). One key:
+# Secret). ON by default: wired to the Secret below, which the owner creates with the monitor's ping URL. One key:
 #   kubectl create secret generic rebalancer-heartbeat -n <ns> --from-literal=url='https://...'
+# The reference is OPTIONAL: without the Secret the pod still starts with HEARTBEAT_URL unset and logs
+# "HEARTBEAT_URL is not set: dead-man's heartbeat OFF". Set secretName to "" to render no HEARTBEAT_URL at all.
 heartbeat:
-  secretName: ""
+  secretName: rebalancer-heartbeat
   urlKey: url
 
 # Platform market-data keys for DATA_GATE_MODE=shadow (ALPACA_DATA_KEY_ID / ALPACA_DATA_KEY_SECRET): a DATA key, never a

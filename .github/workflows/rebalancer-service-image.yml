@@ -186,6 +186,7 @@ jobs:
           echo "  rebalancer-credential-broker (keys url, token), and copy the ghcr pull secret into the namespace."
           echo "  The owner pilot pair (--set pilot.tenantId=... --set pilot.accountId=..., plus Secret rebalancer-pilot-alpaca)"
           echo "  is optional with serveProposalPlans=true: set both or neither."
-          echo "  Optional Secret-backed env: alerts.secretName, heartbeat.secretName, dataGate.secretName, extraEnvFromSecrets."
+          echo "  Alerts and heartbeat are on by default, from optional Secrets rebalancer-alerts (keys resendApiKey, fromEmail)"
+          echo "  and rebalancer-heartbeat (key url); without them the pod still starts. Other optional env: dataGate.secretName, extraEnvFromSecrets."
           echo "  See that chart's values.yaml and NOTES.txt."
           echo "=========================================="
