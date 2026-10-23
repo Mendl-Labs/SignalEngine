@@ -73,6 +73,13 @@
 //! every tick that ran pings it and a tick that could not run pings `<url><HEARTBEAT_FAIL_SUFFIX>` (default `/fail`),
 //! on a short-timeout transport so the ping can never hold the loop; a failure streak is logged and raised once as
 //! `ALERT_HEARTBEAT_FAILED`. Neither can stop a run or change what a run does.
+//!
+//! # Proof that the alert path works (P0-04, `rebalancer_alerts::daily_test`)
+//! At startup, if no one could be told about a halt (delivery off, sender disabled, no verified alert channel, or no
+//! heartbeat), ONE Critical `ALERT_DELIVERY_UNCONFIGURED` row is written and the problems are logged. With delivery
+//! on, ONE `ALERT_DAILY_TEST` (Warning) a day at `ALERT_TEST_UTC` (default `13:00`; `off` disables it) goes through
+//! the same delivery path as a real alert, just before the tick's delivery step, so a day without it means the channel
+//! is broken.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -84,7 +91,9 @@ use broker_adapters::transport::reqwest_transport::ReqwestTransport;
 use broker_adapters::transport::HttpTransport;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use market_data::{DataGateMode, EnvKeyProvider, MassiveDataSource, ENV_DATA_GATE_MODE};
-use rebalancer_alerts::{alerts_enabled, sender_from_lookup, DeliveryWorker, Heartbeat, HeartbeatConfig, HeartbeatMonitor, Sender, TickOutcome, DEFAULT_BACKLOG_SECS, ENV_ALERTS_ENABLED, ENV_HEARTBEAT_URL};
+use rebalancer_alerts::{
+    alerts_enabled, delivery_problems, delivery_unconfigured_alert, sender_from_lookup, test_time_from_lookup, DailyTestAlert, DeliveryCheck, DeliveryLedger, DeliveryWorker, Heartbeat, HeartbeatConfig, HeartbeatMonitor, Sender, TickOutcome, DEFAULT_BACKLOG_SECS, ENV_ALERTS_ENABLED, ENV_ALERT_TEST_UTC, ENV_HEARTBEAT_URL,
+};
 use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_run::clock::Clock;
 use rebalancer_run::data::DataSource;
@@ -252,6 +261,14 @@ fn run_service() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rebalancer-service: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The daily test alert's time (P0-04): a malformed value refuses the start like every other setting.
+    let daily_test_time = match test_time_from_lookup(|k| std::env::var(k).ok()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("rebalancer-service: refusing to start: {e}");
             std::process::exit(1);
         }
     };
@@ -594,6 +611,41 @@ fn run_service() {
         }
     };
     let heartbeat_monitor = HeartbeatMonitor::new();
+
+    // --- Proof that the alert path works (P0-04). At startup: one Critical row when no one could be told about a
+    // halt. Then, with delivery on, one test alert a day at ALERT_TEST_UTC.
+    let check = DeliveryCheck {
+        alerts_enabled: delivery.is_some(),
+        sender: delivery.as_ref().map(|w| w.sender_name().to_string()),
+        channels: delivery.as_ref().map(|w| w.ledger().channels().map(|c| c.len()).map_err(|e| e.to_string())),
+        heartbeat_enabled: heartbeat.is_some(),
+    };
+    let problems = delivery_problems(&check);
+    if let Some(alert) = delivery_unconfigured_alert(&problems, clock.now()) {
+        for p in &problems {
+            log(format!("ALERT PATH NOT CONFIGURED: {p}"));
+        }
+        match notifier.notify(&alert) {
+            Ok(()) => log("ALERT_DELIVERY_UNCONFIGURED raised (critical, once per start)"),
+            Err(e) => log(format!("ALERT_DELIVERY_UNCONFIGURED could not be persisted either: {e}")),
+        }
+    } else {
+        log("alert path configured: delivery on, a sender, at least one verified channel and the heartbeat");
+    }
+    let daily_test = match (&delivery, daily_test_time) {
+        (Some(_), Some(t)) => {
+            log(format!("daily test alert ON: ALERT_DAILY_TEST once a day at {} UTC", t.format("%H:%M")));
+            Some(DailyTestAlert::new(t))
+        }
+        (Some(_), None) => {
+            log(format!("{ENV_ALERT_TEST_UTC}=off: daily test alert OFF"));
+            None
+        }
+        (None, _) => {
+            log("daily test alert OFF: alert delivery is off, so there is no channel to test");
+            None
+        }
+    };
     let write_back = match (&provenance, &reconciliation) {
         (Some(reg), Some(store)) => Some((reg.as_ref(), store)),
         _ => None,
@@ -639,6 +691,14 @@ fn run_service() {
                 TickOutcome::Failed
             }
         };
+        // The daily test of the alert channel, raised just before delivery so the same tick sends it.
+        if let Some(t) = &daily_test {
+            match t.raise_if_due(clock.now(), &notifier) {
+                Some(Ok(())) => log("ALERT_DAILY_TEST raised (sent by this tick's alert delivery)"),
+                Some(Err(e)) => log(format!("ALERT_DAILY_TEST could not be persisted: {e}; retried next tick")),
+                None => {}
+            }
+        }
         // After the runs, never before them, and never able to change them: deliver what the runs raised ...
         if let Some(w) = &delivery {
             let report = w.run(clock.now());

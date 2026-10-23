@@ -16,6 +16,8 @@ pub const ENV_ALERT_FROM_EMAIL: &str = "ALERT_FROM_EMAIL";
 pub const RESEND_BASE_URL: &str = "https://api.resend.com";
 /// The `alert_deliveries.error` text of a delivery nobody could send because no sender is configured.
 pub const SENDER_DISABLED_ERROR: &str = "sender_disabled";
+/// [`Sender::name`] of the [`DisabledSender`].
+pub const SENDER_DISABLED_NAME: &str = "disabled";
 /// Error texts are bounded so a vendor body can never bloat the ledger.
 const MAX_ERROR_CHARS: usize = 240;
 
@@ -80,7 +82,7 @@ pub struct DisabledSender;
 
 impl Sender for DisabledSender {
     fn name(&self) -> &'static str {
-        "disabled"
+        SENDER_DISABLED_NAME
     }
     fn send(&self, _email: &OutboundEmail) -> Result<String, SendError> {
         Err(SendError::Disabled)
@@ -166,7 +168,7 @@ pub fn sender_from_lookup(lookup: impl Fn(&str) -> Option<String>, transport: Ar
     let from = lookup(ENV_ALERT_FROM_EMAIL).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     match (key, from) {
         (Some(k), Some(f)) => (Box::new(ResendSender::new(&k, &f, transport)), "resend"),
-        _ => (Box::new(DisabledSender), "disabled"),
+        _ => (Box::new(DisabledSender), SENDER_DISABLED_NAME),
     }
 }
 

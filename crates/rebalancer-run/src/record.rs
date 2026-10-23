@@ -150,10 +150,17 @@ pub enum AlertCode {
     /// under the old limits, blocks new orders and tells a person. Critical; raised at first sight and again at 1,
     /// 7 and 30 days, showing the current drawdown. It never sells anything.
     AccountExcludedWithPositions,
+    /// The daily test of the alert channel (`rebalancer-alerts::daily_test`, P0-04): one a day at a configured UTC
+    /// time, about the platform (not an account). Warning, so platform channels receive it; a day without it means
+    /// alert delivery is broken. Never a trading signal.
+    DailyTest,
+    /// At startup the service found no working alert path (delivery off, sender disabled, no verified channel, or no
+    /// heartbeat): a halt might reach no one. Critical, one per start, about the platform.
+    DeliveryUnconfigured,
 }
 
 impl AlertCode {
-    pub const ALL: [AlertCode; 10] = [
+    pub const ALL: [AlertCode; 12] = [
         AlertCode::Halt,
         AlertCode::FlattenIncomplete,
         AlertCode::RunFailed,
@@ -164,6 +171,8 @@ impl AlertCode {
         AlertCode::HeartbeatFailed,
         AlertCode::DataGateShadowRefuse,
         AlertCode::AccountExcludedWithPositions,
+        AlertCode::DailyTest,
+        AlertCode::DeliveryUnconfigured,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -178,6 +187,8 @@ impl AlertCode {
             AlertCode::HeartbeatFailed => "ALERT_HEARTBEAT_FAILED",
             AlertCode::DataGateShadowRefuse => "ALERT_DATA_GATE_SHADOW_REFUSE",
             AlertCode::AccountExcludedWithPositions => "ACCOUNT_EXCLUDED_WITH_POSITIONS",
+            AlertCode::DailyTest => "ALERT_DAILY_TEST",
+            AlertCode::DeliveryUnconfigured => "ALERT_DELIVERY_UNCONFIGURED",
         }
     }
 }

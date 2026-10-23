@@ -25,6 +25,8 @@ pub fn what_to_do(code: &str) -> Option<&'static str> {
         "ALERT_DECISION_NOT_ACTED" => Some("What to do: a planned order was not carried out, so the decision stays pending and is planned again next run. Check the placed orders in the run record for a venue refusal or guard denial."),
         "ALERT_HEARTBEAT_FAILED" => Some("What to do: the service could not reach its external monitor; the monitor will page as if the service were down. Check network egress from the service and the monitor URL."),
         "ACCOUNT_EXCLUDED_WITH_POSITIONS" => Some("What to do: this account is no longer being managed, but its positions are being HELD, not sold: nothing has been liquidated and nothing will be. New orders are blocked and the old limits no longer run. Approve a new proposal for the account or sign off on the holdings; until then this alert repeats at 1, 7 and 30 days."),
+        "ALERT_DAILY_TEST" => Some("What to do: nothing; this is the daily test of the alert channel. If a day passes without it, alert delivery is broken: check the rebalancer's log for 'alert delivery' and the alert_deliveries table before trusting any silence."),
+        "ALERT_DELIVERY_UNCONFIGURED" => Some("What to do: the rebalancer is running but may not be able to tell anyone about a halt. Fix each problem listed above (the alert Secret with RESEND_API_KEY and ALERT_FROM_EMAIL, ALERTS_ENABLED=true, a verified alert channel, the heartbeat Secret), then restart the service and confirm the next daily test arrives."),
         _ => None,
     }
 }
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn action_codes_get_a_what_to_do_footer_and_informational_codes_do_not() {
-        for code in ["ALERT_HALT", "ALERT_STILL_HALTED", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ALERT_DECISION_NOT_ACTED", "ALERT_HEARTBEAT_FAILED"] {
+        for code in ["ALERT_HALT", "ALERT_STILL_HALTED", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ALERT_DECISION_NOT_ACTED", "ALERT_HEARTBEAT_FAILED", "ALERT_DAILY_TEST", "ALERT_DELIVERY_UNCONFIGURED"] {
             let r = render(&alert(code), Severity::Critical);
             assert!(r.body.contains("What to do:"), "{code} needs a footer:\n{}", r.body);
         }

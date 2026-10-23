@@ -45,8 +45,8 @@ impl Severity {
     /// confined to tenant channels because nobody added it here.
     pub fn fallback_for_code(code: &str) -> Severity {
         match code.trim() {
-            "ALERT_HALT" | "ALERT_FLATTEN_INCOMPLETE" | "ALERT_RUN_FAILED" | "ACCOUNT_EXCLUDED_WITH_POSITIONS" => Severity::Critical,
-            "ALERT_STILL_HALTED" | "ALERT_MANDATE_UNUSABLE" | "ALERT_DECISION_NOT_ACTED" | "ALERT_HEARTBEAT_FAILED" => Severity::Warning,
+            "ALERT_HALT" | "ALERT_FLATTEN_INCOMPLETE" | "ALERT_RUN_FAILED" | "ACCOUNT_EXCLUDED_WITH_POSITIONS" | "ALERT_DELIVERY_UNCONFIGURED" => Severity::Critical,
+            "ALERT_STILL_HALTED" | "ALERT_MANDATE_UNUSABLE" | "ALERT_DECISION_NOT_ACTED" | "ALERT_HEARTBEAT_FAILED" | "ALERT_DAILY_TEST" => Severity::Warning,
             _ => Severity::Warning,
         }
     }
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn every_pipeline_code_has_a_fallback_and_unknown_codes_fail_towards_warning() {
-        let critical = ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ACCOUNT_EXCLUDED_WITH_POSITIONS"];
+        let critical = ["ALERT_HALT", "ALERT_FLATTEN_INCOMPLETE", "ALERT_RUN_FAILED", "ACCOUNT_EXCLUDED_WITH_POSITIONS", "ALERT_DELIVERY_UNCONFIGURED"];
         for c in AlertCode::ALL {
             let want = if critical.contains(&c.as_str()) { Severity::Critical } else { Severity::Warning };
             assert_eq!(Severity::fallback_for_code(c.as_str()), want, "{}", c.as_str());

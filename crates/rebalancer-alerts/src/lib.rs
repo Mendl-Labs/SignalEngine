@@ -18,6 +18,8 @@
 //!   a tick with nothing due; a tick that could not run (kill flag unreadable, due scan failed) pings the monitor's
 //!   fail URL instead. The ping is bounded by its transport's timeout and never decides anything: a failed ping is
 //!   logged and raised once per failure streak as `ALERT_HEARTBEAT_FAILED` through the notifier.
+//! * [`daily_test`]: one `ALERT_DAILY_TEST` a day at `ALERT_TEST_UTC` (default 13:00 UTC) so a person knows the
+//!   channel works, and one Critical `ALERT_DELIVERY_UNCONFIGURED` at startup when no one could be told about a halt.
 //!
 //! Both are dark by default: `ALERTS_ENABLED` (default `false`) and `HEARTBEAT_URL` (unset = disabled). The tables
 //! `alert_channels` and `alert_deliveries` are a contract with `databaseschema-internal`
@@ -29,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod daily_test;
 pub mod heartbeat;
 pub mod ledger;
 pub mod sender;
@@ -36,9 +39,10 @@ pub mod severity;
 pub mod template;
 pub mod worker;
 
+pub use daily_test::{delivery_problems, delivery_unconfigured_alert, test_time_from_lookup, DailyTestAlert, DeliveryCheck, DEFAULT_TEST_TIME_UTC, ENV_ALERT_TEST_UTC};
 pub use heartbeat::{Heartbeat, HeartbeatConfig, HeartbeatMonitor, HeartbeatResult, TickOutcome, DEFAULT_FAIL_SUFFIX, ENV_HEARTBEAT_FAIL_SUFFIX, ENV_HEARTBEAT_URL};
 pub use ledger::{Channel, ChannelScope, DeliveryLedger, InMemoryLedger, LedgerError, NewDelivery, PendingAlert, PendingDelivery, SOURCE_REBALANCER};
-pub use sender::{sender_from_lookup, DisabledSender, OutboundEmail, ResendSender, SendError, Sender, ENV_ALERT_FROM_EMAIL, ENV_RESEND_API_KEY, SENDER_DISABLED_ERROR};
+pub use sender::{sender_from_lookup, DisabledSender, OutboundEmail, ResendSender, SendError, Sender, ENV_ALERT_FROM_EMAIL, ENV_RESEND_API_KEY, SENDER_DISABLED_ERROR, SENDER_DISABLED_NAME};
 pub use severity::{channel_applies, delivery_severity, Severity};
 pub use template::{render, Rendered};
 pub use worker::{alerts_enabled, DeliveryWorker, TickReport, DEFAULT_BACKLOG_SECS, ENV_ALERTS_ENABLED};

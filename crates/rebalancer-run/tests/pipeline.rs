@@ -80,6 +80,9 @@ fn run_alert_and_outcome_codes_are_pinned_and_unique() {
             "ALERT_DATA_GATE_SHADOW_REFUSE",
             // added by R47 (an excluded account that still holds positions; appended, nothing renumbered)
             "ACCOUNT_EXCLUDED_WITH_POSITIONS",
+            // added by P0-04 (the daily channel test and the startup no-delivery notice; appended, nothing renumbered)
+            "ALERT_DAILY_TEST",
+            "ALERT_DELIVERY_UNCONFIGURED",
         ]
     );
     assert_eq!(
