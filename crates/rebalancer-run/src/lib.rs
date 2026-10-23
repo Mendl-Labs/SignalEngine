@@ -16,6 +16,9 @@
 //! * [`driver`] holds `find_due_runs` / `run_all_due`: the multi-account driver loop (WP4.8) that enumerates every
 //!   due tenant-account and calls `run_once` for each, one process's or one account's failure never stopping the
 //!   others.
+//! * [`monitor`] holds `monitor_once` / `monitor_all`: the continuous equity monitor (P1-01) that reads every
+//!   protected account's equity on its own schedule and runs the risk step on each reading, decision pending or not.
+//!   It places no order of its own; only a halt rung's flatten can follow from it.
 //! * [`testkit`]: in-memory doubles for the traits (a recording notifier, a kill-flag switch, fixture data).
 
 #![forbid(unsafe_code)]
@@ -28,6 +31,7 @@ pub mod decision;
 pub mod driver;
 pub mod flatten;
 pub mod latency;
+pub mod monitor;
 pub mod pipeline;
 pub mod recon;
 pub mod record;

@@ -6,6 +6,8 @@
 //! * [`run_store::PgRunStore`] -- `rebalancer_run::stores::RunStore` (the immutable run record).
 //! * [`notifier::PgNotifier`] -- `rebalancer_run::stores::Notifier`.
 //! * [`kill_flag::PgKillFlag`] -- `rebalancer_run::stores::KillFlag` (global, see that module's docs).
+//! * [`equity_log::PgEquityLog`] -- `rebalancer_run::stores::EquityLog`: the continuous monitor's readings, appended
+//!   to `rebalancer_equity_snapshots` with `source = 'monitor'` (INSERT only; the table is append-only).
 //! * [`account_lock::PgAccountLock`] -- `rebalancer_run::driver::AccountLock`, the primary
 //!   concurrency-safety mechanism `run_all_due` uses.
 //! * [`account_source::PgAccountSource`] -- `rebalancer_run::driver::AccountSource` for the paper pilot: the allow-listed
@@ -37,6 +39,7 @@
 pub mod account_lock;
 pub mod account_source;
 pub mod delivery_ledger;
+pub mod equity_log;
 pub mod json;
 pub mod kill_flag;
 pub mod latency_store;
@@ -55,6 +58,7 @@ pub use account_source::{
     PlanExecution, PlanPoint,
 };
 pub use delivery_ledger::PgDeliveryLedger;
+pub use equity_log::PgEquityLog;
 pub use kill_flag::PgKillFlag;
 pub use latency_store::PgLatencyStore;
 pub use notifier::PgNotifier;

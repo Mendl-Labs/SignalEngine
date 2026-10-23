@@ -1,6 +1,7 @@
 //! The persistence and side-effect seams of the pipeline, as traits with in-memory implementations:
 //! [`RunStore`] (append-only run records with a UNIQUE run key), [`Notifier`] (halt / failure alerts) and
-//! [`KillFlag`] (the database kill switch read at the start of every run). A Postgres implementation of
+//! [`KillFlag`] (the database kill switch read at the start of every run), plus [`EquityLog`] (the continuous
+//! monitor's append-only equity readings). A Postgres implementation of
 //! `RunStore` maps `begin` to `INSERT ... ON CONFLICT (account, scheduled_for, sleeve_set) DO NOTHING` plus a read,
 //! and `finish` to one immutable-row insert (a trigger rejects UPDATE/DELETE).
 //!
@@ -408,4 +409,64 @@ pub trait Notifier {
 /// The kill flag (a database row in production). `Err` means "could not read it": the run fails closed.
 pub trait KillFlag {
     fn is_set(&self) -> Result<bool, String>;
+}
+
+// ------------------------------------------------------------------------------------------------------------
+// Equity log (the continuous monitor's reading history)
+// ------------------------------------------------------------------------------------------------------------
+
+/// The `source` of an equity reading taken by the continuous monitor (`crate::monitor`). A finished run's own
+/// readings are written by the run store as `pre_run` / `post_run`; the monitor never writes those.
+pub const MONITOR_SNAPSHOT_SOURCE: &str = "monitor";
+
+/// One broker-reported equity reading, as the append-only `rebalancer_equity_snapshots` table stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquityReading {
+    pub account_id: String,
+    pub taken_at: DateTime<Utc>,
+    pub equity: Dec,
+    pub cash: Dec,
+    pub derived_equity: Dec,
+    /// [`MONITOR_SNAPSHOT_SOURCE`] for the monitor.
+    pub source: &'static str,
+}
+
+/// Where the continuous monitor appends its readings. Append-only by contract (the Postgres table refuses UPDATE,
+/// DELETE and TRUNCATE): there is no method to change or remove a reading. A failed append is reported to the caller
+/// and never stops the risk evaluation that follows it.
+pub trait EquityLog {
+    fn append(&self, reading: &EquityReading) -> Result<(), String>;
+}
+
+/// In-memory [`EquityLog`] for tests and single-process use.
+#[derive(Default)]
+pub struct InMemoryEquityLog {
+    readings: Mutex<Vec<EquityReading>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl InMemoryEquityLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every reading appended so far, oldest first.
+    pub fn readings(&self) -> Vec<EquityReading> {
+        self.readings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Make every append fail (the store is unreachable) until switched back.
+    pub fn set_failing(&self, failing: bool) {
+        self.fail.store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl EquityLog for InMemoryEquityLog {
+    fn append(&self, reading: &EquityReading) -> Result<(), String> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("EQUITY_LOG_UNAVAILABLE: injected failure".to_string());
+        }
+        self.readings.lock().unwrap_or_else(|e| e.into_inner()).push(reading.clone());
+        Ok(())
+    }
 }
