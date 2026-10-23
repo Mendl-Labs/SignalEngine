@@ -26,7 +26,12 @@
 //!    crashed attempt's orders), stale view, equity cross-check. Any unexplained finding halts the account (no
 //!    flatten: we do not know what is true) and alerts.
 //! 7. `risk`: HWM and day-start are folded in and the ladder / daily-loss limit evaluated on BROKER equity. A halt
-//!    rung alerts, and in Live mode flattens (verify flat, then `Halted`); the run stops.
+//!    rung alerts, and in Live mode flattens (verify flat, then `Halted`); the run stops. The day-start follows
+//!    `RunConfig::day_start` (default: the first observation of the trading day). Under
+//!    `DayStartRule::UtcMidnight` a UTC day whose first reading came after the anchor window has NO day-start: the
+//!    daily-loss limit cannot fire that day, and the run PAUSES NEW BUYS (every buy that does not cover a short is
+//!    not sent, `DAY_START_MISSING`, so the decision is not acted and is planned again on an anchored day); sells and
+//!    the ladder are unaffected. The run whose reading found the missing anchor alerts (`ALERT_RUN_FAILED`, Warning).
 //! 8. `targets`: the targets of the PENDING sleeves only, built from the step 3b evaluations (ANY refusal of the
 //!    reference rules or the data layer already failed the run closed there). Sleeves that are not pending are left
 //!    out: the planner leaves instruments no target names alone, so their positions are untouched this run.
@@ -102,8 +107,8 @@ use rebalancer_core::guard::{DayCounters, PricePoint};
 use rebalancer_core::planner::{OrderPlan, OrderPlanner, PlanConfig, PlannedOrder, SkipReason, SleeveTarget};
 use rebalancer_core::policy::{DeploymentLimits, MandateEnvelope, MandateStatus, Policy, Standing};
 use rebalancer_core::venue::{SizeRefusal, VenueRuleBook};
-use rebalancer_risk::overlay::{step, RiskAction, RiskPolicy};
-use rebalancer_risk::state::{AccountState, AccountStatus, HaltReason};
+use rebalancer_risk::overlay::{step_with, RiskAction, RiskPolicy};
+use rebalancer_risk::state::{AccountState, AccountStatus, DayStartRule, HaltReason};
 use rebalancer_risk::store::{StateStore, StoreError};
 
 use crate::broker::{Broker, VenueEnvironment};
@@ -215,6 +220,19 @@ pub enum VenuePolicy {
     PaperOnly,
 }
 
+/// The stable prefix of the "no 00:00 UTC day-start" condition (`DayStartRule::UtcMidnight`), on the alert, the step
+/// note and the detail of every buy it held back.
+pub const DAY_START_MISSING: &str = "DAY_START_MISSING";
+
+/// The text of the "no 00:00 UTC day-start" condition. `first_at` is the late first reading of the day when the
+/// caller's own reading found the gap.
+pub fn day_start_missing_message(day: NaiveDate, max_lag_secs: i64, first_at: Option<DateTime<Utc>>) -> String {
+    let first = first_at.map_or(String::new(), |t| format!(" (the first reading of the day was at {})", t.to_rfc3339()));
+    format!(
+        "{DAY_START_MISSING}: no reading of {day} was taken within {max_lag_secs}s of 00:00 UTC{first}, so the day has no 00:00 UTC value: the one-day loss limit cannot fire today and new buys are paused until the next anchored day; sells and the drawdown ladder still apply"
+    )
+}
+
 /// Tunables of a run. None of these is a mandate field; each is a documented default a deployment may change.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -237,6 +255,10 @@ pub struct RunConfig {
     pub deployment: Option<DeploymentLimits>,
     /// Which venue connections may be used (default: unrestricted). See [`VenuePolicy`].
     pub venue_policy: VenuePolicy,
+    /// How the daily-loss limit's day-start is anchored (default: the historical first observation of the trading
+    /// day). The service sets `DayStartRule::UtcMidnight` only together with the continuous monitor, which takes the
+    /// reading at 00:00 UTC that the rule needs.
+    pub day_start: DayStartRule,
 }
 
 impl Default for RunConfig {
@@ -255,6 +277,7 @@ impl Default for RunConfig {
             flatten_max_rounds: 4,
             deployment: None,
             venue_policy: VenuePolicy::Unrestricted,
+            day_start: DayStartRule::FirstObservation,
         }
     }
 }
@@ -304,6 +327,11 @@ struct Run<'a> {
     /// Set only by `step_assess` when every order the plan called for was carried out (or ticketed), or there was
     /// nothing to do. `finish` counts a planned decision as acted only when this is true.
     carried: bool,
+    /// Set by `step_risk` when the day has no 00:00 UTC anchor (`DayStartRule::UtcMidnight`): new buys are paused
+    /// for this run and this text is the reason each paused buy carries.
+    buys_paused: Option<String>,
+    /// Assisted mode: the buys that were NOT ticketed because buys are paused (each is a gap for `step_assess`).
+    paused_tickets: Vec<String>,
 }
 
 fn summarize(s: &BrokerSnapshot) -> SnapshotSummary {
@@ -380,6 +408,8 @@ pub fn run_once(ctx: &RunContext<'_>) -> RunRecord {
         applied_ids: BTreeSet::new(),
         pending: Vec::new(),
         carried: false,
+        buys_paused: None,
+        paused_tickets: Vec::new(),
     };
 
     // 1. Acquire the run key.
@@ -562,6 +592,10 @@ impl Run<'_> {
                     out.push((format!("planner skipped {} ({:?})", s.symbol, s.reason), false));
                 }
             }
+        }
+        // Assisted: buys that were not ticketed because new buys are paused (no 00:00 UTC day-start).
+        for t in &self.paused_tickets {
+            out.push((t.clone(), false));
         }
         // Orders that were actually sent (Live / Paper).
         for p in &self.rec.placed {
@@ -892,7 +926,9 @@ impl Run<'_> {
     fn step_risk(&mut self) -> Result<(), Stop> {
         let snap = self.snapshot.clone().ok_or(Stop)?;
         let risk_policy = self.risk_policy.clone().ok_or(Stop)?;
-        let (next, decision, transition) = step(&self.state, &snap.equity_snapshot(), self.ctx.trading_day, &risk_policy);
+        let prior_day = self.state.trading_day();
+        let rule = self.ctx.config.day_start;
+        let (next, decision, transition) = step_with(&self.state, &snap.equity_snapshot(), self.ctx.trading_day, &risk_policy, rule);
         self.note("risk", format!("{} scale {}", decision.codes().join(","), decision.risk_scale));
         self.rec.risk = Some(decision.clone());
         if let Some(t) = transition {
@@ -900,6 +936,19 @@ impl Run<'_> {
         }
         self.save_state(next)?;
         if decision.action != RiskAction::HaltFlatten {
+            if let DayStartRule::UtcMidnight { max_lag_secs } = rule {
+                let day = snap.taken_at.date_naive();
+                if self.state.day_start_missing(day) {
+                    // This run's reading started the day outside the window: it is the one that found the gap.
+                    let first_at = (prior_day != Some(day)).then_some(snap.taken_at);
+                    let message = day_start_missing_message(day, max_lag_secs, first_at);
+                    self.note("risk", format!("{message}; new buys are paused in this run"));
+                    if first_at.is_some() {
+                        self.alert(AlertCode::RunFailed, AlertSeverity::Warning, message.clone(), &format!("day_start_missing:{day}"));
+                    }
+                    self.buys_paused = Some(message);
+                }
+            }
             return Ok(());
         }
         let reasons = decision.reasons.iter().map(|r| format!("{}: {}", r.code, r.message)).collect::<Vec<_>>().join(" | ");
@@ -1186,7 +1235,11 @@ impl Run<'_> {
     fn step_execute(&mut self, targets: &[SleeveTarget], plan: OrderPlan) -> Result<(), Stop> {
         match self.ctx.mode {
             ExecutionMode::Assisted => {
-                self.rec.tickets = plan.orders.clone();
+                let (tickets, paused): (Vec<PlannedOrder>, Vec<PlannedOrder>) = plan.orders.iter().cloned().partition(|o| !self.buy_is_paused(o));
+                if let Some(why) = &self.buys_paused {
+                    self.paused_tickets = paused.iter().map(|o| format!("buy {} not ticketed: {why}", o.symbol)).collect();
+                }
+                self.rec.tickets = tickets;
                 self.note("execute", format!("assisted: {} ticket(s) written, nothing placed", self.rec.tickets.len()));
                 Ok(())
             }
@@ -1221,6 +1274,16 @@ impl Run<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Is `o` a buy that new-buy pausing holds back? Only while buys are paused, and never a buy that covers a short
+    /// the account holds (that reduces risk).
+    fn buy_is_paused(&self, o: &PlannedOrder) -> bool {
+        if self.buys_paused.is_none() || o.side != Side::Buy {
+            return false;
+        }
+        let covers_short = self.snapshot.as_ref().and_then(|s| s.holding(&o.symbol)).is_some_and(|h| h.quantity.is_negative());
+        !covers_short
     }
 
     fn finalize(placed: &mut PlacedOrder, r: OrderReport) {
@@ -1307,6 +1370,11 @@ impl Run<'_> {
         // Never send anything unless the account may add risk (a halting account only ever gets flatten's sells).
         if !self.state.status().may_add_risk() {
             placed.detail = format!("refused: the account is {}", self.state.status().as_str());
+            return placed;
+        }
+        // No 00:00 UTC day-start today (`DayStartRule::UtcMidnight`): a buy that adds exposure is not sent.
+        if self.buy_is_paused(o) {
+            placed.detail = format!("not sent: {}", self.buys_paused.as_deref().unwrap_or(DAY_START_MISSING));
             return placed;
         }
         // Never send an order whose tag already exists at the broker (an earlier attempt of this run placed it).

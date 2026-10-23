@@ -98,6 +98,32 @@ impl HaltReason {
     ];
 }
 
+/// How the daily-loss limit's reference (`day_start_equity`) is anchored. A DEPLOYMENT setting, never a mandate field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DayStartRule {
+    /// The historical rule: the first observation of the caller's trading day is the day's start, whenever in the
+    /// day it is taken (see [`AccountState::observe`]). With one reading a day it compares a reading to itself.
+    #[default]
+    FirstObservation,
+    /// The day-start is the equity at 00:00 UTC (R75: "-20% from the previous 00:00 UTC balance"), defined precisely
+    /// as: the FIRST reading whose UTC timestamp is at or after 00:00:00 of its UTC date, provided it was taken at most
+    /// `max_lag_secs` after that midnight (inclusive). See [`AccountState::observe_anchored`].
+    ///
+    /// * A first reading of the day taken LATER than that window (the process was down across midnight, or nothing
+    ///   reads the account at night) is NOT the 00:00 value, and nothing else is either: the day has NO anchor. The
+    ///   state records the day with `day_start_equity = None` ([`AccountState::day_start_missing`]), the daily-loss
+    ///   limit cannot fire for the rest of that UTC day (the ladder still applies), and the caller pauses new buys
+    ///   and alerts. Nothing is invented: neither the late reading, nor the previous day's last reading, nor any
+    ///   other value stands in for the missing one.
+    /// * The anchor is a field of the persisted state (`trading_day` + `day_start_equity`), so it survives a restart:
+    ///   a reading later the same day keeps it (or keeps it missing); it is never re-taken until the next UTC date.
+    UtcMidnight { max_lag_secs: i64 },
+}
+
+/// The default anchor window of [`DayStartRule::UtcMidnight`]: 30 minutes after 00:00 UTC. With the continuous
+/// monitor reading every 5 minutes the first reading of the day normally lands within the first tick.
+pub const DEFAULT_DAY_START_MAX_LAG_SECS: i64 = 1800;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaltRecord {
     pub reason: HaltReason,
@@ -188,6 +214,14 @@ pub struct AccountState {
 
 fn one() -> Dec {
     Dec::from_i64(1)
+}
+
+/// Is `at` at most `max_lag_secs` after 00:00:00 UTC of its own UTC date (inclusive)? A negative window admits
+/// nothing; the date's midnight always exists in UTC.
+fn within_anchor_window(at: DateTime<Utc>, max_lag_secs: i64) -> bool {
+    let Some(midnight) = at.date_naive().and_hms_opt(0, 0, 0) else { return false };
+    let lag = at.signed_duration_since(midnight.and_utc());
+    max_lag_secs >= 0 && lag <= chrono::Duration::seconds(max_lag_secs)
 }
 
 impl AccountState {
@@ -338,7 +372,8 @@ impl AccountState {
     ///
     /// Design note: day-start is "equity at the first run of the day", not the previous close. A loss that happens
     /// between the last run of one day and the first run of the next is caught by the drawdown ladder, not by the
-    /// daily-loss limit.
+    /// daily-loss limit. This is [`DayStartRule::FirstObservation`]; [`AccountState::observe_anchored`] is the
+    /// 00:00 UTC rule.
     pub fn observe(&self, snapshot: &EquitySnapshot, day: NaiveDate) -> AccountState {
         let mut s = self.clone();
         let equity = snapshot.equity();
@@ -359,6 +394,55 @@ impl AccountState {
             s.day_start_equity = Some(equity);
         }
         s
+    }
+
+    /// Fold in a broker-reported equity snapshot under [`DayStartRule::UtcMidnight`]. Identical to
+    /// [`AccountState::observe`] for `last_equity` and the high-water mark; only the day-start differs:
+    /// * the trading day is the UTC date of the READING (`snapshot.at()`), not a caller-supplied day;
+    /// * on the first reading of a later UTC date, the day-start becomes this equity if the reading was taken at
+    ///   most `max_lag_secs` after 00:00:00 UTC of that date (inclusive), and becomes NONE otherwise (the day has no
+    ///   anchor: [`AccountState::day_start_missing`]);
+    /// * a later reading of the same UTC date never changes the day-start (present or missing);
+    /// * a reading dated before the recorded day is ignored for the day-start (a clock that went backwards must not
+    ///   re-base the daily-loss reference).
+    pub fn observe_anchored(&self, snapshot: &EquitySnapshot, max_lag_secs: i64) -> AccountState {
+        let mut s = self.clone();
+        let equity = snapshot.equity();
+        let at = snapshot.at();
+        s.last_equity = Some(equity);
+        s.last_equity_at = Some(at);
+        if s.status.may_add_risk() {
+            s.hwm = Some(match s.hwm {
+                Some(h) if h >= equity => h,
+                _ => equity,
+            });
+        }
+        let day = at.date_naive();
+        let new_day = match s.trading_day {
+            None => true,
+            Some(d) => day > d,
+        };
+        if new_day {
+            s.trading_day = Some(day);
+            s.day_start_equity = if within_anchor_window(at, max_lag_secs) { Some(equity) } else { None };
+        }
+        s
+    }
+
+    /// [`AccountState::observe`] or [`AccountState::observe_anchored`], as `rule` says. `day` is used only by
+    /// [`DayStartRule::FirstObservation`].
+    pub fn observe_with(&self, snapshot: &EquitySnapshot, day: NaiveDate, rule: DayStartRule) -> AccountState {
+        match rule {
+            DayStartRule::FirstObservation => self.observe(snapshot, day),
+            DayStartRule::UtcMidnight { max_lag_secs } => self.observe_anchored(snapshot, max_lag_secs),
+        }
+    }
+
+    /// The daily-loss limit cannot be measured on `day`: a reading of `day` has been folded in, but none inside the
+    /// anchor window, so the day has no start value (only [`AccountState::observe_anchored`] produces this). The
+    /// caller must not add risk on `day` (pause new buys) and must not invent a reference.
+    pub fn day_start_missing(&self, day: NaiveDate) -> bool {
+        self.trading_day == Some(day) && self.day_start_equity.is_none()
     }
 
     // ----------------------------------------------------------------------------------------------------------

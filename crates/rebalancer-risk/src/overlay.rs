@@ -14,7 +14,9 @@
 //! * **Ladder.** Rungs are ascending. The highest rung hit decides: a `shrink` rung scales every target by its
 //!   `scale`; the last rung (`halt_flatten`) halts and flattens.
 //! * **Daily loss.** `day_start - equity >= limit * day_start` (inclusive) halts and flattens, whatever the
-//!   drawdown. Day-start is the equity at the first observation of the account-local trading day the caller supplies.
+//!   drawdown. Day-start is the equity at the first observation of the account-local trading day the caller supplies
+//!   ([`DayStartRule::FirstObservation`], the default), or under [`DayStartRule::UtcMidnight`] the first reading at or
+//!   after 00:00 UTC inside the anchor window; a day with no anchor is not evaluated for daily loss ([`step_with`]).
 //! * **Recovery from a shrink (hysteresis, a documented parameter).** A shrink rung is released only when the
 //!   drawdown has recovered to within `recovery_fraction` of that rung's trigger: `loss <= at * recovery_fraction *
 //!   hwm`. The default is 0.5 ("recover to within half of the rung"): with a 10% shrink rung the account returns to
@@ -32,7 +34,7 @@ use mandate_core::mandate::{self, LadderAction, MandateBody};
 use rebalancer_core::dec_math::{div_floor, mul, ratio_to_dec, sub, MathError, RatioRound};
 use rebalancer_core::Dec;
 
-use crate::state::{AccountState, HaltReason, Transition};
+use crate::state::{AccountState, DayStartRule, HaltReason, Transition};
 
 /// A broker-reported equity reading. The constructor name is the policy: there is no other way to make one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,7 +515,21 @@ pub fn step(
     day: NaiveDate,
     policy: &RiskPolicy,
 ) -> (AccountState, RiskDecision, Option<Transition>) {
-    let observed = state.observe(snapshot, day);
+    step_with(state, snapshot, day, policy, DayStartRule::FirstObservation)
+}
+
+/// [`step`] with an explicit day-start rule ([`DayStartRule`]). Under `UtcMidnight` a day with no anchor has no
+/// day-start, so the daily-loss limit is not evaluated for it (it cannot fire, and it is never measured against an
+/// invented reference); the drawdown ladder is evaluated as always. The caller detects that case with
+/// `AccountState::day_start_missing` and pauses new buys.
+pub fn step_with(
+    state: &AccountState,
+    snapshot: &EquitySnapshot,
+    day: NaiveDate,
+    policy: &RiskPolicy,
+    rule: DayStartRule,
+) -> (AccountState, RiskDecision, Option<Transition>) {
+    let observed = state.observe_with(snapshot, day, rule);
     let decision = evaluate_risk(&observed, snapshot, policy);
     let (next, transition) = apply_decision(&observed, &decision, snapshot.at());
     (next, decision, transition)

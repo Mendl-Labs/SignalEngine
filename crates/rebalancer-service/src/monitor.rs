@@ -7,26 +7,38 @@
 //!   minutes, around the clock). Read only when the monitor is on; anything that is not a positive whole number of
 //!   seconds refuses the start, like every other malformed setting of this binary.
 //!
+//! * `REBALANCER_DAY_START_MAX_LAG_SECS`: with the monitor on, the runs and the monitor anchor the daily-loss limit
+//!   at 00:00 UTC (`DayStartRule::UtcMidnight`): the first reading at or after 00:00 UTC is the day's start if it
+//!   was taken within this many seconds of midnight (default 1800, at most 43200). Off, the historical rule (first
+//!   observation of the trading day) is unchanged. The 00:00 UTC rule needs a reading at night, which only the
+//!   monitor takes, so it is never enabled without it.
+//!
 //! The monitor runs inside the tick loop, so its effective cadence is never finer than `REBALANCER_TICK_SECS`
 //! (default also 300). [`MonitorSettings::describe`] says so at startup when the interval is shorter than the tick.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rebalancer_risk::state::{DayStartRule, DEFAULT_DAY_START_MAX_LAG_SECS};
 
 pub const ENV_MONITOR_ENABLED: &str = "REBALANCER_MONITOR_ENABLED";
 pub const ENV_MONITOR_SECS: &str = "REBALANCER_MONITOR_SECS";
 pub const DEFAULT_MONITOR_SECS: u64 = 300;
+pub const ENV_DAY_START_MAX_LAG_SECS: &str = "REBALANCER_DAY_START_MAX_LAG_SECS";
+/// The widest anchor window accepted: 12 hours (a reading at noon is not a midnight value).
+pub const MAX_DAY_START_MAX_LAG_SECS: i64 = 43_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorSettings {
     pub enabled: bool,
     pub interval_secs: u64,
+    /// The 00:00 UTC anchor window (used only when `enabled`).
+    pub day_start_max_lag_secs: i64,
 }
 
 impl MonitorSettings {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let enabled = lookup(ENV_MONITOR_ENABLED).is_some_and(|v| v.trim() == "true");
         if !enabled {
-            return Ok(Self { enabled: false, interval_secs: DEFAULT_MONITOR_SECS });
+            return Ok(Self { enabled: false, interval_secs: DEFAULT_MONITOR_SECS, day_start_max_lag_secs: DEFAULT_DAY_START_MAX_LAG_SECS });
         }
         let interval_secs = match lookup(ENV_MONITOR_SECS).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
             None => DEFAULT_MONITOR_SECS,
@@ -35,7 +47,24 @@ impl MonitorSettings {
                 _ => return Err(format!("{ENV_MONITOR_SECS} is {v:?}; it must be a positive whole number of seconds")),
             },
         };
-        Ok(Self { enabled: true, interval_secs })
+        let day_start_max_lag_secs = match lookup(ENV_DAY_START_MAX_LAG_SECS).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            None => DEFAULT_DAY_START_MAX_LAG_SECS,
+            Some(v) => match v.parse::<i64>() {
+                Ok(n) if n > 0 && n <= MAX_DAY_START_MAX_LAG_SECS => n,
+                _ => return Err(format!("{ENV_DAY_START_MAX_LAG_SECS} is {v:?}; it must be a whole number of seconds from 1 to {MAX_DAY_START_MAX_LAG_SECS}")),
+            },
+        };
+        Ok(Self { enabled: true, interval_secs, day_start_max_lag_secs })
+    }
+
+    /// The day-start rule the runs and the monitor use: the 00:00 UTC anchor with the monitor on, the historical rule
+    /// with it off.
+    pub fn day_start_rule(&self) -> DayStartRule {
+        if self.enabled {
+            DayStartRule::UtcMidnight { max_lag_secs: self.day_start_max_lag_secs }
+        } else {
+            DayStartRule::FirstObservation
+        }
     }
 
     /// One startup log line.
@@ -47,6 +76,10 @@ impl MonitorSettings {
             "{ENV_MONITOR_ENABLED}=true: continuous equity monitor ON, every {}s around the clock; it reads every protected account's equity and runs the drawdown ladder and daily-loss limit on each reading, and sends no order except a halt rung's flatten (Live mode)",
             self.interval_secs
         );
+        s.push_str(&format!(
+            "; the daily-loss limit is measured from the first reading within {}s after 00:00 UTC (a day without one pauses new buys and alerts)",
+            self.day_start_max_lag_secs
+        ));
         if self.interval_secs < tick_secs {
             s.push_str(&format!("; NOTE: the tick interval is {tick_secs}s, so readings are at most once per tick"));
         }
@@ -126,12 +159,28 @@ mod tests {
 
     #[test]
     fn describe_says_off_or_on_and_warns_when_the_tick_is_coarser() {
-        let off = MonitorSettings { enabled: false, interval_secs: 300 };
+        let off = MonitorSettings { enabled: false, interval_secs: 300, day_start_max_lag_secs: 1800 };
         assert!(off.describe(300).contains("OFF"));
-        let on = MonitorSettings { enabled: true, interval_secs: 60 };
+        let on = MonitorSettings { enabled: true, interval_secs: 60, day_start_max_lag_secs: 1800 };
+        assert!(on.describe(300).contains("within 1800s after 00:00 UTC"));
         assert!(on.describe(300).contains("ON, every 60s"));
         assert!(on.describe(300).contains("at most once per tick"));
         assert!(!on.describe(60).contains("at most once per tick"));
+    }
+
+    #[test]
+    fn the_midnight_anchor_is_on_exactly_when_the_monitor_is_on() {
+        let off = MonitorSettings::from_lookup(lookup(&[(ENV_DAY_START_MAX_LAG_SECS, "600")])).unwrap();
+        assert_eq!(off.day_start_rule(), DayStartRule::FirstObservation, "the 00:00 UTC rule needs the monitor's night readings");
+        let on = MonitorSettings::from_lookup(lookup(&[(ENV_MONITOR_ENABLED, "true")])).unwrap();
+        assert_eq!(on.day_start_rule(), DayStartRule::UtcMidnight { max_lag_secs: 1800 });
+        let custom = MonitorSettings::from_lookup(lookup(&[(ENV_MONITOR_ENABLED, "true"), (ENV_DAY_START_MAX_LAG_SECS, " 600 ")])).unwrap();
+        assert_eq!(custom.day_start_rule(), DayStartRule::UtcMidnight { max_lag_secs: 600 });
+        for bad in ["0", "-1", "43201", "abc", "1.5"] {
+            let e = MonitorSettings::from_lookup(lookup(&[(ENV_MONITOR_ENABLED, "true"), (ENV_DAY_START_MAX_LAG_SECS, bad)])).unwrap_err();
+            assert!(e.contains(ENV_DAY_START_MAX_LAG_SECS), "{bad}: {e}");
+        }
+        assert!(MonitorSettings::from_lookup(lookup(&[(ENV_MONITOR_ENABLED, "true"), (ENV_DAY_START_MAX_LAG_SECS, "43200")])).is_ok());
     }
 
     #[test]

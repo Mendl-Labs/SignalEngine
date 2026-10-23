@@ -27,6 +27,10 @@
 //! 8. `risk`: `observe` + `evaluate_risk` + `apply_decision` on the BROKER equity, with the UTC date of the reading
 //!    as the trading day (the pipeline's `trading_day` is the UTC date of its slot, so both agree). The new state is
 //!    saved (compare-and-swap); a shrink rung only changes the posture, which the next run applies to its targets.
+//!    The day-start follows `RunConfig::day_start` (the same rule the runs use). Under `DayStartRule::UtcMidnight`
+//!    the monitor's first reading after 00:00 UTC is the day's start; if that first reading came after the anchor
+//!    window the day has no start, the reading that found it raises one `ALERT_RUN_FAILED` (Warning,
+//!    `DAY_START_MISSING`, once per UTC day) and the runs pause new buys for the rest of that day.
 //! 9. A halt rung or the daily-loss limit (`RiskAction::HaltFlatten`) alerts (`ALERT_HALT`, Critical) and, in Live
 //!    mode, flattens with the pipeline's own `flatten` (same tags, keyed by the halt time, so a run or a later
 //!    reading that resumes it never sends an order twice); in Assisted / Paper mode the account goes straight to
@@ -52,15 +56,15 @@ use mandate_core::mandate::MandateBody;
 use rebalancer_core::policy::{MandateStatus, Policy};
 use rebalancer_core::venue::VenueRuleBook;
 use rebalancer_core::Dec;
-use rebalancer_risk::overlay::{step, RiskAction, RiskDecision, RiskPolicy};
-use rebalancer_risk::state::{AccountState, AccountStatus, HaltReason, Transition};
+use rebalancer_risk::overlay::{step_with, RiskAction, RiskDecision, RiskPolicy};
+use rebalancer_risk::state::{AccountState, AccountStatus, DayStartRule, HaltReason, Transition};
 use rebalancer_risk::store::{StateStore, StoreError};
 
 use crate::broker::{Broker, VenueEnvironment};
 use crate::clock::Clock;
 use crate::driver::{AccountLock, AccountRuntime, ActiveAccount};
 use crate::flatten::{flatten, FlattenReport, FlattenSpec, FlattenVerdict};
-use crate::pipeline::{RunConfig, VenuePolicy};
+use crate::pipeline::{day_start_missing_message, RunConfig, VenuePolicy};
 use crate::record::{Alert, AlertCode, AlertSeverity, ExecutionMode};
 use crate::stores::{EquityLog, EquityReading, KillFlag, Notifier, RunStore, MONITOR_SNAPSHOT_SOURCE};
 use crate::view::BrokerSnapshot;
@@ -175,6 +179,9 @@ pub struct MonitorReport {
     pub alert_delivery_failures: Vec<String>,
     /// Broker reads this call made (1 for a normal reading; the flatten's own reads are not counted here).
     pub reads: u32,
+    /// Under `DayStartRule::UtcMidnight`: the reading's UTC day has no 00:00 UTC day-start (the one-day loss limit
+    /// cannot fire today and the runs pause new buys).
+    pub day_start_missing: bool,
 }
 
 impl MonitorReport {
@@ -194,6 +201,7 @@ impl MonitorReport {
             alerts: Vec::new(),
             alert_delivery_failures: Vec::new(),
             reads: 0,
+            day_start_missing: false,
         }
     }
 
@@ -349,7 +357,9 @@ impl Monitor<'_> {
             AccountStatus::Active | AccountStatus::Shrunk => {}
         }
         // 8. the risk step on the broker's equity, with the reading's UTC date as the trading day.
-        let (next, decision, transition) = step(&self.state, &snap.equity_snapshot(), now.date_naive(), &risk_policy);
+        let prior_day = self.state.trading_day();
+        let rule = ctx.config.day_start;
+        let (next, decision, transition) = step_with(&self.state, &snap.equity_snapshot(), now.date_naive(), &risk_policy, rule);
         self.report.decision = Some(decision.clone());
         if let Some(t) = transition {
             self.report.transitions.push(t);
@@ -369,7 +379,21 @@ impl Monitor<'_> {
             return self.done(MonitorCode::StateStoreError, format!("the account state could not be saved: {e}"));
         }
         if decision.action != RiskAction::HaltFlatten {
-            return self.done(MonitorCode::Observed, String::new());
+            let mut message = String::new();
+            if let DayStartRule::UtcMidnight { max_lag_secs } = rule {
+                let day = snap.taken_at.date_naive();
+                if self.state.day_start_missing(day) {
+                    self.report.day_start_missing = true;
+                    // Only the reading that STARTED the day outside the window alerts: once per UTC day, and the
+                    // missing day is persisted state, so a restart does not alert again.
+                    let first_at = (prior_day != Some(day)).then_some(snap.taken_at);
+                    message = day_start_missing_message(day, max_lag_secs, first_at);
+                    if first_at.is_some() {
+                        self.alert(AlertCode::RunFailed, AlertSeverity::Warning, message.clone(), &format!("day_start_missing:{day}"));
+                    }
+                }
+            }
+            return self.done(MonitorCode::Observed, message);
         }
         // 9. a halt rung or the daily-loss limit: alert, then flatten (Live) or halt and tell a person (otherwise).
         let reasons = decision.reasons.iter().map(|r| format!("{}: {}", r.code, r.message)).collect::<Vec<_>>().join(" | ");

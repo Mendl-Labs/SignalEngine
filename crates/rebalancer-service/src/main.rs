@@ -578,7 +578,10 @@ fn run_service() {
 
     let clock = SystemClock;
     // Paper-only: the pipeline refuses any broker that does not report a paper connection (`VenuePolicy::PaperOnly`).
-    let config: RunConfig = pilot_run_config();
+    let mut config: RunConfig = pilot_run_config();
+    // P1-02: with the continuous monitor on, the daily-loss limit is anchored at 00:00 UTC for the runs AND the
+    // monitor (one rule, one persisted anchor). Off: the historical first-observation rule, unchanged.
+    config.day_start = monitor_settings.day_start_rule();
     // From here, every tick asks Postgres afresh who is due and eligible: a plan tightened or a mandate revoked
     // between ticks takes effect on the very next one, with no restart needed.
     let accounts = PilotAccountSource::new(pg_source, pilot.clone());
