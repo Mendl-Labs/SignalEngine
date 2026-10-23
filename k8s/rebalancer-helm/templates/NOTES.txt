@@ -55,10 +55,10 @@ Required Secrets in this namespace (this chart never creates them -- see values.
   - {{ .Values.secrets.alpaca.secretName }} (keys {{ .Values.secrets.alpaca.keyIdKey }}, {{ .Values.secrets.alpaca.keySecretKey }}): owner pilot paper Alpaca key (only with a pilot pair)
 {{- end }}
 {{- if .Values.alerts.secretName }}
-  - {{ .Values.alerts.secretName }} (keys {{ .Values.alerts.resendApiKeyKey }}, {{ .Values.alerts.fromEmailKey }}): RESEND_API_KEY, ALERT_FROM_EMAIL
+  - {{ .Values.alerts.secretName }} (keys {{ .Values.alerts.resendApiKeyKey }}, {{ .Values.alerts.fromEmailKey }}): RESEND_API_KEY, ALERT_FROM_EMAIL (optional: without it alerts are recorded, not sent)
 {{- end }}
 {{- if .Values.heartbeat.secretName }}
-  - {{ .Values.heartbeat.secretName }} (key {{ .Values.heartbeat.urlKey }}): HEARTBEAT_URL
+  - {{ .Values.heartbeat.secretName }} (key {{ .Values.heartbeat.urlKey }}): HEARTBEAT_URL (optional: without it the heartbeat is OFF)
 {{- end }}
 {{- if .Values.dataGate.secretName }}
   - {{ .Values.dataGate.secretName }} (keys {{ .Values.dataGate.keyIdKey }}, {{ .Values.dataGate.keySecretKey }}): ALPACA_DATA_KEY_ID, ALPACA_DATA_KEY_SECRET

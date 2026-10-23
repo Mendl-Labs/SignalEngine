@@ -150,8 +150,9 @@ spec:
                   name: {{ .Values.secrets.massive.secretName }}
                   key: {{ .Values.secrets.massive.key }}
 
-            # --- Optional Secret-backed env (all off unless the matching secretName is set; Secrets are created
-            # out of band, the chart never contains a value). See values.yaml.
+            # --- Secret-backed env (Secrets are created out of band, the chart never contains a value). See values.yaml.
+            # Alerts and heartbeat are on by default (P0-04) with OPTIONAL Secret references: a missing Secret leaves
+            # the variable unset and the pod still starts (the service logs the sender as disabled / heartbeat OFF).
             {{- if .Values.alerts.enabled }}
             - name: ALERTS_ENABLED
               value: "true"
@@ -162,11 +163,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.alerts.secretName }}
                   key: {{ .Values.alerts.resendApiKeyKey }}
+                  optional: true
             - name: ALERT_FROM_EMAIL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.alerts.secretName }}
                   key: {{ .Values.alerts.fromEmailKey }}
+                  optional: true
             {{- end }}
             {{- if .Values.heartbeat.secretName }}
             - name: HEARTBEAT_URL
@@ -174,6 +177,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.heartbeat.secretName }}
                   key: {{ .Values.heartbeat.urlKey }}
+                  optional: true
             {{- end }}
             {{- if .Values.dataGate.secretName }}
             - name: ALPACA_DATA_KEY_ID
