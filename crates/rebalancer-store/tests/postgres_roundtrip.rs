@@ -388,3 +388,64 @@ fn notifier_persists_an_alert_that_a_fresh_store_can_read_back() {
 
     cleanup(&url, account_id);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// EquityLog (the continuous monitor's readings): INSERT only, source 'monitor', no run key
+// ---------------------------------------------------------------------------------------------------
+
+#[test]
+fn equity_log_appends_monitor_readings_and_refuses_an_unknown_tenant() {
+    use rebalancer_run::stores::{EquityLog, EquityReading, MONITOR_SNAPSHOT_SOURCE};
+    use rebalancer_store::PgEquityLog;
+
+    let Some(url) = database_url() else { return skip_msg() };
+    // A fresh account id per run and NO cleanup: the table is append-only (migration 2026-10-22-173107 refuses
+    // DELETE once applied), so this test never needs to remove what it wrote.
+    let account_id = format!("rt-equity-log-{}", Uuid::new_v4());
+    let tn = tenants();
+    let pool = rebalancer_store::pg::create_pool(&url, 2).unwrap();
+    let log = PgEquityLog::new(pool, tn.clone()).unwrap();
+    let reading = |equity: &str| EquityReading {
+        account_id: account_id.clone(),
+        taken_at: Utc::now(),
+        equity: rebalancer_run::Dec::parse(equity).unwrap(),
+        cash: rebalancer_run::Dec::parse("100.5").unwrap(),
+        derived_equity: rebalancer_run::Dec::parse(equity).unwrap(),
+        source: MONITOR_SNAPSHOT_SOURCE,
+    };
+
+    // No tenant registered: refused, nothing written under the nil tenant.
+    let refused = log.append(&reading("1000")).unwrap_err();
+    assert!(refused.starts_with("EQUITY_LOG_UNKNOWN_TENANT"), "{refused}");
+
+    tn.register(&account_id, Uuid::new_v4());
+    log.append(&reading("1000")).expect("first reading");
+    log.append(&reading("999.25")).expect("second reading");
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rows: Vec<(String, Option<String>, String)> = rt.block_on(async {
+        use diesel_async::{AsyncConnection, RunQueryDsl};
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            source: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            run_key: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            equity: String,
+        }
+        let mut conn = diesel_async::AsyncPgConnection::establish(&url).await.unwrap();
+        let rows: Vec<Row> = diesel::sql_query("SELECT source, run_key, equity::text AS equity FROM rebalancer_equity_snapshots WHERE account_id = $1 ORDER BY taken_at")
+            .bind::<diesel::sql_types::Text, _>(&account_id)
+            .get_results(&mut conn)
+            .await
+            .unwrap();
+        rows.into_iter().map(|r| (r.source, r.run_key, r.equity)).collect()
+    });
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (source, run_key, _) in &rows {
+        assert_eq!(source, "monitor");
+        assert_eq!(run_key, &None, "a monitor reading belongs to no run");
+    }
+    assert_eq!(rebalancer_run::Dec::parse(&rows[1].2).unwrap(), rebalancer_run::Dec::parse("999.25").unwrap());
+}

@@ -73,6 +73,14 @@
 //! every tick that ran pings it and a tick that could not run pings `<url><HEARTBEAT_FAIL_SUFFIX>` (default `/fail`),
 //! on a short-timeout transport so the ping can never hold the loop; a failure streak is logged and raised once as
 //! `ALERT_HEARTBEAT_FAILED`. Neither can stop a run or change what a run does.
+//!
+//! # The continuous equity monitor (P1-01, `rebalancer_run::monitor`)
+//! Dark by default. With `REBALANCER_MONITOR_ENABLED=true`, every `REBALANCER_MONITOR_SECS` (default 300) the tick
+//! reads the equity of every protected account (active mandate, approved plan, a runtime in the fleet) BEFORE the
+//! tick's runs, whether or not a decision is pending, appends the reading to `rebalancer_equity_snapshots` (source
+//! `monitor`) and runs the drawdown ladder and daily-loss limit on it. It places no order of its own; a halt rung or
+//! the daily-loss limit flattens (Live mode) exactly as a run would. A failure alerts once per streak. Off, nothing in
+//! the tick changes.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -90,6 +98,7 @@ use rebalancer_run::clock::Clock;
 use rebalancer_run::data::DataSource;
 use rebalancer_run::driver::{run_all_due, summarize, AccountRuntime, AccountSource, DueOutcome};
 use rebalancer_run::latency::LatencyRecorder;
+use rebalancer_run::monitor::{monitor_all, summarize as summarize_monitor, FailureStreaks, MonitorCode};
 use rebalancer_run::pipeline::RunConfig;
 use rebalancer_run::record::{Alert, AlertCode, AlertSeverity};
 use rebalancer_run::stores::Notifier;
@@ -98,11 +107,12 @@ use rebalancer_service::credentials::{EnvPilotCredentials, PaperCredentialProvid
 use rebalancer_service::excluded::{check_excluded, ExclusionIo, Outcome};
 use rebalancer_service::fleet::{connect_account, reenumerate_secs_from_lookup, Fleet, ReenumerateSchedule, DEFAULT_REENUMERATE_SECS};
 use rebalancer_service::liveness;
+use rebalancer_service::monitor::{MonitorSchedule, MonitorSettings};
 use rebalancer_service::observer::ObserverConfig;
 use rebalancer_service::pilot::{pilot_run_config, PilotAccountSource, PilotConfig};
 use rebalancer_service::runtime::{connect_account_alpaca_for_sleeves, connect_read_only, pilot_data_source, pilot_data_source_shadow, pilot_template_sql, shadow_gate, PilotAlpaca};
 use rebalancer_store::{
-    reconciliation_for, AccountScope, AccountTenants, PgAccountLock, PgAccountSource, PgDeliveryLedger, PgKillFlag, PgLatencyStore, PgNotifier, PgPlanReconciliation, PgRunStore, PgStateStore,
+    reconciliation_for, AccountScope, AccountTenants, PgAccountLock, PgAccountSource, PgDeliveryLedger, PgEquityLog, PgKillFlag, PgLatencyStore, PgNotifier, PgPlanReconciliation, PgRunStore, PgStateStore,
     PilotAccount, PilotAllowList, PlanOrigin, PlanProvenanceRegistry,
 };
 
@@ -267,9 +277,19 @@ fn run_service() {
     } else {
         DEFAULT_REENUMERATE_SECS
     };
+    // The continuous equity monitor (P1-01): off unless REBALANCER_MONITOR_ENABLED=true; a malformed interval refuses
+    // the start like every other setting.
+    let monitor_settings = match MonitorSettings::from_lookup(|k| std::env::var(k).ok()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebalancer-service: refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
     let tick_secs = tick_secs();
     log(format!("starting: tick interval {tick_secs}s; PAPER-ONLY; {}", pilot.describe()));
     log(observer_cfg.describe());
+    log(monitor_settings.describe(tick_secs));
 
     let tenants = Arc::new(AccountTenants::new());
     // Plan provenance (origin, plan id, paper) travels from the account source to the run store and the
@@ -356,6 +376,20 @@ fn run_service() {
             std::process::exit(1);
         }
     };
+    // --- The continuous monitor's equity log (monitor on only): INSERT-only into rebalancer_equity_snapshots.
+    let equity_log = if monitor_settings.enabled {
+        match PgEquityLog::new(pool.clone(), tenants.clone()) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("rebalancer-service: could not build PgEquityLog: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let mut monitor_schedule = monitor_settings.enabled.then(|| MonitorSchedule::new(monitor_settings.interval_secs));
+    let mut monitor_streaks = FailureStreaks::new();
     let pg_source = match PgAccountSource::with_scope(pool.clone(), scope) {
         Ok(s) => match &provenance {
             Some(reg) => s.with_plan_provenance(reg.clone()),
@@ -628,6 +662,13 @@ fn run_service() {
                     for (i, (id, _)) in fleet.iter().enumerate() {
                         runtimes.insert(id.clone(), AccountRuntime { broker: &brokers[i], data: data_source, venue_rules: &venue_books[i] });
                     }
+                    // The continuous monitor (on only with REBALANCER_MONITOR_ENABLED=true), BEFORE the runs: every
+                    // protected account's equity is read and the ladder evaluated, decision pending or not.
+                    if let (Some(equity_log), Some(schedule)) = (&equity_log, monitor_schedule.as_mut()) {
+                        if schedule.due(clock.now()) {
+                            monitor_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, equity_log, &clock, &lock, &config, &runtimes, &mut monitor_streaks);
+                        }
+                    }
                     run_tick(&accounts, &tenants, &state_store, &run_store, &notifier, &kill_flag, &clock, &lock, &config, &runtimes, write_back)
                 };
                 // After the runs (and their data fetch), the observer; never before, never instead.
@@ -835,6 +876,48 @@ fn run_tick(
         write_back_reconciliation(&outcomes, registry, store, clock.now());
     }
     TickOutcome::Ran
+}
+
+/// One continuous-monitor pass (P1-01): every protected account's equity read once, logged and run through the risk
+/// step (`rebalancer_run::monitor::monitor_all`). Wrapped in `catch_unwind` like the observer: a monitor bug is
+/// logged and can never abort the tick loop or stop the runs that follow.
+#[allow(clippy::too_many_arguments)]
+fn monitor_tick(
+    accounts: &dyn AccountSource,
+    tenants: &Arc<AccountTenants>,
+    state_store: &PgStateStore,
+    run_store: &PgRunStore,
+    notifier: &PgNotifier,
+    kill_flag: &PgKillFlag,
+    equity_log: &PgEquityLog,
+    clock: &SystemClock,
+    lock: &PgAccountLock,
+    config: &RunConfig,
+    runtimes: &BTreeMap<String, AccountRuntime<'_>>,
+    streaks: &mut FailureStreaks,
+) {
+    let active = match accounts.active_accounts() {
+        Ok(a) => a,
+        Err(e) => {
+            log(format!("monitor: active_accounts failed ({e}); no account read this pass"));
+            return;
+        }
+    };
+    // The tenant of every row the monitor writes (equity readings, state, alerts) comes from this registry.
+    tenants.set_all(active.iter().map(|a| (a.account_id.clone(), uuid_or_nil(&a.tenant_id))));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| monitor_all(&active, runtimes, state_store, run_store, notifier, kill_flag, equity_log, clock, lock, config, streaks)));
+    match result {
+        Ok(reports) => {
+            log(format!("monitor: {}", summarize_monitor(&reports)));
+            for r in reports.iter().filter(|r| r.code != MonitorCode::Observed || r.log_error.is_some() || !r.transitions.is_empty()) {
+                log(format!("  monitor {}", r.summary()));
+            }
+        }
+        Err(payload) => {
+            let msg = payload.downcast_ref::<&str>().map(|s| (*s).to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "non-string panic payload".into());
+            log(format!("monitor PANICKED (no run affected): {msg}"));
+        }
+    }
 }
 
 /// `strategy_plans.reconciliation_*` for every finished run of a proposal-served account this tick. A run that was
